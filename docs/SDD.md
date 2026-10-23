@@ -5227,6 +5227,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
 | D18 | Network cut-over, Octavia and Heat (§23): what 0.4.0 does | decided by the owner 2026-10-21: §23.11's eleven defaults as written - both built-in actions and generic hooks, hooks in an admin's catalog, a failure after the stop following `auto_rollback`, `auto` kept with a new-address warning and the keep-address move opt-in, the source's floating IP disassociated (journaled) during the cutover, Designate and RFC 2136 built in, BGP by verification only, Octavia findings and the member helper as a Technology Preview, Heat findings with `SRC_VM_AUTOSCALED` blocking until acknowledged, the Technology Preview label until LAB-NET passes, `allowed_address_pairs` a finding in 0.4.0 | the LAB-NET cases of §23.10 end the Technology Preview |
 | D19 | Notifications (§24): what 0.5.0 does | decided by the owner 2026-10-23: §24.11's twelve defaults as written | each item binds with its plan task (§24.12); the live smoke NT12 gates 0.5.0 |
+| D20 | Per-tenant credentials (§27): a provider's credential per Keystone project, PRD §9's 0.2.0 item no release delivered | decided by the owner 2026-10-23: §27.11's ten defaults as written - application credentials on the provider by project id, written by an admin; a plan names one source and one destination project; no fallback to the provider's credential; admin-only steps keep the provider's; a Technology Preview in 0.5.0 | each item binds with its plan task (§27.12); the LAB-TC cases of §27.10 end the Technology Preview |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -7318,3 +7319,314 @@ The owner took each default as written on 2026-10-23 (D8):
 | the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
+
+## 27. Per-tenant credentials (0.5.0, Technology Preview)
+
+Status: proposed 2026-10-23 and decided by the owner the same day (D20): §27.11's defaults as written. Each item
+becomes binding in the section §27.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task TC1. Per-tenant credentials ship as a **Technology Preview** until LAB-TC01–LAB-TC06 pass (§27.10).
+
+What it answers: the 0.2.0 item "per-tenant credentials" of the release table (PRD §9), and PRD §10's assumption
+"Tenant credentials (or admin with role assignment) on both clouds". No FR, design or code covered them, and no
+release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
+`superpowers/plans/2026-10-23-tenant-credentials.md`. §24 to §26 are left to the proposals of other branches.
+
+The proposed fields, routes, check keys, findings and gate rule stay out of the tables the SDD-reading tests parse
+(§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did; a proposed finding code is written here
+without code quotes. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their
+documentation and, for Cinder's manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a
+behaviour only a lab can show, is marked `TODO(LAB): confirm`.
+
+### 27.1 What 0.4.0 has
+
+* **One credential per provider:** a `clouds.yaml` entry (`cloud`) or a secret (`credentials_secret`) that an admin
+  writes through `PUT /providers/{id}/credentials` as `provider-{id}`, never read back (§12, §13.3).
+* **Its project bounds what the provider does.** A Keystone token is scoped to one project, and:
+  * the source's inventory lists that project's servers: `list_vms` asks Nova for no other project (§10);
+  * os-migrate exports that project's workloads alone: its prelude filters every export by the token's project
+    (`roles/prelude_src`: "It is currently not supported to export/import for multiple projects"), and a step fails
+    when the export holds no server of the VM's id (§7.2);
+  * the destination creates every volume, port, server and floating IP in that project, keypairs as its user, and a
+    plan's conversion hosts there with their network, router, keypair, security group and floating IP (§6.5, §7.2);
+    the storage handover manages its volumes and creates its server there (§7.3);
+  * the destination's inventory lists that one project with its quota, floating IPs, keypairs and Designate zones
+    (§10), and the helpers of §8.3–§8.5 move that project's floating IPs and the pool members it sees.
+* **`plan.mappings.projects`** renames project names inside the exported references and names the project the quota
+  charges (§7.2, §9.3); a mapping to a project the destination's inventory does not list is `DST_PROJECT_MISSING`, a
+  blocker, so a VM goes to the destination credential's project.
+* **An admin credential adds cloud-wide rights, not other projects.** §21.5 asks for it for the storage handover
+  (Cinder manage, its pools), pre-staged flavors and an unshared external network; Placement's capacity reads (§22.3)
+  and a floating IP's chosen address (§23.4) take it too. With it `get_vm` reads another project's VM by id, but that
+  VM's export finds nothing, so its cold or warm cutover fails before any import; only the handover, which acts by id,
+  could move it, into the destination credential's project.
+* **So moving T tenants takes T providers on each side**, each with a credential of its project, T plans and T
+  conversion host pairs; a step that needs `admin` needs it in that project's credential (PRD §10's "admin with role
+  assignment").
+
+### 27.2 The problem
+
+A provider is one cloud reached as one project. An operator who moves many tenants registers each cloud once per tenant
+and gives each credential `admin` wherever a step of the tenant needs it, so the credential that copies one tenant's
+disks can act on every tenant (§27.8). Per-tenant credentials let one provider per cloud hold, beside its own, a
+project-scoped credential per project, `member` alone in most cases: the work inside a project runs as that project,
+and the provider's own credential keeps the cloud-wide and admin-only work.
+
+### 27.3 Scope
+
+Proposed for 0.5.0, in the order of the plan:
+1. Project credentials on an OpenStack or RHOSO provider: one per Keystone project, written by an admin, write-only
+   (§27.4).
+2. A plan names the project it moves on each side. Its steps act with those projects' credentials, and the provider's
+   own credential keeps the steps that are cloud-wide or need `admin` (§27.5).
+3. A check of each project credential, findings, and a cutover gate that waits rather than cut over with a credential
+   about to expire (§27.7).
+4. The dashboard's project credentials, project pickers and findings; the demo's tenants.
+
+Not in 0.5.0: a plan whose VMs come from several projects (owner decision 7); project credentials of a VMware source or
+of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfer in the storage handover (owner decision
+8); conversion host settings per project; credentials an operator writes (owner decision 5).
+
+### 27.4 The model
+
+* **On the provider** (owner decision 2), a map by Keystone project id, server-owned as `credentials_updated_at` is:
+  `PATCH /providers/{id}` refuses it (422) and `POST /providers` ignores it (§12).
+  ```text
+  Provider { ...,
+             project_credentials: dict[str, ProjectCredential] = {} }   # by project id (1-64 letters, digits, - or _);
+                                                                       # none on a vmware provider (422)
+  ProjectCredential { secret: str,           # its secret's name (below), never a value
+                      updated_at: datetime }  # when an admin wrote it
+  ```
+* **Routes** (proposed, admin, §12 with plan task TC2):
+  * `PUT /providers/{id}/projects/{project_id}/credentials`, write-only: an application credential,
+    `{application_credential_id, application_credential_secret}` (owner decision 3). It signs in at the auth URL of
+    the provider's own credential, else at its endpoint (§13.3), and takes no `auth_url` of its own, so it is never sent
+    to another endpoint. It answers the `Provider` and drops that project's entry from the check report (§27.7). Event:
+    `provider.credentials_updated`, its data the provider, `project_id`, the secret's name and the key names (§4.3).
+  * `DELETE /providers/{id}/projects/{project_id}/credentials`: the secret and the entry go, with the same event and
+    `deleted` true. 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider (§12): a
+    plan neither completed nor cancelled that names it, or a completed one with VMs not finalized, rolled back or
+    cancelled. `DELETE /providers/{id}` deletes them with its other managed secrets.
+* **The secret's name** is `provider-{id}.project-<h>`, `<h>` the first 16 hex digits of the SHA-256 of the project id.
+  A provider id never holds a `.` (§4.2), so the name is no provider's `provider-{x}` or `provider-{x}-ssh` and no other
+  provider's project secret; it fits both stores (at most 97 characters: lower-case letters, digits, `-`, `.`, §13.3).
+  The entry records its project id, so a write whose name another project's entry holds (equal 64-bit digests) is
+  refused (409), never written over. The `SEAMLESS_SECRET_*` variables read `.` and `-` alike, so `POST /providers`
+  refuses (409) an id ending in `-project-` and 16 hex digits whose prefix is another provider's id, and that provider
+  while such an id exists, as it refuses the `-ssh` pair (§13.3, audit AP-04).
+* **A plan names its projects** by id (§4.2 with TC4):
+  ```text
+  Plan { ...,
+         source_project: str|null = null,        # whose credential reads and moves the plan's VMs at the source;
+                                                 # null: the source provider's own credential (0.4.0's rule)
+         destination_project: str|null = null }  # the same at the destination; both refused (422) for a VMware source
+  ```
+  `PATCH /plans/{id}` takes a change of either as it takes a changed provider (§12): 409 while a migration is in
+  flight or `failed`, since a rollback acts with its attempt's credentials. `mappings.projects` keeps renaming the
+  references to other projects; mapping the VMs' own project to another than `destination_project` stays
+  `DST_PROJECT_MISSING`.
+* **VMs carry their project's id:** `VMRef.project_id: str|null` beside `project` (its name), null for VMware and for a
+  VM recorded before. `GET /providers/{id}/inventory?project=<project id>` (viewer) reads a source's VMs, or a
+  destination's view, with that project's credential; 404 for a project that is neither the provider's own nor one it
+  holds a credential for; without the query, its own credential as today.
+
+### 27.5 Which credential each step uses
+
+A plan's **source** and **destination credentials** are the project credentials its `source_project` and
+`destination_project` name, else the providers' own. The provider's own credential acts in its own project, and in
+another only where a service lets an admin act by id or on the project's behalf.
+
+| Step | Source | Destination | Roles (secure-RBAC; legacy as §21.5) |
+|---|---|---|---|
+| check, series, policy profile, storage pools (§10) | provider | provider | `admin` for the pools |
+| GPU capacity and allocations (§22.3) | — | provider | `admin` or `service`, Placement's default (`TODO(LAB): confirm` per series) |
+| inventory: VMs; networks, quotas, floating IPs, keypairs, zones, flavors, volume types | plan's | plan's | `member` |
+| pre-staging: networks, subnets, routers, security groups, keypairs; conversion hosts | plan's | plan's | `member` |
+| pre-staging: flavors (§7.2) | plan's (export) | provider (import) | `admin` creates a flavor |
+| pre-copy, sync, cold and warm cutover, verification, rollback, cancel cleanup, finalize, source watch (§8.1) | plan's | plan's | `member`; §6.6's role for another project's network |
+| storage handover (§7.3) | provider, by id | plan's, which must carry `admin` | `admin` on both sides |
+| floating IP reservation (§8.3) | — | plan's when it may choose the address, else the provider's for the project | `admin`, or the project's `manager` |
+| floating IP move, return, release; Octavia drain, join, restore (§8.3, §8.5) | plan's | plan's | `member`; Octavia adds `load-balancer_member` |
+| Designate swap (§8.4) | — | plan's | `member` |
+| VMware: the kit's `dst_cloud`, its rollback's calls (§7.2) | vCenter | provider | as today (§27.9) |
+
+* **No fallback** (owner decision 6). A project credential the plan names that is missing, fails its check or has
+  expired is never replaced by the provider's own, which would act as `admin` or in another project. Validation
+  refuses the plan (400, as it answers today for a provider whose check fails), and a step whose credential cannot sign
+  in fails before it changes anything: a cutover signs in to the destination before it stops the source (§6.6, §7.3
+  step 0), and a source credential that cannot sign in stops nothing.
+* **One project pair per plan** (owner decision 7): validation refuses (400) a plan whose VMs are not all of its source
+  project - the provider's own when `source_project` is null -, naming the projects and their VM counts.
+* **The flavor import** is the one playbook pair that mixes credentials: the export runs as the plan's source project,
+  the import as the destination provider. A flavor it creates private (`is_public` false) is given access for the
+  plan's destination project, which could not use it otherwise: os-migrate's import creates no access (`TODO(LAB):
+  confirm`).
+* **Conversion hosts** of a plan with a project are deployed in that project with its credential (`manage` true): the
+  import finds each by name in its credential's project (`roles/import_workloads`). An existing host (`manage` false)
+  serves its provider's own project alone: validation refuses (400) a plan that names a project on such a side.
+* **A rotated credential** is used from the next step on: the registry's connection fingerprint holds each project
+  credential's `updated_at`, as it holds the provider's (§10, §13.3). **Hooks** still get no credential (§23.3).
+
+### 27.6 Where created resources land
+
+* Nova, Cinder and Neutron create a resource in the project of the token that asks for it: a server, a port, a
+  floating IP, a volume, a managed volume too (Cinder's manage takes the request's project and user). An admin may
+  create a Neutron resource for another project and, from compute microversion 2.10, another user's keypair
+  (`TODO(LAB): confirm`), but not a server or a volume (os-migrate's design notes; Nova's and Neutron's references).
+  So `destination_project` chooses where the plan's VMs land, as the destination credential's project did in 0.4.0.
+* **Keypairs belong to users** ("Keys are owned by users", Nova's API reference), and an application credential acts as
+  the user who created it:
+  * `DST_KEYPAIR_MISSING` and the pre-staged keypairs (§7.2, §9.3) read the plan's credentials' users, as today;
+  * two project credentials of one user share its keypairs: a key name two tenants use is one key there, and the
+    second tenant's VM would get the first tenant's public key wherever its guest takes keys again on a new instance
+    id (`TODO(LAB): confirm` per image). A VM whose key name's destination keypair has another fingerprint than its
+    source keypair is a blocker (proposed DST_KEYPAIR_KEY_MISMATCH), and Operations.md asks for a user per project
+    credential (owner decision 3).
+* **The storage handover** manages the volumes and creates the server with the destination credential (§7.3), so into a
+  project that credential is the project's, with `admin`, since Cinder's manage is an admin's call. Its source half
+  acts by id with the source provider's admin: the stop, `delete_on_termination`, the deletion and the unmanage
+  (`TODO(LAB): confirm` Cinder's unmanage of another project's volume by an admin of the provider's project).
+* **The keep-address reservation** (§8.3): Neutron lets `admin`, or the project's `manager` under the secure-RBAC
+  defaults, choose a floating IP's address. For a `member` project credential the provider's admin creates it for the
+  project (`project_id`), and the project's credential associates it (`TODO(LAB): confirm`).
+* **Conversion hosts** count against the plan's projects' quotas, as they count today against the credential's.
+
+### 27.7 Checks, findings and the cutover gate
+
+* **The provider check** (`POST /providers/{id}/check`) signs in with each project credential too, and a validation's
+  check (§8) with the plan's alone. It reports per project (check report key `projects`, by project id): `status`
+  (`ok` or `error`) and its `message`, the token's `project_name`, `domain`, `user_id` and `roles`, the application
+  credential's `restricted` flag and `expires_at`, and `checked_at`. Keystone caps a token issued with an application
+  credential at its expiry since the fix of CVE-2022-2447, and the credential's own record holds the date
+  (`TODO(LAB): confirm` both reads). A credential whose token's project is not its key is `error` and never used. The
+  report also names the provider credential's own project (`project`: id, name, domain). One project's failure fails
+  neither the provider's check nor another project's.
+* **Validation** refuses (400) a plan whose project credential is missing, failed or expired, naming the provider and
+  the project, before any finding.
+* **Findings** (proposed; each enters §9.3 with TC6, with its catalog entry, its tests and the mock):
+  * PROJECT_CREDENTIAL_EXPIRING, warning: a credential the plan uses expires within 7 days, or before the plan's
+    `cutover_window` ends (owner decision 9);
+  * PROJECT_CREDENTIAL_UNRESTRICTED, warning: an application credential the plan uses may create other application
+    credentials and trusts;
+  * PROJECT_CREDENTIAL_ROLE_MISSING, blocker: the plan's credential lacks `member` in its project - a token lists the
+    roles its roles imply, so `manager` and `admin` carry it (`TODO(LAB): confirm` that, and the legacy profile, whose
+    rules take any role on the project) -, or `load-balancer_member` for a plan that maps Octavia pools;
+  * DST_KEYPAIR_KEY_MISMATCH, blocker (§27.6).
+
+  The role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE` read the plan's destination
+  credential's roles, and `DST_FIP_ADDRESS_UNAVAILABLE` takes the provider's `admin` for the reservation (§27.6).
+  `storage_handover` is ineligible (§9.2) for a plan whose `destination_project` credential lacks `admin`, the reason
+  naming the project. `DST_PROJECT_MISSING`'s remediation names `destination_project` too.
+* **The cutover gate** (§5.4, proposed rule 6, TC7): a cutover starts only while each credential its step and a
+  rollback would use expires, as the last check read it, no sooner than 24 hours on (owner decision 9); a credential
+  written since that check holds it until a check reads it (the provider dialog checks after a save, §16). Otherwise
+  the migration keeps syncing, as under rule 5, and its page names the credential that holds it. A token dies with its
+  application credential, so a cutover cut off by an expiry would be rolled back with the same credential, which fails
+  too, and the source would stay stopped until an admin writes a new one: the margin keeps that from happening.
+* **The executors** sign in with the plan's credentials before each step's playbooks or calls run; a failure to sign
+  in is a permanent failure before anything changes, naming the provider and the project, never the credential.
+
+### 27.8 Security
+
+* **Blast radius.** Today the run files of every OpenStack step (`secrets.yml`, `clouds.yaml`, §7.2) hold both
+  providers' credentials, admin ones wherever any step of the plan needed `admin`. With project credentials a cold or
+  warm step's files hold the plan's two project credentials, `member` in most cases, so a stolen run directory reaches
+  one project on each cloud. For a plan with projects the provider's admin credential reaches a run's files for the
+  flavor import alone; the handover, Placement and the floating IP reservation use it in-process. A project
+  credential with `admin` is no narrower than an admin one: many services take a token with the `admin` role as admin
+  of every project (Keystone bug 968696; `TODO(LAB): confirm` per service and series).
+* **Application credentials** (owner decision 3): bound to one project by Keystone; their roles a subset of their
+  user's; restricted by default, so they create no other application credential and, by the API reference, no trust;
+  an optional `expires_at`; invalid once their user loses the role on the project; a secret Keystone shows once.
+  Access rules can narrow one to services, methods and paths; 0.5.0 asks for none, since the calls os-migrate and
+  openstacksdk make differ by series (`TODO(LAB): confirm` a rule set).
+* **Passwords** are refused for project credentials: a user's password signs in to every project the user has a role
+  in, so it is no project's credential, and it is a person's secret. The provider's own credential keeps both forms.
+* **Keystone trusts** were weighed: a trustee signs in as itself ("The user specified by authentication must match the
+  trust's trustee_user_id"), so Seamless would need a Keystone user and a credential of its own in each cloud, plus a
+  trust per project from a user who holds the roles there, which dies with that user's role as an application
+  credential does. Trusts add an identity per cloud and remove no secret.
+* **Audit.** `actor` stays the Seamless principal; `provider.credentials_updated` names the project, the secret's name
+  and the key names, never a value. Keystone's and Nova's logs show the credential's user: a user per project
+  credential keeps the clouds' trail per tenant (Security.md C4-04).
+* **Redaction.** A project credential's secret is a credential key's value (`application_credential_secret`), which
+  `redact` and `redact_payload` remove (§13.4); run files stay 0600 and are deleted after each run (§13.3).
+
+### 27.9 VMware sources
+
+* vCenter has no Keystone projects: a VMware source keeps its one credential, and `source_project` is refused (422).
+* The migration kit creates the server with `dst_cloud` and attaches its copies to the destination's existing conversion
+  host, which the rollback finds in that credential's project (§7.2). A project credential would need such a host in
+  each project, which no provider setting describes. In 0.5.0 a VMware plan keeps the destination provider's own
+  credential, and `destination_project` is refused (422) (owner decision 10).
+
+### 27.10 Validation
+
+* **In the test process:** the fakes (§10) hold two tenant projects on each side, each with a project credential, beside
+  the providers' own projects; each fake call records the credential it came with, and a test fails a step that used
+  the provider's credential where §27.5 names the plan's, or the reverse. The demo seeds a plan with a project pair.
+* **Lab cases** (proposed; QASuite with TC10, results with TC11), on RHOSO 18.0 and a Tier 1 community series, with two
+  tenant projects per cloud and an application credential with `member` for each:
+  * LAB-TC01: a cold and a warm plan per project pair: the servers, volumes, ports and floating IPs land in the plan's
+    destination project, and no admin credential is in their steps' run files;
+  * LAB-TC02: the handover into a project, its credential with `admin`; its source half by id with the provider's admin;
+  * LAB-TC03: expiry and deletion: a credential that expires during a sync pass fails it before it changes anything,
+    and the next pass runs once an admin wrote a new one; one deleted before a cutover fails it before the source
+    stops; one that expires within 24 hours holds the cutover at the gate; nothing runs with the provider's credential;
+  * LAB-TC04: roles under each policy profile: `member` alone; `service` (secure-RBAC) for another project's network;
+    the keep-address reservation by the provider's admin; `load-balancer_member` for the member helper;
+  * LAB-TC05: keypairs: two project credentials of one user and a key name both tenants use (the finding blocks), then
+    a user per project (the guest boots with its own key);
+  * LAB-TC06: a private pre-staged flavor given to the destination project, and conversion hosts in each tenant project
+    (image, flavor, router gateway, floating IP, quota).
+* **The open questions the lab closes:** Cinder's unmanage across projects; the token's cap at an application
+  credential's expiry and the read of its `expires_at`; Neutron's floating IP for another project with a chosen
+  address; the roles Placement and Octavia take on RHOSO 18.0; key injection on a migrated guest; what an `admin` role
+  reaches in each service.
+
+### 27.11 Owner decisions
+
+The owner took each default as written on 2026-10-23 (D20):
+
+1. **The release: 0.5.0, as a Technology Preview** until LAB-TC01–LAB-TC06 pass. PRD §9 put per-tenant credentials in
+   0.2.0, and no release delivered them. What a cloud's Keystone and policies allow differs per series and per
+   deployment, and the fakes show the selection rules, not what a cloud permits, as for §22 and §23.
+2. **The home: on the provider,** a map from project id to a secret name, with the plan naming its project pair. The
+   alternatives: a provider per project under a parent, whose cloud settings every reader would resolve or copies would
+   drift; or credentials on the plan, though a credential belongs to a cloud and a project, outlives plans, would be
+   rotated plan by plan, and plans have no owner (§13.2).
+3. **Application credentials only, and a Keystone user per project credential:** project-scoped by Keystone,
+   restricted by default, revocable alone, no person's password; a user per project keeps keypairs and the clouds'
+   audit trail per tenant.
+4. **Both sides,** each optional per plan: a null `source_project` or `destination_project` means the provider's own
+   credential, so a 0.4.0 plan runs unchanged.
+5. **Admins write them,** as provider credentials (§12). §13.2 gives no plan an owner, so "an operator for the plans
+   they own" has nothing to rest on, and a credential serves every plan of its project.
+6. **No fallback** to the provider's credential for a plan's project: refused at validation, and before the stop at
+   the cutover (§27.5).
+7. **One source project and one destination project per plan.** Pre-staging, conversion hosts, quota and approvals stay
+   per plan, and a tenant's window is its own. Several projects per plan would deploy a conversion host pair and
+   pre-stage per project pair; it can follow.
+8. **Admin-only steps:** the storage handover into a project needs that project's credential with `admin`, else it is
+   ineligible; the keep-address reservation for a `member` project is the provider's admin's. The alternative for the
+   handover, Cinder's volume transfer from the provider's project to the plan's (of an `available` volume), adds a
+   transfer and an accept per volume inside the outage and a journal step each; it can follow once a lab measured it.
+9. **Expiry:** a warning within 7 days of a credential's expiry or before the window ends; the gate holds a cutover
+   whose credentials expire within 24 hours.
+10. **VMware: unchanged in 0.5.0** (§27.9).
+
+### 27.12 Contract changes (each binding from its plan task)
+
+| Change | Where | Task |
+|---|---|---|
+| PRD: a functional requirement for project credentials, the 0.2.0 row as delivered, a 0.5.0 row; D20 decided | PRD, §20 | TC1 |
+| `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 | TC2 |
+| the check of each project credential: the report keys `projects` and `project` | §10, §21.5 | TC3 |
+| `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 | TC4 |
+| the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 | TC5 |
+| the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
+| the cutover gate's rule 6; the executors' sign-in failure | §5.4, §7.1 | TC7 |
+| the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 | TC8 |
+| the demo's tenant projects and its plan with a project pair | §10 | TC9 |
+| QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
+| the lab; the Technology Preview label goes when LAB-TC01–LAB-TC06 pass | QASuite §13 | TC11 |
