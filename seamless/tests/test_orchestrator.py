@@ -12243,6 +12243,7 @@ async def test_a_pre_stop_hook_failure_keeps_the_source_running(tmp_path, store)
     await run_plan(h, plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
     m = await h.wait_phase(mid, P.failed)
+    await h.wait_kind("migration.error")  # emitted once the failure is saved (PR #101's CI)
     await h.orch.stop()
     assert m.downtime_started_at is None
     assert h.history(m)[-2:] == [P.cutover, P.failed]

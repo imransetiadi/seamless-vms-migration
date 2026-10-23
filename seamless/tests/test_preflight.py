@@ -3747,6 +3747,12 @@ FIXED_TEXTS = {
 }
 
 
+#: the wording guard's scan of each control-plane file, by its name and text: every case below
+#: runs the guard again with one file's text changed, and the others need no second scan - the
+#: guard's cases took over a minute of CI's py3.11 job under coverage (2026-10-23)
+_WORDING_GUARD_SCANS: dict[tuple[str, str], list[str]] = {}
+
+
 def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
     """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06, RV24-04, RV25-05): a text built for a plan
     or a migration - a finding's message, an eligibility reason, an executor's refusal, failure or
@@ -3898,14 +3904,14 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
                 skip.update(id(n) for n in ast.walk(node.value))
         return skip
 
-    found = []
-    for path in sorted(root.rglob("*.py")):
-        name = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    def scan(name, source):
+        """What one file says of "the destination" where its rule forbids it."""
+        tree = ast.parse(source)
         skip = fixed(tree, name)
         parents = {
             id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
         }
+        said = []
         for node in ast.walk(tree):
             text = None if id(node) in skip else fold(node)
             if text is None or not words.search(text):
@@ -3916,7 +3922,16 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
                 and fallback(node, parents)
             ):
                 continue
-            found.append(f"{name}:{node.lineno}: {text}")
+            said.append(f"{name}:{node.lineno}: {text}")
+        return said
+
+    found = []
+    for path in sorted(root.rglob("*.py")):
+        name = path.relative_to(root).as_posix()
+        source = path.read_text(encoding="utf-8")
+        if (name, source) not in _WORDING_GUARD_SCANS:
+            _WORDING_GUARD_SCANS[(name, source)] = scan(name, source)
+        found.extend(_WORDING_GUARD_SCANS[(name, source)])
     assert found == []
 
 
