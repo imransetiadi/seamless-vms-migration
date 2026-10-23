@@ -122,6 +122,21 @@ export interface ConversionHostConfig {
   ssh_allowed_cidr: string | null;
   /** Secret holding the private key of an existing conversion host (VMware sources). */
   ssh_key_secret: string | null;
+  /** The host's public keys as its operator declares them, one OpenSSH line each - ed25519, ECDSA or RSA -; they win
+   * over the pin (SDD §4.2, §26.3). Older fixtures omit it ([]). */
+  ssh_host_keys?: string[];
+}
+
+/** A conversion host's pinned host keys (SDD §4.2, §26.4): server-owned - the provider check writes it (§10), the API
+ * returns it and never writes it. */
+export interface HostKeyPin {
+  /** The Nova server whose keys they are: the pin applies to it alone. */
+  server_id: string;
+  /** Its public keys, each `<type> <base64>`, without a comment. */
+  keys: string[];
+  /** Injected at the server's creation (§26.3), or read from its console (§10). */
+  source: 'injected' | 'console';
+  pinned_at: Timestamp;
 }
 
 /** Presets and display only (SDD §4.2); `kind` decides the code path. */
@@ -158,6 +173,9 @@ export interface Provider {
   /** Server-owned: when the write-only credentials / conversion key were last stored. */
   credentials_updated_at: Timestamp | null;
   conversion_key_updated_at: Timestamp | null;
+  /** Server-owned: its conversion host's pinned host keys (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it.
+   * Older fixtures omit it (null). */
+  conversion_host_pin?: HostKeyPin | null;
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
@@ -990,6 +1008,8 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.credentials_updated',
   'provider.deleted',
   'provider.checked',
+  // the provider check pinned its conversion host from the console (SDD §4.3, §10, §26.5, plan task ST2)
+  'conversion_host.key_pinned',
   // the hook catalog's changes (SDD §4.3, §23.3, plan task N3)
   'hook.created',
   'hook.updated',

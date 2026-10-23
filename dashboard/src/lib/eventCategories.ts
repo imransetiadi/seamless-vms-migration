@@ -11,13 +11,20 @@ export const EVENT_CATEGORIES: Array<{ value: string; label: string; match: (kin
     match: (k) =>
       k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.') || k.startsWith('policy.'),
   },
-  { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
+  // a conversion host's pinned key is its provider's (SDD §4.2, §26.4)
+  { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') || k.startsWith('conversion_host.') },
   // a prune cuts the audit trail itself (SDD §15); a dashboard user created grants access (SDD §13.1); a policy change
-  // can weaken an approval gate (SDD §14.5); a hook runs code with the control plane's reach (SDD §23.3)
+  // can weaken an approval gate (SDD §14.5); a hook runs code with the control plane's reach (SDD §23.3); a conversion
+  // host's key decides whom the data path trusts (SDD §26.5)
   {
     value: 'security',
     label: 'Security',
     match: (k) =>
-      k.startsWith('auth.') || k.startsWith('user.') || k.startsWith('policy.') || k.startsWith('hook.') || k === 'events.pruned',
+      k.startsWith('auth.') ||
+      k.startsWith('user.') ||
+      k.startsWith('policy.') ||
+      k.startsWith('hook.') ||
+      k.startsWith('conversion_host.') ||
+      k === 'events.pruned',
   },
 ];
