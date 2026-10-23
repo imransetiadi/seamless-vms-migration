@@ -439,7 +439,7 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
 ```text
 plugins/ roles/ playbooks/   os-migrate collection + warm path (blocksync, warm modules, warm role)
 seamless/                    control plane: src/seamless_migrate/, tests/, Containerfile
-dashboard/                   React 18 + Vite + TypeScript dashboard (design tokens: SDD §16)
+dashboard/                   React 19 + Vite + TypeScript dashboard (design tokens: SDD §16)
 deploy/compose/              Docker Compose stack: a Linux host's Docker Engine, Colima on macOS, or Podman
 deploy/openshift/            kustomize manifests (OpenShift 4.16+)
 deploy/kubernetes/           kustomize overlay of those manifests for vanilla Kubernetes 1.28+

@@ -4234,7 +4234,7 @@ is no origin a browser sends (review RV31-03).
 
 ## 16. Dashboard (`dashboard/`)
 
-* Stack: Vite 8 + React 18 + TypeScript 5 (strict) + Tailwind CSS 4.3 (CSS-first theme), `react-router-dom` 7,
+* Stack: Vite 8 + React 19 + TypeScript 5 (strict) + Tailwind CSS 4.3 (CSS-first theme), `react-router-dom` 7,
   `@tanstack/react-query` 5, `recharts` 2, `lucide-react` icons; tests with Vitest + Testing
   Library (jsdom).
 * Design system (generated with ui-ux-pro-max, persisted in `dashboard/design-system/`): *Minimalism
