@@ -3458,7 +3458,7 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
   the alias keyed with it - under the host's alias (§26.4: `os_migrate_conv_src`, `os_migrate_conv_dst`, or
   `conversion_host` for a VMware destination's host): its declared keys (`ssh_host_keys`) when it has some, else its
   pin's keys when the pin's server is the one the host resolves to - never the pin of another server -, else nothing.
-  Runs write theirs from plan task ST5 (§26.4).
+  Each run writes its own with it (§7.2 "Conversion host keys", §26.4; since plan task ST5).
 
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
@@ -7232,7 +7232,10 @@ ST2's - `ssh_host_keys`, the pin, the console parser, the known_hosts writer, th
 `conversion_host.key_pinned` - are binding in §4.2, §4.3, §10 and §12 since that task; plan task ST3's - the
 collection's known_hosts variable and module option, `RemoteShell`'s pinned options, the inventory's common arguments
 and a refusal as its own permanent error - in §6.4, §6.5 and §6.6 since that task; plan task ST4's - the role's
-injected host key and its report of the servers it created and found - in §6.5 since that task. The facts
+injected host key and its report of the servers it created and found - in §6.5 since that task; plan task ST5's - each
+run's known_hosts, its checked Ansible and its own ControlPersist directory, the console read and the refusals before
+any playbook, the injected key pair and its pins, a refusal in a run's output as a permanent failure and
+`conversion_host.key_refused` - in §4.3 and §7.2 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7310,7 +7313,8 @@ decision 10).
   the server task runs with `no_log`, since a module result can carry the user data back. The public half is pinned
   only when the role reports that it created the server; a server it found keeps its pin. The role's side - its
   variables, the user data, `no_log` and the report `conversion/hosts.json` - is binding in §6.5 since plan task
-  ST4; the run's side comes with plan task ST5.
+  ST4; the run's side - the key pair made in memory, its private file, the report read and the pins - in §7.2 since
+  plan task ST5.
 * **Who can read an injected private key.** Nova keeps the user data for the server's life. The API shows it
   (`OS-EXT-SRV-ATTR:user_data`) to admins alone by default (`rule:context_is_admin`). Any process on the host can
   read it from the metadata service (`/openstack/latest/user_data`) or the config drive, and cloud-init warns that
@@ -7350,7 +7354,8 @@ decision 10).
 * **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
   else the pins, of the hosts it uses: one hashed entry per key under the host's alias - its inventory name,
   `os_migrate_conv_src` or `os_migrate_conv_dst`, or the group's name, `conversion_host`, for a VMware destination's
-  host. No ssh writes to it. The writer is binding in §10 since plan task ST2; the runs use it with plan task ST5.
+  host. No ssh writes to it. The writer is binding in §10 since plan task ST2; the runs' use of it in §7.2 since plan
+  task ST5.
 * **The options of every hop:** `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<the run's file>`,
   `GlobalKnownHostsFile=/dev/null`, `HostKeyAlias=<the alias>`, `CheckHostIP=no`, `UpdateHostKeys=no`,
   `VerifyHostKeyDNS=no`, `HashKnownHosts=yes`, `HostKeyAlgorithms` the pinned keys' algorithms and
@@ -7362,8 +7367,9 @@ decision 10).
   of the extra arguments' `StrictHostKeyChecking=no`, with `ansible_ssh_host_key_checking: true` so that Ansible's own
   `no` does not come first. An RSA key's algorithms are `rsa-sha2-512,rsa-sha2-256`. Without them the collection
   behaves as upstream.
-* **In the executor.** Every run with pins gets `ANSIBLE_HOST_KEY_CHECKING=True` - else Ansible's own `no` comes first
-  and wins - and the VMware inventory's entry gets the same common arguments.
+* **In the executor** (binding in §7.2 since plan task ST5). Every run with pins gets `ANSIBLE_HOST_KEY_CHECKING=True` -
+  else Ansible's own `no` comes first and wins -, the VMware inventory's entry gets the same common arguments, and each
+  run has its own ControlPersist directory: Ansible's masters are named by address, not by alias.
 * **A host created in the run.** Before a pre-staging the executor looks each host up: one that exists runs on its
   pin; for one that does not, it writes the injected public key under the host's alias. A server the role finds
   instead does not hold that key and is refused (§26.5).
@@ -7378,13 +7384,14 @@ decision 10).
   wait. So does a link the source host refuses ("Permission denied", a forward "administratively prohibited"). The
   message names the side, the alias, the server, the host's address, the pinned fingerprints and, when ssh printed it,
   the offered one. It holds neither ssh's command line nor the word "timeout" (§6.6, review RV42B-02).
-* **In the control plane.** A failure whose output names a refused host key or link is permanent, whatever else the
-  output holds: the check comes before §7.2's transient patterns.
+* **In the control plane** (binding in §7.2 since plan task ST5). A failure whose output names a refused host key or
+  link is permanent, whatever else the output holds: the check comes before §7.2's transient patterns.
 * **Before the stop.** A cutover connects to both hosts and sets up and probes its link (§26.6) before the source
   stops. A refusal there ends the cutover with the source running.
 * **After the stop** (a host replaced during a cutover) the automatic rollback runs (§8). The warm rollback reports a
   temporary snapshot it cannot remove and goes on to start the source (its role's `rollback.yml`).
-* **Failure reasons** (proposed; the collection's two, the first and the fourth, binding in §6.6 since plan task ST3):
+* **Failure reasons** (the collection's two, the first and the fourth, binding in §6.6 since plan task ST3; the
+  executor's three in §7.2 since plan task ST5):
   * "host key refused: the {side} conversion host ({alias}, server {id} at {address}) presented {offered}, not its
     pinned key {pinned}";
   * "host key unknown: no key is pinned or declared for the {side} conversion host {name}";
@@ -7393,8 +7400,9 @@ decision 10).
   * "the conversion host {name}, created with an injected host key, does not present it: check its image's
     cloud-init".
 * **Events** (persisted): `conversion_host.key_pinned` (provider, side, server, fingerprints, source), binding in §4.3
-  since plan task ST2, and, proposed, `conversion_host.key_refused` (provider, side, server, pinned and offered
-  fingerprints, the plan and migration). A refused key may be an attack: an operator should be able to alert on it.
+  since plan task ST2, and `conversion_host.key_refused` (provider, side, server, pinned and offered fingerprints, the
+  plan and migration), binding in §4.3 and §7.2 since plan task ST5. A refused key may be an attack: an operator
+  should be able to alert on it.
 * **Findings** (proposed for §9.3, for `cold`, `warm`, `vmware_cold` and `vmware_warm`):
   * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
     keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
@@ -7538,7 +7546,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | `ConversionHostConfig.ssh_host_keys`; the provider's pin; the console parser and the provider check's pinning; `conversion_host.key_pinned` | §4.2, §4.3, §10, §12 (binding) | ST2 |
 | the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 (binding) | ST3 |
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 (binding) | ST4 |
-| the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 | ST5 |
+| the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 (binding) | ST5 |
 | the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 if decided | §6.2, §6.4, §6.5, §6.6, §7.2 | ST6 |
 | the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
