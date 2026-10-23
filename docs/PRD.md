@@ -193,7 +193,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | NFR-03 | Scale | 1,000 VMs per plan; 10 concurrent migrations and 3 concurrent cutovers by default (configurable) |
 | NFR-04 | Reliability | Idempotent steps; at-least-once execution with safe retries; no data loss on control-plane crash |
 | NFR-05 | Integrity | End-to-end manifest digest per disk per pass (BLAKE2b-128 over chunk digests) |
-| NFR-06 | Security | No credentials in DB/API/logs; TLS to all endpoints; NBD only on loopback or SSH; RBAC; audit (Security.md) |
+| NFR-06 | Security | No credentials in DB/API/logs; TLS to all endpoints; NBD only on loopback or SSH; RBAC; audit (Security.md); from 0.5.0 the data path's SSH checks every conversion host's pinned key, and the dst→src link key is held to a forced command (SDD §26) |
 | NFR-07 | AI safety | AI outputs advisory, bounded, logged with source and confidence; untrusted text screened; secrets redacted |
 | NFR-08 | Usability | Dashboard WCAG 2.2 AA; dense ops layout; live updates ≤ 2 s latency |
 | NFR-09 | Observability | Structured logs, events, metrics; every migration has a complete timeline |
@@ -225,7 +225,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | 0.2.0 | Ceph-direct incremental diff, per-tenant credentials; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications and HA moved to 0.5.0 |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
 | 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
-| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25) |
+| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25); SSH trust on the data path, its lab cases a gate of the release (NFR-06; SDD §26) |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
