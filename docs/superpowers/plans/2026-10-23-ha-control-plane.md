@@ -1,10 +1,9 @@
-# HA control plane — implementation plan (2026-10-23, proposal)
+# HA control plane — implementation plan (2026-10-23)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task by task. **Do not start a task before the owner has
-> decided SDD §25.11**: this plan is a proposal, like §25 itself.
+> superpowers:executing-plans to implement this plan task by task.
 
-**Goal.** The release is 0.5.0 if the owner agrees (owner decision 1). The plan answers FR-27 ("HA control plane
+**Goal.** The release is 0.5.0 (owner decision 1). The plan answers FR-27 ("HA control plane
 (leader election)"), PRD §9's 0.2.0 item "HA (PostgreSQL leader election)" and D2:
 - On OpenShift and Kubernetes two replicas of the control plane run on two nodes. A lease in PostgreSQL makes one of
   them the leader, and only the leader runs the orchestrator.
@@ -17,11 +16,10 @@
   second orchestrator.
 - HA is a Technology Preview until the lab's failover cases pass (SDD §25.10).
 
-**Spec:** SDD §25 and D2. §25 is a proposal until the owner decides §25.11; after that, each item becomes binding when
-its task moves it into the section §25.12 names. The PRD's FR-27 and §9 change with HA1.
+**Spec:** SDD §25 and D2. Each item becomes binding when its task moves it into the section §25.12 names. The PRD's FR-27 and §9 change with HA1.
 
-**Decisions:** the ten of SDD §25.11, each with its proposed default, are the owner's, and D2 records them once taken.
-The research behind the proposal was done on 2026-10-23: PostgreSQL's and Kubernetes' documentation, client-go's
+**Decisions:** the owner took the ten defaults of SDD §25.11 as written on 2026-10-23 (D2).
+The research behind the design was done on 2026-10-23: PostgreSQL's and Kubernetes' documentation, client-go's
 leader election package, PgBouncer's feature table and Martin Kleppmann's article on fencing tokens. The pull request
 that proposes this plan lists the sources.
 
