@@ -468,9 +468,9 @@ function MigrationAdvisor({ m }: { m: Migration }) {
             <RecommendationList
               items={page.items}
               showSubject={false}
-              actionsFor={(rec, focusAfterRef) =>
+              actionsFor={(rec) =>
                 can(role, 'advisor.approve') && decidable(rec, m, page.items.find((r) => !r.legacy)?.id) ? (
-                  <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                  <RecommendationActions rec={rec} migration={m} onDecided={setDecided} />
                 ) : null
               }
             />

@@ -4,7 +4,7 @@
  * invalidate the affected queries in small batches (NFR-08: live updates ≤ 2 s).
  */
 import type { Query, QueryClient, QueryKey } from '@tanstack/react-query';
-import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
+import { createContext, useContext, useEffect, useEffectEvent, useSyncExternalStore } from 'react';
 import { isSummaryList, summaryOf } from '../lib/summary';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
@@ -74,12 +74,14 @@ export function useLiveStatus(): LiveStatus {
   return useSyncExternalStore(hub.subscribeSnapshot, status, status);
 }
 
-/** Calls `listener` for every streamed event (persisted and ephemeral) while mounted. */
+/**
+ * Calls `listener` for every streamed event (persisted and ephemeral) while mounted: the listener of the last render, an
+ * Effect Event, so the subscription outlives the renders.
+ */
 export function useLiveEvents(listener: (event: Event) => void): void {
   const hub = useLiveHub();
-  const ref = useRef(listener);
-  ref.current = listener;
-  useEffect(() => hub.subscribe((event) => ref.current(event)), [hub]);
+  const onEvent = useEffectEvent(listener);
+  useEffect(() => hub.subscribe((event) => onEvent(event)), [hub]);
 }
 
 /** A `migration.sync_pass` payload when it is a pass that ended (SDD §4.3), else null. */

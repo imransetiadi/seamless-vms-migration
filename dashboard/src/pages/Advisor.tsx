@@ -1,6 +1,6 @@
 import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX, SlidersHorizontal } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useId, useMemo, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
+import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useAdvisorNotes, useAdvisorStatus, useMigration, usePlans, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
 import { ADVISOR_QUERY_MAX, DECISION_TYPES, type AdvisorRecommendation, type DecisionType } from '../api/types';
@@ -84,21 +84,9 @@ function ServiceCard({
  * Approve or override a decision that waits for a person, while its migration - read alone, not with every
  * migration - still holds on it (SDD §14.6, §16).
  */
-function WaitingDecision({
-  rec,
-  migrationId,
-  focusAfterRef,
-  onDecided,
-}: {
-  rec: AdvisorRecommendation;
-  migrationId: string;
-  focusAfterRef?: RefObject<HTMLElement | null>;
-  onDecided: (message: string) => void;
-}) {
+function WaitingDecision({ rec, migrationId, onDecided }: { rec: AdvisorRecommendation; migrationId: string; onDecided: (message: string) => void }) {
   const migration = useMigration(migrationId).data;
-  return migration && migration.advisor_hold === rec.id ? (
-    <RecommendationActions rec={rec} migration={migration} focusAfterRef={focusAfterRef} onDecided={onDecided} />
-  ) : null;
+  return migration && migration.advisor_hold === rec.id ? <RecommendationActions rec={rec} migration={migration} onDecided={onDecided} /> : null;
 }
 
 export default function Advisor() {
@@ -244,10 +232,10 @@ export default function Advisor() {
               <RecommendationList
                 items={recommendations.data.items}
                 emptyText={planFilter || typeFilter ? 'No recommendations match these filters.' : 'No recommendations yet.'}
-                actionsFor={(rec, focusAfterRef) =>
+                actionsFor={(rec) =>
                   // only a pending_approval decision holds its migration (SDD §14.6)
                   can(role, 'advisor.approve') && rec.migration_id && rec.decision.status === 'pending_approval' ? (
-                    <WaitingDecision rec={rec} migrationId={rec.migration_id} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                    <WaitingDecision rec={rec} migrationId={rec.migration_id} onDecided={setDecided} />
                   ) : null
                 }
               />

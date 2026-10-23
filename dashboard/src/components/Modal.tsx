@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent, type ReactNode, type RefObject } from 'react';
+import { useEffect, useEffectEvent, useRef, type KeyboardEvent, type ReactNode, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { cn } from '../lib/cn';
 
@@ -75,9 +75,10 @@ export function Modal({
   children,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
-  // read by the page's Escape listener, which is set up once per opening
-  const closeRef = useRef({ onClose, dismissible });
-  closeRef.current = { onClose, dismissible };
+  // the page's Escape listener, set up once per opening, closes with the props of the last render (an Effect Event)
+  const onPageEscape = useEffectEvent(() => {
+    if (dismissible) onClose();
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -99,7 +100,7 @@ export function Modal({
     const onPageKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== 'Escape' || openDialogs[openDialogs.length - 1] !== token) return;
       if (event.target instanceof Node && panelRef.current?.contains(event.target)) return;
-      if (closeRef.current.dismissible) closeRef.current.onClose();
+      onPageEscape();
     };
     document.addEventListener('keydown', onPageKeyDown);
 

@@ -1,10 +1,11 @@
 import { Bot, ChevronLeft, ChevronRight, History, ListChecks, TriangleAlert, type LucideIcon } from 'lucide-react';
-import { useRef, type ReactNode, type RefObject } from 'react';
+import { useRef, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { AdvisorRecommendation } from '../api/types';
 import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, decisionText, recommendedParts } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { evidenceSummary } from '../lib/evidence';
+import { FocusAfterDecision } from '../lib/focusAfterDecision';
 import { formatDateTime, formatNumber, formatRelative } from '../lib/format';
 import { ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { Button } from './Button';
@@ -40,8 +41,11 @@ export function DecisionLine({ rec, className }: { rec: AdvisorRecommendation; c
   return <p className={className}>Decision: {decisionText(rec)}</p>;
 }
 
-/** The actions for one entry; `focusAfterRef` is where focus goes after a decision that removes them (SDD §16). */
-export type ActionsFor = (rec: AdvisorRecommendation, focusAfterRef: RefObject<HTMLElement | null>) => ReactNode;
+/**
+ * The actions for one entry. After a decision that removes them the focus goes to the entry's Details link, which the
+ * entry provides to them (FocusAfterDecision, SDD §16).
+ */
+export type ActionsFor = (rec: AdvisorRecommendation) => ReactNode;
 
 /** What the advisor recommended, then what was decided: the line the migration runs (SDD §16). Untrusted text renders as plain text. */
 /** The entry's line on its evidence (SDD §16, ADV-02): its details hold the card. */
@@ -99,7 +103,7 @@ function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorReco
       {rec.legacy && rec.legacy_text && (
         <p className="mt-1.5 wrap-break-word border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {rec.legacy_text}</p>
       )}
-      {actionsFor?.(rec, detailsRef)}
+      {actionsFor && <FocusAfterDecision value={detailsRef}>{actionsFor(rec)}</FocusAfterDecision>}
     </li>
   );
 }
