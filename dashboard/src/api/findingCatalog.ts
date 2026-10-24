@@ -328,6 +328,16 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
     remediation: 'Configure a conversion host on the provider.',
   },
+  CONV_HOST_KEY_UNKNOWN: {
+    severity: 'blocker',
+    strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
+    remediation: "Declare the conversion host's public keys on its provider (conversion_host.ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and pre-stage again, which creates it with an injected key.",
+  },
+  CONV_HOST_KEYS_UNCHECKED: {
+    severity: 'warning',
+    strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
+    remediation: 'Set SEAMLESS_ANSIBLE_HOST_KEY_CHECKING to true: each conversion host then needs declared keys or a pin, which a host Seamless creates gets injected and the provider check reads from the console of one it finds.',
+  },
   HANDOVER_BACKEND_UNMAPPED: {
     severity: 'info',
     strategies: ['storage_handover'],

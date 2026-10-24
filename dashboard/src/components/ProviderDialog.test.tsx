@@ -308,3 +308,95 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
     expect(reads('kolla-gpu')).toBe(0);
   });
 });
+
+describe("ProviderDialog: a conversion host's declared host keys (SDD §4.2, §16, §26.3; plan task ST7)", () => {
+  const DST = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPG3KNdzNY5BMzcxmBiodxJzFyuk3o+NUwZvY9B8BPyn';
+  const DC3 = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONXdEMQsyylyTGj3eyOnSgAxp5zE4Y8rF+Fpabez7MG';
+  /** Every write the page sends, with its body. */
+  const record = (server: ReturnType<typeof createTestServer>) => {
+    const bodies: Array<{ method: string; path: string; body: unknown }> = [];
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      if (method !== 'GET') bodies.push({ method, path, body });
+      return handle(method, path, query, body, token);
+    };
+    return bodies;
+  };
+
+  it('takes declared host keys and names a line that is no public key', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const bodies = record(server);
+    // a host Seamless deploys, without an address the form would drop: its form gives it back as it is
+    server.providers.find((p) => p.id === 'hibiscus-dc3')!.conversion_host!.address = null;
+    renderPage(server);
+    const replace = async (field: HTMLElement, text: string) => {
+      await user.clear(field);
+      await user.click(field);
+      await user.paste(text);
+    };
+    // an existing provider's declared keys fill the field, one per line
+    const hibiscus = await screen.findByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    await user.click(within(hibiscus).getByRole('button', { name: /^edit /i }));
+    let dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /deployed by seamless as os-migrate-conv-dc3/i }));
+    let keys = within(dialog).getByLabelText(/^host keys/i);
+    expect(keys).toHaveValue(`${DC3} os-migrate-conv-dc3`);
+    // unchanged, they are not sent: a PATCH of another field leaves the conversion host out
+    const region = within(dialog).getByLabelText(/^region/i);
+    await replace(region, 'RegionTwo');
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(bodies.filter((b) => b.method === 'PATCH').at(-1)?.body).toEqual({ region: 'RegionTwo' });
+
+    // a line that is no ed25519, ECDSA or RSA public key is named by its number, never quoted, and nothing is sent
+    await user.click(within(hibiscus).getByRole('button', { name: /^edit /i }));
+    dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /deployed by seamless as os-migrate-conv-dc3/i }));
+    keys = within(dialog).getByLabelText(/^host keys/i);
+    const sent = bodies.length;
+    await replace(keys, `${DC3} os-migrate-conv-dc3\n\nfrom="10.0.0.1" ${DST}\n-----BEGIN OPENSSH PRIVATE KEY-----\nssh-dss AAAAB3NzaC1kc3M=\nssh-ed25519 AAAAB3NzaC1yc2E=`);
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    const summary = await within(dialog).findByRole('alert');
+    const problem =
+      'line 3: options or a host name before the key type: declare the key alone; line 4: a private key: declare its public key; line 5: ssh-dss is not an ed25519, ECDSA or RSA key; line 6: its base64 field holds no ssh-ed25519 key';
+    expect(within(summary).getAllByRole('link').map((link) => link.textContent)).toEqual([problem]);
+    expect(summary).not.toHaveTextContent(/BEGIN|10\.0\.0\.1|AAAA/);
+    await waitFor(() => expect(summary).toHaveFocus());
+    expect(bodies).toHaveLength(sent);
+    // the line leads to the field, which says it
+    await user.click(within(summary).getByRole('link'));
+    expect(keys).toHaveFocus();
+    expect(keys).toHaveAttribute('aria-invalid', 'true');
+    expect(keys).toHaveAccessibleDescription(problem);
+
+    // the keys are sent whole, each line trimmed and blank lines dropped
+    await replace(keys, `\n  ${DC3} os-migrate-conv-dc3  \n\n${DST} os-migrate-conv-dst\n`);
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const patch = bodies.filter((b) => b.method === 'PATCH').at(-1)?.body as { conversion_host: { ssh_host_keys: string[] } };
+    expect(patch.conversion_host.ssh_host_keys).toEqual([`${DC3} os-migrate-conv-dc3`, `${DST} os-migrate-conv-dst`]);
+    expect(server.providers.find((p) => p.id === 'hibiscus-dc3')?.conversion_host?.ssh_host_keys).toEqual([`${DC3} os-migrate-conv-dc3`, `${DST} os-migrate-conv-dst`]);
+
+    // a provider added with a conversion host declares them as it is added
+    await user.click(screen.getByRole('button', { name: /^add provider$/i }));
+    dialog = await screen.findByRole('dialog', { name: /^add provider$/i });
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^deployed by seamless/i }));
+    await replace(within(dialog).getByLabelText(/^host keys/i), DST);
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Keys');
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-keys.example.com:5000/v3');
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.providers.find((p) => p.id === 'kolla-keys')?.conversion_host?.ssh_host_keys).toEqual([DST]);
+
+    // a vCenter's form takes none
+    await user.click(within(screen.getByRole('article', { name: 'vCenter HQ' })).getByRole('button', { name: /^edit /i }));
+    dialog = await screen.findByRole('dialog', { name: /edit vcenter hq/i });
+    expect(within(dialog).getByRole('button', { name: /existing host/i })).toHaveAttribute('aria-expanded', 'true');
+    expect(within(dialog).queryByLabelText(/^host keys/i)).not.toBeInTheDocument();
+  });
+});

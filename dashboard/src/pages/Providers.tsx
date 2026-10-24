@@ -1,9 +1,9 @@
 import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useCheckAllProviders, useCheckProvider, useDeleteProvider, usePlans, useProviders } from '../api/hooks';
+import { useCheckAllProviders, useCheckProvider, useDeleteProvider, useMe, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import type { Provider } from '../api/types';
+import type { HostKeyPin, Provider } from '../api/types';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PlatformMark, ProviderDialog } from '../components/ProviderDialog';
@@ -17,6 +17,7 @@ import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative, namesText } from '../lib/format';
 import { checkedGpuCapacity, gpuCapacityReason, poolFreeText, poolLabel } from '../lib/gpu';
+import { useFingerprints } from '../lib/hostKeys';
 import { deleteRefusal, plansThatNeed, providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
@@ -228,6 +229,64 @@ function GpuCapacitySummary({ provider }: { provider: Provider }) {
   );
 }
 
+/** Where a pin's keys came from, in words (SDD §16, §26.3). */
+const PIN_SOURCE: Record<HostKeyPin['source'], string> = {
+  injected: 'Injected at creation',
+  console: 'Read from the console',
+};
+
+/** Each key's fingerprint with what says where it came from, once the browser computed them (SDD §16). */
+function Fingerprints({ keys, origin }: { keys: readonly string[]; origin: string }) {
+  const prints = useFingerprints(keys);
+  if (!prints) return null;
+  return (
+    <ul className="flex flex-col gap-0.5 text-sm text-foreground">
+      {prints.map((print, i) => (
+        <li key={`${i}:${keys[i]}`} className="min-w-0 wrap-break-word">
+          {print ? <code className="text-xs">{print}</code> : <span className="text-status-warning">A key it cannot read</span>}{' '}
+          <span className="text-muted-foreground">{origin}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The host keys of an OpenStack or RHOSO provider's conversion host (SDD §16, §26.4; plan task ST7): the declared keys'
+ * fingerprints, which win over the pin; else the pin's, with its source, its server and its time; else that the next
+ * check pins them from the host's console.
+ */
+function HostKeys({ provider }: { provider: Provider }) {
+  const headingId = useId();
+  const declared = provider.conversion_host?.ssh_host_keys ?? [];
+  const pin = provider.conversion_host_pin ?? null;
+  return (
+    <div role="group" aria-labelledby={headingId} className="flex min-w-0 flex-col gap-1.5 rounded-md border border-border px-3 py-2">
+      <h4 id={headingId} className="text-sm font-medium text-foreground">
+        Host keys
+      </h4>
+      {declared.length > 0 ? (
+        <Fingerprints keys={declared} origin="Declared" />
+      ) : pin ? (
+        <>
+          <Fingerprints keys={pin.keys} origin={PIN_SOURCE[pin.source]} />
+          <p className="min-w-0 wrap-break-word text-xs text-muted-foreground">
+            Server <code>{pin.server_id}</code>
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Pinned{' '}
+            <time dateTime={pin.pinned_at} title={formatDateTime(pin.pinned_at)}>
+              {formatRelative(pin.pinned_at)}
+            </time>
+          </p>
+        </>
+      ) : (
+        <p className="text-sm text-muted-foreground">Not pinned yet: the next check reads the host&apos;s console.</p>
+      )}
+    </div>
+  );
+}
+
 /** Where the provider signs in from, without ever showing a credential. */
 function CredentialState({ provider }: { provider: Provider }) {
   if (provider.credentials_secret && provider.credentials_updated_at) {
@@ -352,6 +411,8 @@ function ProviderCard({
           )}
         </dd>
       </dl>
+
+      {provider.kind !== 'vmware' && ch && <HostKeys provider={provider} />}
 
       {provider.role === 'destination' && provider.kind !== 'vmware' && <GpuCapacitySummary provider={provider} />}
 
@@ -549,6 +610,8 @@ export default function Providers() {
   usePageTitle('Providers');
   const providers = useProviders();
   const role = useRole();
+  // off, no hop of the data path checks a conversion host's key: said once, above the cards (SDD §12, §16, §26.8)
+  const unchecked = useMe().data?.host_key_checking === false;
   const [announcement, setAnnouncement] = useState('');
   const [dialog, setDialog] = useState<{ open: boolean; provider?: Provider }>({ open: false });
   const list = providers.data ?? [];
@@ -587,6 +650,15 @@ export default function Providers() {
         />
       )}
       {list.length > 0 && <FleetSummary providers={list} canCheck={canCheck} onAnnounce={setAnnouncement} />}
+      {list.length > 0 && unchecked && (
+        <p className="mb-5 flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-foreground">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <span>
+            Host keys are not checked: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false, so no hop of the data path checks a conversion
+            host&apos;s key.
+          </span>
+        </p>
+      )}
       {list.length > 0 && (
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
           <ProviderColumn

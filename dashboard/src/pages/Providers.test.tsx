@@ -785,3 +785,76 @@ describe("Providers: a destination's GPU capacity (SDD §16, §22.11; plan task 
     expect(screen.getAllByRole('group', { name: 'GPU capacity' }).map((group) => group.closest('article'))).toEqual([screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })]);
   });
 });
+
+describe("Providers: a conversion host's host keys (SDD §16, §26.4; plan task ST7)", () => {
+  /** A card's host keys, named by its heading. */
+  const keysOf = (card: HTMLElement) => within(card).getByRole('group', { name: 'Host keys' });
+  const lines = (group: HTMLElement) => within(group).queryAllByRole('listitem').map((item) => item.textContent);
+  // the demo destinations' declared keys (synthetic, as the API demo's) and their fingerprints as ssh-keygen -l prints them
+  const DST = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPG3KNdzNY5BMzcxmBiodxJzFyuk3o+NUwZvY9B8BPyn';
+  const DC3 = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONXdEMQsyylyTGj3eyOnSgAxp5zE4Y8rF+Fpabez7MG';
+  const DST_PRINT = 'SHA256:c7YZ2kyybPWsZp/yLpIl7YrkvASjTK9SIZdcPY+5aP0';
+  const DC3_PRINT = 'SHA256:sEjGO8jPw9A7YTcBql1IsdjRiT9LliDPmN1IP8DtJsY';
+
+  it("shows the conversion host's pinned fingerprints, their source and server", async () => {
+    const server = createTestServer();
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    // declared keys win over a pin: the pin is not shown beside them
+    hibiscus.conversion_host_pin = { server_id: 'srv-dc3-old', keys: [DST], source: 'console', pinned_at: new Date(TEST_NOW - 60_000).toISOString() };
+    const view = renderPage('viewer', server);
+    const rhoso = await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
+    await waitFor(() => expect(lines(keysOf(rhoso))).toEqual([`${DST_PRINT} Declared`]));
+    const dc3 = keysOf(screen.getByRole('article', { name: hibiscus.name }));
+    await waitFor(() => expect(lines(dc3)).toEqual([`${DC3_PRINT} Declared`]));
+    expect(dc3).not.toHaveTextContent(/srv-dc3-old|Read from the console|Pinned/);
+    // neither declared nor pinned: the next check reads its console
+    const rhosp = screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    expect(keysOf(rhosp)).toHaveTextContent("Not pinned yet: the next check reads the host's console.");
+    expect(lines(keysOf(rhosp))).toEqual([]);
+    // a vCenter's host, and a provider without a conversion host, show none
+    for (const name of ['vCenter HQ', 'OpenStack Lab (2023.1)', 'Kolla Edge (Bobcat)', 'RHOSO 18.0 — Staging']) {
+      expect(within(screen.getByRole('article', { name })).queryByRole('group', { name: 'Host keys' }), name).not.toBeInTheDocument();
+    }
+    view.unmount();
+
+    // pinned: each key's fingerprint with its source in words, then its server and its time
+    const pinned = createTestServer();
+    const injectedAt = new Date(TEST_NOW - 3 * 60_000).toISOString();
+    const readAt = new Date(TEST_NOW - 90 * 60_000).toISOString();
+    const prod = pinned.providers.find((p) => p.id === 'rhoso-prod')!;
+    prod.conversion_host = { ...prod.conversion_host!, ssh_host_keys: [] };
+    prod.conversion_host_pin = { server_id: 'srv-conv-dst', keys: [DST, DC3], source: 'injected', pinned_at: injectedAt };
+    pinned.providers.find((p) => p.id === 'rhosp17-dc1')!.conversion_host_pin = { server_id: 'srv-conv-src', keys: [DC3], source: 'console', pinned_at: readAt };
+    renderPage('viewer', pinned);
+    const injected = keysOf(await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' }));
+    await waitFor(() => expect(lines(injected)).toEqual([`${DST_PRINT} Injected at creation`, `${DC3_PRINT} Injected at creation`]));
+    expect(injected).toHaveTextContent('Server srv-conv-dst');
+    const injectedTime = within(injected).getByText(/^Pinned$/).querySelector('time');
+    expect(injectedTime).toHaveAttribute('datetime', injectedAt);
+    expect(injectedTime).toHaveAttribute('title', formatDateTime(injectedAt));
+    const fromConsole = keysOf(screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' }));
+    await waitFor(() => expect(lines(fromConsole)).toEqual([`${DC3_PRINT} Read from the console`]));
+    expect(fromConsole).toHaveTextContent('Server srv-conv-src');
+    expect(within(fromConsole).getByText(/^Pinned$/).querySelector('time')).toHaveAttribute('datetime', readAt);
+    expect(fromConsole).not.toHaveTextContent(/Not pinned yet/);
+  });
+
+  it('warns that host keys are not checked', async () => {
+    const server = createTestServer();
+    server.hostKeyChecking = false;
+    const view = renderPage('viewer', server);
+    // once, above the cards, naming the setting
+    const warning = await screen.findByText(/^Host keys are not checked:/);
+    expect(warning).toHaveTextContent(
+      "Host keys are not checked: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false, so no hop of the data path checks a conversion host's key.",
+    );
+    expect(screen.getAllByText(/Host keys are not checked/)).toHaveLength(1);
+    const firstCard = screen.getAllByRole('article')[0]!;
+    expect(warning.compareDocumentPosition(firstCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    view.unmount();
+    // checked, the default: no warning
+    renderPage('viewer');
+    await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
+    expect(screen.queryByText(/Host keys are not checked/)).not.toBeInTheDocument();
+  });
+});
