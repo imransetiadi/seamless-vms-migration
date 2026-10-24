@@ -7368,7 +7368,10 @@ and a refusal as its own permanent error - in §6.4, §6.5 and §6.6 since that 
 injected host key and its report of the servers it created and found - in §6.5 since that task; plan task ST5's - each
 run's known_hosts, its checked Ansible and its own ControlPersist directory, the console read and the refusals before
 any playbook, the injected key pair and its pins, a refusal in a run's output as a permanent failure and
-`conversion_host.key_refused` - in §4.3 and §7.2 since that task. The facts
+`conversion_host.key_refused` - in §4.3 and §7.2 since that task; plan task ST6's - the link (the per-run key, the source
+host's entry, the gate, the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link
+removed), the content install's sshd settings and R-02 (the helper script's private directory and its SHA-256 check) -
+in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7564,8 +7567,10 @@ decision 10).
   * `from="<address>"`: the destination host's address as the source host sees it. The probe below reads it from
     `SSH_CONNECTION` on the source host, so no network topology is guessed (`TODO(LAB): confirm` what each topology
     shows);
-  * `expiry-time="<UTC time>Z"`: the run's start plus the step timeout when one is set (§15.1), else 7 days - a bound
-    for an entry a crash leaves behind;
+  * `expiry-time="<time>"`: the run's start plus the step timeout when one is set (§15.1), else 7 days - a bound
+    for an entry a crash leaves behind. Written by the source host's own clock in its system time zone, without the
+    `Z` of UTC: OpenSSH reads that suffix only since 9.1 (its release notes, read 2026-10-24), and the RHEL 8
+    family's 8.0 would ignore a line that carries it (proposed as UTC with `Z` until plan task ST6 found this);
   * cold runs: `port-forwarding` and one `permitopen="127.0.0.1:<port>"` per disk, written once the export has claimed
     its ports; the forward then names `127.0.0.1` instead of `localhost`.
 * **The gate** is a `gate` command of the run's blocksync script (§6.2), which the forced command runs as the source
@@ -7680,7 +7685,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 (binding) | ST3 |
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 (binding) | ST4 |
 | the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 (binding) | ST5 |
-| the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 if decided | §6.2, §6.4, §6.5, §6.6, §7.2 | ST6 |
+| the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 (owner decision 10) | §6.2, §6.4, §6.5, §6.6, §7.2 (binding) | ST6 |
 | the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
