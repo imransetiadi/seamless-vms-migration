@@ -1,0 +1,31 @@
+---
+# The run's own link between the conversion hosts, for the workload of the loop (Seamless Migrate
+# SDD 6.4, 26.6). import_workloads_warm_link_state present makes one - or, given
+# import_workloads_warm_link_given, writes import_workloads_warm_link_volume_ids (a warm run's temporary
+# volumes) or import_workloads_warm_link_ports (a cold run's export ports) into it -; absent removes
+# import_workloads_warm_link_given, or without one every entry of the workload. The link stays in
+# import_workloads_warm_link, {} once removed. import_workloads_warm_link_best_effort lets a removal in a
+# rescue fail without failing the rescue, whose error is the run's.
+- name: Change the run's conversion host link
+  os_migrate.os_migrate.conversion_host_link:
+    src_conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+    dst_conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
+    ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+    ssh_known_hosts: "{{ os_migrate_conversion_host_known_hosts | default(omit, true) }}"
+    src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
+    dst_ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+    workload: "{{ item['_info']['id'] }}"
+    link: "{{ import_workloads_warm_link_given | default({}, true) or omit }}"
+    volume_ids: "{{ import_workloads_warm_link_volume_ids | default(omit) }}"
+    ports: "{{ import_workloads_warm_link_ports | default(omit) }}"
+    expiry_s: "{{ os_migrate_conversion_link_expiry_s }}"
+    python_interpreter: "{{ os_migrate_warm_python_interpreter | default('python3') }}"
+    # 0.4.0's static link key, which the first link of a host pair removes (SDD 26.6)
+    old_link_key_path: "{{ os_migrate_conversion_link_keypair_private_path | default(omit, true) }}"
+    state: "{{ import_workloads_warm_link_state }}"
+  register: import_workloads_warm_link_result
+  ignore_errors: "{{ import_workloads_warm_link_best_effort | default(false) | bool }}"
+
+- name: Keep the run's conversion host link
+  ansible.builtin.set_fact:
+    import_workloads_warm_link: "{{ import_workloads_warm_link_result.link | default({}) }}"

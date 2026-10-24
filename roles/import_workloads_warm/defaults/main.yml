@@ -53,5 +53,12 @@ os_migrate_workload_boot_volume_prefix: os-migrate-  # noqa: var-naming[no-role-
 os_migrate_workloads_filter:  # noqa: var-naming[no-role-prefix]
   - regex: .*
 
+# Each run makes its own link between the conversion hosts and removes it when it ends
+# (Seamless Migrate SDD 6.4, 26.6): false keeps upstream's static link of the deploy.
+os_migrate_conversion_link_per_run: false  # noqa: var-naming[no-role-prefix]
+# Seconds after a link is made when the source host's sshd stops accepting its key: the step
+# timeout of the run, else 7 days.
+os_migrate_conversion_link_expiry_s: 604800  # noqa: var-naming[no-role-prefix]
+
 # Set by the playbooks: precopy, cutover or rollback.
 import_workloads_warm_action: precopy

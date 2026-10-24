@@ -1,6 +1,10 @@
 # Modified by the Seamless Migrate project, 2026.
 - name: Import a workload
   block:
+    - name: Forget the link of an earlier workload
+      ansible.builtin.set_fact:
+        import_workloads_warm_link: {}
+
     - name: Preliminary setup for workload import
       os_migrate.os_migrate.import_workload_prelim:
         cloud: dst
@@ -35,6 +39,18 @@
         dst_filters: "{{ os_migrate_dst_filters }}"
       when:
         - prelim is defined and prelim.changed
+
+    # the run's own link between the conversion hosts, before the stop: a host or link that
+    # refuses ends the import with the source running (Seamless Migrate SDD 26.5, 26.6)
+    - name: Set up and probe the run's conversion host link
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/conversion_link.yml"
+      vars:
+        import_workloads_warm_link_state: present
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - prelim is defined and prelim.changed
+        - item["_migration_params"]["data_copy"] | default(true)
+        - not item['_migration_params']['use_nbdkit_direct'] | default(false)
 
     # a stop that still runs is waited for, not sent again (Seamless Migrate SDD 6.5)
     - name: Wait until no stop or start of the source server runs
@@ -106,6 +122,19 @@
         - item["_migration_params"]["data_copy"] | default(true)
         - not item['_migration_params']['use_nbdkit_direct'] | default(false)
 
+    # once the export claimed its ports: the link may forward to them alone (SDD 26.6)
+    - name: Let the run's conversion host link forward the exports
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/conversion_link.yml"
+      vars:
+        import_workloads_warm_link_state: present
+        import_workloads_warm_link_given: "{{ import_workloads_warm_link }}"
+        import_workloads_warm_link_ports: "{{ exports.volume_map.values() | map(attribute='port') | list }}"
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - prelim is defined and prelim.changed
+        - item["_migration_params"]["data_copy"] | default(true)
+        - not item['_migration_params']['use_nbdkit_direct'] | default(false)
+
     - name: Export volume map for nbdkit direct
       os_migrate.os_migrate.import_workload_export_volume_map:
         cloud: "{{ cloud_vars_src }}"
@@ -152,6 +181,8 @@
         # records each volume as soon as Cinder created it: a rollback deletes
         # exactly those, as a cold retry never reuses them (Seamless Migrate SDD 6.3, 7)
         warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
+        # the run's own link, else upstream's static one (SDD 6.4, 26.6)
+        link: "{{ import_workloads_warm_link or omit }}"
       register: transfer
       when:
         - prelim is defined and prelim.changed
@@ -193,6 +224,17 @@
         - prelim is defined and prelim.changed
         - item["_migration_params"]["data_copy"] | default(true)
         - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
+
+    - name: Remove the run's conversion host link
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/conversion_link.yml"
+      vars:
+        import_workloads_warm_link_state: absent
+        import_workloads_warm_link_given: "{{ import_workloads_warm_link }}"
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - prelim is defined and prelim.changed
+        - item["_migration_params"]["data_copy"] | default(true)
+        - not item['_migration_params']['use_nbdkit_direct'] | default(false)
 
   rescue:
     # first, and best effort: it never fails, so the source cleanup's failure never keeps it
@@ -248,6 +290,19 @@
         - exports is defined and 'volume_map' in exports
         - item["_migration_params"]["data_copy"] | default(true)
         - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
+
+    # whether or not it came up: without one, every entry of the workload goes (SDD 26.6)
+    - name: Remove the run's conversion host link after the failure
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/conversion_link.yml"
+      vars:
+        import_workloads_warm_link_state: absent
+        import_workloads_warm_link_given: "{{ import_workloads_warm_link | default({}) }}"
+        import_workloads_warm_link_best_effort: true
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - prelim is defined and prelim.changed
+        - item["_migration_params"]["data_copy"] | default(true)
+        - not item['_migration_params']['use_nbdkit_direct'] | default(false)
 
     - name: Fail if there was a problem in the migration
       ansible.builtin.fail:

@@ -1,0 +1,23 @@
+---
+# sshd's forwarding for each run's own link (Seamless Migrate SDD 26.6): the source host forwards
+# local ports alone - a key's port-forwarding allows remote forwards too, which permitlisten
+# cannot forbid -, the destination host none; tunnels stay off, which restrict covers only since
+# OpenSSH 10.6. First in the file, before any Include: sshd keeps an option's first value.
+- name: Set sshd's forwarding for the conversion host link
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: "# {mark} SEAMLESS MIGRATE CONVERSION LINK"
+    insertbefore: BOF
+    block: |
+      AllowTcpForwarding {{ 'local' if inventory_hostname == 'os_migrate_conv_src' else 'no' }}
+      PermitTunnel no
+    validate: /usr/sbin/sshd -t -f %s
+  register: conversion_host_content_sshd
+
+# at once, not as a handler: a handler a later failure skips would leave the file changed and
+# never reloaded, since the next run finds the block as it wants it and notifies nothing
+- name: Reload sshd for its forwarding settings  # noqa: no-handler
+  ansible.builtin.service:
+    name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+    state: reloaded
+  when: conversion_host_content_sshd is changed

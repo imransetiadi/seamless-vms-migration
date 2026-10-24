@@ -45,6 +45,7 @@ STUBBED = (
     "os_conversion_host_info",
     "server_action",
     "server_info",
+    "conversion_host_link",
 )
 
 STUB = r'''#!/usr/bin/python
@@ -113,7 +114,20 @@ def save(path, state):
 
 
 result = {"changed": False}
-if [NAME, name] in world.get("fail", []):
+if NAME == "conversion_host_link":
+    state = args.get("state") or "present"
+    if [NAME, state, bool(args.get("link"))] in world.get("fail", []):
+        result = {"failed": True, "msg": world["link_refusal"]}
+    elif state == "absent":
+        result = {"changed": True, "link": {}}
+    else:
+        link = dict(args.get("link") or {"id": "link-" + args["workload"],
+                                          "key": "/tmp/seamless-link-x.Ab12Cd34Ef/key",
+                                          "script": "/tmp/seamless-link-x.Gh56Ij78Kl/blocksync.py"})
+        link["volume_ids"] = args.get("volume_ids") or []
+        link["ports"] = args.get("ports") or []
+        result = {"changed": True, "link": link}
+elif [NAME, name] in world.get("fail", []):
     result = {"failed": True, "msg": "injected %%s failure for %%s" %% (NAME, name)}
 elif NAME == "import_workload_prelim":
     if name in world.get("existing", []):
@@ -135,7 +149,8 @@ elif NAME == "import_workload_warm_snapshot":
     if args.get("state", "present") == "present":
         uuid = "uuid-%%s-%%d" %% (name, len(state["passes"]) + 1)
         state["pending_snapshot"] = {"transfer_uuid": uuid,
-                                     "volume_map": {"/dev/vda": {"source_dev": "/dev/vdb"}}}
+                                     "volume_map": {"/dev/vda": {"source_dev": "/dev/vdb",
+                                                                 "tmp_volume_id": "tmp-" + uuid}}}
         save(path, state)
         result = {"changed": True, "transfer_uuid": uuid,
                   "volume_map": state["pending_snapshot"]["volume_map"]}
@@ -187,9 +202,9 @@ elif NAME == "import_workload_rollback":
 elif NAME == "import_workload_export_volumes":
     result = {"changed": True, "transfer_uuid": "uuid-cold-" + name, "volume_map": {
         "/dev/vda": {"source_id": "svol-%%s-vda" %% name, "size": 1, "bootable": True,
-                     "name": "os-migrate-" + name},
+                     "name": "os-migrate-" + name, "port": 10809},
         "/dev/vdb": {"source_id": "svol-%%s-vdb" %% name, "size": 2, "bootable": False,
-                     "name": name + "-data"}}}
+                     "name": name + "-data", "port": 10810}}}
 elif NAME == "import_workload_transfer_volumes":
     volume_map = dict((dev, dict(entry, dest_id="dvol-%%s-%%s" %% (name, dev.split("/")[-1])))
                       for dev, entry in args["volume_map"].items())
@@ -392,6 +407,10 @@ def modules_for(calls, name, server_id):
             sequence.append("server_action:" + args["action"])
         elif call["module"] == "import_workload_src_check" and args.get("name") == server_id:
             sequence.append(call["module"])
+        elif call["module"] == "conversion_host_link" and args.get("workload") == server_id:
+            # its state, and whether it changes a link it was given (SDD 26.6)
+            sequence.append("conversion_host_link:%s%s" % (
+                args.get("state") or "present", ":given" if args.get("link") else ""))
     return sequence
 
 
@@ -1127,3 +1146,121 @@ def test_every_module_that_reaches_a_conversion_host_gets_the_known_hosts_file(e
         rc, out, calls = env.run("import_workloads_precopy", **unset)
         assert rc == 0, out
         assert not [c for c in calls if "ssh_known_hosts" in c["args"]], unset
+
+
+#: a run with its own conversion host link (SDD 6.4, 26.6), as the control plane runs every one
+LINKED = {"os_migrate_conversion_link_per_run": True, "os_migrate_conversion_link_expiry_s": 5400}
+LINK_REFUSAL = ("link refused by the source conversion host (os_migrate_conv_src at 10.0.0.10): "
+                "Permission denied (publickey)")
+
+
+def link_calls(calls):
+    return [c["args"] for c in calls if c["module"] == "conversion_host_link"]
+
+
+def test_a_warm_cutover_probes_its_link_before_it_stops_the_source(env):
+    """SDD 26.5, 26.6 (plan task ST6): a warm cutover sets up and probes the run's own link before
+    it stops the source; once the snapshot made the temporary volumes it lets the link read them,
+    the final pass runs through the link, and the link is removed before the snapshot. A
+    pre-copy pass does the same around its sync, with no stop."""
+    rc, out, calls = env.run("import_workloads_precopy", **LINKED)
+    assert rc == 0, out
+    assert modules_for(calls, "vm1", "srv-1") == [
+        "import_workload_prelim",
+        "import_workload_dst_check",
+        "import_workload_warm_snapshot:present",
+        "conversion_host_link:present",
+        "import_workload_warm_sync",
+        "conversion_host_link:absent:given",
+        "import_workload_warm_snapshot:absent",
+    ]
+
+    rc, out, calls = env.run("import_workloads_cutover", **LINKED)
+    assert rc == 0, out
+    assert modules_for(calls, "vm1", "srv-1") == [
+        "import_workload_prelim",
+        "import_workload_dst_check",
+        "conversion_host_link:present",
+        "server_action:stop",
+        "import_workload_src_check",
+        "import_workload_warm_snapshot:present",
+        "conversion_host_link:present:given",
+        "import_workload_warm_sync",
+        "conversion_host_link:absent:given",
+        "import_workload_warm_snapshot:absent",
+        "import_workload_create_instance",
+    ]
+    made, given, removed = [a for a in link_calls(calls) if a["workload"] == "srv-1"]
+    assert made["src_conversion_host"]["id"] == "src-conv"
+    assert made["dst_conversion_host"]["id"] == "dst-conv"
+    assert made["expiry_s"] == 5400 and "volume_ids" not in made and "link" not in made
+    assert given["link"]["id"] == "link-srv-1"
+    assert given["volume_ids"] == ["tmp-uuid-vm1-2"]
+    sync = next(c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
+    assert sync["link"] == dict(given["link"], volume_ids=["tmp-uuid-vm1-2"], ports=[])
+    assert removed["state"] == "absent" and removed["link"] == sync["link"]
+
+    # upstream's run, without the variable: no link of its own, the sync takes none
+    rc, out, calls = env.run("import_workloads_precopy")
+    assert rc == 0, out
+    assert link_calls(calls) == []
+    assert all("link" not in c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
+
+
+def test_a_cold_cutover_probes_its_link_before_it_stops_the_source(env):
+    """SDD 26.5, 26.6 (plan task ST6): the cold import sets up and probes the run's own link
+    before it stops the source; once the export claimed its ports the link may forward to those
+    alone, the transfer forwards over it, and the link is removed when the import ends."""
+    rc, out, calls = env.run("import_workloads", **dict(COLD, **LINKED))
+
+    assert rc == 0, out
+    assert modules_for(calls, "vm1", "srv-1") == [
+        "import_workload_prelim",
+        "import_workload_dst_check",
+        "conversion_host_link:present",
+        "server_action:stop",
+        "import_workload_src_check",
+        "import_workload_export_volumes",
+        "conversion_host_link:present:given",
+        "import_workload_transfer_volumes",
+        "import_workload_create_instance",
+        "import_workload_src_cleanup",
+        "conversion_host_link:absent:given",
+    ]
+    made, given, removed = link_calls(calls)
+    assert "ports" not in made
+    assert sorted(given["ports"]) == [10809, 10810]
+    transfer = next(c["args"] for c in calls if c["module"] == "import_workload_transfer_volumes")
+    assert transfer["link"] == dict(given["link"], ports=given["ports"], volume_ids=[])
+    assert removed["link"] == transfer["link"]
+
+    rc, out, calls = env.run("import_workloads", **COLD)  # upstream's: no link of its own
+    assert rc == 0, out
+    assert link_calls(calls) == []
+    transfer = next(c["args"] for c in calls if c["module"] == "import_workload_transfer_volumes")
+    assert "link" not in transfer
+
+
+@pytest.mark.parametrize("playbook", ["import_workloads_cutover", "import_workloads"])
+def test_a_link_refused_before_the_stop_leaves_the_source_running(env, playbook):
+    """SDD 26.5 (plan task ST6): a cutover whose link the source host refuses - its key, its
+    login - fails before the source stops, with the refusal as its message for the control
+    plane, which takes it as permanent; nothing is exported or snapshotted, and the rescue removes
+    whatever the link left."""
+    env.world["fail"] = [["conversion_host_link", "present", False]]
+    env.world["link_refusal"] = LINK_REFUSAL
+    extra = dict(LINKED, **(COLD if playbook == "import_workloads" else {}))
+    if playbook == "import_workloads_cutover":
+        assert env.run("import_workloads_precopy")[0] == 0
+
+    rc, out, calls = env.run(playbook, **extra)
+
+    assert rc != 0
+    assert LINK_REFUSAL in out
+    sequence = modules_for(calls, "vm1", "srv-1")
+    assert "server_action:stop" not in sequence and env.nova_actions() == []
+    assert not [m for m in sequence if m.startswith(("import_workload_export_volumes",
+                                                     "import_workload_warm_snapshot:present"))]
+    # the rescue removes its workload's every entry, the link that failed having none
+    assert sequence[sequence.index("conversion_host_link:present") + 1] == (
+        "conversion_host_link:absent")

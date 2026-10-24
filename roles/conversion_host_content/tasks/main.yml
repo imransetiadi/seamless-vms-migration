@@ -27,6 +27,11 @@
     - name: Include the tasks of the conversion host's OS
       ansible.builtin.include_tasks: "{{ os_migrate_conversion_host_content_tasks }}"
 
+    # each run's own link between the conversion hosts (Seamless Migrate SDD 26.6)
+    - name: Include sshd's settings for the conversion host link
+      ansible.builtin.include_tasks: sshd_link.yml
+      when: os_migrate_conversion_link_per_run | default(false) | bool
+
     - name: Running post content hook
       ansible.builtin.shell: "{{ os_migrate_conversion_host_post_content_hook }}"
       args:

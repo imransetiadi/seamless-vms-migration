@@ -13,3 +13,9 @@ os_migrate_workloads_filter:
 # each conversion host's own SSH user, upstream's single one unless set (Seamless Migrate SDD 6.5)
 os_migrate_src_conversion_host_ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
 os_migrate_dst_conversion_host_ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+# Each run makes its own link between the conversion hosts and removes it when it ends
+# (Seamless Migrate SDD 6.4, 26.6): false keeps upstream's static link of the deploy.
+os_migrate_conversion_link_per_run: false
+# Seconds after a link is made when the source host's sshd stops accepting its key: the step
+# timeout of the run, else 7 days.
+os_migrate_conversion_link_expiry_s: 604800
