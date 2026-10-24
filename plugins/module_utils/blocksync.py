@@ -13,6 +13,7 @@ standard library only::
                                  [--assume-zero] [--progress-interval S]
                                  [--expect-serial ID] -- SENDER_COMMAND [ARGS...]
     python3 blocksync.py hash    --device PATH [--chunk-size N]
+    python3 blocksync.py gate    --python PYTHON [--volume ID ...]
 
 ``--expect-serial ID`` checks, before a byte is read or written, that the
 device opened is the disk of volume ``ID``: its virtio serial must be a prefix
@@ -38,6 +39,14 @@ stdin/stdout pipes. Wire protocol v1, all integers big-endian:
 The receiver sends digests and applies frames on separate threads (one
 direction blocking can never deadlock the other) and verifies the manifest
 digest of the result before it fsyncs the device and prints its summary.
+
+``gate`` is the forced command of a run's link key on the source conversion
+host (Seamless Migrate SDD 6.2, 26.6): it reads ``SSH_ORIGINAL_COMMAND`` and
+answers ``probe`` with the client address of ``SSH_CONNECTION``, or execs,
+without a shell, exactly ``sudo -n PYTHON <this script> send --device PATH
+--chunk-size N --workers W --expect-serial ID`` for an ID given as ``--volume``
+on a disk that shows its serial. It refuses everything else with one line on
+stderr and exit 2.
 
 With ``--extents FILE`` (JSON ``[offset, length]`` pairs, sorted and merged
 here; each chunk an extent touches is listed) the sender runs one of two
@@ -69,6 +78,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import signal
 import stat
 import struct
@@ -1187,12 +1197,103 @@ def _arg_interval(value):
     return number
 
 
+#: the line a gate's refusal starts with, which the warm sync reads on the receiver's stderr as a
+#: refused link (Seamless Migrate SDD 6.2, 6.6, 26.6)
+GATE_REFUSED = "seamless-link gate refused: "
+#: the options of the one send the gate runs, in the order the warm sync writes them (SDD 6.4)
+_GATE_SEND_OPTIONS = ["--device", "--chunk-size", "--workers", "--expect-serial"]
+
+
+class _GateRefusal(Exception):
+    """What the gate refuses, as its stderr line names it."""
+
+
+def _disk_serial(path):
+    """The virtio-blk serial of the disk at ``path``, or None: a path that names no block device,
+    or a disk that shows no serial."""
+    try:
+        return _serial_of(os.stat(path))
+    except (IOError, OSError):
+        return None
+
+
+def _gate_word(word):
+    """A refused command's first word as the refusal names it: short, one line."""
+    return word.replace("\n", " ")[:64]
+
+
+def _gate_send(words, python, volumes):
+    """The argv of the send ``words`` ask for, rebuilt from the values the gate checked; raises
+    _GateRefusal for any other command (SDD 6.2, 26.6)."""
+    head = ["sudo", "-n", python, os.path.abspath(__file__), "send"]
+    if words[: len(head)] != head:
+        raise _GateRefusal("a command it does not run: " + _gate_word(words[0]))
+    options = words[len(head):]
+    names = options[0::2]
+    if "--expect-serial" not in names:
+        raise _GateRefusal("send without --expect-serial")
+    if len(options) != 2 * len(_GATE_SEND_OPTIONS) or names != _GATE_SEND_OPTIONS:
+        raise _GateRefusal("send with other options")
+    device, chunk_size, workers, serial = options[1::2]
+    if serial not in volumes:
+        raise _GateRefusal("volume %s, which is not the run's" % _gate_word(serial))
+    for name, value, check in (
+        ("--chunk-size", chunk_size, _arg_chunk_size),
+        ("--workers", workers, _arg_workers),
+    ):
+        try:
+            check(value)
+        except argparse.ArgumentTypeError as err:
+            raise _GateRefusal("send with %s %s: %s" % (name, _gate_word(value), err))
+    if not os.path.isabs(device):
+        raise _GateRefusal("%s, which is no absolute path" % _gate_word(device))
+    shown = _disk_serial(device)
+    if shown is None:
+        raise _GateRefusal("%s, which shows no virtio serial" % _gate_word(device))
+    if not serial.startswith(shown):
+        raise _GateRefusal(
+            "%s is the disk of volume %s, not of volume %s" % (_gate_word(device), shown, serial)
+        )
+    return head + [
+        "--device", device,
+        "--chunk-size", str(_arg_chunk_size(chunk_size)),
+        "--workers", str(_arg_workers(workers)),
+        "--expect-serial", serial,
+    ]
+
+
+def _cmd_gate(args):
+    """The forced command of a run's link key (SDD 6.2, 26.6): ``probe``, the run's own send, or
+    a refusal - never a shell."""
+    original = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        if not original.strip():
+            raise _GateRefusal("a shell")
+        try:
+            words = shlex.split(original)
+        except ValueError:
+            raise _GateRefusal("a command it cannot read")
+        if words == ["probe"]:
+            client = os.environ.get("SSH_CONNECTION", "").split()
+            if not client:
+                raise _GateRefusal("a probe without SSH_CONNECTION")
+            sys.stdout.write(client[0] + "\n")
+            sys.stdout.flush()
+            return EXIT_OK
+        argv = _gate_send(words, args.python, args.volume)
+    except _GateRefusal as refusal:
+        _emit_stderr(GATE_REFUSED + str(refusal))
+        return EXIT_USAGE
+    os.execvp("sudo", argv)
+    return EXIT_USAGE  # never reached: execvp returns only by raising
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="blocksync.py",
         description="Block-level delta sync for warm migrations (protocols v1 and v2).",
     )
-    commands = parser.add_subparsers(dest="command", metavar="{send,receive,hash}")
+    commands = parser.add_subparsers(dest="command", metavar="{send,receive,hash,gate}")
     commands.required = True
 
     def device_options(sub):
@@ -1264,6 +1365,19 @@ def _build_parser():
         "hash", help="print the manifest digest (hex) and size of a device"
     )
     device_options(hash_cmd)
+
+    gate = commands.add_parser(
+        "gate",
+        help="the forced command of a run's link key: probe, or the run's own send",
+    )
+    gate.add_argument("--python", required=True, help="the interpreter the send must name")
+    gate.add_argument(
+        "--volume",
+        metavar="ID",
+        action="append",
+        default=[],
+        help="a volume of the run, whose disk a send may read (repeatable)",
+    )
     return parser
 
 
@@ -1411,6 +1525,8 @@ def main(argv=None):
         return EXIT_USAGE
     if args.command == "send":
         return _cmd_send(args)
+    if args.command == "gate":
+        return _cmd_gate(args)
     return _cmd_hash(args)
 
 

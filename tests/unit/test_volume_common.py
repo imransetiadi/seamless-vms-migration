@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 import traceback
@@ -2433,3 +2434,86 @@ def test_a_link_the_source_host_refuses_fails_the_cold_transfer_at_once(
     with pytest.raises(RuntimeError, match="Timed out starting nbdkit exports"):
         unpinned._create_forwarding_process()
     assert len(waits) == 5
+
+
+#: a run's link as conversion_host_link returns it (SDD 6.4, 26.6): paths on the destination host
+RUN_LINK = {
+    "id": "0123456789abcdef0123456789abcdef",
+    "key": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Ab12Cd34Ef/key",
+    "known_hosts": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Ab12Cd34Ef/known_hosts",
+    "script": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Gh56Ij78Kl/blocksync.py",
+}
+
+
+def _linked_transfer(**options):
+    volume_map = {
+        "/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809),
+        "/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810),
+    }
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([cloud()])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            cloud(), "dst-conv", "/keys/k", "ubuntu", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=5, src_ssh_user="cloud-user", **options
+        )
+    transfer.shell = ForwardingHost(free=4)
+    transfer._create_forwarding_process()
+    [forward] = [c for c in transfer.shell.commands if "-L" in c]
+    return forward
+
+
+def test_the_cold_forward_names_127_0_0_1():
+    """SDD 26.6 (plan task ST6): with a run's link, the cold transfer forwards each export to
+    127.0.0.1 - the address its entry's permitopen names and the exports bind (SDD 6.6), where
+    permitopen compares the name as written and "localhost" would be refused. Without one, the
+    forward is upstream's."""
+    forward = _linked_transfer(link=dict(RUN_LINK))
+    targets = [forward[i + 1] for i, word in enumerate(forward) if word == "-L"]
+    assert [t.split(":", 1)[1] for t in targets] == ["127.0.0.1:10809", "127.0.0.1:10810"]
+    assert not [word for word in forward if "localhost" in word]
+
+    upstream = _linked_transfer()
+    targets = [upstream[i + 1] for i, word in enumerate(upstream) if word == "-L"]
+    assert [t.split(":", 1)[1] for t in targets] == ["localhost:10809", "localhost:10810"]
+
+
+def test_the_link_preamble_pins_the_source_host_on_the_destination_host(tmp_path):
+    """SDD 6.6, 26.4, 26.6 (plan task ST6): the link's preamble, which the destination host runs,
+    logs in with the run's link key - never the destination user's own - and checks the source
+    host's key strictly against the link's known_hosts beside that key on the destination host,
+    under the source alias, with the algorithms of the run's source pin; the run's own file on
+    the control plane never reaches it. The cold forward and the warm sender use it alike."""
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
+
+    run_file = local_sshd.write_known_hosts(str(tmp_path / "known_hosts"), [
+        ("os_migrate_conv_src", local_sshd.keygen(str(tmp_path / "src"), "rsa")),
+        ("os_migrate_conv_dst", local_sshd.keygen(str(tmp_path / "dst"))),
+    ])
+
+    def option(words, name):
+        return [w.split("=", 1)[1] for w in words if w.startswith(name + "=")]
+
+    forward = _linked_transfer(link=dict(RUN_LINK), ssh_known_hosts=run_file)
+    preamble = volume_common.link_shell(
+        "10.0.0.10", "cloud-user", RUN_LINK, known_hosts=run_file).ssh_preamble()
+    for words in (forward, preamble):
+        assert words[words.index("-i") + 1] == RUN_LINK["key"]
+        assert option(words, "StrictHostKeyChecking") == ["yes"]
+        assert option(words, "UserKnownHostsFile") == [RUN_LINK["known_hosts"]]
+        assert option(words, "GlobalKnownHostsFile") == ["/dev/null"]
+        assert option(words, "HostKeyAlias") == ["os_migrate_conv_src"]
+        assert option(words, "HostKeyAlgorithms") == ["rsa-sha2-512,rsa-sha2-256"]
+        assert option(words, "IdentitiesOnly") == ["yes"]
+        assert "cloud-user@10.0.0.10" in words
+        assert run_file not in " ".join(words)
+    assert forward[:len(preamble)] == preamble
+
+    sender = warm_migration.blocksync_receive_command(
+        "uuid-1", "/dev/vdc", "/dev/vdb", preamble, "ubuntu",
+        source_script=RUN_LINK["script"], source_serial="vol-1")
+    argv = shlex.split(" ".join(sender))
+    assert argv[argv.index("--") + 6:][:len(preamble)] == preamble
+
+    # without known_hosts the link still uses its own key, unchecked as upstream's preamble
+    unpinned = volume_common.link_shell("10.0.0.10", "cloud-user", RUN_LINK).ssh_preamble()
+    assert unpinned[unpinned.index("-i") + 1] == RUN_LINK["key"]
+    assert option(unpinned, "StrictHostKeyChecking") == ["no"]

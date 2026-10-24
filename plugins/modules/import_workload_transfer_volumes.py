@@ -102,6 +102,15 @@ options:
         for its hop to the source's exports. Defaults to I(ssh_user).
     required: false
     type: str
+  link:
+    description:
+      - The run's own link, as M(os_migrate.os_migrate.conversion_host_link) returned it
+        (Seamless Migrate SDD 6.4, 26.6). With it, the destination conversion host forwards the
+        exports to C(127.0.0.1) with the link's key, and given I(ssh_known_hosts) checks the
+        source host's key against the link's pin.
+      - Unset, the forward logs in as upstream's does, with the destination user's own key.
+    required: false
+    type: dict
   state_file:
     description:
       - Path to store a transfer progress file for this conversion process.
@@ -316,6 +325,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         warm_state_dir=None,
         src_ssh_user=None,
         ssh_known_hosts=None,
+        link=None,
     ):
 
         super().__init__(
@@ -331,6 +341,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             preserve_volume_type=preserve_volume_type,
             src_ssh_user=src_ssh_user,
             ssh_known_hosts=ssh_known_hosts,
+            link=link,
         )
 
         # Required unique parameters:
@@ -580,6 +591,7 @@ def run_module():
         ssh_user=dict(type="str", required=True),
         ssh_known_hosts=dict(type="path", required=False, default=None),
         src_ssh_user=dict(type="str", required=False, default=None),
+        link=dict(type="dict", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
         volume_map=dict(type="dict", required=True),
@@ -655,6 +667,7 @@ def run_module():
             warm_state_dir=module.params["warm_state_dir"],
             src_ssh_user=module.params["src_ssh_user"],
             ssh_known_hosts=module.params["ssh_known_hosts"],
+            link=module.params["link"],
         )
         destination_host.transfer_exports()
     except DiskIdentityError as err:

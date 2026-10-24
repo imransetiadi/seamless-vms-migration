@@ -5,6 +5,10 @@
 # "Stop the source server".
 - name: Warm cutover of a workload
   block:
+    - name: Forget the link of an earlier workload
+      ansible.builtin.set_fact:
+        import_workloads_warm_link: {}
+
     - name: Read the warm state of the workload
       ansible.builtin.slurp:
         src: "{{ os_migrate_warm_state_dir }}/{{ item['_info']['id'] }}.json"
@@ -115,6 +119,14 @@
                 data: "{{ item }}"
                 dst_filters: "{{ os_migrate_dst_filters }}"
 
+            # before the stop: a host or link that refuses ends the cutover with the source
+            # running (Seamless Migrate SDD 26.5, 26.6)
+            - name: Set up and probe the run's conversion host link
+              ansible.builtin.include_tasks: conversion_link.yml
+              vars:
+                import_workloads_warm_link_state: present
+              when: os_migrate_conversion_link_per_run | bool
+
             - name: Wait until no stop or start of the source server runs
               ansible.builtin.include_tasks: source_stop_settled.yml
 
@@ -159,6 +171,16 @@
                 state: present
               register: import_workloads_warm_snapshot
 
+            - name: Let the run's conversion host link read the temporary volumes
+              ansible.builtin.include_tasks: conversion_link.yml
+              vars:
+                import_workloads_warm_link_state: present
+                import_workloads_warm_link_given: "{{ import_workloads_warm_link }}"
+                import_workloads_warm_link_volume_ids: >-
+                  {{ import_workloads_warm_snapshot.volume_map.values()
+                     | map(attribute='tmp_volume_id') | list }}
+              when: os_migrate_conversion_link_per_run | bool
+
             - name: Run the final synchronisation pass
               os_migrate.os_migrate.import_workload_warm_sync:
                 cloud: dst
@@ -185,7 +207,16 @@
                 log_file: "{{ import_workloads_warm_prelim.log_file }}"
                 state_file: "{{ import_workloads_warm_prelim.state_file }}"
                 timeout: "{{ os_migrate_timeout }}"
+                # the run's own link, else upstream's static one (SDD 6.4, 26.6)
+                link: "{{ import_workloads_warm_link or omit }}"
               register: import_workloads_warm_sync
+
+            - name: Remove the run's conversion host link
+              ansible.builtin.include_tasks: conversion_link.yml
+              vars:
+                import_workloads_warm_link_state: absent
+                import_workloads_warm_link_given: "{{ import_workloads_warm_link }}"
+              when: os_migrate_conversion_link_per_run | bool
 
             - name: Remove the temporary snapshot
               os_migrate.os_migrate.import_workload_warm_snapshot:
@@ -229,6 +260,17 @@
     - name: Remember why the cutover failed
       ansible.builtin.set_fact:
         import_workloads_warm_error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+
+    # whether or not it came up: without one, every entry of the workload goes (SDD 26.6)
+    - name: Remove the run's conversion host link after the failure
+      ansible.builtin.include_tasks: conversion_link.yml
+      vars:
+        import_workloads_warm_link_state: absent
+        import_workloads_warm_link_given: "{{ import_workloads_warm_link | default({}) }}"
+        import_workloads_warm_link_best_effort: true
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - import_workloads_warm_proceed | default(false) | bool
 
     # The destination volumes are kept: a retried cutover reuses them and
     # rollback_workloads.yml decides whether to delete them. The source

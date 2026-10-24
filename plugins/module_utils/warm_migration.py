@@ -18,6 +18,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -39,12 +40,12 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     ATTACH_LOCK_FILE_SOURCE,
     DEFAULT_TIMEOUT,
     OpenStackVolumeBase,
-    RemoteShell,
     SshRefused,
     destination_volume_sdk_params,
     detach_volume_bounded,
     image_volume_size,
     link_refused,
+    link_shell,
     refused_link,
     use_lock,
     volume_or_none,
@@ -55,7 +56,10 @@ PASS_KINDS = ("full", "delta", "final")
 REQUESTED_PASS_KINDS = ("auto",) + PASS_KINDS
 DEFAULT_PARALLEL_DISKS = 4
 DEFAULT_TMP_PREFIX = "os-migrate-"
-BLOCKSYNC_REMOTE_PATH = "/tmp/seamless-blocksync-{transfer_uuid}.py"
+#: where a pass's copy of blocksync goes on each host: a directory mktemp makes, 0700, its name
+#: this and ten random characters, the script inside it (R-02, Seamless Migrate SDD 6.4)
+BLOCKSYNC_REMOTE_DIR = "/tmp/seamless-blocksync-{transfer_uuid}"
+BLOCKSYNC_SCRIPT = "blocksync.py"
 
 _SAFE_SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SAFE_TRANSFER_UUID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
@@ -267,8 +271,27 @@ def parse_blocksync_summary(output):
     return None
 
 
-def blocksync_script_path(transfer_uuid):
-    return BLOCKSYNC_REMOTE_PATH.format(transfer_uuid=_checked_transfer_uuid(transfer_uuid))
+def sender_pattern(script):
+    """pkill's pattern for the senders started from ``script`` (a run's link's, SDD 26.6): its
+    path, its first character in brackets so that the pkill's own sudo does not match it."""
+    return "[%s]%s send" % (script[0], script[1:].replace(".", "[.]"))
+
+
+def blocksync_remote_dir(transfer_uuid):
+    """The name the private directories of a pass's copies of blocksync start with."""
+    return BLOCKSYNC_REMOTE_DIR.format(transfer_uuid=_checked_transfer_uuid(transfer_uuid))
+
+
+def script_check_words(sha256, script):
+    """Shell words that go on only when ``script`` is the copy whose SHA-256 is ``sha256``, else
+    fail with exit 2 and one line on stderr: what runs before every ``sudo python3`` of it (R-02,
+    SDD 6.4). sha256sum reads the check from its standard input, ``-`` named for BSD's."""
+    refusal = "blocksync: error: %s does not match its SHA-256" % script
+    return [
+        "echo", shlex.quote("%s  %s" % (sha256, script)), "|", "sha256sum", "-c", "-",
+        ">/dev/null", "2>&1", "||", "{", "echo", shlex.quote(refusal), ">&2;", "exit", "2;",
+        "};",
+    ]
 
 
 def blocksync_source():
@@ -298,6 +321,10 @@ def blocksync_receive_command(
     python="python3",
     source_serial=None,
     dest_serial=None,
+    dest_script=None,
+    source_script=None,
+    sha256=None,
+    source_gate=False,
 ):
     """Shell words that run ``blocksync receive`` on the destination host.
 
@@ -309,10 +336,17 @@ def blocksync_receive_command(
     more for the source shell, so device paths are never interpreted.
     ``source_serial`` and ``dest_serial`` are the volume ids each end's
     device must show as its virtio serial (Seamless Migrate SDD 6.2).
+    ``dest_script`` and ``source_script`` are each host's copy of blocksync;
+    given ``sha256``, each host checks its copy before sudo runs it (R-02) -
+    the source host's sender alone when ``source_gate`` is false: through a
+    run's link the gate's forced command checks it, and runs the send only
+    as written here (SDD 6.2, 26.6).
     """
-    script = blocksync_script_path(transfer_uuid)
+    remote_dir = blocksync_remote_dir(transfer_uuid)
+    dest_script = dest_script or remote_dir + "/" + BLOCKSYNC_SCRIPT
+    source_script = source_script or dest_script
     sender_remote = [
-        "sudo", "-n", python, script, "send",
+        "sudo", "-n", python, source_script, "send",
         "--device", source_device,
         "--chunk-size", str(int(chunk_size)),
         "--workers", str(int(workers)),
@@ -320,9 +354,11 @@ def blocksync_receive_command(
     if source_serial:
         sender_remote += ["--expect-serial", source_serial]
     sender = ["sudo", "-n", "-u", ssh_user, "--"] + list(source_ssh)
+    if sha256 and not source_gate:
+        sender += script_check_words(sha256, source_script)
     sender += [shlex.quote(word) for word in sender_remote]
     receiver = [
-        "sudo", "-n", python, script, "receive",
+        "sudo", "-n", python, dest_script, "receive",
         "--device", dest_device,
         "--chunk-size", str(int(chunk_size)),
         "--workers", str(int(workers)),
@@ -332,7 +368,8 @@ def blocksync_receive_command(
         receiver.append("--assume-zero")
     if dest_serial:
         receiver += ["--expect-serial", dest_serial]
-    return [shlex.quote(word) for word in receiver + ["--"] + sender]
+    check = script_check_words(sha256, dest_script) if sha256 else []
+    return check + [shlex.quote(word) for word in receiver + ["--"] + sender]
 
 
 def _snapshot_entry(source_id, size, bootable, name, volume_type):
@@ -386,13 +423,14 @@ class _WarmVolumeBase(OpenStackVolumeBase):
             self._wait_detached(volume_id, side)
 
     def _forget_transfer(self, shell, transfer_uuid):
-        """Best effort: stop blocksync processes and remove the script."""
-        script = blocksync_script_path(transfer_uuid)
+        """Best effort: stop blocksync processes and remove the script - its private
+        directories, and the file an earlier version left (R-02, SDD 6.4)."""
+        copies = shlex.quote(blocksync_remote_dir(transfer_uuid)) + ".*"
         # "[s]eamless" matches the processes but not this pkill command line.
         pattern = "[s]eamless-blocksync-" + transfer_uuid
         for command in (
             ["sudo", "pkill", "-f", shlex.quote(pattern)],
-            ["sudo", "rm", "-f", script],
+            ["sudo", "rm", "-rf", copies],
         ):
             try:
                 shell.cmd_val(command)
@@ -672,6 +710,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         preserve_volume_type=False,
         src_ssh_user=None,
         ssh_known_hosts=None,
+        link=None,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -687,6 +726,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             preserve_volume_type=preserve_volume_type,
             src_ssh_user=src_ssh_user,
             ssh_known_hosts=ssh_known_hosts,
+            link=link,
         )
         self.ser_server = ser_server
         self.state = state
@@ -701,6 +741,11 @@ class OpenstackWarmSync(_WarmVolumeBase):
         self._receivers = {}
         self._receivers_lock = threading.Lock()
         self._cancelled = threading.Event()
+        # each host's copy of blocksync and its SHA-256, once installed (R-02); through a run's
+        # link the source host's is the link's (SDD 26.6)
+        self.dest_script = None
+        self.source_script = self.link["script"] if self.link else None
+        self.script_sha256 = None
 
     # --- public ----------------------------------------------------------
 
@@ -927,18 +972,34 @@ class OpenstackWarmSync(_WarmVolumeBase):
         return self._shell(self.source_conversion_host_address, self.src_ssh_user, "source")
 
     def _install_blocksync(self):
-        script = blocksync_script_path(self.transfer_uuid)
+        """Copy blocksync into a private directory mktemp makes on each host - on the
+        destination host alone through a run's link, whose script the source host runs - and
+        note its SHA-256, which each host checks before sudo runs it (R-02, SDD 6.4, 26.6)."""
+        source = blocksync_source()
+        self.script_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         fd, local_path = tempfile.mkstemp(prefix="seamless-blocksync-", suffix=".py")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(blocksync_source())
-            for shell in (self.shell, self._source_shell()):
+                f.write(source)
+            shells = [("dest_script", self.shell)]
+            if not self.link:
+                shells.append(("source_script", self._source_shell()))
+            for attribute, shell in shells:
+                template = blocksync_remote_dir(self.transfer_uuid) + ".XXXXXXXXXX"
+                directory = shell.cmd_out(["mktemp", "-d", shlex.quote(template)]).strip()
+                if not directory.startswith(blocksync_remote_dir(self.transfer_uuid) + "."):
+                    raise RuntimeError(
+                        "mktemp on %s made no directory for blocksync: %r"
+                        % (shell.address, directory)
+                    )
+                script = directory + "/" + BLOCKSYNC_SCRIPT
                 rc = shell.scp_to(local_path, script)
                 if rc != 0:
                     raise RuntimeError(
                         "Could not copy blocksync to %s (scp exit status %s)"
                         % (shell.address, rc)
                     )
+                setattr(self, attribute, script)
         finally:
             os.unlink(local_path)
 
@@ -976,9 +1037,13 @@ class OpenstackWarmSync(_WarmVolumeBase):
             raise RuntimeError("cancelled after another disk failed")
         mapping = self.volume_map[dev]
         # the receiver's hop logs in as the source host's user; it runs as this host's own,
-        # the link key's owner (SDD 6.5)
-        source_ssh = RemoteShell(
-            self.source_conversion_host_address, self.src_ssh_user
+        # the link key's owner (SDD 6.5) - the run's link's, pinned to the source host's key
+        # given known_hosts (SDD 26.6)
+        source_ssh = link_shell(
+            self.source_conversion_host_address,
+            self.src_ssh_user,
+            self.link,
+            known_hosts=self.ssh_known_hosts,
         ).ssh_preamble()
         command = blocksync_receive_command(
             self.transfer_uuid,
@@ -993,6 +1058,10 @@ class OpenstackWarmSync(_WarmVolumeBase):
             python=self.python_interpreter,
             source_serial=mapping.get("tmp_volume_id"),
             dest_serial=mapping.get("dest_id"),
+            dest_script=self.dest_script,
+            source_script=self.source_script,
+            sha256=self.script_sha256,
+            source_gate=bool(self.link),
         )
         self.log.info("Synchronising %s: %s", dev, " ".join(command))
         self._update_progress(dev, 0.0)
@@ -1023,7 +1092,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         finally:
             with self._receivers_lock:
                 self._receivers.pop(dev, None)
-        if returncode != 0 and self.ssh_known_hosts:
+        if returncode != 0 and (self.ssh_known_hosts or self.link):
             # the sender's ssh - the link - speaks on the receiver's stderr: the source host
             # refusing it is a refusal, never a failed pass to retry (SDD 6.6)
             reason = refused_link("".join(said), self.source_conversion_host_address)
@@ -1038,6 +1107,19 @@ class OpenstackWarmSync(_WarmVolumeBase):
         self.log.info("blocksync %s summary: %s", dev, summary)
         self._update_progress(dev, 100.0)
         return summary
+
+    def _forget_senders(self):
+        """The source host's side of the pass: its senders stopped and its copy removed - or,
+        through a run's link, the senders the gate started, its script left to the link's
+        removal (SDD 26.6)."""
+        if not self.link:
+            self._forget_transfer(self._source_shell(), self.transfer_uuid)
+            return
+        command = ["sudo", "pkill", "-f", shlex.quote(sender_pattern(self.link["script"]))]
+        try:
+            self._source_shell().cmd_val(command)
+        except (OSError, subprocess.SubprocessError) as err:
+            self.log.warning("Command %s failed on %s: %s", command, self.source_conversion_host_address, err)
 
     def _cancel_receivers(self):
         self._cancelled.set()
@@ -1062,7 +1144,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         steps = (
             self._cancel_receivers,
             lambda: self._forget_transfer(self.shell, self.transfer_uuid),
-            lambda: self._forget_transfer(self._source_shell(), self.transfer_uuid),
+            self._forget_senders,
             self._detach_volumes_from_destination_converter,
         )
         first_failure = None

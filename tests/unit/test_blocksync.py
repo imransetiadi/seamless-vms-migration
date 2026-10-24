@@ -1012,6 +1012,173 @@ def test_the_serial_read_is_the_opened_devices_own(tmp_path, monkeypatch, conten
     assert blocksync._serial_of(regular) is None
 
 
+# --- the gate: the forced command of a run's link key on the source host (SDD 6.2, 26.6) -----
+
+GATE_SCRIPT = os.path.abspath(blocksync.__file__)
+GATE_PYTHON = "/usr/libexec/platform-python"
+VOLUME = "0b5e7f1c-9a2d-4e6b-8c1f-3d2a1b0c9e8f"
+OTHER_VOLUME = "7d3c2b1a-0f9e-4d8c-b7a6-5e4d3c2b1a0f"
+
+
+def send_words(device="/dev/vdb", serial=VOLUME, chunk="4194304", workers="4", script=None):
+    """The send the warm sync asks the source host for, word by word (SDD 6.4)."""
+    words = ["sudo", "-n", GATE_PYTHON, script or GATE_SCRIPT, "send", "--device", device,
+             "--chunk-size", chunk, "--workers", workers]
+    if serial is not None:
+        words += ["--expect-serial", serial]
+    return words
+
+
+class Gate:
+    """``blocksync.py gate`` run in-process as sshd runs it: SSH_ORIGINAL_COMMAND and
+    SSH_CONNECTION in its environment, the disk serials it reads and the program it would exec
+    recorded - an exec never happens here."""
+
+    def __init__(self, monkeypatch, capsys, serials=None):
+        self.monkeypatch = monkeypatch
+        self.capsys = capsys
+        self.serials = dict(serials or {"/dev/vdb": VOLUME[:20]})
+        self.execs = []
+        monkeypatch.setattr(blocksync, "_disk_serial", self.serials.get)
+
+        def execvp(program, argv):
+            self.execs.append((program, list(argv)))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(blocksync.os, "execvp", execvp)
+        monkeypatch.setenv("SSH_CONNECTION", "198.51.100.7 51234 192.0.2.10 22")
+
+    def run(self, original, volumes=(VOLUME,)):
+        if original is None:
+            self.monkeypatch.delenv("SSH_ORIGINAL_COMMAND", raising=False)
+        else:
+            self.monkeypatch.setenv("SSH_ORIGINAL_COMMAND", original)
+        argv = ["gate", "--python", GATE_PYTHON]
+        for volume in volumes:
+            argv += ["--volume", volume]
+        try:
+            status = blocksync.main(argv)
+        except SystemExit as exc:  # the exec
+            status = exc.code
+        out, err = self.capsys.readouterr()
+        return status, out, err
+
+
+@pytest.fixture
+def gate(monkeypatch, capsys):
+    return Gate(monkeypatch, capsys)
+
+
+def test_the_gate_answers_the_probe_with_the_client_address(gate):
+    """SDD 6.2, 26.6 (plan task ST6): `probe` answers the client address of SSH_CONNECTION - the
+    destination host's address as the source host sees it, which the link's entry then takes as
+    from= - and runs nothing."""
+    status, out, err = gate.run("probe")
+
+    assert (status, out, err) == (0, "198.51.100.7\n", "")
+    assert gate.execs == []
+
+
+def test_the_gate_runs_send_for_a_volume_of_the_run_without_a_shell(gate):
+    """SDD 6.2, 26.6: the send the warm sync asks for - on a disk that shows the serial of one of
+    the run's temporary volumes - is exec'd as sudo with exactly those words, never through a
+    shell: words that a shell would read as two commands stay one argument."""
+    status, out, err = gate.run(" ".join(shlex.quote(w) for w in send_words()))
+
+    assert status == 0 and err == ""
+    assert gate.execs == [("sudo", send_words())]
+
+    gate.serials["/dev/vd b;id"] = VOLUME[:20]
+    gate.execs.clear()
+    gate.run(" ".join(shlex.quote(w) for w in send_words(device="/dev/vd b;id")))
+    assert gate.execs == [("sudo", send_words(device="/dev/vd b;id"))]
+
+
+def test_the_gate_refuses_a_volume_that_is_not_the_runs(gate):
+    """SDD 6.2, 26.6: a volume the forced command does not name is not the run's, and a disk that
+    shows another volume's serial, or none, is not the volume's: refused, nothing run."""
+    gate.serials.update({"/dev/vdc": OTHER_VOLUME[:20], "/dev/vdd": None})
+    for words, reason in (
+        (send_words(serial=OTHER_VOLUME), "volume %s, which is not the run's" % OTHER_VOLUME),
+        (send_words(device="/dev/vdc"), "/dev/vdc is the disk of volume %s, not of volume %s"
+         % (OTHER_VOLUME[:20], VOLUME)),
+        (send_words(device="/dev/vdd"), "/dev/vdd, which shows no virtio serial"),
+        (send_words(device="/dev/vde"), "/dev/vde, which shows no virtio serial"),
+        (send_words(device="vdb"), "vdb, which is no absolute path"),
+    ):
+        status, out, err = gate.run(" ".join(shlex.quote(w) for w in words))
+        assert status == 2 and out == "", words
+        assert err == "seamless-link gate refused: %s\n" % reason
+    status, _out, err = gate.run(" ".join(send_words()), volumes=())
+    assert status == 2 and "is not the run's" in err
+    assert gate.execs == []
+
+
+def test_the_gate_refuses_send_without_an_expected_serial(gate):
+    """SDD 6.2, 26.6: a send without --expect-serial would read whatever disk the path names: the
+    gate never runs one."""
+    status, out, err = gate.run(" ".join(send_words(serial=None)))
+
+    assert (status, out) == (2, "")
+    assert err == "seamless-link gate refused: send without --expect-serial\n"
+    assert gate.execs == []
+
+
+@pytest.mark.parametrize(
+    "original, reason",
+    [
+        (None, "a shell"),
+        ("", "a shell"),
+        ("id", "a command it does not run: id"),
+        ("scp -t /tmp", "a command it does not run: scp"),
+        ("internal-sftp", "a command it does not run: internal-sftp"),
+        ("probe; id", "a command it does not run: probe;"),
+        ("probe extra", "a command it does not run: probe"),
+        ("sh -c 'id'", "a command it does not run: sh"),
+        ("sudo -n /usr/bin/python3 %s send --device /dev/vdb" % GATE_SCRIPT,
+         "a command it does not run: sudo"),
+        ("sudo -n %s /tmp/other.py send --device /dev/vdb" % GATE_PYTHON,
+         "a command it does not run: sudo"),
+        ("sudo -n %s %s receive --device /dev/vdb" % (GATE_PYTHON, GATE_SCRIPT),
+         "a command it does not run: sudo"),
+        ("sudo -n %s %s hash --device /dev/vdb" % (GATE_PYTHON, GATE_SCRIPT),
+         "a command it does not run: sudo"),
+        (" ".join(send_words() + ["&&", "id"]), "send with other options"),
+        (" ".join(send_words() + ["--assume-zero"]), "send with other options"),
+        (" ".join(send_words(chunk="12")), "send with --chunk-size 12: must be between"),
+        (" ".join(send_words(workers="many")), "send with --workers many: not an integer"),
+        ("probe 'unclosed", "a command it cannot read"),
+    ],
+    ids=["no command", "an empty command", "id", "scp", "sftp", "probe then id", "probe with a "
+         "word", "a shell", "another python", "another script", "receive", "hash", "send then id",
+         "another option", "a bad chunk size", "bad workers", "unbalanced quotes"],
+)
+def test_the_gate_refuses_a_shell_a_copy_and_any_other_command(gate, original, reason):
+    """SDD 6.2, 26.6: a session with no command (a shell), a copy (scp's command, sftp's
+    subsystem), and every command but `probe` and the run's own send: one line on stderr, exit 2,
+    nothing run."""
+    status, out, err = gate.run(original)
+
+    assert (status, out) == (2, "")
+    assert err.startswith("seamless-link gate refused: " + reason), err
+    assert err.count("\n") == 1
+    assert gate.execs == []
+
+
+def test_the_gate_is_a_command_of_the_script(tmp_path):
+    """SDD 6.2: the gate is blocksync.py's own command, run as the conversion hosts run the
+    script: its help names it, and a probe answers through the real CLI."""
+    env = dict(os.environ, SSH_ORIGINAL_COMMAND="probe",
+               SSH_CONNECTION="192.0.2.44 40000 192.0.2.10 22")
+    proc = subprocess.run([PYTHON, BLOCKSYNC, "gate", "--python", PYTHON], env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, timeout=60, check=False)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "192.0.2.44\n", "")
+    helped = subprocess.run([PYTHON, BLOCKSYNC, "--help"], stdout=subprocess.PIPE,
+                            universal_newlines=True, timeout=60, check=False)
+    assert "gate" in helped.stdout
+
+
 # --- protocol v2 and the extent check (SDD 6.2, 28.5; plan task CE2) ------------------------------
 
 

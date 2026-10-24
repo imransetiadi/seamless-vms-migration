@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.warm_migrati
     WarmState,
 )
 from ansible_collections.os_migrate.os_migrate.tests.unit import fake_openstack as fake
+from ansible_collections.os_migrate.os_migrate.tests.unit import local_sshd
 
 SRC_CONV = "10.0.0.10"
 DST_CONV = "10.1.0.10"
@@ -373,7 +375,7 @@ def test_receive_command_quotes_paths():
 
     # What the destination conversion host's shell executes:
     argv = shlex.split(" ".join(command))
-    script = "/tmp/seamless-blocksync-1234-abcd.py"
+    script = "/tmp/seamless-blocksync-1234-abcd/blocksync.py"
     assert argv[:5] == ["sudo", "-n", "python3", script, "receive"]
     assert argv[argv.index("--device") + 1] == "/dev/disk/by-id/virtio-dst $(reboot)"
     assert argv[argv.index("--chunk-size") + 1] == "1048576"
@@ -781,12 +783,13 @@ def test_sync_runs_blocksync_between_attached_devices(tmp_path):
     sync = scenario.sync("uuid-1", chunk_size=1048576, workers=3)
     sync.sync("auto")
 
-    script = "/tmp/seamless-blocksync-uuid-1.py"
+    script = "/tmp/seamless-blocksync-uuid-1.Rnd0Ab12Cd/blocksync.py"
     source_text = warm_migration.blocksync_source()
     for address in (SRC_CONV, DST_CONV):
         copied = [c for shell in scenario.shells.at(address) for c in shell.copied]
         assert copied == [(script, source_text)]
-        assert ["sudo", "rm", "-f", script] in scenario.shells.commands_at(address)
+        assert ["sudo", "rm", "-rf", "/tmp/seamless-blocksync-uuid-1.*"] in (
+            scenario.shells.commands_at(address))
     commands = receive_commands(scenario)
     assert len(commands) == 2
     used = {}
@@ -1041,9 +1044,9 @@ def test_sync_failure_detaches_and_raises(tmp_path):
     assert sorted(state.dest_volumes) == ["/dev/vda", "/dev/vdb"]  # kept for reuse
     for entry in state.dest_volumes.values():
         assert scenario.dst.volumes[entry["dest_id"]].attachments == []
-    script = "/tmp/seamless-blocksync-uuid-1.py"
     for address in (SRC_CONV, DST_CONV):
-        assert ["sudo", "rm", "-f", script] in scenario.shells.commands_at(address)
+        assert ["sudo", "rm", "-rf", "/tmp/seamless-blocksync-uuid-1.*"] in (
+            scenario.shells.commands_at(address))
 
 
 def test_parallel_sync_reports_the_failed_disk(tmp_path):
@@ -1184,6 +1187,27 @@ def test_sync_module_returns_pass_volume_map_and_bdm(tmp_path, capsys):
     assert scenario.state().passes == [result["sync_pass"]]
 
 
+def test_the_sync_module_takes_the_runs_link(tmp_path, capsys):
+    """SDD 6.4 (plan task ST6): import_workload_warm_sync takes the run's link as the playbooks
+    pass it - its senders then go through the link's gate, and no copy goes to the source host."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_warm_sync as sync_module,
+    )
+
+    scenario = Scenario(tmp_path)
+    scenario.snapshot("uuid-1").create()
+    link = {"id": "0" * 32, "key": "/tmp/seamless-link-x.Ab/key", "known_hosts": None,
+            "script": "/tmp/seamless-link-x.Cd/blocksync.py", "public_key": "ssh-ed25519 AAAA"}
+    args = _module_args(scenario, "dst", "dst-conv", DST_CONV,
+                        src_conversion_host_address=SRC_CONV, link=link)
+
+    result = _run_module(sync_module, args, scenario.dst, scenario.shells, capsys)
+
+    assert result["_exit_code"] == 0, result
+    assert [c for shell in scenario.shells.at(SRC_CONV) for c in shell.copied] == []
+    assert all(link["script"] in " ".join(argv) for argv in receive_commands(scenario))
+
+
 def test_sync_module_fails_without_snapshot_or_with_bad_chunk_size(tmp_path, capsys):
     from ansible_collections.os_migrate.os_migrate.plugins.modules import (
         import_workload_warm_sync as sync_module,
@@ -1240,14 +1264,15 @@ def test_receive_command_runs_end_to_end_through_two_shells(tmp_path, monkeypatc
         (bin_dir / name).write_text(text)
         (bin_dir / name).chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
-    monkeypatch.setattr(
-        warm_migration,
-        "BLOCKSYNC_REMOTE_PATH",
-        str(tmp_path / "seamless-blocksync-{transfer_uuid}.py"),
-    )
-    script = warm_migration.blocksync_script_path("uuid-e2e")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(warm_migration.blocksync_source())
+    # each host's private copy (R-02): two directories, as two hosts' mktemp made them
+    source_text = warm_migration.blocksync_source()
+    scripts = {}
+    for side in ("src", "dst"):
+        (tmp_path / side).mkdir(mode=0o700)
+        scripts[side] = str(tmp_path / side / "blocksync.py")
+        with open(scripts[side], "w", encoding="utf-8") as f:
+            f.write(source_text)
+    sha256 = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
 
     chunk = 65536
     data = os.urandom(5 * chunk + 17)
@@ -1266,17 +1291,23 @@ def test_receive_command_runs_end_to_end_through_two_shells(tmp_path, monkeypatc
         workers=2,
         progress_interval=0,
         python=sys.executable,
-    )
-    # The migrator runs it like RemoteShell.cmd_sub: ssh <preamble> <words>.
-    proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "cloud-user@10.1.0.10"] + command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-        timeout=120,
-        check=False,
+        dest_script=scripts["dst"],
+        source_script=scripts["src"],
+        sha256=sha256,
     )
 
+    def run(words):
+        # The migrator runs it like RemoteShell.cmd_sub: ssh <preamble> <words>.
+        return subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "cloud-user@10.1.0.10"] + words,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=120,
+            check=False,
+        )
+
+    proc = run(command)
     assert proc.returncode == 0, proc.stderr
     summary = warm_migration.parse_blocksync_summary(proc.stdout)
     assert summary["ok"] is True and summary["chunks"] == 6
@@ -1285,12 +1316,24 @@ def test_receive_command_runs_end_to_end_through_two_shells(tmp_path, monkeypatc
     progress = [warm_migration.parse_blocksync_progress(line) for line in proc.stderr.splitlines()]
     assert [p for p in progress if p][-1]["pct"] == 100.0
 
+    # R-02: a copy changed after the copy is never run, on either host - sudo never starts it
+    for side in ("dst", "src"):
+        with open(scripts[side], "a", encoding="utf-8") as f:
+            f.write("raise SystemExit('the changed copy ran')\n")
+        proc = run(command)
+        assert proc.returncode != 0
+        assert "blocksync: error: %s does not match its SHA-256" % scripts[side] in proc.stderr
+        assert "the changed copy ran" not in proc.stdout + proc.stderr
+        with open(scripts[side], "w", encoding="utf-8") as f:
+            f.write(source_text)
+
 
 def test_a_pinned_warm_pass_pins_each_conversion_host_and_keeps_the_links_options(tmp_path):
     """Seamless Migrate SDD 6.6 (plan task ST3): given a known_hosts file, the warm snapshot pins
     the source host under its alias by its server, the warm sync the destination host, and the
     sync's copy of blocksync the source host by its address alone - no server id is known there.
-    The link the receiver opens from the destination host keeps today's options until ST6."""
+    Without a run's link (SDD 26.6) the link the receiver opens from the destination host keeps
+    upstream's options."""
     known_hosts = str(tmp_path / "known_hosts")
     scenario = Scenario(tmp_path)
     scenario.snapshot(ssh_known_hosts=known_hosts).create()
@@ -1344,3 +1387,96 @@ def test_a_link_the_source_host_refuses_fails_the_warm_sync_at_once(tmp_path):
     with pytest.raises(RuntimeError, match="blocksync failed") as other_host:
         scenario.sync(ssh_known_hosts=known_hosts).sync()
     assert not isinstance(other_host.value, volume_common.SshRefused)
+
+
+def test_each_hosts_copy_of_blocksync_is_private_and_checked_before_sudo(tmp_path):
+    """R-02 (Security.md C3-07; SDD 6.4, 26.10 owner decision 10): each host's copy of blocksync
+    goes into a directory mktemp makes there - 0700, its name random, which no other user can
+    have made first or replace a file in - and each host checks the copy's SHA-256 before sudo
+    runs it: the receiver on the destination host, the sender on the source host. The pass's
+    cleanup removes the directories, and the file an earlier version left."""
+    scenario = Scenario(tmp_path)
+    scenario.snapshot("uuid-1").create()
+    scenario.sync("uuid-1").sync("auto")
+
+    source_text = warm_migration.blocksync_source()
+    sha256 = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    script = "/tmp/seamless-blocksync-uuid-1.Rnd0Ab12Cd/blocksync.py"
+    for address in (SRC_CONV, DST_CONV):
+        commands = scenario.shells.commands_at(address)
+        assert [c for c in commands if c[:2] == ["mktemp", "-d"]] == [
+            ["mktemp", "-d", "/tmp/seamless-blocksync-uuid-1.XXXXXXXXXX"]]
+        assert ["sudo", "rm", "-rf", "/tmp/seamless-blocksync-uuid-1.*"] in commands
+    check = "echo '%s  %s' | sha256sum -c - >/dev/null 2>&1 || { echo 'blocksync: error: %s " \
+        "does not match its SHA-256' >&2; exit 2; };" % (sha256, script, script)
+    receives = [" ".join(c) for c in scenario.shells.commands_at(DST_CONV)
+                if "receive" in " ".join(c)]
+    assert len(receives) == 2
+    for receive in receives:
+        assert receive.startswith(check + " sudo -n python3 " + script + " receive ")
+        sender = shlex.split(receive.split(" -- ", 1)[1])
+        remote = " ".join(sender[sender.index("cloud-user@" + SRC_CONV) + 1:])
+        assert remote.startswith(check + " sudo -n python3 " + script + " send ")
+
+
+def test_a_warm_pass_through_a_run_link_sends_through_its_gate(tmp_path):
+    """SDD 26.6 (plan task ST6): through a run's link the sender logs in with the link's key,
+    checks the source host against the link's pin, and asks the gate for exactly the send it
+    runs - the link's own script, no check before it (the forced command checks the script);
+    no copy of blocksync goes to the source host, and the pass's cleanup there stops the senders
+    the gate started and leaves the link's script to the link's removal."""
+    link = {
+        "id": "0123456789abcdef0123456789abcdef",
+        "key": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Ab12Cd34Ef/key",
+        "known_hosts": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Ab12Cd34Ef/known_hosts",
+        "script": "/tmp/seamless-link-0123456789abcdef0123456789abcdef.Gh56Ij78Kl/blocksync.py",
+    }
+    known_hosts = local_sshd.write_known_hosts(str(tmp_path / "known_hosts"), [
+        ("os_migrate_conv_src", local_sshd.keygen(str(tmp_path / "src"))),
+        ("os_migrate_conv_dst", local_sshd.keygen(str(tmp_path / "dst"))),
+    ])
+    scenario = Scenario(tmp_path)
+    source_map = scenario.snapshot("uuid-1").create()
+    scenario.sync("uuid-1", link=dict(link), ssh_known_hosts=known_hosts).sync("auto")
+
+    src_commands = scenario.shells.commands_at(SRC_CONV)
+    assert [c for shell in scenario.shells.at(SRC_CONV) for c in shell.copied] == []
+    assert not [c for c in src_commands if c[:1] == ["mktemp"] or c[:3] == ["sudo", "rm", "-rf"]]
+    assert ["sudo", "pkill", "-f", shlex.quote(warm_migration.sender_pattern(link["script"]))] \
+        in src_commands
+    receives = receive_commands(scenario)
+    assert len(receives) == 2
+    tmp_volumes = {entry["source_dev"]: entry["tmp_volume_id"] for entry in source_map.values()}
+    for argv in receives:
+        sender = argv[argv.index("--") + 1:]
+        host = sender.index("cloud-user@" + SRC_CONV)
+        preamble = sender[5:host]
+        assert preamble[preamble.index("-i") + 1] == link["key"]
+        assert "UserKnownHostsFile=" + link["known_hosts"] in preamble
+        assert "HostKeyAlias=os_migrate_conv_src" in preamble
+        remote = shlex.split(" ".join(sender[host + 1:]))
+        device = remote[remote.index("--device") + 1]
+        assert remote == ["sudo", "-n", "python3", link["script"], "send", "--device", device,
+                          "--chunk-size", "4194304", "--workers", "4", "--expect-serial",
+                          tmp_volumes[device]]
+
+
+def test_the_gates_refusal_fails_a_warm_pass_through_a_link_at_once(tmp_path):
+    """SDD 6.2, 6.6, 26.6 (plan task ST6): the gate of a run's link refusing what the sender asked
+    for - on the receiver's stderr, where the sender's lines arrive - is a refused link,
+    LinkRefused by its own words for every disk at once, also without known_hosts: never a failed
+    pass the control plane would retry."""
+    def receive(command):
+        return fake.FakeProcess(3, "", "seamless-link gate refused: volume vol-x, which is not "
+                                "the run's\nblocksync: error: the sender ended\n")
+
+    scenario = Scenario(tmp_path, receive=receive)
+    scenario.snapshot().create()
+    link = {"id": "0" * 32, "key": "/tmp/seamless-link-x.Ab/key", "known_hosts": None,
+            "script": "/tmp/seamless-link-x.Cd/blocksync.py"}
+    with pytest.raises(volume_common.LinkRefused) as refused:
+        scenario.sync(link=link).sync()
+    assert str(refused.value) == (
+        "link refused by the source conversion host (os_migrate_conv_src at %s): its gate refused "
+        "volume vol-x, which is not the run's" % SRC_CONV
+    )

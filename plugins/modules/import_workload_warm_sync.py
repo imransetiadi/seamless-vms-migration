@@ -27,10 +27,14 @@ description:
   - "Destination-cloud half of a warm migration pass. Ensures the destination
     volumes exist (created on the first pass with the same name, size,
     bootable flag and parameters as the cold import), attaches them to the
-    destination conversion host, copies blocksync.py to both conversion hosts
-    as C(/tmp/seamless-blocksync-{transfer_uuid}.py) and runs
+    destination conversion host, copies blocksync.py to both conversion hosts,
+    each copy in a private directory made by C(mktemp -d) as
+    C(/tmp/seamless-blocksync-{transfer_uuid}.XXXXXXXXXX/blocksync.py) and
+    checked against its SHA-256 before C(sudo) runs it, and runs
     C(blocksync receive) on the destination host, which pulls the changed
     chunks of the pending snapshot from the source conversion host over SSH."
+  - "With I(link), the run's own link, the senders go through the link's gate
+    and the source host gets no copy (Seamless Migrate SDD 6.4, 26.6)."
   - "Progress is streamed into I(state_file) (C({device: percent})), the pass
     is appended to the warm state file and the destination volumes are
     detached again."
@@ -74,6 +78,16 @@ options:
         for the copy of blocksync and its sender. Defaults to I(ssh_user).
     required: false
     type: str
+  link:
+    description:
+      - The run's own link, as M(os_migrate.os_migrate.conversion_host_link) returned it
+        (Seamless Migrate SDD 6.4, 26.6). With it, each sender logs in to the source
+        conversion host with the link's key, asks the link's gate for exactly its send of the
+        run's script, and given I(ssh_known_hosts) checks the source host's key against the
+        link's pin; no copy of blocksync goes to the source host.
+      - Unset, the senders log in as upstream's link does, with the destination user's own key.
+    required: false
+    type: dict
   state_dir:
     description:
       - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).
@@ -250,6 +264,7 @@ def run_module():
         ssh_user=dict(type="str", required=True),
         ssh_known_hosts=dict(type="path", required=False, default=None),
         src_ssh_user=dict(type="str", required=False, default=None),
+        link=dict(type="dict", required=False, default=None),
         state_dir=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
         dst_conversion_host_address=dict(type="str", default=None),
@@ -317,6 +332,7 @@ def run_module():
             timeout=params["timeout"],
             src_ssh_user=params["src_ssh_user"],
             ssh_known_hosts=params["ssh_known_hosts"],
+            link=params["link"],
         )
         sync_pass = warm_sync.sync(params["pass_kind"])
         block_device_mapping = warm_sync.block_device_mapping()

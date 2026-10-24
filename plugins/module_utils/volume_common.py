@@ -472,6 +472,7 @@ class OpenStackVolumeBase:
         preserve_volume_type=False,
         src_ssh_user=None,
         ssh_known_hosts=None,
+        link=None,
     ):
         # Required common parameters:
         # openstack_connection: OpenStack connection object
@@ -496,9 +497,12 @@ class OpenStackVolumeBase:
         #               SDD 6.5: each host keeps its own provider's user)
         # ssh_known_hosts: a known_hosts file that pins the conversion hosts'
         #                  keys; unset or empty, upstream's ssh (SDD 6.6)
+        # link: the run's own link to the source host (conversion_host_link's result,
+        #       SDD 26.6); unset, upstream's link: the destination user's own key
         self.conversion_host_address = conversion_host_address
         self.src_ssh_user = src_ssh_user or ssh_user
         self.ssh_known_hosts = ssh_known_hosts or None
+        self.link = link or None
         self.state_file = state_file
         self.log_file = log_file
         self.timeout = timeout
@@ -1167,7 +1171,7 @@ _UNKNOWN_KEY = re.compile(r"No (\S+) host key is known for ")
 _OFFERED_TYPES = re.compile(r"no matching host key type found\. Their offer: (\S+)")
 
 
-def _names_alias(names, alias):
+def names_alias(names, alias):
     """Whether a known_hosts entry's names field names ``alias``: hashed as HashKnownHosts writes
     it (|1|salt|HMAC-SHA1 of the name), or among its comma-separated names."""
     if names.startswith("|1|"):
@@ -1192,7 +1196,7 @@ def pinned_host_keys(known_hosts, alias):
     keys = []
     for line in lines:
         fields = line.split()
-        if len(fields) < 3 or fields[0].startswith(("#", "@")) or not _names_alias(fields[0], alias):
+        if len(fields) < 3 or fields[0].startswith(("#", "@")) or not names_alias(fields[0], alias):
             continue
         try:
             base64.b64decode(fields[2], validate=True)
@@ -1237,15 +1241,23 @@ def refused_host_key(stderr):
     return "a key it does not pin"
 
 
+#: the line the gate of a run's link starts a refusal with (blocksync.GATE_REFUSED, SDD 6.2)
+_GATE_REFUSAL = re.compile(r"seamless-link gate refused: ([^\r\n]*)")
+
+
 def refused_link(output, address):
     """ssh's reason when ``output`` shows the source conversion host at ``address`` refusing the
     link - its "Permission denied" for that host, or a forward "administratively prohibited" -,
-    else None (Seamless Migrate SDD 6.6)."""
+    or the gate's when the run's link key's forced command refused what the link asked for
+    (SDD 26.6); else None (Seamless Migrate SDD 6.6)."""
     denied = re.search(r"@%s: (Permission denied \([^)]*\))" % re.escape(address), output)
     if denied:
         return denied.group(1)
     if "administratively prohibited" in output:
         return "a forward administratively prohibited"
+    gate = _GATE_REFUSAL.search(output)
+    if gate:
+        return "its gate refused " + gate.group(1)
     return None
 
 
@@ -1254,6 +1266,30 @@ def link_refused(address, reason):
     return LinkRefused(
         "link refused by the source conversion host (%s at %s): %s"
         % (HOST_KEY_ALIASES["source"], address, reason)
+    )
+
+
+def link_shell(address, ssh_user, link=None, known_hosts=None, shell_factory=None):
+    """The shell whose ssh_preamble() the destination conversion host runs to reach the source
+    host at ``address`` as ``ssh_user`` - the cold transfer's forward, the warm sync's sender.
+
+    Given a run's ``link`` (conversion_link's result, SDD 6.4, 26.6) it logs in with the link's
+    key, which never left the destination host, and - given ``known_hosts``, the run's file on
+    this host - checks the source host's key against the link's known_hosts beside that key,
+    under the source alias. Without a link, upstream's preamble: the destination user's own key,
+    no check (SDD 6.6)."""
+    factory = shell_factory or RemoteShell
+    if not link:
+        return factory(address, ssh_user)
+    if not known_hosts:
+        return factory(address, ssh_user, link["key"])
+    return factory(
+        address,
+        ssh_user,
+        link["key"],
+        known_hosts=known_hosts,
+        side="source",
+        known_hosts_at=link["known_hosts"],
     )
 
 
@@ -1266,11 +1302,24 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
     caller knows it. Without it - none, or an empty name - every command line is upstream's
     (Seamless Migrate SDD 6.6)."""
 
-    def __init__(self, address, ssh_user, key_path=None, known_hosts=None, side=None, server=None):
+    def __init__(
+        self,
+        address,
+        ssh_user,
+        key_path=None,
+        known_hosts=None,
+        side=None,
+        server=None,
+        known_hosts_at=None,
+    ):
         self.address = address
         self.ssh_user = ssh_user
         self.key_path = key_path
         self.known_hosts = known_hosts or None
+        # the known_hosts file's path on the host that runs ssh when that is not this one - the
+        # link's, beside its key on the destination host -; ``known_hosts`` is then this host's
+        # copy of its pins, read for their algorithms (SDD 6.6, 26.6)
+        self.known_hosts_at = known_hosts_at or self.known_hosts
         self.side = side
         self.server = server
         self.alias = None
@@ -1292,7 +1341,7 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
-            "UserKnownHostsFile=" + self.known_hosts,
+            "UserKnownHostsFile=" + self.known_hosts_at,
             "-o",
             "GlobalKnownHostsFile=/dev/null",
             # the alias keeps the check off the address: a floating IP that moves changes nothing
@@ -1887,21 +1936,28 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         forwarding to the NBD ports listening on the source conversion host.
         """
         # It is expected that key authorization has already been set up from
-        # the destination conversion host to the source conversion host!
-        source_shell = RemoteShell(
-            self.source_conversion_host_address, ssh_user=self.src_ssh_user
+        # the destination conversion host to the source conversion host: the run's
+        # link (SDD 26.6), else upstream's static key
+        source_shell = link_shell(
+            self.source_conversion_host_address,
+            self.src_ssh_user,
+            self.link,
+            known_hosts=self.ssh_known_hosts,
         )
+        # the link's entry permits 127.0.0.1 alone, where the exports bind: permitopen
+        # compares the name as written (Seamless Migrate SDD 26.6)
+        export_host = "127.0.0.1" if self.link else "localhost"
         forward_ports = ["-N", "-T"]
         for path, mapping in self.volume_map.items():
             port = self._find_free_port()
-            forward = f"{port}:localhost:{mapping['port']}"
+            forward = f"{port}:{export_host}:{mapping['port']}"
             forward_ports.extend(["-L", forward])
             url = "nbd://localhost:" + str(port) + "/" + self.transfer_uuid
             self.volume_map[path]["url"] = url
         command = source_shell.ssh_preamble()
         command.extend(forward_ports)
         self.log.debug("SSH forwarding command: %s", " ".join(command))
-        if self.ssh_known_hosts:
+        if self.ssh_known_hosts or self.link:
             # what the link says, read for a refusal each time an export does not answer
             # (Seamless Migrate SDD 6.6)
             self.link_output = tempfile.TemporaryFile()
