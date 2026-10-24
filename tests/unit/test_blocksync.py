@@ -854,7 +854,7 @@ magic, version = b.PROTOCOL_MAGIC, b.PROTOCOL_VERSION
 if scenario == "bad_magic":
     magic = b"XXXX"
 if scenario == "bad_version":
-    version = 2
+    version = 3
 out.write(b._HELLO.pack(magic, version, chunk, size)); out.flush()
 if scenario in ("bad_magic", "bad_version"):
     sys.exit(0)
@@ -893,7 +893,7 @@ out.flush()
     "scenario, message, untouched",
     [
         ("bad_magic", "bad protocol magic", True),
-        ("bad_version", "unsupported protocol version 2", True),
+        ("bad_version", "unsupported protocol version 3", True),
         ("misaligned", "not chunk aligned", True),
         ("beyond", "beyond the source size", True),
         ("wrong_length", "has length", True),
@@ -1010,3 +1010,326 @@ def test_the_serial_read_is_the_opened_devices_own(tmp_path, monkeypatch, conten
 
     assert blocksync._serial_of(device) == serial
     assert blocksync._serial_of(regular) is None
+
+
+# --- protocol v2 and the extent check (SDD 6.2, 28.5; plan task CE2) ------------------------------
+
+
+def extents_file(tmp_path, extents, name="extents.json"):
+    """The extents a pass names, as the warm sync writes them: JSON [offset, length] pairs."""
+    path = tmp_path / name
+    path.write_text(extents if isinstance(extents, str) else json.dumps(extents))
+    return str(path)
+
+
+def extent_sender(src, extents, mode, chunk_size=CHUNK, workers=2, prefix=()):
+    return list(prefix) + sender_cmd(src, chunk_size, workers) + [
+        "--extents", extents, "--extents-mode", mode]
+
+
+def receive_from(dst, sender, chunk_size=CHUNK, workers=2, assume_zero=False):
+    cmd = [PYTHON, BLOCKSYNC, "receive", "--device", dst, "--workers", str(workers),
+           "--progress-interval", "0", "--chunk-size", str(chunk_size)]
+    if assume_zero:
+        cmd.append("--assume-zero")
+    proc = subprocess.run(cmd + ["--"] + sender, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=120, check=False)
+    lines = proc.stdout.decode("utf-8").strip().splitlines()
+    return proc.returncode, (json.loads(lines[-1]) if lines else None), proc.stderr.decode(
+        "utf-8", "replace")
+
+
+def chunks_of(data, chunk=CHUNK):
+    return [data[i:i + chunk] for i in range(0, len(data), chunk)]
+
+
+def changed_pair(tmp_path, changed, count=8, tail=0, seed=11):
+    """A source and a destination equal but for the chunks ``changed`` (indexes) of the source."""
+    base = rand_bytes(count * CHUNK + tail, seed)
+    source = bytearray(base)
+    for index in changed:
+        start = index * CHUNK
+        end = min(start + CHUNK, len(source))
+        source[start:end] = rand_bytes(end - start, 1000 + index)
+    return write(tmp_path / "src", bytes(source)), write(tmp_path / "dst", base), bytes(source)
+
+
+def test_extents_map_to_every_chunk_they_touch():
+    """SDD 6.2, 28.5: the extents are sorted and merged, and each chunk an extent touches is
+    listed once, in order - a byte at a chunk's last offset, an extent across a boundary, the last
+    short chunk."""
+    size = 4 * CHUNK + 100
+    mapped = blocksync.extent_chunks
+    assert mapped([], size, CHUNK) == []
+    assert mapped([[0, 1]], size, CHUNK) == [0]
+    assert mapped([[CHUNK - 1, 2]], size, CHUNK) == [0, 1]
+    assert mapped([[CHUNK, CHUNK]], size, CHUNK) == [1]
+    assert mapped([[100, 2 * CHUNK]], size, CHUNK) == [0, 1, 2]
+    assert mapped([[3 * CHUNK, 10], [0, 5], [2, 4]], size, CHUNK) == [0, 3]
+    assert mapped([[0, CHUNK], [CHUNK, 1]], size, CHUNK) == [0, 1]  # touching: merged
+    assert mapped([[4 * CHUNK + 99, 1]], size, CHUNK) == [4]  # the short last chunk
+    assert mapped([[0, size]], size, CHUNK) == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    "extents, reason",
+    [
+        ([[-1, 10]], "negative"),
+        ([[0, -5]], "negative"),
+        ([[0, 0]], "empty"),
+        ([[0]], "an [offset, length] pair"),
+        ([[0, None]], "an [offset, length] pair"),
+        ([[True, 4]], "an [offset, length] pair"),
+        ([[0, 1.5]], "an [offset, length] pair"),
+        ([[0, 4 * CHUNK + 1]], "beyond the source"),
+        ([[2 ** 64, 1]], "beyond the source"),
+        ({"offset": 0}, "a list"),
+        ("not json", "not JSON"),
+    ],
+    ids=["negative offset", "negative length", "empty", "no length", "null length", "a bool",
+         "a float", "beyond the source", "unbounded", "an object", "not json"],
+)
+def test_an_extent_that_is_negative_empty_or_unbounded_is_refused(tmp_path, extents, reason):
+    """SDD 6.2, 28.5: an extent that is negative, empty, without a length or reaching beyond the
+    source - and a file that is no list of pairs - is refused before the sender writes its
+    HELLO: exit 2, nothing on stdout."""
+    src = write(tmp_path / "src", rand_bytes(4 * CHUNK, 3))
+    for mode in ("read", "check"):
+        proc = subprocess.run(
+            extent_sender(src, extents_file(tmp_path, extents), mode),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60, check=False)
+        assert proc.returncode == 2, (mode, proc.stderr)
+        assert proc.stdout == b""
+        assert reason in proc.stderr.decode(), proc.stderr
+    missing = subprocess.run(sender_cmd(src) + ["--extents-mode", "read"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=60, check=False)
+    assert missing.returncode == 2 and missing.stdout == b""
+
+
+def test_a_read_pass_sends_only_the_listed_chunks(tmp_path):
+    """SDD 6.2, 28.5: a read pass names the listed chunks in its version 2 HELLO; the receiver
+    sends their digests alone and the sender frames only those that differ - a change outside
+    the extents is not looked at."""
+    src, dst, source = changed_pair(tmp_path, changed=[2, 5, 7])
+    before = read(dst)
+    extents = extents_file(tmp_path, [[5 * CHUNK + 7, 3], [2 * CHUNK, CHUNK + 10]])  # 2, 3, 5
+
+    rc, summary, err = receive_from(dst, extent_sender(src, extents, "read"))
+
+    assert rc == 0, err
+    after = chunks_of(read(dst))
+    for index in range(8):
+        expected = chunks_of(source)[index] if index in (2, 5) else chunks_of(before)[index]
+        assert after[index] == expected, index
+    assert summary["chunks"] == 3 and summary["chunks_changed"] == 2
+    assert summary["bytes_transferred"] == 2 * CHUNK and summary["bytes_changed"] == 2 * CHUNK
+
+
+PREAD_SPY = r"""
+import os, runpy, sys
+script, log = sys.argv[1], sys.argv[2]
+real = os.pread
+def pread(fd, length, offset):
+    with open(log, "a") as f:
+        f.write("%d %d\n" % (offset, length))
+    return real(fd, length, offset)
+os.pread = pread
+sys.argv = [script] + sys.argv[3:]
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def test_a_read_pass_reads_no_unlisted_chunk_on_either_side(tmp_path, monkeypatch):
+    """SDD 6.2, 28.5: a read pass reads the listed chunks alone - the sender on the source, the
+    receiver on the destination -, which is what removes the scan from the final pass."""
+    src, dst, _source = changed_pair(tmp_path, changed=[1, 6])
+    listed = [1, 4, 6]
+    extents = extents_file(tmp_path, [[i * CHUNK, CHUNK] for i in listed])
+    spy = tmp_path / "spy.py"
+    spy.write_text(PREAD_SPY)
+    sender_log = tmp_path / "sender.log"
+    sender = [PYTHON, str(spy), BLOCKSYNC, str(sender_log)] + sender_cmd(src)[2:] + [
+        "--extents", extents, "--extents-mode", "read"]
+    receiver_reads = []
+    real = blocksync.os.pread
+
+    def pread(fd, length, offset):
+        receiver_reads.append((offset, length))
+        return real(fd, length, offset)
+
+    monkeypatch.setattr(blocksync.os, "pread", pread)
+    summary = blocksync.run_receiver(dst, CHUNK, 2, sender)
+    monkeypatch.setattr(blocksync.os, "pread", real)
+
+    assert summary.chunks == 3
+    sender_reads = [tuple(int(v) for v in line.split()) for line in read(sender_log).decode().split("\n") if line]
+    for reads in (sender_reads, receiver_reads):
+        assert reads, "nothing was read"
+        assert {offset // CHUNK for offset, _length in reads} == set(listed)
+
+
+FAKE_V2_SENDER = r"""
+import struct, sys
+sys.path.insert(0, sys.argv[2])
+import blocksync as b
+scenario, chunk, size = sys.argv[1], int(sys.argv[3]), int(sys.argv[4])
+listed = [int(i) for i in sys.argv[5].split(",")] if sys.argv[5] else []
+out, inp = sys.stdout.buffer, sys.stdin.buffer
+out.write(b._HELLO.pack(b.PROTOCOL_MAGIC, 2, chunk, size))
+out.write(struct.pack(">Q", len(listed)) + b"".join(struct.pack(">Q", i) for i in listed))
+out.flush()
+theirs = [b._read_exact(inp, b.DIGEST_SIZE) for _ in listed]
+payload = b"\x5a" * chunk
+transferred = changed = 0
+if scenario == "unlisted_frame":
+    out.write(b.FRAME_DATA + b._FRAME_HEADER.pack(2 * chunk, chunk) + payload)
+    changed, transferred = 1, chunk
+manifest = b.extent_manifest(zip(listed, theirs))
+if scenario == "lying_manifest":
+    manifest = b.manifest_digest(theirs)  # v1's manifest: no indexes
+out.write(b.FRAME_END + b._END.pack(len(listed), changed, transferred, manifest))
+out.flush()
+"""
+
+
+def run_fake_v2(tmp_path, scenario, listed, size=4 * CHUNK, assume_zero=False):
+    fake = tmp_path / "fake_v2_sender.py"
+    fake.write_text(FAKE_V2_SENDER)
+    original = rand_bytes(4 * CHUNK, 77)
+    dst = write(tmp_path / "dst", original)
+    sender = [PYTHON, str(fake), scenario, os.path.dirname(blocksync.__file__), str(CHUNK),
+              str(size), ",".join(str(i) for i in listed)]
+    return dst, original, sender
+
+
+def test_a_read_pass_verifies_a_manifest_over_the_listed_chunks(tmp_path):
+    """SDD 6.2, 28.5: a version 2 end frame carries a manifest over each listed chunk's index and
+    digest, in order; the receiver recomputes it from its own digests and the frames it applied
+    and refuses one that differs (exit 3) - v1's manifest, which names no index, too."""
+    dst, original, sender = run_fake_v2(tmp_path, "honest", [0, 3])
+    summary = blocksync.run_receiver(dst, CHUNK, 1, sender)
+    assert (summary.chunks, summary.chunks_changed) == (2, 0)
+    dst, original, sender = run_fake_v2(tmp_path, "lying_manifest", [0, 3])
+    with pytest.raises(blocksync.ProtocolError, match="manifest digest mismatch") as caught:
+        blocksync.run_receiver(dst, CHUNK, 1, sender)
+    assert caught.value.exit_code == 3 and read(dst) == original
+    digests = [blocksync.chunk_digest(b"a"), blocksync.chunk_digest(b"b")]
+    expected = blocksync.new_hasher(b"\0" * 7 + b"\x01" + digests[0] + b"\0" * 7 + b"\x05"
+                                    + digests[1]).digest()
+    assert blocksync.extent_manifest(zip([1, 5], digests)) == expected
+
+
+def test_a_read_pass_counts_only_the_listed_chunks_as_scanned(tmp_path):
+    """SDD 28.5: bytes_scanned counts the listed chunks - the short last one with its own
+    length -, not the source's size."""
+    src, dst, _source = changed_pair(tmp_path, changed=[0], count=4, tail=100)
+    extents = extents_file(tmp_path, [[0, 10], [4 * CHUNK + 50, 10]])  # chunks 0 and 4 (100 B)
+
+    rc, summary, err = receive_from(dst, extent_sender(src, extents, "read"))
+
+    assert rc == 0, err
+    assert summary["bytes_scanned"] == CHUNK + 100
+    assert summary["chunks"] == 2 and summary["chunks_changed"] == 1
+    events = progress_events(err)
+    assert events[-1]["bytes_total"] == CHUNK + 100 and events[-1]["pct"] == 100.0
+
+
+def test_a_frame_for_an_unlisted_chunk_exits_3(tmp_path):
+    """SDD 6.2: in a version 2 pass every frame is for a listed chunk, after its digest; one for
+    another chunk is refused before it is written."""
+    dst, original, sender = run_fake_v2(tmp_path, "unlisted_frame", [1, 3])
+    with pytest.raises(blocksync.ProtocolError, match="chunk 2 is not listed") as caught:
+        blocksync.run_receiver(dst, CHUNK, 1, sender)
+    assert caught.value.exit_code == 3 and read(dst) == original
+
+
+@pytest.mark.parametrize(
+    "listed, message",
+    [([3, 1], "strictly increasing"), ([1, 1], "strictly increasing"),
+     ([0, 4], "beyond the source"), ([2 ** 63], "beyond the source")],
+    ids=["out of order", "twice", "beyond", "far beyond"],
+)
+def test_listed_chunks_out_of_order_or_beyond_the_source_exit_3(tmp_path, listed, message):
+    """SDD 6.2: the HELLO's chunk indexes are strictly increasing and within the source, or the
+    receiver refuses them (exit 3) before it reads or writes a chunk."""
+    dst, original, sender = run_fake_v2(tmp_path, "honest", listed)
+    with pytest.raises(blocksync.ProtocolError, match=message) as caught:
+        blocksync.run_receiver(dst, CHUNK, 1, sender)
+    assert caught.value.exit_code == 3 and read(dst) == original
+
+
+def test_the_receiver_accepts_version_1_and_version_2_hellos(tmp_path):
+    """SDD 6.2: one receiver takes a version 1 pass - a full scan, as before - and a version 2
+    read pass alike."""
+    src, dst, source = changed_pair(tmp_path, changed=[1, 2])
+    rc, summary, err = receive_from(
+        dst, extent_sender(src, extents_file(tmp_path, [[CHUNK, CHUNK]]), "read"))
+    assert rc == 0 and summary["chunks"] == 1, err
+    rc, summary, err = receive_from(dst, sender_cmd(src))
+    assert rc == 0 and summary["chunks"] == 8 and summary["chunks_changed"] == 1, err
+    assert read(dst) == source
+
+
+def test_assume_zero_is_refused_with_extents(tmp_path):
+    """SDD 6.2, 28.5: --assume-zero, which skips the destination's read, is refused with a
+    version 2 pass: exit 2, the destination untouched."""
+    src, dst, _source = changed_pair(tmp_path, changed=[1])
+    before = read(dst)
+    rc, summary, err = receive_from(
+        dst, extent_sender(src, extents_file(tmp_path, [[CHUNK, 1]]), "read"), assume_zero=True)
+    assert rc == 2 and summary["ok"] is False
+    assert "--assume-zero" in summary["error"]
+    assert read(dst) == before
+
+
+def test_a_check_pass_copies_what_a_full_scan_copies(tmp_path):
+    """SDD 6.2, 28.5: a check pass is protocol v1 on the wire and a full scan: it leaves the
+    destination equal to the source and reports what a plain pass reports, plus the extents'
+    counts."""
+    src, dst, source = changed_pair(tmp_path, changed=[0, 3, 6])
+    plain_dst = write(tmp_path / "plain", read(dst))
+    extents = extents_file(tmp_path, [[0, 10], [3 * CHUNK, 10], [6 * CHUNK, 10]])
+
+    rc, checked, err = receive_from(dst, extent_sender(src, extents, "check"))
+    assert rc == 0, err
+    rc, plain, err = receive_from(plain_dst, sender_cmd(src))
+    assert rc == 0, err
+
+    assert read(dst) == read(plain_dst) == source
+    for key in ("chunks", "chunks_changed", "bytes_scanned", "bytes_changed", "bytes_transferred"):
+        assert checked[key] == plain[key], key
+    assert (checked["extent_chunks"], checked["missed_chunks"]) == (3, 0)
+    assert "extent_chunks" not in plain and "missed_chunks" not in plain
+
+
+def test_a_check_pass_counts_changes_outside_the_extents(tmp_path):
+    """SDD 28.5: the sender of a check pass counts the chunks whose digests differed that the
+    extents do not list - a miss, which turns tracking off for the disk."""
+    src, dst, source = changed_pair(tmp_path, changed=[1, 4, 6])
+    extents = extents_file(tmp_path, [[CHUNK, 2 * CHUNK], [4 * CHUNK, 1]])  # 1, 2, 4
+
+    rc, summary, err = receive_from(dst, extent_sender(src, extents, "check"))
+
+    assert rc == 0, err
+    assert summary["chunks_changed"] == 3
+    assert (summary["extent_chunks"], summary["missed_chunks"]) == (3, 1)
+    assert read(dst) == source
+
+
+def test_extents_that_miss_a_write_leave_it_to_a_read_and_a_check_finds_it(tmp_path):
+    """SDD 28.5: why a read pass needs a clean check first - extents that miss a write leave that
+    chunk as it was, and the manifest, over the listed chunks alone, cannot see it; a check pass
+    of the same extents finds the miss and copies it."""
+    src, dst, source = changed_pair(tmp_path, changed=[2, 5])
+    extents = extents_file(tmp_path, [[2 * CHUNK, CHUNK]])  # 5 is missed
+
+    rc, summary, err = receive_from(dst, extent_sender(src, extents, "read"))
+    assert rc == 0 and summary["ok"] is True, err
+    assert chunks_of(read(dst))[5] != chunks_of(source)[5]
+
+    rc, summary, err = receive_from(dst, extent_sender(src, extents, "check"))
+    assert rc == 0, err
+    assert summary["missed_chunks"] == 1
+    assert read(dst) == source

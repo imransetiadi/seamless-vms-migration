@@ -1,6 +1,6 @@
 # Copyright: Seamless Migrate contributors
 # Apache License 2.0 (see LICENSE)
-"""Block-level delta synchronisation for warm migrations (protocol v1).
+"""Block-level delta synchronisation for warm migrations (protocols v1 and v2).
 
 This file is both an os-migrate ``module_utils`` module and a standalone
 script that runs on the conversion hosts, so it depends on the Python 3.6+
@@ -8,6 +8,7 @@ standard library only::
 
     python3 blocksync.py send    --device PATH [--chunk-size N] [--workers W]
                                  [--expect-serial ID]
+                                 [--extents FILE --extents-mode read|check]
     python3 blocksync.py receive --device PATH [--chunk-size N] [--workers W]
                                  [--assume-zero] [--progress-interval S]
                                  [--expect-serial ID] -- SENDER_COMMAND [ARGS...]
@@ -38,6 +39,22 @@ The receiver sends digests and applies frames on separate threads (one
 direction blocking can never deadlock the other) and verifies the manifest
 digest of the result before it fsyncs the device and prints its summary.
 
+With ``--extents FILE`` (JSON ``[offset, length]`` pairs, sorted and merged
+here; each chunk an extent touches is listed) the sender runs one of two
+modes (Seamless Migrate SDD 6.2, 28.5):
+
+* ``read`` - protocol v2: ``HELLO`` with ``version=2``, then ``u64 n`` and the
+  ``n`` listed chunk indexes (``u64``, strictly increasing, within the
+  source). The receiver sends the digests of those chunks alone, reading no
+  other; frames are v1's, each for a listed chunk; the end frame carries ``n``
+  and a manifest over each listed chunk's index (``u64``) and digest, in
+  order. ``bytes_scanned`` counts the listed chunks; ``--assume-zero`` is
+  refused (exit 2).
+* ``check`` - protocol v1 on the wire and a full scan; the sender also counts
+  the chunks whose digests differed that the extents do not list, and
+  reports both counts on stderr for the receiver's summary
+  (``extent_chunks``, ``missed_chunks``).
+
 Exit codes: 0 ok, 2 usage or I/O error, 3 protocol or verification error,
 4 destination smaller than the source.
 """
@@ -63,6 +80,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 PROTOCOL_MAGIC = b"SMBS"
 PROTOCOL_VERSION = 1
+#: a read pass's protocol: the HELLO lists the chunks the extents touch (SDD 6.2, 28.5)
+PROTOCOL_VERSION_EXTENTS = 2
+EXTENTS_MODES = ("read", "check")
 DEFAULT_CHUNK_SIZE = 4194304
 DEFAULT_WORKERS = 4
 DEFAULT_PROGRESS_INTERVAL = 1.0
@@ -92,6 +112,7 @@ _STREAM_GRACE = 5.0
 _KILL_GRACE = 5.0
 
 _HELLO = struct.Struct(">4sBIQ")
+_U64 = struct.Struct(">Q")
 _FRAME_HEADER = struct.Struct(">QI")
 _END = struct.Struct(">QQQ16s")
 
@@ -120,23 +141,26 @@ class DestinationTooSmall(BlocksyncError):
 SenderStats = collections.namedtuple(
     "SenderStats",
     "chunks chunks_changed bytes_scanned bytes_changed bytes_transferred "
-    "duration_s manifest",
+    "duration_s manifest extent_chunks missed_chunks",
 )
+# a pass without extents has no counts of them (Python 3.6: no namedtuple defaults)
+SenderStats.__new__.__defaults__ = (None, None)
 
 
 class ReceiverSummary(
     collections.namedtuple(
         "ReceiverSummary",
         "ok chunks chunks_changed bytes_scanned bytes_changed bytes_transferred "
-        "duration_s",
+        "duration_s extent_chunks missed_chunks",
     )
 ):
-    """Result of a receive; ``to_dict()`` is the CLI's JSON summary line."""
+    """Result of a receive; ``to_dict()`` is the CLI's JSON summary line. A check pass's
+    sender reports ``extent_chunks`` and ``missed_chunks``; any other pass has none."""
 
     __slots__ = ()
 
     def to_dict(self):
-        return collections.OrderedDict(
+        summary = collections.OrderedDict(
             [
                 ("ok", self.ok),
                 ("chunks", self.chunks),
@@ -147,6 +171,13 @@ class ReceiverSummary(
                 ("duration_s", float(self.duration_s)),
             ]
         )
+        if self.extent_chunks is not None:
+            summary["extent_chunks"] = self.extent_chunks
+            summary["missed_chunks"] = self.missed_chunks
+        return summary
+
+
+ReceiverSummary.__new__.__defaults__ = (None, None)
 
 
 _Chunk = collections.namedtuple("_Chunk", "index offset length digest data")
@@ -209,6 +240,58 @@ def manifest_digest(digests):
 
 def chunk_count(size, chunk_size):
     return (size + chunk_size - 1) // chunk_size
+
+
+def extent_manifest(listed):
+    """A version 2 pass's manifest: BLAKE2b-128 over each listed chunk's index (u64,
+    big-endian) and digest, in order - ``listed`` yields (index, digest) pairs."""
+    manifest = new_hasher()
+    for index, digest in listed:
+        manifest.update(_U64.pack(index))
+        manifest.update(digest)
+    return manifest.digest()
+
+
+def _extent_pairs(extents):
+    """``extents`` as (offset, length) pairs of non-negative integers, each length positive;
+    BlocksyncError (exit 2) for anything else."""
+    if not isinstance(extents, list):
+        raise BlocksyncError("the extents are not a list of [offset, length] pairs")
+    pairs = []
+    for extent in extents:
+        if (
+            not isinstance(extent, (list, tuple))
+            or len(extent) != 2
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in extent)
+        ):
+            raise BlocksyncError(
+                "an extent is not an [offset, length] pair of integers: %r" % (extent,)
+            )
+        offset, length = extent
+        if offset < 0 or length < 0:
+            raise BlocksyncError("a negative extent: [%d, %d]" % (offset, length))
+        if length == 0:
+            raise BlocksyncError("an empty extent: [%d, 0]" % offset)
+        pairs.append((offset, length))
+    return pairs
+
+
+def extent_chunks(extents, size, chunk_size):
+    """The indexes of the chunks ``extents`` touch - the pairs sorted and merged -, sorted, each
+    once (SDD 6.2, 28.5). An extent that is no pair of integers, negative, empty or reaching
+    beyond the source's ``size`` bytes raises BlocksyncError (exit 2)."""
+    indexes = []
+    for offset, length in sorted(_extent_pairs(extents)):
+        end = offset + length
+        if end > size:
+            raise BlocksyncError(
+                "an extent beyond the source (%d bytes): [%d, %d]" % (size, offset, length)
+            )
+        first = offset // chunk_size
+        if indexes and first <= indexes[-1]:  # overlapping or in the same chunk: merged
+            first = indexes[-1] + 1
+        indexes.extend(range(first, (end - 1) // chunk_size + 1))
+    return indexes
 
 
 def _chunk_length(index, size, chunk_size):
@@ -302,16 +385,18 @@ def _hash_chunk(fd, index, chunk_size, size, keep_data):
     return _Chunk(index, offset, length, chunk_digest(data), data if keep_data else None)
 
 
-def _scan_chunks(fd, size, chunk_size, workers, keep_data=False, stop=None):
-    """Yield every chunk of the device in order.
+def _scan_chunks(fd, size, chunk_size, workers, keep_data=False, stop=None, indexes=None):
+    """Yield every chunk of the device in order - or, given ``indexes`` (increasing), those
+    chunks alone: no other is read.
 
     With ``workers > 1`` chunks are read and hashed ahead by a thread pool
     (``os.pread`` and hashlib release the GIL); at most ``2 * workers``
     chunks are in flight, which bounds memory to ``2 * workers * chunk_size``.
     """
-    count = chunk_count(size, chunk_size)
+    if indexes is None:
+        indexes = range(chunk_count(size, chunk_size))
     if workers <= 1:
-        for index in range(count):
+        for index in indexes:
             if stop is not None and stop.is_set():
                 return
             yield _hash_chunk(fd, index, chunk_size, size, keep_data)
@@ -319,22 +404,19 @@ def _scan_chunks(fd, size, chunk_size, workers, keep_data=False, stop=None):
 
     pool = ThreadPoolExecutor(max_workers=workers)
     pending = collections.deque()
-    next_index = 0
+    upcoming = iter(indexes)
     try:
-        while next_index < count and len(pending) < 2 * workers:
-            pending.append(
-                pool.submit(_hash_chunk, fd, next_index, chunk_size, size, keep_data)
-            )
-            next_index += 1
+        for index in upcoming:
+            pending.append(pool.submit(_hash_chunk, fd, index, chunk_size, size, keep_data))
+            if len(pending) >= 2 * workers:
+                break
         while pending:
             if stop is not None and stop.is_set():
                 return
             chunk = pending.popleft().result()
-            if next_index < count:
-                pending.append(
-                    pool.submit(_hash_chunk, fd, next_index, chunk_size, size, keep_data)
-                )
-                next_index += 1
+            for index in upcoming:
+                pending.append(pool.submit(_hash_chunk, fd, index, chunk_size, size, keep_data))
+                break
             yield chunk
     finally:
         for future in pending:
@@ -461,6 +543,35 @@ def _parse_send_progress(line):
     return None
 
 
+def _extent_check_line(extent_chunks, missed_chunks):
+    """A check pass's counts, which the sender reports on stderr for the receiver's summary."""
+    return _json_line(
+        collections.OrderedDict(
+            [
+                ("event", "extent_check"),
+                ("extent_chunks", extent_chunks),
+                ("missed_chunks", missed_chunks),
+            ]
+        )
+    )
+
+
+def _parse_extent_check(line):
+    """(extent_chunks, missed_chunks) of a sender's extent_check line, else None."""
+    if not line.startswith("{"):
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    if isinstance(event, dict) and event.get("event") == "extent_check":
+        try:
+            return int(event["extent_chunks"]), int(event["missed_chunks"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
 def run_sender(
     device,
     chunk_size,
@@ -470,36 +581,64 @@ def run_sender(
     progress_cb=None,
     progress_interval=DEFAULT_PROGRESS_INTERVAL,
     expect_serial=None,
+    extents=None,
+    extents_mode=None,
 ):
-    """Sender side of protocol v1.
+    """Sender side of protocols v1 and v2.
 
     Reads the receiver's digests from ``inp`` and writes frames to ``out``
-    (binary streams). Returns ``SenderStats``.
+    (binary streams). Returns ``SenderStats``. With ``extents`` (``[offset,
+    length]`` pairs) and ``extents_mode``: ``read`` runs protocol v2 over the
+    chunks they touch alone; ``check`` runs v1 in full and counts the changed
+    chunks they do not list (Seamless Migrate SDD 6.2, 28.5).
     """
     started = time.monotonic()
     _validate_chunk_size(chunk_size)
     workers = _validate_workers(workers)
+    if (extents is None) != (extents_mode is None):
+        raise BlocksyncError("--extents and --extents-mode go together")
+    if extents_mode is not None and extents_mode not in EXTENTS_MODES:
+        raise BlocksyncError("the extents mode is read or check, not %r" % (extents_mode,))
     fd = os.open(device, os.O_RDONLY)
     try:
         _check_identity(fd, device, expect_serial)
         size = _fd_size(fd)
-        count = chunk_count(size, chunk_size)
-        out.write(_HELLO.pack(PROTOCOL_MAGIC, PROTOCOL_VERSION, chunk_size, size))
+        listed = None if extents is None else extent_chunks(extents, size, chunk_size)
+        if extents_mode == "read":
+            indexes = listed
+            total = sum(_chunk_length(index, size, chunk_size) for index in indexes)
+            out.write(
+                _HELLO.pack(PROTOCOL_MAGIC, PROTOCOL_VERSION_EXTENTS, chunk_size, size)
+                + _U64.pack(len(indexes))
+                + b"".join(_U64.pack(index) for index in indexes)
+            )
+        else:
+            indexes = None
+            total = size
+            out.write(_HELLO.pack(PROTOCOL_MAGIC, PROTOCOL_VERSION, chunk_size, size))
         out.flush()
-        reporter = _ProgressReporter(size, progress_cb, progress_interval)
+        count = len(indexes) if indexes is not None else chunk_count(size, chunk_size)
+        outside = set(listed) if extents_mode == "check" else None
+        reporter = _ProgressReporter(total, progress_cb, progress_interval)
         manifest = new_hasher()
-        changed = bytes_changed = transferred = 0
-        for chunk in _scan_chunks(fd, size, chunk_size, workers, keep_data=True):
+        changed = bytes_changed = transferred = missed = done = 0
+        for position, chunk in enumerate(
+            _scan_chunks(fd, size, chunk_size, workers, keep_data=True, indexes=indexes)
+        ):
             theirs = _read_exact(inp, DIGEST_SIZE)
             if len(theirs) != DIGEST_SIZE:
                 raise ProtocolError(
                     "the receiver's digest stream ended after %d of %d chunks"
-                    % (chunk.index, count)
+                    % (position, count)
                 )
+            if indexes is not None:
+                manifest.update(_U64.pack(chunk.index))
             manifest.update(chunk.digest)
             if theirs != chunk.digest:
                 changed += 1
                 bytes_changed += chunk.length
+                if outside is not None and chunk.index not in outside:
+                    missed += 1
                 if chunk.digest == zero_digest(chunk.length) and chunk.data == _zeros(
                     chunk.length
                 ):
@@ -508,21 +647,26 @@ def run_sender(
                     out.write(FRAME_DATA + _FRAME_HEADER.pack(chunk.offset, chunk.length))
                     out.write(chunk.data)
                     transferred += chunk.length
-            reporter.update(chunk.offset + chunk.length)
+            done += chunk.length
+            reporter.update(done)
         digest = manifest.digest()
+        if outside is not None:
+            _emit_stderr(_extent_check_line(len(listed), missed))
         out.write(FRAME_END + _END.pack(count, changed, transferred, digest))
         out.flush()
-        reporter.update(size, force=True)
+        reporter.update(total, force=True)
     finally:
         os.close(fd)
     return SenderStats(
         count,
         changed,
-        size,
+        total,
         bytes_changed,
         transferred,
         round(time.monotonic() - started, 3),
         digest,
+        len(listed) if outside is not None else None,
+        missed if outside is not None else None,
     )
 
 
@@ -548,6 +692,13 @@ class _ReceiveSession:
         self.interval = interval
         self.proc = None
         self.reporter = None
+        # the chunks this pass syncs - every chunk (v1), or the HELLO's listed ones (v2) -,
+        # their digests in that order, and for v2 each listed chunk's position and the bytes
+        # done once it is (SDD 6.2, 28.5)
+        self.indexes = None
+        self.positions = None
+        self.done_at = None
+        self.extent_check = None
         self.digests = []
         self.sent = 0
         self.digest_error = None
@@ -576,28 +727,42 @@ class _ReceiveSession:
             )
         try:
             self.stderr_thread = self._start(self._pump_stderr)
-            source_size = self._read_hello(dest_size)
+            source_size, listed = self._read_hello(dest_size)
             count = chunk_count(source_size, self.chunk_size)
-            self.digests = [None] * count
-            self.reporter = _ProgressReporter(source_size, self.progress_cb, self.interval)
+            if listed is None:
+                self.indexes = range(count)
+                scanned = source_size
+            else:
+                self.indexes = listed
+                self.positions = dict((index, position) for position, index in enumerate(listed))
+                self.done_at = []
+                scanned = 0
+                for index in listed:
+                    scanned += _chunk_length(index, source_size, self.chunk_size)
+                    self.done_at.append(scanned)
+            self.digests = [None] * len(self.indexes)
+            self.reporter = _ProgressReporter(scanned, self.progress_cb, self.interval)
             self.reporter.update(0)
             self.digest_thread = self._start(self._send_digests, source_size, count)
             changed, bytes_changed, transferred = self._apply_frames(source_size, count)
             os.fsync(self.fd)
             self._finish_sender()
             self._raise_callback_error()
-            self.reporter.update(source_size, force=True)
+            self.reporter.update(scanned, force=True)
         except BaseException:
             self._abort()
             raise
+        extent_chunks, missed_chunks = self.extent_check or (None, None)
         return ReceiverSummary(
             True,
-            count,
+            len(self.indexes),
             changed,
-            source_size,
+            scanned,
             bytes_changed,
             transferred,
             round(time.monotonic() - started, 3),
+            extent_chunks,
+            missed_chunks,
         )
 
     @staticmethod
@@ -614,7 +779,7 @@ class _ReceiveSession:
         magic, version, chunk_size, source_size = _HELLO.unpack(hello)
         if magic != PROTOCOL_MAGIC:
             raise ProtocolError("bad protocol magic %r" % (magic,))
-        if version != PROTOCOL_VERSION:
+        if version not in (PROTOCOL_VERSION, PROTOCOL_VERSION_EXTENTS):
             raise ProtocolError("unsupported protocol version %d" % version)
         if chunk_size != self.chunk_size:
             raise ProtocolError(
@@ -626,7 +791,42 @@ class _ReceiveSession:
                 "destination is smaller than the source (%d < %d bytes)"
                 % (dest_size, source_size)
             )
-        return source_size
+        if version == PROTOCOL_VERSION:
+            return source_size, None
+        if self.assume_zero:
+            # a read pass digests the destination's listed chunks: assuming them zero would
+            # skip the read the pass relies on (SDD 28.5)
+            raise BlocksyncError(
+                "--assume-zero is refused with a version 2 pass, which reads the listed "
+                "chunks of the destination"
+            )
+        return source_size, self._read_listed(chunk_count(source_size, chunk_size))
+
+    def _read_listed(self, count):
+        """A version 2 HELLO's chunk indexes: at most the source's chunks, strictly increasing,
+        each within the source - else ProtocolError (exit 3), before a chunk is read."""
+        raw = _read_exact(self.proc.stdout, _U64.size)
+        if len(raw) != _U64.size:
+            self._raise_sender_failure("the sender closed the stream inside its HELLO")
+        (number,) = _U64.unpack(raw)
+        if number > count:
+            raise ProtocolError(
+                "the HELLO lists %d chunks, beyond the source's %d" % (number, count)
+            )
+        raw = _read_exact(self.proc.stdout, number * _U64.size)
+        if len(raw) != number * _U64.size:
+            self._raise_sender_failure("the sender closed the stream inside its HELLO")
+        listed = []
+        for position in range(number):
+            (index,) = _U64.unpack_from(raw, position * _U64.size)
+            if index >= count:
+                raise ProtocolError(
+                    "listed chunk %d is beyond the source (%d chunks)" % (index, count)
+                )
+            if listed and index <= listed[-1]:
+                raise ProtocolError("the listed chunk indexes are not strictly increasing")
+            listed.append(index)
+        return listed
 
     def _send_digests(self, source_size, count):
         out = self.proc.stdin
@@ -645,13 +845,20 @@ class _ReceiveSession:
                         out.flush()
                         batch = []
             else:
-                for chunk in _scan_chunks(
-                    self.fd, source_size, self.chunk_size, self.workers, stop=self.stop
+                for position, chunk in enumerate(
+                    _scan_chunks(
+                        self.fd,
+                        source_size,
+                        self.chunk_size,
+                        self.workers,
+                        stop=self.stop,
+                        indexes=self.indexes,
+                    )
                 ):
-                    self.digests[chunk.index] = chunk.digest
+                    self.digests[position] = chunk.digest
                     # Counted before it is written: the sender may answer
                     # before this thread runs again.
-                    self.sent = chunk.index + 1
+                    self.sent = position + 1
                     out.write(chunk.digest)
                     out.flush()
         except BaseException as err:  # pylint: disable=broad-except
@@ -666,7 +873,11 @@ class _ReceiveSession:
             for raw in iter(self.proc.stderr.readline, b""):
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 done = _parse_send_progress(line)
-                if done is None:
+                counts = None if done is not None else _parse_extent_check(line)
+                if counts is not None:
+                    # a check pass's counts, for the summary (SDD 28.5)
+                    self.extent_check = counts
+                elif done is None:
                     _emit_stderr(line)
                 elif self.reporter is not None and self.callback_error is None:
                     try:
@@ -707,37 +918,43 @@ class _ReceiveSession:
             if len(header) != _FRAME_HEADER.size:
                 self._raise_sender_failure("truncated frame header")
             offset, length = _FRAME_HEADER.unpack(header)
-            index = self._check_frame(offset, length, last_index, count, source_size)
+            index, position = self._check_frame(offset, length, last_index, count, source_size)
             last_index = index
             if kind == FRAME_DATA:
                 payload = _read_exact(stream, length)
                 if len(payload) != length:
                     self._raise_sender_failure("truncated data frame")
                 _pwrite_full(self.fd, payload, offset)
-                self.digests[index] = chunk_digest(payload)
+                self.digests[position] = chunk_digest(payload)
                 transferred += length
             else:
                 _pwrite_full(self.fd, _zeros(length), offset)
-                self.digests[index] = zero_digest(length)
+                self.digests[position] = zero_digest(length)
             changed += 1
             bytes_changed += length
-            self.reporter.update(offset + length)
+            self.reporter.update(
+                offset + length if self.done_at is None else self.done_at[position]
+            )
             self._raise_callback_error()
 
         end = _read_exact(stream, _END.size)
         if len(end) != _END.size:
             self._raise_sender_failure("truncated end frame")
         chunks, chunks_changed, bytes_transferred, their_manifest = _END.unpack(end)
-        if (chunks, chunks_changed, bytes_transferred) != (count, changed, transferred):
+        synced = len(self.indexes)
+        if (chunks, chunks_changed, bytes_transferred) != (synced, changed, transferred):
             raise ProtocolError(
                 "end frame mismatch: sender reports %d chunks/%d changed/%d bytes, "
                 "receiver saw %d/%d/%d"
-                % (chunks, chunks_changed, bytes_transferred, count, changed, transferred)
+                % (chunks, chunks_changed, bytes_transferred, synced, changed, transferred)
             )
         self._check_digest_thread()
-        if self.sent != count or any(digest is None for digest in self.digests):
+        if self.sent != synced or any(digest is None for digest in self.digests):
             raise ProtocolError("the receiver did not send every digest")
-        ours = manifest_digest(self.digests)
+        if self.positions is None:
+            ours = manifest_digest(self.digests)
+        else:
+            ours = extent_manifest(zip(self.indexes, self.digests))
         if ours != their_manifest:
             raise ProtocolError(
                 "manifest digest mismatch: source %s, destination %s"
@@ -755,6 +972,7 @@ class _ReceiveSession:
             raise error
 
     def _check_frame(self, offset, length, last_index, count, source_size):
+        """The frame's chunk index and its position among the synced chunks."""
         if offset % self.chunk_size:
             raise ProtocolError("frame offset %d is not chunk aligned" % offset)
         index = offset // self.chunk_size
@@ -762,14 +980,22 @@ class _ReceiveSession:
             raise ProtocolError("frame offset %d is beyond the source size" % offset)
         if index <= last_index:
             raise ProtocolError("frame for chunk %d is out of order" % index)
-        if index >= self.sent:
+        if self.positions is None:
+            position = index
+        else:
+            position = self.positions.get(index)
+            if position is None:
+                raise ProtocolError(
+                    "frame for chunk %d: chunk %d is not listed in the HELLO" % (index, index)
+                )
+        if position >= self.sent:
             raise ProtocolError("frame for chunk %d arrived before its digest" % index)
         expected = _chunk_length(index, source_size, self.chunk_size)
         if length != expected:
             raise ProtocolError(
                 "frame for chunk %d has length %d, expected %d" % (index, length, expected)
             )
-        return index
+        return index, position
 
     def _raise_sender_failure(self, message):
         try:
@@ -899,10 +1125,11 @@ def run_receiver(
     progress_interval=DEFAULT_PROGRESS_INTERVAL,
     expect_serial=None,
 ):
-    """Receiver side of protocol v1.
+    """Receiver side of protocols v1 and v2.
 
     Spawns ``sender_cmd`` (an argv list), synchronises ``device`` with the
-    sender's device and returns a ``ReceiverSummary``. Raises
+    sender's device - every chunk (v1), or the chunks a version 2 HELLO
+    lists, reading no other - and returns a ``ReceiverSummary``. Raises
     ``BlocksyncError`` (or ``OSError`` for local I/O failures).
     ``progress_cb(bytes_done, bytes_total)`` is called at most every
     ``progress_interval`` seconds plus once at 100 %.
@@ -963,7 +1190,7 @@ def _arg_interval(value):
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="blocksync.py",
-        description="Block-level delta sync for warm migrations (protocol v1).",
+        description="Block-level delta sync for warm migrations (protocols v1 and v2).",
     )
     commands = parser.add_subparsers(dest="command", metavar="{send,receive,hash}")
     commands.required = True
@@ -998,6 +1225,19 @@ def _build_parser():
     )
     device_options(send)
     identity_option(send)
+    send.add_argument(
+        "--extents",
+        metavar="FILE",
+        default=None,
+        help="JSON [offset, length] pairs of the source that changed since the base pass",
+    )
+    send.add_argument(
+        "--extents-mode",
+        choices=EXTENTS_MODES,
+        default=None,
+        help="read: protocol v2 over the chunks the extents touch alone; check: a full v1 "
+        "pass that counts the changed chunks the extents miss",
+    )
 
     receive = commands.add_parser(
         "receive",
@@ -1062,8 +1302,18 @@ def _print_send_progress(done, total):
     )
 
 
+def _load_extents(path):
+    """The extents file's JSON; BlocksyncError (exit 2) when it is not JSON."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except ValueError as err:
+        raise BlocksyncError("the extents file is not JSON: %s" % err)
+
+
 def _cmd_send(args):
     try:
+        extents = None if args.extents is None else _load_extents(args.extents)
         run_sender(
             args.device,
             args.chunk_size,
@@ -1072,6 +1322,8 @@ def _cmd_send(args):
             sys.stdout.buffer,
             progress_cb=_print_send_progress,
             expect_serial=args.expect_serial,
+            extents=extents,
+            extents_mode=args.extents_mode,
         )
     except BrokenPipeError:
         _silence_stdout()
