@@ -2285,6 +2285,49 @@ async def test_flavor_pre_staging_leaves_out_gpu_flavors(env):
     assert await prestage(vgpu, alias) == []
 
 
+@pytest.mark.parametrize(
+    ("strategy", "step"),
+    [
+        (Strategy.warm, StepName.PRECOPY),
+        (Strategy.warm, StepName.SYNC),
+        (Strategy.warm, StepName.CUTOVER),
+        (Strategy.cold, StepName.CUTOVER),
+    ],
+)
+def test_every_openstack_run_makes_its_own_conversion_host_link(env, strategy, step):
+    """SDD §7.2, §26.6 (plan task ST6): every run of an OpenStack migration makes its own link
+    between the conversion hosts and removes it when it ends - whatever the host key setting,
+    since the restricted link applies either way -, its entry bounded by the step timeout when
+    one is set, else 7 days; the plan's 0.4.0 link key is named, for the link to remove. A VMware
+    run has no link."""
+    ctx, _ = ctx_for(env, strategy=strategy)
+    v = build_vars(step, ctx)
+    assert v["os_migrate_conversion_link_per_run"] is True
+    assert v["os_migrate_conversion_link_expiry_s"] == 7 * 24 * 3600
+    assert v["os_migrate_conversion_link_keypair_private_path"].endswith(
+        "/osm/conversion/link-ssh.key"
+    )
+
+    ctx.settings = ctx.settings.model_copy(update={"step_timeout_s": 5400.5})
+    assert build_vars(step, ctx)["os_migrate_conversion_link_expiry_s"] == 5401
+    ctx.settings = ctx.settings.model_copy(update={"ansible_host_key_checking": False})
+    assert build_vars(step, ctx)["os_migrate_conversion_link_per_run"] is True
+
+    vmware, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
+    assert not [k for k in build_vars(step, vmware) if "conversion_link" in k]
+
+
+async def test_a_prestage_makes_no_static_conversion_link(env):
+    """SDD §7.2, §26.6 (plan task ST6): pre-staging no longer copies a plan's link key to the
+    destination host nor authorizes it on the source host - each run makes its own -, and the
+    content install sets each host's sshd for the runs' links."""
+    await env.executor.prestage(make_plan(id="plan-00c0ffee", prestage_resources=[]), SRC, DST)
+    [deploy] = read_log(env.log)
+    assert deploy["playbook"] == "deploy_conversion_hosts.yml"
+    assert deploy["vars"]["os_migrate_link_conversion_hosts"] is False
+    assert deploy["vars"]["os_migrate_conversion_link_per_run"] is True
+
+
 def test_build_vars_and_inventory_are_pure(env):
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
     v1 = build_vars(StepName.CUTOVER, ctx)

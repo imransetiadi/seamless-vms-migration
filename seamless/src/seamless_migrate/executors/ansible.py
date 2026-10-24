@@ -14,6 +14,7 @@ import copy
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -152,6 +153,8 @@ OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
 WARM_CHUNK_SIZE = 4194304
 WARM_WORKERS = 4
+#: a run's link entry's bound without a step timeout: 7 days (SDD §26.6)
+LINK_EXPIRY_S = 7 * 24 * 3600
 TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
 #: a conversion host's key, or the link, refused in a run's output (SDD §6.6, §7.2, §26.5): the
 #: collection's two refusals, and ssh's own words - also as Ansible's unreachable message carries
@@ -664,6 +667,9 @@ def _common_openstack_vars(
         "os_migrate_warm_workers": WARM_WORKERS,
         # Security.md SEC-04: conversion hosts never accept password SSH logins
         "os_migrate_conversion_host_ssh_user_enable_password_access": False,
+        # each run makes its own link between the conversion hosts and removes it when it ends,
+        # whatever the host key setting; the content install sets sshd for it (SDD §7.2, §26.6)
+        "os_migrate_conversion_link_per_run": True,
     }
     ssh_user = "cloud-user"
     for side, provider in (("src", source), ("dst", destination)):
@@ -742,6 +748,11 @@ def build_vars(
         run_key(ctx.settings, ctx.plan.id),
     )
     out["os_migrate_workloads_filter"] = workload_filter(m.vm.name)
+    # the link's entry stops admitting its key once the run cannot be running any more: the
+    # step timeout when one is set, else 7 days - the bound of an entry a crash left (SDD §26.6)
+    out["os_migrate_conversion_link_expiry_s"] = (
+        math.ceil(ctx.settings.step_timeout_s) if ctx.settings.step_timeout_s > 0 else LINK_EXPIRY_S
+    )
     out["os_migrate_workload_stop_before_migration"] = (
         m.strategy == Strategy.cold and step == StepName.CUTOVER
     )
@@ -1481,6 +1492,9 @@ class AnsibleExecutor:
         variables = _common_openstack_vars(
             source, destination, osm, osm, installation_key(self.settings)
         )
+        # no static link: no plan's link key goes to the hosts - each run makes its own (SDD §7.2,
+        # §26.6)
+        variables["os_migrate_link_conversion_hosts"] = False
         if deploy_conversion_hosts:
             for side, old_key in sorted(rekey.items()):
                 variables[f"os_migrate_{side}_conversion_rekey_private_path"] = str(old_key)
