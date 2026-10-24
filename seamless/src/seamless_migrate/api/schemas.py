@@ -189,6 +189,14 @@ class Me(BaseModel):
     role: Role
 
 
+class CurrentUser(Me):
+    """GET /me: the signed-in user, and what the dashboard needs to know of the installation."""
+
+    #: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING, for the provider page's warning while it is off - for a
+    #: signed-in viewer alone, never on the public /health (SDD §12, §16, plan task ST7)
+    host_key_checking: bool
+
+
 class JevStatus(BaseModel):
     mode: str
     available: bool

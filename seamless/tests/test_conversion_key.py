@@ -79,6 +79,9 @@ def ansible(tmp_path, monkeypatch):
         ansible_playbook=str(install(tmp_path / "bin")),
         clouds_yaml=clouds_yaml,
         collection_root=find_repo_root(),
+        # the conversion key alone: host key checks, on by default since plan task ST7, have their
+        # own tests (SDD §7.2, §26.8)
+        ansible_host_key_checking=False,
     )
     return settings, log
 

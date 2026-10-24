@@ -12,6 +12,7 @@ from typing import Any, Literal
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef, Wave
 from ..guest_os import identify
+from ..security.host_keys import SIDE_ALIASES
 from .gpu import (
     PoolKey,
     ProfileSize,
@@ -581,6 +582,20 @@ CATALOG: dict[str, CatalogEntry] = {
         Severity.warning,
         (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
         "Configure a conversion host on the provider.",
+    ),
+    "CONV_HOST_KEY_UNKNOWN": CatalogEntry(
+        Severity.blocker,
+        (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
+        "Declare the conversion host's public keys on its provider (conversion_host."
+        "ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and "
+        "pre-stage again, which creates it with an injected key.",
+    ),
+    "CONV_HOST_KEYS_UNCHECKED": CatalogEntry(
+        Severity.warning,
+        (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
+        "Set SEAMLESS_ANSIBLE_HOST_KEY_CHECKING to true: each conversion host then needs declared "
+        "keys or a pin, which a host Seamless creates gets injected and the provider check reads "
+        "from the console of one it finds.",
     ),
     "HANDOVER_BACKEND_UNMAPPED": CatalogEntry(
         Severity.info,
@@ -1641,6 +1656,8 @@ def run_preflight(
     shares: Mapping[str, QuotaShare] | None = None,
     dns_ttl: int | None = None,
     lb_pools: Mapping[str, PoolPair] | None = None,
+    host_key_checking: bool | None = None,
+    checked: Mapping[str, Provider] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1650,7 +1667,10 @@ def run_preflight(
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles);
     ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4);
-    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5).
+    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5);
+    ``host_key_checking`` the setting SEAMLESS_ANSIBLE_HOST_KEY_CHECKING, None unjudged (§26.5);
+    ``checked`` the providers as validation's checks just left them, by id - their pins, and a host
+    found replaced -, else ``source`` and ``destination`` as given (§10 "Host key pins").
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -2168,6 +2188,14 @@ def run_preflight(
                     f"No conversion host configured on: {', '.join(lacking)}.",
                 )
             )
+        if host_key_checking is not None:
+            out.extend(
+                _host_key_findings(
+                    (checked or {}).get(source.id, source),
+                    (checked or {}).get(destination.id, destination),
+                    host_key_checking,
+                )
+            )
 
     if destination is not None and dst_caps:
         out.extend(_destination_capabilities(destination, dst_caps))
@@ -2261,6 +2289,64 @@ def _stack_findings(
         else:
             out.append(finding("SRC_VM_AUTOSCALED", text))
     return out
+
+
+#: how the provider check reports a pin of another server (SDD §10 "Host key pins", §26.5)
+_REPLACED = "conversion host replaced: "
+
+
+def _host_key_findings(source: Provider, destination: Provider, checking: bool) -> list[Finding]:
+    """CONV_HOST_KEY_UNKNOWN and CONV_HOST_KEYS_UNCHECKED (SDD §9.3, §26.5): the conversion hosts
+    the plan needs - both for an OpenStack source, a VMware source's destination host alone -
+    while their keys are checked, each with declared keys or a pin of its server, or one
+    Seamless will create; else the warning that no hop checks a key."""
+    vmware = source.kind == ProviderKind.vmware
+    needed = (
+        [("destination", destination)]
+        if vmware
+        else [
+            ("source", source),
+            ("destination", destination),
+        ]
+    )
+    needed = [(side, p) for side, p in needed if p.conversion_host is not None]
+    if not needed:
+        return []
+    if not checking:
+        return [
+            finding(
+                "CONV_HOST_KEYS_UNCHECKED",
+                "SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false: no hop of the data path checks a "
+                "conversion host's key, so a host at a conversion host's address that is not it "
+                "would be trusted with the disks.",
+            )
+        ]
+    problems: list[str] = []
+    for side, provider in needed:
+        host = provider.conversion_host
+        assert host is not None
+        if host.ssh_host_keys:
+            continue
+        name = f"{side} {provider.label} ({host.name or SIDE_ALIASES[side]})"
+        message = provider.status_message or ""
+        if message.startswith(_REPLACED):
+            problems.append(f"{name}: {message[len(_REPLACED) :]}")
+        elif provider.conversion_host_pin is not None:
+            continue
+        elif not host.manage or (vmware and side == "destination"):
+            problems.append(
+                f"{name} has neither declared keys nor a pin, and Seamless will not create it"
+            )
+    if not problems:
+        return []
+    return [
+        finding(
+            "CONV_HOST_KEY_UNKNOWN",
+            "No key is known for a conversion host the plan needs while keys are checked: "
+            + "; ".join(problems)
+            + ". Its runs would be refused before their first playbook.",
+        )
+    ]
 
 
 def _memberships(vm: VMRef, members: Sequence[PoolMember]) -> list[PoolMember]:

@@ -936,3 +936,26 @@ async def test_the_demo_shows_the_heat_and_octavia_findings(tmp_path, store):
     for name in ("web-01", "web-02", "web-03"):
         assert "SRC_VM_LB_MEMBER" not in findings[name]
     assert not [m for m in store.list("migration", Migration) if m.phase == Phase.blocked]
+
+
+def test_the_demo_destinations_declare_their_conversion_hosts_keys():
+    """SDD §10, §26.3, §26.5 (plan task ST7): host keys are checked by default, and the VMware
+    plan's destination host is one the operator brings, which Seamless never pins from a console
+    the demo does not print: each demo destination declares its conversion host's keys -
+    synthetic ed25519 keys, as an operator reads them out of band -, so no demo plan is blocked by
+    CONV_HOST_KEY_UNKNOWN, and the provider page shows them as declared."""
+    from seamless_migrate.demo import DEMO_PROVIDERS
+    from seamless_migrate.security.host_keys import public_key_problem
+
+    for provider in DEMO_PROVIDERS:
+        if provider.role != ProviderRole.destination:
+            continue
+        keys = provider.conversion_host.ssh_host_keys
+        assert len(keys) == 1 and keys[0].startswith("ssh-ed25519 "), provider.id
+        assert public_key_problem(keys[0]) is None
+    declared = [
+        p.conversion_host.ssh_host_keys[0]
+        for p in DEMO_PROVIDERS
+        if p.role == ProviderRole.destination
+    ]
+    assert len(set(declared)) == len(declared)  # each host its own key

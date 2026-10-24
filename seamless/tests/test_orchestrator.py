@@ -32,6 +32,7 @@ from seamless_migrate.domain.models import (
     AdvisorSnapshot,
     AppProbe,
     Approval,
+    ConversionHostConfig,
     CutoverWindow,
     Event,
     Finding,
@@ -1191,6 +1192,33 @@ async def test_validation_judges_a_network_with_the_roles_its_check_just_read(tm
     assert [f.code for f in web.findings] == ["NET_PORT_NOT_PERMITTED"]
     assert "'app-net' (project project-admin)" in web.findings[0].message
     assert web.phase == P.blocked
+
+
+@pytest.mark.parametrize(
+    ("checking", "code"),
+    [(True, "CONV_HOST_KEY_UNKNOWN"), (False, "CONV_HOST_KEYS_UNCHECKED")],
+    ids=["keys checked", "keys unchecked"],
+)
+async def test_validation_judges_the_conversion_hosts_keys_by_the_setting(
+    tmp_path, store, checking, code
+):
+    """SDD §9.3, §15.1, §26.5 (plan task ST7): validation judges the conversion hosts' keys with
+    SEAMLESS_ANSIBLE_HOST_KEY_CHECKING and the providers as its checks just left them - a host
+    the operator brings without a key blocks the data path's strategies while keys are checked,
+    and with the setting off the plan is warned that no hop checks a key."""
+    settings = make_settings(tmp_path, ansible_host_key_checking=checking)
+    h, plan = await setup(tmp_path, store, [vm(1)], settings=settings)
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(
+            update={"conversion_host": ConversionHostConfig(name="conv-dst", manage=False)}
+        ),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    web = await h.by_vm(plan.id, "vm-1")
+    assert [f.code for f in web.findings] == [code]
+    data_path = [e for e in web.estimates if e.strategy in (Strategy.cold, Strategy.warm)]
+    assert data_path and all(e.eligible is (not checking) for e in data_path)
 
 
 async def test_validation_records_resolved_flavor_mapping(tmp_path, store):
@@ -5751,6 +5779,8 @@ async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_
         collection_root=find_repo_root(),
         step_timeout_s=1.0,
         max_step_retries=0,
+        # the clock alone: the host key checks have their own tests (SDD §7.2, plan task ST7)
+        ansible_host_key_checking=False,
     )
     executor = AnsibleExecutor(settings, providers=FakeRegistry(), poll_s=0.02)
     source = make_vm(source_id="srv-1", name="web-01")
