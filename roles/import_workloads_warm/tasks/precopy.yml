@@ -4,6 +4,10 @@
 # "full"), later passes only transfer changed chunks (kind "delta").
 - name: Warm pre-copy of a workload
   block:
+    - name: Forget the link of an earlier workload
+      ansible.builtin.set_fact:
+        import_workloads_warm_link: {}
+
     - name: Preliminary setup for the warm pre-copy
       os_migrate.os_migrate.import_workload_prelim:
         cloud: dst
@@ -75,6 +79,17 @@
             state: present
           register: import_workloads_warm_snapshot
 
+        # the run's own link, which lets this pass's senders read its temporary volumes alone
+        # (Seamless Migrate SDD 6.4, 26.6)
+        - name: Set up the run's conversion host link
+          ansible.builtin.include_tasks: conversion_link.yml
+          vars:
+            import_workloads_warm_link_state: present
+            import_workloads_warm_link_volume_ids: >-
+              {{ import_workloads_warm_snapshot.volume_map.values()
+                 | map(attribute='tmp_volume_id') | list }}
+          when: os_migrate_conversion_link_per_run | bool
+
         - name: Synchronise the snapshot into the destination volumes
           os_migrate.os_migrate.import_workload_warm_sync:
             cloud: dst
@@ -101,7 +116,16 @@
             log_file: "{{ import_workloads_warm_prelim.log_file }}"
             state_file: "{{ import_workloads_warm_prelim.state_file }}"
             timeout: "{{ os_migrate_timeout }}"
+            # the run's own link, else upstream's static one (SDD 6.4, 26.6)
+            link: "{{ import_workloads_warm_link or omit }}"
           register: import_workloads_warm_sync
+
+        - name: Remove the run's conversion host link
+          ansible.builtin.include_tasks: conversion_link.yml
+          vars:
+            import_workloads_warm_link_state: absent
+            import_workloads_warm_link_given: "{{ import_workloads_warm_link }}"
+          when: os_migrate_conversion_link_per_run | bool
 
         - name: Remove the temporary snapshot
           os_migrate.os_migrate.import_workload_warm_snapshot:
@@ -133,6 +157,17 @@
     - name: Remember why the pre-copy failed
       ansible.builtin.set_fact:
         import_workloads_warm_error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+
+    # whether or not it came up: without one, every entry of the workload goes (SDD 26.6)
+    - name: Remove the run's conversion host link after the failure
+      ansible.builtin.include_tasks: conversion_link.yml
+      vars:
+        import_workloads_warm_link_state: absent
+        import_workloads_warm_link_given: "{{ import_workloads_warm_link | default({}) }}"
+        import_workloads_warm_link_best_effort: true
+      when:
+        - os_migrate_conversion_link_per_run | bool
+        - import_workloads_warm_proceed | default(false) | bool
 
     - name: Remove the temporary snapshot after the failure
       os_migrate.os_migrate.import_workload_warm_snapshot:

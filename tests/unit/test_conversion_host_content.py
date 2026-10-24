@@ -179,3 +179,59 @@ def test_the_role_fails_on_an_os_it_cannot_set_up_before_it_installs_anything(tm
     assert "The conversion host runs Debian 12" in run.stdout, run.stdout
     assert "Ubuntu 24.04 or later" in run.stdout, run.stdout
     assert "Install content" not in run.stdout, run.stdout
+
+
+def _rendered(task, host, os_family="RedHat"):
+    loader = DataLoader()
+    facts = {"inventory_hostname": host, "ansible_os_family": os_family}
+    return Templar(loader=loader, variables=facts).template(trust_as_template(task))
+
+
+def test_the_content_install_allows_local_forwarding_only_on_a_source_host(tmp_path):
+    """SDD 26.6 (plan task ST6): with each run's own link, the content install sets the source
+    host's sshd to forward local ports only - a key's port-forwarding would allow remote forwards
+    too, which permitlisten cannot forbid -, the destination host's to forward none, and tunnels
+    off on both (restrict covers tunnels only since OpenSSH 10.6). Its lines go first in
+    sshd_config, before any Include, since sshd keeps an option's first value; sshd checks the
+    file before it replaces it and reloads. Upstream's install, without the variable, leaves sshd
+    as it is."""
+    tasks = _main_tasks()
+    [include] = [t for t in tasks if t.get("ansible.builtin.include_tasks") == "sshd_link.yml"]
+    assert include["when"] == "os_migrate_conversion_link_per_run | default(false) | bool"
+    position = tasks.index(include)
+    assert position > [i for i, t in enumerate(tasks)
+                       if t.get("ansible.builtin.include_tasks") == "{{ os_migrate_conversion_host_content_tasks }}"][0]
+    edit, reload = _load("tasks", "sshd_link.yml")
+    settings = edit["ansible.builtin.blockinfile"]
+    assert settings["path"] == "/etc/ssh/sshd_config"
+    assert settings["insertbefore"] == "BOF"
+    assert settings["validate"] == "/usr/sbin/sshd -t -f %s"
+    blocks = {host: _rendered(settings["block"], host)
+              for host in ("os_migrate_conv_src", "os_migrate_conv_dst")}
+    assert blocks["os_migrate_conv_src"].split("\n")[:2] == ["AllowTcpForwarding local", "PermitTunnel no"]
+    assert blocks["os_migrate_conv_dst"].split("\n")[:2] == ["AllowTcpForwarding no", "PermitTunnel no"]
+    service = reload["ansible.builtin.service"]
+    assert service["state"] == "reloaded"
+    assert _rendered(service["name"], "x", "Debian") == "ssh"
+    assert _rendered(service["name"], "x", "RedHat") == "sshd"
+    assert reload["when"] == "conversion_host_content_sshd is changed"
+
+    # a real sshd reads the first value: the block first wins over an image's drop-in
+    sshd = next((p for p in ("/usr/sbin/sshd", "/usr/local/sbin/sshd") if os.access(p, os.X_OK)), None)
+    if sshd is None:
+        return
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "host")],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+    (tmp_path / "conf.d").mkdir()
+    (tmp_path / "conf.d" / "50-image.conf").write_text("AllowTcpForwarding yes\nPermitTunnel yes\n")
+    config = tmp_path / "sshd_config"
+    config.write_text(blocks["os_migrate_conv_src"] + "\nInclude %s/*.conf\nHostKey %s\n"
+                      "UsePAM no\n" % (tmp_path / "conf.d", tmp_path / "host"))
+    effective = subprocess.run([sshd, "-T", "-f", str(config)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, check=False)
+    if effective.returncode != 0 and "Include" in effective.stderr:
+        pytest.skip("this sshd reads no Include: %s" % effective.stderr.strip())
+    assert effective.returncode == 0, effective.stderr
+    lines = effective.stdout.splitlines()
+    assert "allowtcpforwarding local" in lines and "permittunnel no" in lines

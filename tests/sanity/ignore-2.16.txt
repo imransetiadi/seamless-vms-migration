@@ -41,6 +41,7 @@ plugins/modules/import_workload_src_check.py validate-modules:missing-gplv3-lice
 plugins/modules/import_workload_src_cleanup.py validate-modules:missing-gplv3-license
 plugins/modules/import_workload_transfer_volumes.py validate-modules:missing-gplv3-license
 plugins/modules/import_workload_warm_snapshot.py validate-modules:missing-gplv3-license
+plugins/modules/conversion_host_link.py validate-modules:missing-gplv3-license
 plugins/modules/import_workload_warm_sync.py validate-modules:missing-gplv3-license
 plugins/modules/os_conversion_host_info.py validate-modules:missing-gplv3-license
 plugins/modules/os_keypairs_info.py validate-modules:missing-gplv3-license

@@ -12,6 +12,7 @@ __metaclass__ = type
 import io
 import itertools
 import json
+import shlex
 import re
 import subprocess
 
@@ -624,6 +625,9 @@ class FakeShell:
 
     def cmd_out(self, command, **kwargs):
         self.commands.append(list(command))
+        if command[:2] == ["mktemp", "-d"]:
+            # as mktemp: the template's X's made random, here the same on every call
+            return shlex.split(command[2])[0].replace("XXXXXXXXXX", "Rnd0Ab12Cd")
         if command[:3] == ["sudo", "rm", "-vf"]:  # use_lock releases its lock
             self.cloud.held_locks.get(self.address, set()).discard(command[3])
         if command and command[0] == "lsblk":

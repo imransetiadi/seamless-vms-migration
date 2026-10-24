@@ -687,3 +687,32 @@ This project follows a simple changelog to satisfy collection metadata validatio
   each server task the role writes ``conversion/hosts.json`` in the data
   directory: the servers it created and those it found, each with its side's
   inventory name and its Nova server id, and no key material.
+- A run's own conversion host link (Seamless Migrate SDD 6.2, 6.4-6.6, 26.6,
+  plan task ST6): with ``os_migrate_conversion_link_per_run``, each cold
+  import, warm pre-copy and warm cutover makes its own link from the
+  destination conversion host to the source conversion host with the new
+  ``conversion_host_link`` module and removes it when it ends, also after a
+  failure. Its ed25519 key is made on the destination host and never leaves
+  it; the source user's ``authorized_keys`` holds it under ``restrict``, a
+  forced command that runs blocksync's new ``gate``, the address the source
+  host saw for the destination host's probe as ``from=``, an ``expiry-time``
+  (``os_migrate_conversion_link_expiry_s``, 7 days by default) and, for a cold
+  run, ``permitopen="127.0.0.1:<port>"`` for its exports alone. The gate
+  answers the probe and runs the warm sync's ``send`` of the run's temporary
+  volumes without a shell; it refuses anything else. The cutovers set the
+  link up and probe it before they stop the source. A new link first removes
+  the workload's earlier entries, every expired one and the static link of
+  ``deploy_conversion_hosts.yml`` (the ``CONVERSION LINK KEY`` block, and the
+  destination's ``~/.ssh/id_rsa`` when it holds the plan's link key). The
+  cold forward names ``127.0.0.1``; ``import_workload_transfer_volumes`` and
+  ``import_workload_warm_sync`` take the ``link``, and given
+  ``ssh_known_hosts`` check the source host's key against the link's pin on
+  the destination host. ``conversion_host_content`` then sets sshd's
+  ``AllowTcpForwarding`` (``local`` on the source host, ``no`` on the
+  destination host) and ``PermitTunnel no``. Without the variable, every role
+  and module behaves as before.
+- The warm sync's copies of blocksync (Seamless Migrate SDD 6.4, R-02): each
+  goes into a private directory ``mktemp -d`` makes,
+  ``/tmp/seamless-blocksync-<transfer uuid>.XXXXXXXXXX/blocksync.py``, and its
+  SHA-256 is checked before ``sudo python3`` runs it, on both hosts; the
+  cleanup removes the directories and the single file earlier versions left.
