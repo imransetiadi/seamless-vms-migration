@@ -716,3 +716,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``/tmp/seamless-blocksync-<transfer uuid>.XXXXXXXXXX/blocksync.py``, and its
   SHA-256 is checked before ``sudo python3`` runs it, on both hosts; the
   cleanup removes the directories and the single file earlier versions left.
+- blocksync protocol v2 and the extent check (Seamless Migrate SDD 6.2, 28.5,
+  plan task CE2): ``send --extents FILE --extents-mode read|check`` takes the
+  JSON ``[offset, length]`` pairs that changed since the base pass and lists
+  each chunk they touch. ``read`` speaks protocol v2: the HELLO lists those
+  chunks, both sides read and digest them alone, every frame must be for a
+  listed chunk, and the end frame's manifest covers each listed chunk's index
+  and digest; ``bytes_scanned`` counts the listed chunks, and
+  ``--assume-zero`` is refused with it. ``check`` stays protocol v1 and scans
+  in full, and the summary adds ``extent_chunks`` and ``missed_chunks``, the
+  changed chunks the extents did not list. The receiver accepts versions 1
+  and 2. A malformed, negative, empty or out-of-range extent exits 2.
