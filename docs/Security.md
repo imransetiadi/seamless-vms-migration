@@ -367,7 +367,8 @@ Baseline: `RemoteShell._default_options` (`plugins/module_utils/volume_common.py
 sets `ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'` for the Ansible connection. With `no`, a first
 connection to an impostor succeeds silently and a changed key only produces a warning. Conversion hosts are
 created for the migration, so there is no pre-existing `known_hosts` entry to compare with. The `AnsibleExecutor`
-sets `ANSIBLE_HOST_KEY_CHECKING` for every run from `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (default `false`) and logs
+sets `ANSIBLE_HOST_KEY_CHECKING` for every run from `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (default `true` since SDD §26's
+plan task ST7, which pinned every hop; `false` keeps 0.4.0's options and validation warns, `CONV_HOST_KEYS_UNCHECKED`) and logs
 a warning once per run while it is off: the control plane's own environment no longer decides it, so an exported
 `ANSIBLE_HOST_KEY_CHECKING=True` changes nothing (SDD §15.1, D8). The setting reaches only the conversion host of a
 VMware migration: the OpenStack conversion hosts' inventory passes `-o StrictHostKeyChecking=no` itself, which OpenSSH
@@ -776,9 +777,10 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
 - [ ] Separate tokens per person/automation; `viewer` for application owners; `admin` only for provider setup.
 - [ ] `verify_tls: true` for every provider; CA bundles configured; no `verify: false` in `clouds.yaml`.
 - [ ] Keystone **application credentials** (project-scoped) instead of passwords; admin credentials only where handover requires them.
-- [ ] `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING=true` once the conversion hosts' keys are known (SEC-02, §6.3); an exported
-      `ANSIBLE_HOST_KEY_CHECKING` is ignored. Today it checks only a VMware migration's conversion host: the OpenStack
-      hops stay unchecked until SEC-02 lands.
+- [ ] `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING=true` - the default since SDD §26's plan task ST7 - with each conversion host's
+      key declared or pinned (SEC-02, §6.3; validation blocks a host without one, `CONV_HOST_KEY_UNKNOWN`); an exported
+      `ANSIBLE_HOST_KEY_CHECKING` is ignored. The rest of this section, as the code had it before SDD §26, follows with
+      plan task ST8.
 - [ ] `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` stays `false` unless the tenants agreed that console excerpts may go
       to a remote Jev provider (SDD §13.4; `GET /advisor/data-sent` lists what each decision sends).
 
