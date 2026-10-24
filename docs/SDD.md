@@ -967,6 +967,7 @@ file **and** executable as a script (`python3 blocksync.py …`). Hash: BLAKE2b 
 
 ```text
 blocksync.py send    --device PATH [--chunk-size N] [--workers W] [--expect-serial ID]
+                     [--extents FILE --extents-mode read|check]
     stdin: manifest from receiver; stdout: frames; stderr: logs
 blocksync.py receive --device PATH [--chunk-size N] [--workers W] [--assume-zero]
                      [--progress-interval S] [--expect-serial ID] -- SENDER_COMMAND [ARGS...]
@@ -1010,6 +1011,29 @@ the path between the check and the use; a disk taken away after the open fails t
 
 The last chunk may be short (`length = source_size - offset`). `--workers` controls bounded,
 in-order read-ahead hashing threads on each side (hashlib releases the GIL).
+
+**Extents** (§28.5, plan task CE2). `send --extents FILE --extents-mode read|check` takes the extents that changed on
+the source since the base pass: `FILE` is a JSON list of `[offset, length]` byte pairs, as the extent query returns
+them (§6.4). The sender sorts and merges them and lists, once and in order, each chunk an extent touches - chunk
+`offset // chunk_size` to `(offset + length - 1) // chunk_size`. A file that is not JSON, not a list of pairs of
+integers (a boolean is none), or an extent that is negative, empty (length `0`) or ends beyond the source exits `2`
+before the HELLO; so do `--extents` and `--extents-mode` one without the other. The receiver takes either protocol from
+the HELLO's version; there is no receiver option.
+* **`read`: protocol v2.** HELLO `b"SMBS"`, `u8 version=2`, `u32 chunk_size`, `u64 source_size`, `u64 n`, then `n`
+  `u64` chunk indexes. The receiver checks the chunk size and the destination's size as in v1, then the list: at most
+  the source's chunk count, strictly increasing, each within the source - else exit `3` before it reads a chunk. It
+  streams the digests of the listed chunks alone, in order, reading no other chunk; the sender reads only those too.
+  Frames are v1's; each must be for a listed chunk (else exit `3`, "chunk N is not listed in the HELLO"), after its
+  digest, in increasing order. The end frame is v1's with `chunks = n` and a manifest over each listed chunk's index
+  (`u64`, big-endian) followed by its digest, in order (`blocksync.extent_manifest`); the receiver recomputes it from
+  its digests and the frames it applied. The summary's `chunks` is `n` and `bytes_scanned` the listed chunks' bytes;
+  progress counts those bytes. `--assume-zero` is refused with a v2 HELLO (exit `2`): the pass relies on reading the
+  listed chunks of the destination. A v1 receiver refuses version 2 (exit `3`).
+* **`check`: protocol v1** on the wire and a full scan, which copies what a plain pass copies. The sender also counts
+  the chunks whose digests differed that the extents do not list, and before its end frame writes on stderr
+  `{"event":"extent_check","extent_chunks":int,"missed_chunks":int}` - the listed chunks and those misses -, which the
+  receiver keeps out of its own stderr and adds to its summary as `extent_chunks` and `missed_chunks`. A pass without
+  `check` has neither key.
 
 ### 6.3 Warm state file
 
