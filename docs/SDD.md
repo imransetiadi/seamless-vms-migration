@@ -975,6 +975,8 @@ blocksync.py receive --device PATH [--chunk-size N] [--workers W] [--assume-zero
     stdout (last line): JSON summary {"ok":true,"chunks":int,"chunks_changed":int,
     "bytes_scanned":int,"bytes_changed":int,"bytes_transferred":int,"duration_s":float}
 blocksync.py hash    --device PATH [--chunk-size N]      prints manifest digest (hex) + size
+blocksync.py gate    --python PYTHON [--volume ID ...]   a run's link key's forced command (below)
+    reads SSH_ORIGINAL_COMMAND and SSH_CONNECTION; stdout: the probe's answer; stderr: a refusal
 ```
 
 Exit codes: `0` ok, `2` usage/IO error, `3` protocol or verification error, `4` destination
@@ -990,6 +992,22 @@ sender and the destination volume's id to the receiver: the kernel gives a freed
 attached, and a path another volume took between the attach and the open would otherwise be read, or written into
 (the hazard of review RV12-03 on the warm path). The check reads the opened descriptor's device, so nothing can take
 the path between the check and the use; a disk taken away after the open fails the transfer's I/O.
+
+**The gate** (§26.6, plan task ST6). `gate` is the forced command of a run's link key on the source conversion host
+(§6.4 "The link"): it runs as the source host's user and reads the command the link asked for,
+`SSH_ORIGINAL_COMMAND`, split as a POSIX shell splits it. It admits two:
+* `probe`: it prints the client address of `SSH_CONNECTION` (its first field) and exits `0` - the destination host's
+  address as the source host sees it;
+* exactly `sudo -n <PYTHON> <its own path> send --device <path> --chunk-size <n> --workers <n> --expect-serial <id>`,
+  in that order, where `<PYTHON>` is `--python`'s, `<id>` one of the `--volume`s - the run's temporary volumes -,
+  `<n>` a chunk size and a worker count `send` accepts, and `<path>` an absolute path whose block device shows a
+  virtio serial that is a prefix of `<id>` (read through `/sys/dev/block/<major>:<minor>/serial`, as above). It then
+  execs `sudo` with those words, rebuilt from the values it checked, never through a shell.
+
+It refuses everything else - a session without a command (a shell), an empty one, a copy (`scp`'s command, `sftp`'s
+subsystem), any other command or interpreter or script, `receive` and `hash`, a send without `--expect-serial`, with
+other options or words, of a volume that is not the run's, or of a disk that shows another volume's serial or none -
+with one line on stderr, `seamless-link gate refused: <what>`, and exit `2`, having run nothing.
 
 **Wire protocol v1** (all integers big-endian):
 
@@ -1068,7 +1086,8 @@ existed (Seamless 0.1.0) has no file.
 | Module | Cloud | Purpose |
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
-| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts - each copy in a private directory, its SHA-256 checked before sudo runs it ("The helper script" below) -, run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding; with `link`, the run's own link, below, whose script the source host runs and which gets no copy), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `conversion_host_link` | src, dst (conversion hosts) | A run's own link from the dst to the src conversion host (§26.6, plan task ST6; "The link" below): `state: present` makes it - first removing the workload's earlier entries, every expired one and 0.4.0's static link -, or, given `link`, writes the run's `volume_ids` or `ports` into its entry; `state: absent` removes it, or without `link` every entry of the workload. Returns `link`. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; when the state file records no server, or the server it records is gone - deleted since, while a re-run's create whose answer was lost left the earlier id recorded (review RV4-04) - the single server named like the workload that holds one of the recorded volumes, attached through Nova and not to the destination conversion host: built from them, it is the migration's own even when Nova's answer to its create was lost, while a same-named server holding none of them is another one and is kept - review RV3-06; several such servers are an error) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and empties the warm state: the file stays, holding no volume, pass or server (`state_cleared`), as the sign that the workload's migration recorded it (§6.3), and a pending source snapshot's record stays for its cleanup; with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
@@ -1113,6 +1132,64 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 `transfer_uuid`, `log_file`, `state_file`, `timeout`) plus `state_dir`, `chunk_size`
 (default 4194304), `workers` (default 4).
 
+**The link** (§26.6, plan task ST6). `conversion_host_link` (`plugins/module_utils/conversion_link.py`) runs on the
+control plane and reaches both conversion hosts as every module does (`ssh_key_path`, each side's user, given
+`ssh_known_hosts` each host pinned, §6.6). Its options: `state` (`present`, `absent`), `src_conversion_host` and
+`dst_conversion_host` (as `os_conversion_host_info` reports them: `id`, `address`), `ssh_key_path`, `src_ssh_user`,
+`dst_ssh_user`, `ssh_known_hosts`, `workload` (the workload's source server id), `link` (what an earlier `present`
+returned), `volume_ids`, `ports`, `expiry_s` (default 604800), `python_interpreter` (default `python3`),
+`old_link_key_path` and `src_authorized_keys` (default `~/.ssh/authorized_keys`, for a source host whose sshd reads
+another file). A new link, in this order:
+1. **Leftovers.** On the source host the workload's earlier entries, every expired entry and 0.4.0's block between
+   `# BEGIN CONVERSION LINK KEY` and `# END CONVERSION LINK KEY` are removed, with the link directories of the runs
+   those entries name on both hosts; on the destination host `~/.ssh/id_rsa` is removed when `ssh-keygen -y` reads
+   from it the public key of `old_link_key_path`'s `.pub` - the plan's 0.4.0 link key -, and kept otherwise.
+2. **The key**, made on the destination host in a directory `mktemp -d /tmp/seamless-link-<run>.XXXXXXXXXX` (0700;
+   `<run>` 32 hex digits, new for each link) with `ssh-keygen -q -t ed25519 -N ''`: `key`, `key.pub`. Its private
+   half never leaves that host: the module reads `key.pub` alone. Given `ssh_known_hosts`, the run file's lines that
+   pin the source host's alias go beside it as `known_hosts` (0600) - the link's pin.
+3. **The script**, the module's blocksync, copied into a directory of the same name on the source host, its SHA-256
+   noted.
+4. **The entry**, one line in the source user's file, written by a program the source host's Python runs from its
+   standard input under an exclusive `flock` on `<file>.seamless-lock`: it drops the run's entry, the workload's and
+   the expired ones and the old block, adds the new line, and replaces the file with a 0600 temporary file renamed
+   over it. The line: `restrict`, `command="<the check>; exec <python> <script> gate --python <python> [--volume
+   <id>...]"`, later `from="<address>"`, `expiry-time="<YYYYMMDDHHMM>"`, then the public key and the comment
+   `seamless-link workload=<server id> run=<run>`. `<the check>` is `echo '<sha256>  <script>' | sha256sum -c -
+   >/dev/null 2>&1 || { echo 'seamless-link gate refused: <script> does not match its SHA-256' >&2; exit 2; }`: no
+   Python runs a changed script (R-02). The expiry is written by the source host's clock, `expiry_s` from now rounded
+   up to the minute, in its system time zone (the program clears `TZ`), with no `Z`: OpenSSH reads a `Z` suffix only
+   since 9.1, and the RHEL 8 family's 8.0 would ignore the line.
+5. **The probe**, from the destination host: `ssh <the link's preamble> <src user>@<src address> probe`. The gate's
+   answer must be an IP address; ssh's refusal of the source host's key raises `HostKeyRefused` for the source host
+   (§6.6), a denied login or the gate's refusal `LinkRefused`, anything else a transient failure.
+6. **`from=`**: the entry is written again with the probe's answer.
+
+`present` with `link` writes the entry again with `link`'s `from` and expiry and the given `volume_ids` (a warm run's
+temporary volumes: `--volume` each) or `ports` (a cold run's export ports on the source host, sorted, each once:
+`port-forwarding` and `permitopen="127.0.0.1:<port>"` each); an entry without ports forwards nothing. `absent` stops
+the senders the gate started (`sudo pkill -f`, the script's path the pattern), removes the run's entry and both
+directories, trying each step and raising the first failure; without `link`, the workload's every entry and their
+runs' directories. A new link that fails at any step is removed - entry, directories - before the module fails, with
+the refusal's or the error's message and no traceback. The result, `link`: `id`, `workload`, `python`, `dst_dir`,
+`key` (its path), `public_key`, `known_hosts` (its path, or null), `src_dir`, `script`, `sha256`, `expires`, `from`,
+`volume_ids`, `ports` - no private key.
+
+`import_workload_transfer_volumes` and `import_workload_warm_sync` take `link`, unset by default. With it, the hop from
+the destination host to the source host - the cold transfer's forward, the warm sync's senders - logs in with the
+link's key and, given `ssh_known_hosts`, checks the source host's key against the link's `known_hosts` (§6.6); the
+forward names `127.0.0.1` (`-L <port>:127.0.0.1:<export port>`), which its entry's `permitopen` names as written; the
+warm sync copies no blocksync to the source host, asks the gate for each disk's send exactly as above, and at its end
+stops the senders the gate started and leaves the script to the link's removal. Without it, the hop is upstream's.
+
+**The helper script** (R-02, Security.md C3-07; plan task ST6, owner decision 10 of §26.10). The warm sync copies
+blocksync on each host into a directory `mktemp -d /tmp/seamless-blocksync-{transfer_uuid}.XXXXXXXXXX` (0700, a name
+no other user can make first) as `blocksync.py`, and every `sudo python3` of a copy runs after the copy's SHA-256 check,
+in the same shell: the receiver's command on the destination host, and - without a link - the sender's on the source
+host, each `echo '<sha256>  <script>' | sha256sum -c - >/dev/null 2>&1 || { echo 'blocksync: error: <script> does not
+match its SHA-256' >&2; exit 2; };` before it. A pass's cleanup removes `/tmp/seamless-blocksync-{transfer_uuid}.*`,
+which also takes the single file an earlier version left there.
+
 **`ssh_known_hosts`** (§26.4, plan task ST3). Every module that reaches a conversion host over SSH takes it, a path,
 unset by default: `import_workload_warm_snapshot` and `import_workload_warm_sync` above (`import_workload_rollback`
 reaches none), the cold path's `import_workload_export_volumes`, `import_workload_transfer_volumes`,
@@ -1133,8 +1210,8 @@ environment block as `import_workloads.yml`):
 
 | Playbook | Behavior per filtered workload |
 |---|---|
-| `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent |
-| `playbooks/import_workloads_cutover.yml` | wait while a stop of the source runs (below) → stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` with `finish_only: true` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery. With `finish_only` the module itself never creates a server: a recorded one that vanished between the role's lookup and the call fails it the same way, where a create would build a server without the synchronised volumes (the call passes an empty block device mapping: an image-booted VM boots from its image) and record it as the destination (audit A-07). Without it (the first create, the cold import) a recorded server that is gone is replaced by the one the call creates from the block device mapping it got. A recorded server an operator renamed is finished like any other: a refusal would fail the cutover after the source stopped, and the automatic rollback (§8, `plan.verification.auto_rollback`, on by default) would then delete that very server - the one the rename set aside - with the recorded volumes, from which no fresh server can be built while it holds them (lead 8) |
+| `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent; with `os_migrate_conversion_link_per_run`, the run's link (§6.4) made, with the temporary volumes, between the snapshot and the sync and removed after the sync |
+| `playbooks/import_workloads_cutover.yml` | with `os_migrate_conversion_link_per_run`, the run's link made and probed before anything below (§26.5: a refusal ends the cutover with the source running), given the temporary volumes after the snapshot, and removed after the final pass → wait while a stop of the source runs (below) → stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` with `finish_only: true` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery. With `finish_only` the module itself never creates a server: a recorded one that vanished between the role's lookup and the call fails it the same way, where a create would build a server without the synchronised volumes (the call passes an empty block device mapping: an image-booted VM boots from its image) and record it as the destination (audit A-07). Without it (the first create, the cold import) a recorded server that is gone is replaced by the one the call creates from the block device mapping it got. A recorded server an operator renamed is finished like any other: a refusal would fail the cutover after the source stopped, and the automatic rollback (§8, `plan.verification.auto_rollback`, on by default) would then delete that very server - the one the rename set aside - with the recorded volumes, from which no fresh server can be built while it holds them (lead 8) |
 | `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and empty the warm state (the file stays, §6.3) — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server once no stop of it runs (below), unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
 
 Every stop and start of a source server - the warm cutover's stop, the cold import's (`import_workloads.yml` with
@@ -1170,6 +1247,8 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
 | `os_migrate_source_stop_poll_s` | `5` | — (seconds between the reads of the wait above; the cold role takes the same default) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
+| `os_migrate_conversion_link_per_run` | `false` | — (each run makes its own link, §6.4; the cold role's default too) |
+| `os_migrate_conversion_link_expiry_s` | `604800` | `expiry_s` of `conversion_host_link` (the cold role's default too) |
 
 Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
 its OS. `os_migrate_conversion_host_content_tasks` (role vars, a Jinja expression of the gathered facts) names the task
@@ -1182,7 +1261,20 @@ file:
 | Ubuntu 24.04 or later | `ubuntu.yml` | with apt (the package lists refreshed): `qemu-utils`, `nbdkit`, `libnbd-bin` (nbdcopy), `libguestfs-tools` |
 
 Any other OS fails the role with a message that names it and the supported ones, where it used to install nothing and
-the transfer then failed for want of nbdkit. An Ubuntu cloud image logs in as `ubuntu`: the provider's
+the transfer then failed for want of nbdkit.
+
+**The runs' links** (§26.6, plan task ST6). With `os_migrate_conversion_link_per_run`, the warm role's
+`conversion_link.yml` - which the cold role `import_workloads` includes too - runs `conversion_host_link` for the
+workload of the loop: `import_workloads_warm_link_state` `present` or `absent`, the link kept in `import_workloads_warm_link`,
+reset for each workload. The cold import makes and probes the link before its stop, gives it the export's ports once
+the export claimed them, passes it to the transfer as `link`, and removes it after the source cleanup; the warm
+pre-copy and cutover as the table above says, passing it to the warm sync as `link`. Each rescue removes it - the
+link, or with none every entry of the workload - and that removal never fails the rescue. A run whose workload needs
+no source conversion host (the nbdkit direct mode, no data copy) makes none. Without the variable the roles behave as
+upstream's. `conversion_host_content` then also writes, first in `/etc/ssh/sshd_config` (before any `Include`: sshd
+keeps an option's first value) and checked with `sshd -t`, `AllowTcpForwarding local` on the source host
+(`os_migrate_conv_src`; a key's `port-forwarding` allows remote forwards too) or `no` on the destination host, and
+`PermitTunnel no`, and reloads sshd (`ssh` on Ubuntu). An Ubuntu cloud image logs in as `ubuntu`: the provider's
 `conversion_host.ssh_user` (default `cloud-user`, §4.2) names it.
 
 Each conversion host is reached as its own provider's user, so a RHEL source host (`cloud-user`) works with an Ubuntu
@@ -1558,7 +1650,10 @@ the algorithms of the keys the file pins under the alias - an entry hashed for t
 once, in the file's order: an RSA key's are `rsa-sha2-512,rsa-sha2-256`, and a file that pins no key under the alias,
 or cannot be read, gets no `HostKeyAlgorithms`. The alias keeps the check off the address: a floating IP that moves
 changes nothing. Without `ssh_known_hosts` the options are upstream's. The link's preamble, which runs on the
-destination host (the cold transfer's forward, the warm sync's sender), keeps them until plan task ST6 pins it (§26.6).
+destination host (the cold transfer's forward, the warm sync's sender), is pinned with a run's link (§6.4 "The link",
+plan task ST6): `-i <the link's key>` and, given `ssh_known_hosts`, the options above with
+`UserKnownHostsFile=<the link's known_hosts>` on the destination host, `HostKeyAlias=os_migrate_conv_src` and the
+algorithms of the run file's source pin. Without a link it keeps upstream's options and the destination user's key.
 
 A refusal fails the module at once and for good, never as an outage: no wait of the window above, no "SSH timeout".
 With a pinned key, ssh's or scp's exit status 255 with "Host key verification failed.", "No ... host key is known for
@@ -1570,7 +1665,8 @@ offered ...)"); {pinned} is each pinned key's type and fingerprint ("not its pin
 is pinned for it" for none). The warm sync's copy of blocksync names the source host by its address alone: the module
 knows no server id for it. With `ssh_known_hosts`, a link the source host refuses - its ssh's "Permission denied" for
 the source host, or a forward "administratively prohibited" - raises `LinkRefused`: "link refused by the source
-conversion host (os_migrate_conv_src at {address}): {ssh's reason}". The cold transfer reads its forward's output each
+conversion host (os_migrate_conv_src at {address}): {ssh's reason}"; the gate's refusal of a run's link (§6.2), "its gate
+refused {what}", is one too, also without `ssh_known_hosts`. The cold transfer reads its forward's output each
 time a forwarded export does not answer, where it waited out its timeout, and the warm sync its receiver's output once
 the receiver exits. Neither message holds ssh's command line or the word "timeout" (review RV42B-02), and neither
 chains the error that would. `import_workload_export_volumes`, `import_workload_transfer_volumes` and
@@ -2019,9 +2115,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   is reached with it too (`build_inventory`). Until it exists, the runs of a plan that holds a conversion key of its
   own from an earlier version (`{data_dir}/plans/{plan_id}/osm/conversion/ssh.key`) use that one, so a migration in
   flight across the upgrade keeps reaching its hosts - after a restart a plan with no `ready` migration is not
-  pre-staged (§8) -; a pre-staging always passes the installation's path. The **link key** stays per plan
-  (`…/osm/conversion/link-ssh.key`): each pre-staging writes its plan's pair to both hosts, and the last one's stands
-  on both.
+  pre-staged (§8) -; a pre-staging always passes the installation's path. The plan's **link key** of 0.4.0
+  (`…/osm/conversion/link-ssh.key`) is no longer made nor written to the hosts: a pre-staging passes
+  `os_migrate_link_conversion_hosts: false`, and each run makes its own link ("The runs' links" below); runs still pass
+  the plan's path as `os_migrate_conversion_link_keypair_private_path`, so that the first link on a host pair removes
+  the key 0.4.0 left there (§6.4).
 
   Before a pre-staging that deploys conversion hosts, the orchestrator resolves the key
   (`seamless_migrate.conversion_key`, for an executor whose `prestage` takes `rekey_conversion_hosts`). It reads the
@@ -2098,6 +2196,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     host's address, port and user, not its alias: another run's master, unpinned or pinned to another file, would
     carry this run's connection without a check of the key. Each run so has its own, `cp` in its run directory,
     emptied before the run and removed after it, and the control plane's `ANSIBLE_SSH_CONTROL_PATH` does not reach it.
+* **The runs' links** (§26.6, plan task ST6). Every OpenStack run - pre-staging, pre-copy, sync, cutover, rollback,
+  whatever `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` says - gets `os_migrate_conversion_link_per_run: true`: each pre-copy,
+  sync and cutover makes its own link between the conversion hosts and removes it when it ends (§6.4, §6.5), and the
+  pre-staging's content install sets the hosts' sshd for it; a pre-staging also gets `os_migrate_link_conversion_hosts:
+  false`. A run gets `os_migrate_conversion_link_expiry_s`: `SEAMLESS_STEP_TIMEOUT_S` rounded up when it is set, else
+  604800 (7 days). A VMware run has no link.
 * **Hooks** (`seamless_migrate.hooks`, plan task N4, §23.3): how a catalog hook runs at a migration's point; the points
   that call it are §23.3's (plan task N5).
   * **The context document** a hook gets, never a credential: `{"migration_id", "attempt", "point", "plan_id",
