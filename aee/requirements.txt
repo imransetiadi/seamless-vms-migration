@@ -5,6 +5,6 @@
 # 4.5.1 tag carried, so it comes from PyPI again (Security.md SEC-09). It needs
 # Python 3.11 or later. The vendored openstack.cloud modules (2.6.0) no longer read
 # openstack.version, which had kept the fork's pin for 2.5.0.
-openstacksdk>=4.21.0
+openstacksdk>=4.22.0
 PyYAML==6.0.3
 jmespath>=1.1.0
