@@ -338,4 +338,22 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: 'Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.',
   },
+  CEPH_ACCESS_MISSING: {
+    severity: 'warning',
+    strategies: ['warm'],
+    remediation:
+      'Give the source provider its Ceph access (ceph: fsid, monitors, client) and its key (PUT /providers/{id}/ceph-key), and run its check so that an rbd pool of that fsid is known; or turn extent_tracking off. Every pass scans in full until then.',
+  },
+  EXTENT_TRACKING_PARTIAL: {
+    severity: 'info',
+    strategies: ['warm'],
+    remediation:
+      'Nothing stops the migration: the named disks scan in full on every pass, the others use their extents. A tracked disk is an unencrypted Cinder RBD volume of the source\'s cluster whose host the source credential can read.',
+  },
+  EXTENT_TRACKING_MISSED: {
+    severity: 'warning',
+    strategies: ['warm'],
+    remediation:
+      'Check the Ceph releases of the source\'s compute nodes and cluster for the fast-diff fixes (Ceph #61616: Pacific 16.2.14, Quincy 17.2.7, Reef 18.1.2); the disk scans in full for the rest of the migration.',
+  },
 };

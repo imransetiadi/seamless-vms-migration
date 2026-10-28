@@ -10,7 +10,17 @@ from datetime import datetime
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
-from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef, Wave
+from ..domain.models import (
+    Finding,
+    GpuDevice,
+    Mappings,
+    NicOverride,
+    Plan,
+    Provider,
+    SyncPass,
+    VMRef,
+    Wave,
+)
 from ..guest_os import identify
 from .gpu import (
     PoolKey,
@@ -220,6 +230,28 @@ class CatalogEntry:
 
 
 CATALOG: dict[str, CatalogEntry] = {
+    # extent tracking (SDD §9.3, §28.9; plan task CE9)
+    "CEPH_ACCESS_MISSING": CatalogEntry(
+        Severity.warning,
+        (S.warm,),
+        "Give the source provider its Ceph access (ceph: fsid, monitors, client) and its key "
+        "(PUT /providers/{id}/ceph-key), and run its check so that an rbd pool of that fsid is "
+        "known; or turn extent_tracking off. Every pass scans in full until then.",
+    ),
+    "EXTENT_TRACKING_PARTIAL": CatalogEntry(
+        Severity.info,
+        (S.warm,),
+        "Nothing stops the migration: the named disks scan in full on every pass, the others use "
+        "their extents. A tracked disk is an unencrypted Cinder RBD volume of the source's "
+        "cluster whose host the source credential can read.",
+    ),
+    "EXTENT_TRACKING_MISSED": CatalogEntry(
+        Severity.warning,
+        (S.warm,),
+        "Check the Ceph releases of the source's compute nodes and cluster for the fast-diff "
+        "fixes (Ceph #61616: Pacific 16.2.14, Quincy 17.2.7, Reef 18.1.2); the disk scans in "
+        "full for the rest of the migration.",
+    ),
     "SRC_VM_ERROR_STATE": CatalogEntry(
         Severity.blocker,
         (),
@@ -660,6 +692,88 @@ KIT_TWIN_REMEDIATION = (
     "after its name as it writes it, so the two would share them - in separate plans too, when "
     "they go to one destination project."
 )
+
+
+def ceph_pools(source: Provider) -> dict[str, str]:
+    """Cinder pool to Ceph pool, from the source check's ``rbd`` entries whose ``ceph_fsid`` is
+    the provider's (SDD §10, §28.4); {} without a Ceph access or a pool of its cluster."""
+    if source.ceph is None:
+        return {}
+    backends = (source.capabilities or {}).get("storage_backends") or []
+    return {
+        str(b["pool"]): str(b["ceph_pool"])
+        for b in backends
+        if isinstance(b, Mapping)
+        and b.get("family") == "rbd"
+        and b.get("ceph_fsid") == source.ceph.fsid
+        and b.get("pool")
+        and b.get("ceph_pool")
+    }
+
+
+def _extent_findings(
+    vm: VMRef, plan: Plan, source: Provider | None, sync_passes: Sequence[SyncPass] | None
+) -> list[Finding]:
+    """CEPH_ACCESS_MISSING, EXTENT_TRACKING_PARTIAL and EXTENT_TRACKING_MISSED (SDD §9.3, §28.9)
+    for a warm plan that tracks extents: the source's access, key and pool; the VM's disks that
+    do not qualify, each with why; the misses a check of the migration found."""
+    if not plan.extent_tracking or source is None or source.kind == ProviderKind.vmware:
+        return []
+    out: list[Finding] = []
+    pools = ceph_pools(source)
+    if source.ceph is None:
+        why = "no Ceph access"
+    elif source.ceph.key_updated_at is None:
+        why = "no Ceph key"
+    elif not pools:
+        why = f"no rbd pool of its cluster {source.ceph.fsid} in its check report"
+    else:
+        why = None
+    if why is not None:
+        out.append(
+            finding(
+                "CEPH_ACCESS_MISSING",
+                f"The plan tracks extents, but {source.label} has {why}: every pass of {vm.name} "
+                "scans its disks in full.",
+            )
+        )
+    else:
+        problems: list[str] = []
+        for disk in vm.disks:
+            label = disk.name or disk.id
+            if disk.kind != "volume":
+                problems.append(f"{label} is no Cinder volume ({disk.kind})")
+            elif disk.encrypted:
+                problems.append(f"{label} is encrypted")
+            elif not disk.pool:
+                problems.append(f"{label} has a host the source credential cannot read")
+            elif disk.pool not in pools:
+                problems.append(f"{label} is on {disk.pool}, no rbd pool of the cluster")
+        if problems:
+            out.append(
+                finding(
+                    "EXTENT_TRACKING_PARTIAL",
+                    f"{len(problems)} disk(s) of {vm.name} do not qualify for extent tracking and "
+                    "scan in full on every pass: " + "; ".join(problems) + ".",
+                )
+            )
+    missed = sorted(
+        {
+            dev
+            for sync_pass in sync_passes or []
+            for dev, use in sync_pass.extents.items()
+            if use.missed > 0
+        }
+    )
+    if missed:
+        out.append(
+            finding(
+                "EXTENT_TRACKING_MISSED",
+                f"A check of {vm.name} found changes outside the extents of {', '.join(missed)}: "
+                "the disk scans in full for the rest of the migration.",
+            )
+        )
+    return out
 
 
 def finding(
@@ -1641,6 +1755,7 @@ def run_preflight(
     shares: Mapping[str, QuotaShare] | None = None,
     dns_ttl: int | None = None,
     lb_pools: Mapping[str, PoolPair] | None = None,
+    sync_passes: Sequence[SyncPass] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1650,7 +1765,9 @@ def run_preflight(
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles);
     ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4);
-    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5).
+    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5);
+    ``sync_passes`` the migration's passes so far: the misses are read from their extent use
+    (§28.9).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -2202,6 +2319,8 @@ def run_preflight(
                 f"reach the old address for up to {dns_ttl} s.",
             )
         )
+    # a warm plan that tracks extents (SDD §9.3, §28.9; plan task CE9)
+    out.extend(_extent_findings(vm, plan, source, sync_passes))
     return out
 
 

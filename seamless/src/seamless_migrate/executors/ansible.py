@@ -57,6 +57,7 @@ from ..planning.networks import (
     port_refusal_at_run,
     resolve_network,
 )
+from ..planning.preflight import ceph_pools
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.host_keys import (
@@ -708,23 +709,6 @@ CEPH_CONF_FILE = "ceph.conf"
 CEPH_KEYRING_FILE = "ceph.keyring"
 #: seconds rbd may run on the source conversion host for one query (SDD §28.5)
 EXTENT_QUERY_TIMEOUT_S = 300
-
-
-def ceph_pools(source: Provider) -> dict[str, str]:
-    """Cinder pool to Ceph pool, from the source check's ``rbd`` entries whose ``ceph_fsid`` is
-    the provider's (SDD §10, §28.4); {} without a Ceph access or a pool of its cluster."""
-    if source.ceph is None:
-        return {}
-    backends = (source.capabilities or {}).get("storage_backends") or []
-    return {
-        str(b["pool"]): str(b["ceph_pool"])
-        for b in backends
-        if isinstance(b, Mapping)
-        and b.get("family") == "rbd"
-        and b.get("ceph_fsid") == source.ceph.fsid
-        and b.get("pool")
-        and b.get("ceph_pool")
-    }
 
 
 def ceph_tracking(plan: Plan, source: Provider, settings: Settings) -> dict[str, Any] | None:

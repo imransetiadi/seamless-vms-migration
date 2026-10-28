@@ -1400,6 +1400,8 @@ class Orchestrator:
                 shares=shares,
                 dns_ttl=ttls.get(vm.source_id),
                 lb_pools=lb_pairs,
+                # the misses its checks found so far (SDD §28.9)
+                sync_passes=current.sync_passes if current is not None else None,
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)

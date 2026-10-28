@@ -97,6 +97,7 @@ def check(
     shares=None,
     dns_ttl=None,
     lb_pools=None,
+    sync_passes=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -111,6 +112,7 @@ def check(
         shares=shares,
         dns_ttl=dns_ttl,
         lb_pools=lb_pools,
+        sync_passes=sync_passes,
     )
 
 
@@ -198,6 +200,10 @@ def test_catalog_is_complete():
         "NET_ADDRESS_REFUSED",
         "NET_PORT_NOT_PERMITTED",
         "MAP_NIC_OVERRIDE_INVALID",
+        # extent tracking (SDD §9.3, §28.9, plan task CE9)
+        "CEPH_ACCESS_MISSING",
+        "EXTENT_TRACKING_PARTIAL",
+        "EXTENT_TRACKING_MISSED",
         "MAP_NIC_OVERRIDE",
         "MAP_FIP_ADDRESS_CHANGE",
         "DST_FIP_ADDRESS_UNAVAILABLE",
@@ -4317,3 +4323,191 @@ def _destination(case):
         ),
         "dst_caps": {k: dest[k] for k in ("roles", "policy_profile") if k in dest} or None,
     }
+
+
+# --------------------------------------------------------------------------------------------
+# extent tracking (SDD §9.3, §28.9; plan task CE9)
+
+CEPH_FSID = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+
+
+def ceph_source(key=True, pools=True, fsid=CEPH_FSID):
+    """An OpenStack source with Ceph access, its key written, and an rbd pool of its cluster in
+    its check report."""
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.models import CephAccess
+
+    backends = [
+        {
+            "pool": "hostgroup@ceph#ceph",
+            "vendor": "Open Source",
+            "protocol": "ceph",
+            "family": "rbd",
+            "ceph_fsid": fsid if pools else "99999999-2222-4333-8444-555555555555",
+            "ceph_pool": "volumes",
+        },
+        {
+            "pool": "hostgroup@ontap#flex",
+            "vendor": "NetApp",
+            "protocol": "iSCSI",
+            "family": "netapp_block",
+        },
+    ]
+    return make_provider(
+        ceph=CephAccess(
+            fsid=CEPH_FSID,
+            monitors=["mon1.ceph.example"],
+            key_updated_at=datetime(2026, 10, 29, tzinfo=UTC) if key else None,
+        ),
+        capabilities={"storage_backends": backends},
+    )
+
+
+def tracked_vm(**kw):
+    disks = kw.pop("disks", None) or [
+        make_disk(id="vol-boot", name="vm-boot", pool="hostgroup@ceph#ceph", bootable=True),
+        make_disk(id="vol-data", name="vm-data", pool="hostgroup@ceph#ceph"),
+    ]
+    return make_vm(disks=disks, **kw)
+
+
+def test_finding_ceph_access_missing():
+    """SDD §9.3, §28.9: a warm plan that tracks extents whose source has no Ceph access, or no
+    rbd pool of its fsid in its check report, warns that every pass scans in full; a plan that
+    does not track, or a VMware source, is not judged."""
+    plan = make_plan(extent_tracking=True)
+    f = only(check(vm=tracked_vm(), plan=plan, source=SRC), "CEPH_ACCESS_MISSING")
+    assert f.severity == Severity.warning and f.strategies == [Strategy.warm]
+    assert "no Ceph access" in f.message and "scans its disks in full" in f.message
+    assert "PUT /providers/{id}/ceph-key" in f.remediation
+    other = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(pools=False)), "CEPH_ACCESS_MISSING"
+    )
+    assert f"no rbd pool of its cluster {CEPH_FSID}" in other.message
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=make_plan(), source=SRC)
+        if x.code.startswith(("CEPH", "EXTENT"))
+    ]
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware, conversion_host=None)
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=vcenter)
+        if x.code == "CEPH_ACCESS_MISSING"
+    ]
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source())
+        if x.code == "CEPH_ACCESS_MISSING"
+    ]
+
+
+def test_finding_ceph_access_missing_without_a_key():
+    """SDD §9.3: an access without its key (key_updated_at null) is as good as none."""
+    plan = make_plan(extent_tracking=True)
+    f = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(key=False)), "CEPH_ACCESS_MISSING"
+    )
+    assert "no Ceph key" in f.message
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source(key=False))
+        if x.code == "EXTENT_TRACKING_PARTIAL"
+    ]
+
+
+def test_finding_extent_tracking_partial():
+    """SDD §9.3, §28.3: with access, a VM whose disks all qualify gets no finding; one with a disk
+    that does not gets the info, warm alone."""
+    plan = make_plan(extent_tracking=True)
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source())
+        if x.code.startswith(("CEPH", "EXTENT"))
+    ]
+    vm = tracked_vm(
+        disks=[
+            make_disk(id="vol-boot", name="vm-boot", pool="hostgroup@ceph#ceph", bootable=True),
+            make_disk(id="vol-data", name="vm-data", pool="hostgroup@ceph#ceph", encrypted=True),
+        ]
+    )
+    f = only(check(vm=vm, plan=plan, source=ceph_source()), "EXTENT_TRACKING_PARTIAL")
+    assert f.severity == Severity.info and f.strategies == [Strategy.warm]
+    assert "1 disk(s) of" in f.message and "vm-data is encrypted" in f.message
+    assert "scan in full on every pass" in f.message
+
+
+def test_finding_extent_tracking_partial_names_each_disk_and_why():
+    """SDD §9.3, §28.4: each disk that does not qualify is named with its reason - not a Cinder
+    volume, encrypted, a host the credential cannot read, a pool of another backend."""
+    plan = make_plan(extent_tracking=True)
+    vm = tracked_vm(
+        disks=[
+            make_disk(id="vol-1", name="d-image", kind="image_root", pool=None),
+            make_disk(id="vol-2", name="d-enc", pool="hostgroup@ceph#ceph", encrypted=True),
+            make_disk(id="vol-3", name="d-nohost", pool=None),
+            make_disk(id="vol-4", name="d-netapp", pool="hostgroup@ontap#flex"),
+            make_disk(id="vol-5", name="d-ok", pool="hostgroup@ceph#ceph"),
+        ]
+    )
+    f = only(check(vm=vm, plan=plan, source=ceph_source()), "EXTENT_TRACKING_PARTIAL")
+    assert f.message.startswith("4 disk(s) of")
+    for part in (
+        "d-image is no Cinder volume (image_root)",
+        "d-enc is encrypted",
+        "d-nohost has a host the source credential cannot read",
+        "d-netapp is on hostgroup@ontap#flex, no rbd pool of the cluster",
+    ):
+        assert part in f.message, part
+    assert "d-ok" not in f.message
+
+
+def test_finding_extent_tracking_missed():
+    """SDD §9.3, §28.5: a checked pass of the migration that found changes outside a disk's
+    extents warns, naming the devices; passes without a miss do not."""
+    from seamless_migrate.domain.enums import SyncPassKind
+    from seamless_migrate.domain.models import ExtentUse, SyncPass, utcnow
+
+    plan = make_plan(extent_tracking=True)
+    clean = [
+        SyncPass(
+            number=1,
+            kind=SyncPassKind.full,
+            started_at=utcnow(),
+            extents={"/dev/vda": ExtentUse(mode="scanned", reason="first_pass")},
+        ),
+        SyncPass(
+            number=2,
+            kind=SyncPassKind.delta,
+            started_at=utcnow(),
+            extents={"/dev/vda": ExtentUse(mode="checked")},
+        ),
+    ]
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source(), sync_passes=clean)
+        if x.code == "EXTENT_TRACKING_MISSED"
+    ]
+    missed = clean + [
+        SyncPass(
+            number=3,
+            kind=SyncPassKind.delta,
+            started_at=utcnow(),
+            extents={
+                "/dev/vda": ExtentUse(mode="checked", missed=3),
+                "/dev/vdb": ExtentUse(mode="checked", missed=1),
+            },
+        )
+    ]
+    f = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(), sync_passes=missed),
+        "EXTENT_TRACKING_MISSED",
+    )
+    assert f.severity == Severity.warning and f.strategies == [Strategy.warm]
+    assert "outside the extents of /dev/vda, /dev/vdb" in f.message
+    assert "Ceph #61616" in f.remediation
+    # the misses are judged even while the access is gone meanwhile
+    assert only(
+        check(vm=tracked_vm(), plan=plan, source=SRC, sync_passes=missed), "EXTENT_TRACKING_MISSED"
+    )
