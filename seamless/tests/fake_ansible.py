@@ -202,6 +202,21 @@ SCRIPT = textwrap.dedent(
         (logs / (stem + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
         time.sleep(float(os.environ.get("ANSIBLE_FAKE_SLEEP", "0.3")))
 
+    def fake_extents(base, n):
+        # what ANSIBLE_FAKE_EXTENTS says the pass used of each disk's extents (SDD 28.5): JSON, or
+        # "@FILE" read at each run; a "by_pass" map answers by the pass number, "final" for the
+        # cutover's, else "default" - so a lab rehearsal scripts a whole migration's passes
+        raw = os.environ.get("ANSIBLE_FAKE_EXTENTS", "{{}}")
+        if raw.startswith("@"):
+            with open(raw[1:]) as fh:
+                raw = fh.read()
+        use = json.loads(raw)
+        if "by_pass" in use:
+            by = use["by_pass"]
+            key = "final" if base == "import_workloads_cutover.yml" else str(n)
+            return by.get(key, by.get("default", {{}}))
+        return use
+
     if base in ("import_workloads_precopy.yml", "import_workloads_cutover.yml"):
         warm = osm / "workload_warm"
         warm.mkdir(exist_ok=True)
@@ -220,7 +235,7 @@ SCRIPT = textwrap.dedent(
                 "bytes_scanned": 1000, "bytes_changed": 1000 // n,
                 "bytes_transferred": 900 // n, "duration_s": 300.0 / n,
                 # how the pass used each disk's extents, as a test says (SDD 6.3, 28.5)
-                "extents": json.loads(os.environ.get("ANSIBLE_FAKE_EXTENTS", "{{}}"))}})
+                "extents": fake_extents(base, n)}})
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))
