@@ -19,6 +19,7 @@ import { GpuPanel } from '../components/GpuPanel';
 import { MigrationActions } from '../components/MigrationActions';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { SectionNav } from '../components/SectionNav';
 import { PhaseStepper } from '../components/PhaseStepper';
 import { ProgressBar } from '../components/ProgressBar';
 import { RecommendationActions } from '../components/RecommendationActions';
@@ -95,6 +96,16 @@ function useGpuWaitAnnouncement(m: Migration | undefined): string {
   }, [id, waiting, wait, name]);
   return text;
 }
+
+const MIGRATION_SECTIONS = [
+  ['next-step', 'Actions'],
+  ['progress', 'Progress'],
+  ['network', 'Network'],
+  ['verification', 'Verification'],
+  ['findings', 'Findings'],
+  ['estimates', 'Estimates'],
+  ['timeline', 'Timeline'],
+] as const;
 
 /** "CODE: text", as `check_invariants` writes an issue (SDD §5.5). */
 function splitIssue(issue: string): { code: string | null; text: string } {
@@ -804,18 +815,20 @@ export default function MigrationDetail() {
         {gpuAnnouncement}
       </p>
 
+      <SectionNav label="Migration sections" sections={MIGRATION_SECTIONS} />
+
       <div className="flex flex-col gap-4">
         {planUnavailable && (
           <ErrorBanner error={plan.error} title="The plan of this migration is unavailable" onRetry={() => void plan.refetch()} />
         )}
         <Alerts m={m} destination={destinationName(providers.data, p)} />
 
-        <Panel title="Next step">
+        <Panel id="next-step" title="Next step">
           <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} planLoading={planLoading} />
           <DemoSourcePower key={m.id} migration={m} role={role} />
         </Panel>
 
-        <section aria-label="Lifecycle" className="card p-4">
+        <section id="progress" tabIndex={-1} aria-label="Lifecycle" className="card scroll-mt-20 p-4 outline-hidden focus:outline-2 focus:outline-ring">
           <PhaseStepper migration={m} />
         </section>
 
@@ -861,10 +874,10 @@ export default function MigrationDetail() {
           </Panel>
         )}
 
-        <Panel title="Network" description="Where each NIC goes on the destination: the plan's mapping, or this VM's override (SDD §9.3)">
+        <Panel id="network" title="Network" description="Where each NIC goes on the destination: the plan's mapping, or this VM's override (SDD §9.3)">
           <NetworkPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>
-        <Panel title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
+        <Panel id="verification" title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
           <VerificationPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>
         <p role="status" className="sr-only">
@@ -908,7 +921,7 @@ export default function MigrationDetail() {
               <VmDetails m={m} plan={p} />
             </Panel>
           </div>
-          <Panel title="Timeline" description="Phase changes and audit events, newest first">
+          <Panel id="timeline" title="Timeline" description="Phase changes and audit events, newest first">
             {history.error && <ErrorBanner error={history.error} title="Events are unavailable" onRetry={() => void history.refetch()} />}
             <Timeline history={m.phase_history} events={events} />
           </Panel>

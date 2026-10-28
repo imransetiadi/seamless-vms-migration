@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { recordScrolls } from '../test/utils';
@@ -7,6 +7,47 @@ import { ErrorBanner } from './ErrorBanner';
 describe('ErrorBanner (SDD §16)', () => {
   let recorder: ReturnType<typeof recordScrolls> | null = null;
   afterEach(() => recorder?.restore());
+
+  it('returns focus to the dialog heading after Retry succeeds inside a dialog', async () => {
+    const user = userEvent.setup({ delay: null });
+    const view = (failed: boolean) => <>
+      <main><h1>Plans</h1></main>
+      <div role="dialog" aria-labelledby="dialog-title">
+        <h2 id="dialog-title">New plan</h2>
+        {failed && <ErrorBanner error={new Error('offline')} onRetry={() => rerender(view(false))} />}
+      </div>
+    </>;
+    const { rerender } = render(view(true));
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'New plan' })).toHaveFocus());
+  });
+
+  it('does not steal focus when a background retry removes its banner', async () => {
+    const user = userEvent.setup({ delay: null });
+    const view = (failed: boolean) => <main>
+      <h1>Plans</h1>
+      <input aria-label="Search plans" />
+      {failed && <ErrorBanner error={new Error('offline')} onRetry={() => {}} />}
+    </main>;
+    const { rerender } = render(view(true));
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await user.click(screen.getByRole('textbox', { name: 'Search plans' }));
+    rerender(view(false));
+    await Promise.resolve();
+    expect(screen.getByRole('textbox', { name: 'Search plans' })).toHaveFocus();
+  });
+
+  it('leaves focus restoration to the dialog when the dialog itself closes', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { rerender } = render(<>
+      <main><h1>Plans</h1></main>
+      <div role="dialog"><h2>New plan</h2><ErrorBanner error={new Error('offline')} onRetry={() => {}} /></div>
+    </>);
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    rerender(<main><h1>Plans</h1></main>);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(document.body);
+  });
 
   it("scrolls a dialog's request failure into view when it appears and when it changes", () => {
     recorder = recordScrolls();

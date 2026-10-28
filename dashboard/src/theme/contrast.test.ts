@@ -31,12 +31,12 @@ describe('design tokens are exactly SDD §16', () => {
 
   it('light theme', () => {
     const expected: Record<string, string> = {
-      background: '#F8FAFC',
+      background: '#E8EDF3',
       foreground: '#1E293B',
-      card: '#FFFFFF',
-      muted: '#E9EFF8',
+      card: '#F1F4F8',
+      muted: '#DCE3ED',
       'muted-foreground': '#475569',
-      border: '#E2E8F0',
+      border: '#C5CFDC',
       primary: '#2563EB',
       accent: '#EA580C',
       destructive: '#DC2626',

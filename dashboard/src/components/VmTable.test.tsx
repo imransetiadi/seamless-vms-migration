@@ -165,6 +165,52 @@ describe('VmTable', () => {
     expect(screen.getByRole('checkbox', { name: 'Select all 3 matching VMs, 2 shown' })).toBeInTheDocument();
   });
 
+  it('reviews selected VMs across filters and clears the whole selection without losing focus', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onSelectedChange = vi.fn();
+    const table = (selected: Set<string>) => (
+      <VmTable vms={openstackVms} providerKind="openstack" selected={selected} onSelectedChange={onSelectedChange} pageSize={2} />
+    );
+    const { rerender } = render(table(new Set(['os-0a11', 'os-0d51', 'os-0d52'])));
+    const search = screen.getByRole('searchbox', { name: 'Search VMs' });
+    await user.click(screen.getByRole('checkbox', { name: 'Selected only' }));
+    expect(rowNames()).toEqual(['web-01', 'db-pg-01']);
+    await user.type(search, 'db-');
+    expect(rowNames()).toEqual(['db-pg-01', 'db-mysql-02']);
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByRole('checkbox', { name: 'Selected only' })).not.toBeChecked();
+    expect(onSelectedChange).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('checkbox', { name: 'Selected only' }));
+    await user.type(search, 'no-match');
+    await user.click(screen.getByRole('button', { name: 'Clear selection' }));
+    expect(onSelectedChange).toHaveBeenLastCalledWith(new Set());
+    rerender(table(new Set()));
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue('no-match');
+    expect(screen.getByRole('checkbox', { name: 'Selected only' })).not.toBeChecked();
+    expect(screen.queryByRole('button', { name: 'Clear selection' })).not.toBeInTheDocument();
+  });
+
+  it('keeps focus when deselecting removes a row or the entire selected-only table', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onSelectedChange = vi.fn();
+    const table = (selected: Set<string>) => (
+      <VmTable vms={openstackVms} providerKind="openstack" selected={selected} onSelectedChange={onSelectedChange} />
+    );
+    const { rerender } = render(table(new Set(['os-0a11', 'os-0a12'])));
+    await user.click(screen.getByRole('checkbox', { name: 'Selected only' }));
+    await user.click(screen.getByRole('checkbox', { name: 'Select web-01' }));
+    rerender(table(onSelectedChange.mock.lastCall?.[0] as Set<string>));
+    expect(screen.getByLabelText('Search VMs')).toHaveFocus();
+    expect(rowNames()).toEqual(['web-02']);
+    await user.click(screen.getByRole('checkbox', { name: 'Select all 1 shown' }));
+    rerender(table(onSelectedChange.mock.lastCall?.[0] as Set<string>));
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Search VMs')).toHaveFocus();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
   it('moves focus to the table when its last Show more button goes, never to the page (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" pageSize={2} />);

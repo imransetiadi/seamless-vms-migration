@@ -24,6 +24,48 @@ function emitPhase(server: MockServer, message: string) {
 }
 
 describe('Events page', () => {
+  it('returns focus to Search events when filters hide the list and the last older page removes its button', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 500; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: {} });
+    }
+    renderWithApp(<Events />, { route: '/events', server });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    const search = screen.getByLabelText('Search events');
+    await user.type(search, 'no-matching-event');
+    await user.click(screen.getByRole('button', { name: 'Load older events' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Load older events' })).not.toBeInTheDocument());
+    await waitFor(() => expect(search).toHaveFocus());
+  });
+
+  it('keeps focus on Search events when the final older request completes after the user moved there', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 500; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: {} });
+    }
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    renderWithApp(<Events />, {
+      route: '/events', server,
+      wrapFetch: (mock) => async (input, init) => {
+        if (new URL(String(input), 'http://localhost').searchParams.has('before')) await pending;
+        return mock(input, init);
+      },
+    });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    const search = screen.getByLabelText('Search events');
+    await user.type(search, 'policy edit 1');
+    await user.click(screen.getByRole('button', { name: 'Load older events' }));
+    await user.clear(search);
+    await user.type(search, 'policy edit 2');
+    release();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Load older events' })).not.toBeInTheDocument());
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    expect(search).toHaveFocus();
+  });
+
   it('says the plans are unavailable when the plan filter cannot list them (SDD §16)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
@@ -205,6 +247,26 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'all');
     await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'legacy-rhel6-app');
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
+  });
+
+  it('clears search, category, plan and progress filters without resuming paused updates', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Events />, { route: '/events?plan=plan-4f2a9c1e', token: 'viewer', live: true });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    await user.click(screen.getByRole('button', { name: 'Pause live updates' }));
+    await user.selectOptions(screen.getByLabelText('Category'), 'security');
+    await user.click(screen.getByLabelText('Show progress updates'));
+    await user.type(screen.getByLabelText('Search events'), 'no-match');
+    expect(screen.getByText('No events match')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByLabelText('Search events')).toHaveValue('');
+    expect(screen.getByLabelText('Search events')).toHaveFocus();
+    expect(screen.getByLabelText('Category')).toHaveValue('all');
+    expect(screen.getByLabelText('Plan')).toHaveValue('');
+    expect(screen.getByLabelText('Show progress updates')).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Resume live updates' })).toBeInTheDocument();
+    await screen.findByRole('list', { name: /events, newest first/i });
+    expect(screen.queryByRole('button', { name: 'Clear filters' })).not.toBeInTheDocument();
   });
 
   it('files a prune of the audit trail under Security (SDD §4.3, §15)', async () => {

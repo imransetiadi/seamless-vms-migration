@@ -25,7 +25,7 @@ import { useHealth, useMe, useStats } from '../api/hooks';
 import { useLiveSnapshot, type LiveStatus } from '../api/live';
 import { useSignOut } from '../api/session';
 import { cn } from '../lib/cn';
-import { keepsFocus } from '../lib/navigation';
+import { hashTarget, keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
 import { BrandMark } from './BrandMark';
 import { BRAND_DESTINATIONS } from '../lib/platforms';
@@ -442,7 +442,7 @@ export function Layout() {
     // a control that switches the view in place (the inventory's Provider select) keeps the focus: moving it on
     // each choice would be a change of context on input (WCAG 3.2.2, SDD §16)
     if (keepsFocus(state)) return;
-    const target = hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
+    const target = hashTarget(hash);
     if (target && document.activeElement === target) return;
     if (!drawerWasOpen) mainRef.current?.focus({ preventScroll: true });
     window.scrollTo(0, 0);

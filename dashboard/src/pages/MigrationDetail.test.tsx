@@ -1442,6 +1442,18 @@ describe('MigrationDetail', () => {
     expect(within(again).queryByText(/^DNS tail/)).not.toBeInTheDocument();
   });
 
+  it('offers keyboard-friendly section jumps on long migration pages', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    await screen.findByRole('heading', { level: 1, name: 'analytics-db' });
+    const nav = screen.getByRole('navigation', { name: 'Migration sections' });
+    expect(within(nav).getByRole('link', { name: 'Network' })).toHaveAttribute('href', '#network');
+    expect(within(nav).getByRole('link', { name: 'Timeline' })).toHaveAttribute('href', '#timeline');
+    expect(document.getElementById('network')).toHaveAttribute('tabindex', '-1');
+    expect(document.getElementById('timeline')).toHaveAttribute('tabindex', '-1');
+  });
+
   it('shows no demo power control outside demo mode', async () => {
     const server = createTestServer();
     server.health = { ...server.health, demo: false, demo_speed: null };

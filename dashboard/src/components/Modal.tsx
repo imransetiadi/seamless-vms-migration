@@ -21,9 +21,9 @@ function inClosedDetails(el: HTMLElement): boolean {
  */
 function focusables(container: HTMLElement | null): HTMLElement[] {
   if (!container) return [];
-  const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])'));
+  const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]:not(:disabled)'));
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
-    if (el.tabIndex < 0 || el.closest('[inert], [hidden]') || inClosedDetails(el)) return false;
+    if (el.tabIndex < 0 || el.matches(':disabled, input[type="hidden"]') || el.closest('[inert], [hidden]') || inClosedDetails(el)) return false;
     if (!(el instanceof HTMLInputElement) || el.type !== 'radio' || !el.name) return true;
     const group = radios.filter((radio) => radio.name === el.name && radio.form === el.form);
     return el === (group.find((radio) => radio.checked) ?? group[0]);
@@ -31,7 +31,8 @@ function focusables(container: HTMLElement | null): HTMLElement[] {
 }
 
 // the open dialogs, the topmost last: Escape on the page closes that one only (SDD §16)
-const openDialogs: symbol[] = [];
+const openDialogs: Array<{ token: symbol; panel: HTMLElement | null }> = [];
+let background: { root: HTMLElement | null; inert: boolean; overflow: string; focus: HTMLElement | null } | null = null;
 
 export interface ModalProps {
   open: boolean;
@@ -84,8 +85,11 @@ export function Modal({
     if (!open) return;
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const appRoot = document.getElementById('root');
+    if (openDialogs.length === 0) {
+      background = { root: appRoot, inert: appRoot?.hasAttribute('inert') ?? false, overflow: document.body.style.overflow, focus: previouslyFocused };
+    }
+    openDialogs.at(-1)?.panel?.setAttribute('inert', '');
     appRoot?.setAttribute('inert', '');
-    const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
 
     const target = initialFocusRef?.current ?? focusables(panelRef.current)[0] ?? panelRef.current;
@@ -96,21 +100,37 @@ export function Modal({
     // Escape closes the topmost dialog wherever the focus is — one that dropped to the page included; inside the
     // panel its own handler does (SDD §16)
     const token = Symbol('dialog');
-    openDialogs.push(token);
+    openDialogs.push({ token, panel: panelRef.current });
     const onPageKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== 'Escape' || openDialogs[openDialogs.length - 1] !== token) return;
+      if (openDialogs.at(-1)?.token !== token) return;
       if (event.target instanceof Node && panelRef.current?.contains(event.target)) return;
-      onPageEscape();
+      if (event.key === 'Escape') onPageEscape();
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        const items = focusables(panelRef.current);
+        ((event.shiftKey ? items.at(-1) : items[0]) ?? panelRef.current)?.focus();
+      }
     };
     document.addEventListener('keydown', onPageKeyDown);
 
     return () => {
       document.removeEventListener('keydown', onPageKeyDown);
-      const index = openDialogs.indexOf(token);
+      const index = openDialogs.findIndex((dialog) => dialog.token === token);
+      const wasTop = index === openDialogs.length - 1;
       if (index >= 0) openDialogs.splice(index, 1);
-      appRoot?.removeAttribute('inert');
-      document.body.style.overflow = previousOverflow;
-      (returnTo?.current ?? previouslyFocused)?.focus();
+      const top = openDialogs.at(-1)?.panel;
+      if (top) {
+        if (!wasTop) return;
+        top.removeAttribute('inert');
+        const wanted = returnTo?.current ?? previouslyFocused;
+        (wanted && top.contains(wanted) ? wanted : focusables(top)[0] ?? top).focus();
+      } else if (background) {
+        if (!background.inert) background.root?.removeAttribute('inert');
+        document.body.style.overflow = background.overflow;
+        const wanted = returnTo?.current ?? previouslyFocused;
+        (wanted?.isConnected ? wanted : background.focus)?.focus();
+        background = null;
+      }
     };
     // Focus management runs once per opening; initialFocusRef and returnFocusRef are stable ref objects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -119,6 +139,7 @@ export function Modal({
   if (!open) return null;
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (openDialogs.at(-1)?.panel !== event.currentTarget) return;
     if (event.key === 'Escape') {
       event.stopPropagation();
       if (dismissible) onClose();
@@ -132,10 +153,13 @@ export function Modal({
     }
     const first = items[0];
     const last = items[items.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
+    const active = document.activeElement;
+    const beforeFirst = active && first && (first.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_PRECEDING);
+    const afterLast = active && last && (last.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (event.shiftKey && (active === first || beforeFirst)) {
       event.preventDefault();
       last?.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
+    } else if (!event.shiftKey && (active === last || afterLast)) {
       event.preventDefault();
       first?.focus();
     }

@@ -28,19 +28,22 @@ export function ErrorBanner({ error, title = 'Something went wrong', onRetry, cl
     setShownError(error);
     setRetrying(false);
   }
-  // a Retry that succeeded takes the banner away with the focused button: the focus goes to the page's heading,
-  // never to nothing (SDD §16), unless something else took it meanwhile
+  // A successful Retry removes its focused button: keep focus in its dialog or page unless the user moved it.
   const root = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const banner = root.current;
     return () => {
       if (!banner?.contains(document.activeElement)) return;
+      const dialog = banner.closest<HTMLElement>('[role="dialog"], [role="alertdialog"]');
       queueMicrotask(() => {
         if (document.activeElement && document.activeElement !== document.body) return;
-        const heading = document.querySelector<HTMLElement>('main h1') ?? document.querySelector<HTMLElement>('h1');
+        if (dialog && (!dialog.isConnected || dialog.closest('[inert]'))) return;
+        const heading = dialog
+          ? dialog.querySelector<HTMLElement>('h1, h2') ?? dialog
+          : document.querySelector<HTMLElement>('main h1') ?? document.querySelector<HTMLElement>('h1');
         if (!heading) return;
         if (!heading.hasAttribute('tabindex')) heading.setAttribute('tabindex', '-1');
-        heading.focus({ preventScroll: true });
+        heading.focus({ preventScroll: !dialog });
       });
     };
   }, []);

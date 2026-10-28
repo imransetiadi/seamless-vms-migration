@@ -95,7 +95,7 @@ export function SelectField({
     <Chrome id={id} label={label} aside={aside} hint={hint} error={error} required={required} className={className} liveError={liveError}>
       <select
         id={id}
-        className="input cursor-pointer pr-8"
+        className="input h-11 cursor-pointer pr-8"
         aria-invalid={error ? true : undefined}
         aria-describedby={describedBy(id, hint, error)}
         aria-required={required || undefined}

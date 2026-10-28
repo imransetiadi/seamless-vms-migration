@@ -11,6 +11,7 @@ import { readinessFlags, readinessLevel, type ReadinessFlag, type ReadinessLevel
 import { sortBy, nextSort, type SortState } from '../lib/sort';
 import { severityMeta, TONE_CLASSES } from '../lib/status';
 import { Button } from './Button';
+import { Checkbox } from './Checkbox';
 import { EmptyState } from './EmptyState';
 import { SelectField } from './Field';
 import { SortableHeader } from './SortableHeader';
@@ -96,6 +97,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [os, setOs] = useState<OsFilter>('all');
   const [plan, setPlan] = useState<PlanFilter>('all');
   const [gpu, setGpu] = useState<GpuFilter>('all');
+  const [selectedOnly, setSelectedOnly] = useState(false);
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -128,6 +130,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return rows.filter(({ vm, level, haystack, guest, gpus }) => {
+      if (selectedOnly && !selected?.has(vm.source_id)) return false;
       if (power !== 'all' && vm.power_state !== power) return false;
       if (gpuFilter !== 'all' && (gpus.length > 0) !== (gpuFilter === 'with')) return false;
       if (os === 'legacy' ? guest.lifecycle !== 'legacy' : os !== 'all' && guest.family !== os) return false;
@@ -139,7 +142,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
       if (holders && plan !== 'all' && holders.has(vm.source_id) !== (plan === 'held')) return false;
       return !q || haystack.includes(q);
     });
-  }, [rows, query, power, project, readiness, os, plan, holders, gpuFilter]);
+  }, [rows, query, power, project, readiness, os, plan, holders, gpuFilter, selectedOnly, selected]);
 
   const sorted = useMemo(
     () =>
@@ -166,7 +169,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
   const visible = sorted.slice(0, limit);
   const filtersActive =
-    query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all' || plan !== 'all' || gpuFilter !== 'all';
+    query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all' || plan !== 'all' || gpuFilter !== 'all' || selectedOnly;
   // the header checkbox acts on every matching VM, also the rows not rendered yet: the labels say so
   const allMatchingShown = visible.length === filtered.length;
   const visibleIds = new Set(visible.map((r) => r.vm.source_id));
@@ -191,6 +194,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setOs('all');
     setPlan('all');
     setGpu('all');
+    setSelectedOnly(false);
     // the button goes away with the filters: the search field keeps the focus (SDD §16)
     searchRef.current?.focus();
   };
@@ -198,6 +202,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const toggle = (id: string) => {
     if (!selected || !onSelectedChange) return;
     const next = new Set(selected);
+    if (selectedOnly && next.has(id)) searchRef.current?.focus();
     if (next.has(id)) next.delete(id);
     else next.add(id);
     onSelectedChange(next);
@@ -206,6 +211,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const toggleAllShown = () => {
     if (!selected || !onSelectedChange) return;
     const next = new Set(selected);
+    if (selectedOnly && allShownSelected) searchRef.current?.focus();
     for (const { vm } of filtered) {
       if (allShownSelected) next.delete(vm.source_id);
       else next.add(vm.source_id);
@@ -313,11 +319,23 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
         // never read as free while the plans that may hold them are unknown (SDD §16)
         <p className="text-xs text-status-warning">Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.</p>
       )}
-      <p role="status" className="text-xs text-muted-foreground">
-        {showing}
-        {selectable && `, ${formatNumber(selected?.size ?? 0)} selected`}
-        {notShownSelected > 0 && ` (${formatNumber(notShownSelected)} not shown)`}
-      </p>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <p role="status" className="text-xs text-muted-foreground">
+          {showing}
+          {selectable && `, ${formatNumber(selected?.size ?? 0)} selected`}
+          {notShownSelected > 0 && ` (${formatNumber(notShownSelected)} not shown)`}
+        </p>
+        {selectable && <Checkbox label="Selected only" checked={selectedOnly} onChange={setSelectedOnly} />}
+        {selectable && (selected?.size ?? 0) > 0 && (
+          <Button variant="ghost" onClick={() => {
+            onSelectedChange?.(new Set());
+            setSelectedOnly(false);
+            searchRef.current?.focus();
+          }}>
+            Clear selection
+          </Button>
+        )}
+      </div>
 
       {filtered.length === 0 ? (
         <EmptyState
@@ -327,23 +345,25 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
           action={<Button onClick={clearFilters}>Clear filters</Button>}
         />
       ) : (
-        <div className="table-wrap rounded-lg border border-border">
+        <div className="table-wrap rounded-lg border border-border" onFocus={(event) => event.target.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })}>
           <table ref={tableRef} tabIndex={-1} className="data-table outline-hidden">
             <caption className="sr-only">{caption}</caption>
             <thead>
               <tr>
                 {selectable && (
-                  <th scope="col" className="w-10">
-                    <input
-                      ref={selectAllRef}
-                      type="checkbox"
-                      className="size-4 cursor-pointer accent-accent"
-                      aria-label={
-                        allMatchingShown ? `Select all ${filtered.length} shown` : `Select all ${filtered.length} matching VMs, ${visible.length} shown`
-                      }
-                      checked={allShownSelected}
-                      onChange={toggleAllShown}
-                    />
+                  <th scope="col" className="w-14">
+                    <label className="flex size-11 cursor-pointer items-center justify-center">
+                      <input
+                        ref={selectAllRef}
+                        type="checkbox"
+                        className="size-4 cursor-pointer accent-accent"
+                        aria-label={
+                          allMatchingShown ? `Select all ${filtered.length} shown` : `Select all ${filtered.length} matching VMs, ${visible.length} shown`
+                        }
+                        checked={allShownSelected}
+                        onChange={toggleAllShown}
+                      />
+                    </label>
                   </th>
                 )}
                 <SortableHeader label="VM" sortKey="name" sort={sort} onSort={(k) => setSort(nextSort(sort, k))} />
@@ -387,13 +407,15 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                   <tr key={vm.source_id} className={cn(isSelected && 'bg-accent/5')}>
                     {selectable && (
                       <td>
-                        <input
-                          type="checkbox"
-                          className="size-4 cursor-pointer accent-accent"
-                          aria-label={`Select ${vm.name}`}
-                          checked={isSelected}
-                          onChange={() => toggle(vm.source_id)}
-                        />
+                        <label className="flex size-11 cursor-pointer items-center justify-center">
+                          <input
+                            type="checkbox"
+                            className="size-4 cursor-pointer accent-accent"
+                            aria-label={`Select ${vm.name}`}
+                            checked={isSelected}
+                            onChange={() => toggle(vm.source_id)}
+                          />
+                        </label>
                       </td>
                     )}
                     <th scope="row" className="whitespace-nowrap font-mono">
