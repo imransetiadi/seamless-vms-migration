@@ -35,6 +35,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
 1.1.0
 -----
 
+- ``conversion_host_content`` installs ``ceph-common`` on the source conversion host of a plan that tracks extents (``os_migrate_conversion_host_ceph_client``; Seamless Migrate SDD 6.5, 21.6, plan task CE5), from the Red Hat Ceph Tools repository on RHEL, the CentOS Storage SIG on the rest of the RHEL family and Ubuntu's archive.
 - Warm passes track a Ceph volume's changed extents (Seamless Migrate SDD 28, plan task CE4): ``import_workload_warm_snapshot`` keeps a completed pass's snapshot as the disk's base with ``keep_base``, ``import_workload_warm_sync`` takes ``extents`` (``off``, ``check``, ``read``), the run's Ceph files, user, pools and query timeout, records each disk's mode and reason in the pass, and the link's gate admits the sender's extents file beside its script; the role's ``os_migrate_warm_extents_precopy`` and ``os_migrate_warm_extents_final`` turn it on.
 - Warm migration of OpenStack workloads (Seamless Migrate, to RHOSO 18.0): the
   disks of a running server are copied in snapshot pre-copy passes and only the
