@@ -1024,9 +1024,16 @@ const LAB_VMS: VmSpec[] = [
 // Providers
 // -------------------------------------------------------------------------------------------
 
-function conversionHost(name: string, address: string) {
-  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null };
+function conversionHost(name: string, address: string, sshHostKeys: string[] = []) {
+  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null, ssh_host_keys: sshHostKeys };
 }
+
+/** The demo destinations' conversion host keys as their operator declares them: the API demo's (SDD §10, §26.3; plan task ST7),
+ * synthetic - made up from each host's name, so no private half exists anywhere. */
+const DEMO_HOST_KEYS = {
+  dst: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPG3KNdzNY5BMzcxmBiodxJzFyuk3o+NUwZvY9B8BPyn os-migrate-conv-dst',
+  dc3: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONXdEMQsyylyTGj3eyOnSgAxp5zE4Y8rF+Fpabez7MG os-migrate-conv-dc3',
+};
 
 export function buildProviders(now: number): Provider[] {
   // what each seeded destination's check read of its cloud: its GPU capacity among it (SDD §10, §22.3)
@@ -1134,7 +1141,7 @@ export function buildProviders(now: number): Provider[] {
       region: 'regionOne',
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
-      conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
+      conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31', [DEMO_HOST_KEYS.dst]),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
       capabilities: checkOf(
         { id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
@@ -1189,7 +1196,7 @@ export function buildProviders(now: number): Provider[] {
       region: 'RegionOne',
       verify_tls: true,
       ca_cert_path: null,
-      conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
+      conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60', [DEMO_HOST_KEYS.dc3]),
       capabilities: checkOf(
         { id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
         iso(now - 6 * 60_000),

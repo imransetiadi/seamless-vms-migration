@@ -29,7 +29,9 @@ def test_created_user_can_sign_in_with_its_role_and_survives_restart(api, role):
     assert response.headers["cache-control"] == "no-store"
     headers = {"Authorization": f"Bearer {created['token']}"}
     identity = {"name": "New.User", "role": role}
-    assert api.client.get("/api/v1/me", headers=headers).json() == identity
+    # GET /me adds host_key_checking (SDD §12, plan task ST7); the users list does not
+    me = {**identity, "host_key_checking": True}
+    assert api.client.get("/api/v1/me", headers=headers).json() == me
     users = api.get("/api/v1/users", Role.admin)
     assert identity in users.json()
     assert all(set(user) == {"name", "role"} for user in users.json())
@@ -49,7 +51,7 @@ def test_created_user_can_sign_in_with_its_role_and_survives_restart(api, role):
     other_store = Store(api.store.url)
     try:
         with TestClient(create_app(api.settings, other_store)) as client:
-            assert client.get("/api/v1/me", headers=headers).json() == identity
+            assert client.get("/api/v1/me", headers=headers).json() == me
         api.store.delete("user", "new.user")
         assert api.client.get("/api/v1/me", headers=headers).status_code == 401
     finally:
@@ -98,6 +100,7 @@ def test_duplicate_names_do_not_overwrite_existing_access(api):
     assert api.client.get("/api/v1/me", headers=headers).json() == {
         "name": "alice",
         "role": "viewer",
+        "host_key_checking": True,
     }
     assert len(api.store.events(kinds=["user.created"])) == 1
 

@@ -1221,12 +1221,19 @@ export interface Health {
   orchestrator: OrchestratorHealth;
 }
 
-export interface Me {
+/** A dashboard user, as `GET /users` lists it (SDD §12). */
+export interface User {
   name: string;
   role: Role;
 }
 
-export interface UserCreated extends Me {
+/** `GET /me` (SDD §12): the signed-in user, and whether the data path checks the conversion hosts' keys. */
+export interface Me extends User {
+  /** SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (SDD §15.1, §26.8): false, no hop checks a conversion host's key - the provider page warns (§16). */
+  host_key_checking: boolean;
+}
+
+export interface UserCreated extends User {
   token: string;
 }
 

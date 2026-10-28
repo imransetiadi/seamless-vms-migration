@@ -286,7 +286,7 @@ pass, which scans, so the downtime still grows with the disk - slowly:
 SM-1b's 300 s median is met in the model up to 500 GiB on 1 Gbit/s and for every size on 10 Gbit/s, with little to
 spare: `F` = 270 s is the floor, and the real fixed costs and `q` decide (PERF-E2E-SM1b). What the model does not
 remove: a disk that scans in full in the final pass (`scan_U`: not a Cinder RBD volume of the cluster, encrypted, a
-miss in an earlier check, a failed query - the reasons of SDD §28.5 and Operations.md §7.2) keeps today's term, and
+miss in an earlier check, a failed query - the reasons of SDD §28.5 and Operations.md §7.3) keeps today's term, and
 the estimate counts it from `Migration.tracked_disks`. The SLO rule moves a tracked migration to `awaiting_cutover`
 after its first checked pass; a `checked` pass calibrates `S` as today and its longest query replaces `q`
 (`observed_extent_query_s`); a pass that read any disk from extents never calibrates `S` (SDD §28.6). Under owner
@@ -526,7 +526,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Symptom | Likely cause | Action |
 |---|---|---|
 | Downtime ≈ `270 s + scan` and does not improve with a faster link | Scan floor (§4.1) | Raise `S` (more `workers`, faster storage) or scan more disks in parallel (`parallel_disks`, split large volumes); use handover; turn on changed-extent tracking for a Ceph source (`Plan.extent_tracking`, §4.6; 0.5.0 Technology Preview) |
-| A tracked migration's downtime is `270 s + scan` after all | the final pass scanned a disk: its `sync_passes[-1].extents[<device>]` is `scanned` with a reason, or the estimate's `tracked_disks` left it out | read the reason (Operations.md §7.2): a disk that does not qualify keeps its scan; after `missed`, `base_gone`, `resized` or `query_failed` fix the cause and let the next passes check again before the cutover |
+| A tracked migration's downtime is `270 s + scan` after all | the final pass scanned a disk: its `sync_passes[-1].extents[<device>]` is `scanned` with a reason, or the estimate's `tracked_disks` left it out | read the reason (Operations.md §7.3): a disk that does not qualify keeps its scan; after `missed`, `base_gone`, `resized` or `query_failed` fix the cause and let the next passes check again before the cutover |
 | The final pass's or a checked pass's `query_s` is tens of seconds, and the estimate was 10 s | fast-diff off or the object map invalid (one request per object), far or slow monitors | `rbd info` shows the features and flags; `rbd object-map rebuild`; after a checked pass the calibration replaces `q` (`observed_extent_query_s`), or set `extent_query_s` in `estimator_overrides` |
 | Multi-disk VM slower than `270 s + D/(S·P)` | Aggregate read ceiling of the host (1,190 MiB/s on 10 GbE, 2–3 streams on 4 vCPU) | Measure `S_agg` (§6.1); set `max_aggregate_scan_bps` to it (§6.4); add vCPUs or a second conversion-host pair |
 | Warm never leaves `syncing`; five passes, each at the scan floor | `Δ* > convergence_threshold_bytes` (every single disk above ≈ 235 GiB at 2 MiB/s) | Raise the threshold to ≥ `1.2·Δ*` or set `max_sync_passes: 2` (§7.3) |

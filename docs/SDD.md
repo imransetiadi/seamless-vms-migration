@@ -3189,6 +3189,8 @@ Finding catalog (code — severity — condition):
 | `VMW_SNAPSHOTS_PRESENT` | warning | `snapshot_count > 0` |
 | `VMW_TOOLS_MISSING` | info | `tools_ok is False` |
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
+| `CONV_HOST_KEY_UNKNOWN` | blocker (cold, warm, vmware_*) | while SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is true (§15.1, §26.5), a conversion host the plan needs - the source's and the destination's for an OpenStack source, the destination's alone for a VMware source - has no declared keys (`conversion_host.ssh_host_keys`) and either no pin while Seamless will not create it (`conversion_host.manage` false, or a VMware source's destination host, which the operator brings), or a pin of another server: the validation's provider check reports the host resolving to another server than its pin's, its status message "conversion host replaced: ..." (§10 "Host key pins"), a managed host too. Its runs would be refused before their first playbook (§7.2). The message names each such host by its side, provider and name, and a replaced one by the check's words. A host Seamless manages without a pin is not judged: its pre-staging creates it with an injected key, or a run reads and pins its console (§26.3, §26.8) |
+| `CONV_HOST_KEYS_UNCHECKED` | warning (cold, warm, vmware_*) | SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false (§15.1, §26.8) and a conversion host the plan needs is configured: no hop of the data path checks a conversion host's key |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
 | `CEPH_ACCESS_MISSING` | warning (warm) | the plan tracks extents (`extent_tracking`, §28.9) and its source has no Ceph access (`ceph`), no key (`ceph.key_updated_at` null) or no `rbd` pool whose `ceph_fsid` is its own in its check report (§10): every pass scans in full; the message says which. Not judged for a VMware source, which refuses the switch |
@@ -3659,6 +3661,9 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
     stays `ok`, so a validation goes on.
 
   A check that failed (`error`) looks nothing up. The demo's consoles print no keys block: the demo pins nothing.
+  Its destinations declare their conversion hosts' keys instead (`ssh_host_keys`, plan task ST7): one synthetic
+  ed25519 key each, made up from the host's name - no private half exists -, as an operator reads a brought host's
+  key out of band, so no demo plan meets `CONV_HOST_KEY_UNKNOWN` while keys are checked (§9.3).
 * **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
   `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
   that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
@@ -3908,7 +3913,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 |---|---|---|---|---|
 | GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
-| GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
+| GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
@@ -4636,7 +4641,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
-| `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `false` | whether the playbooks verify the SSH host keys of the conversion hosts (`ANSIBLE_HOST_KEY_CHECKING` of every run; the control plane's own environment no longer decides it). It reaches only the conversion host of a VMware migration: the OpenStack conversion hosts' inventory passes `-o StrictHostKeyChecking=no` itself, and the collection's own ssh and scp (`RemoteShell`) always do, so `true` checks none of the OpenStack hops (D8). Off until SEC-02 lands (Security.md §6.3: a per-run `known_hosts` with pinned keys — still open): a host made for the migration has no key to compare with, so `true` works only with hosts whose keys the control plane's `known_hosts` already holds. The executor logs a warning once per run while it is off |
+| `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `true` | whether the data path checks the conversion hosts' SSH host keys (§26.4, §26.8; the control plane's own environment never decides it). `true` (the default since plan task ST7, every hop being pinned): every run checks each conversion host against its declared keys or its pin - `ANSIBLE_HOST_KEY_CHECKING=True`, the run's `known_hosts`, `StrictHostKeyChecking=yes` on the modules' ssh and scp and on the link (§6.6, §7.2) -, and validation reports `CONV_HOST_KEY_UNKNOWN` for a host without a key (§9.3). `false` keeps 0.4.0's options, unchecked: the executor logs a warning once per run, validation reports `CONV_HOST_KEYS_UNCHECKED`, and the dashboard's provider page warns (`GET /me` `host_key_checking`, §12, §16); each run's restricted link applies either way (§26.6) |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook; a storage handover's call in flight returns first, §7.3), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
@@ -5171,7 +5176,19 @@ is no origin a browser sends (review RV31-03).
   that is no UUID, no monitor or more than nine, a monitor that is no address, a client with the "client." prefix or
   of more than 64 characters, a key that is not base64 of at least 16 bytes - each in the error summary with a link
   to its field; it sends `ceph` with `POST`, and with `PATCH` only when its fsid, monitors or client changed, never
-  `key_updated_at` (server-owned); the form
+  `key_updated_at` (server-owned);
+  an OpenStack or RHOSO card with a conversion host shows
+  its host keys (§26.4; plan task ST7) under "Host keys": the declared keys' SHA256 fingerprints with "Declared" when
+  `conversion_host.ssh_host_keys` holds some, else the pin's (`conversion_host_pin`) with its source ("Injected at
+  creation", "Read from the console"), its server and its time ("Pinned 3 min ago"), else "Not pinned yet: the next
+  check reads the host's console."; each fingerprint as `ssh-keygen -l` prints it (`SHA256:` and the unpadded base64
+  of the key's SHA-256), computed in the browser. While host keys are not checked (`GET /me` `host_key_checking`
+  false, §12) the page warns once above the cards that no conversion host's key is checked and names
+  SEAMLESS_ANSIBLE_HOST_KEY_CHECKING; the form
+  takes, for an OpenStack or RHOSO provider with a conversion host, its declared host keys (`conversion_host.
+  ssh_host_keys`, §4.2) under "Host keys" as a text area of one OpenSSH public key per line (blank lines dropped), and
+  refuses before anything is sent a line that is no ed25519, ECDSA or RSA public key, naming its line number - never
+  quoting it - in the error summary with a link to the field, as the API refuses it (422); it sends the list whole; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first), for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
   §4.2), and for an OpenStack or RHOSO provider, source or destination alike, its declared vGPU profiles
@@ -7495,7 +7512,9 @@ any playbook, the injected key pair and its pins, a refusal in a run's output as
 `conversion_host.key_refused` - in §4.3 and §7.2 since that task; plan task ST6's - the link (the per-run key, the source
 host's entry, the gate, the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link
 removed), the content install's sshd settings and R-02 (the helper script's private directory and its SHA-256 check) -
-in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task. The facts
+in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task; plan task ST7's - the two findings, the setting's default `true`,
+`GET /me`'s `host_key_checking` and the dashboard's host keys, its warning and the form's declared keys - in §9.3, §12,
+§15.1 and §16 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7810,7 +7829,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 (binding) | ST4 |
 | the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 (binding) | ST5 |
 | the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 (owner decision 10) | §6.2, §6.4, §6.5, §6.6, §7.2 (binding) | ST6 |
-| the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
+| the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, its warning while keys are not checked (`GET /me` `host_key_checking`), the form's declared keys, the findings' catalog | §9.3, §12, §15.1, §16 (binding) | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
 

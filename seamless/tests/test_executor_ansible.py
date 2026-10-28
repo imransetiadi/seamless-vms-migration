@@ -334,6 +334,9 @@ def env(tmp_path, monkeypatch):
         clouds_yaml=clouds,
         secrets_dir=tmp_path / "secrets",
         collection_root=find_repo_root(),
+        # these tests are about the rest of a run; the host key checks, on by default since plan
+        # task ST7, have their own tests, which turn them on (SDD §7.2, §26.8)
+        ansible_host_key_checking=False,
     )
     registry = FakeRegistry()
     executor = AnsibleExecutor(settings, providers=registry, poll_s=0.02)
@@ -5406,6 +5409,7 @@ async def test_missing_ansible_playbook_binary_is_permanent(env):
         clouds_yaml=env.settings.clouds_yaml,
         secrets_dir=env.settings.secrets_dir,
         collection_root=env.settings.collection_root,
+        ansible_host_key_checking=env.settings.ansible_host_key_checking,
     )
     executor = AnsibleExecutor(broken, providers=env.registry, poll_s=0.02)
     plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)

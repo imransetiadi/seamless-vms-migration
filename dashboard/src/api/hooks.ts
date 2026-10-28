@@ -32,6 +32,7 @@ import type {
   Hook,
   HookPatch,
   Me,
+  User,
   UserCreated,
   Migration,
   MigrationAction,
@@ -127,7 +128,7 @@ export function useUsers(enabled: boolean) {
   const api = useApi();
   return useApiQuery({
     queryKey: queryKeys.users,
-    queryFn: ({ signal }) => api.get<Me[]>('/users', { signal }),
+    queryFn: ({ signal }) => api.get<User[]>('/users', { signal }),
     enabled,
     retry: noRetryOnClientErrors,
   });
@@ -137,7 +138,7 @@ export function useCreateUser() {
   const api = useApi();
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (user: Me) => api.post<UserCreated>('/users', user),
+    mutationFn: (user: User) => api.post<UserCreated>('/users', user),
     retry: false,
     // The one-time token leaves the mutation cache when dismissed or the page unmounts.
     gcTime: 0,

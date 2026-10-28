@@ -11,14 +11,17 @@ from seamless_migrate.domain.models import (
     ACKNOWLEDGEABLE_FINDINGS,
     DEFAULT_PRESTAGE,
     AppProbe,
+    ConversionHostConfig,
     GpuDevice,
     HandoverConfig,
+    HostKeyPin,
     Mappings,
     Nic,
     VerificationConfig,
     VMRef,
     Wave,
     invalid_plan_settings,
+    utcnow,
 )
 from seamless_migrate.planning.gpu import gpu_requests
 from seamless_migrate.planning.platforms import destination_release
@@ -48,6 +51,7 @@ from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.providers.openstack import OpenStackProvider
 from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
+from tests.key_support import bare, public_key
 
 SRC = make_provider()
 # the destination provider a message about the destination cloud names (SDD §1 naming, plan T6)
@@ -98,6 +102,7 @@ def check(
     dns_ttl=None,
     lb_pools=None,
     sync_passes=None,
+    host_key_checking=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -113,6 +118,7 @@ def check(
         dns_ttl=dns_ttl,
         lb_pools=lb_pools,
         sync_passes=sync_passes,
+        host_key_checking=host_key_checking,
     )
 
 
@@ -170,6 +176,9 @@ def test_catalog_is_complete():
         "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
+        # the conversion hosts' keys (SDD §9.3, §26.5, plan task ST7)
+        "CONV_HOST_KEY_UNKNOWN",
+        "CONV_HOST_KEYS_UNCHECKED",
         # the Heat and Octavia codes (SDD §9.3, plan task N2)
         "SRC_VM_HEAT_STACK",
         "SRC_VM_AUTOSCALED",
@@ -2750,6 +2759,123 @@ def test_finding_conv_host_missing():
         ),
         "CONV_HOST_MISSING",
     )
+
+
+_DATA_PATH = {Strategy.cold, Strategy.warm, Strategy.vmware_cold, Strategy.vmware_warm}
+
+
+def _brought(provider, **host):
+    """``provider`` with a conversion host Seamless does not create (manage false)."""
+    return provider.model_copy(
+        update={"conversion_host": ConversionHostConfig(name="conv", manage=False, **host)}
+    )
+
+
+def _pinned(provider, server="srv-conv-1"):
+    pin = HostKeyPin(
+        server_id=server, keys=[bare(public_key(7))], source="console", pinned_at=utcnow()
+    )
+    return provider.model_copy(update={"conversion_host_pin": pin})
+
+
+def test_finding_conv_host_key_unknown_for_a_brought_host_without_keys():
+    """SDD §9.3, §26.5 (plan task ST7): while keys are checked, a conversion host the plan needs
+    that Seamless will not create - manage false, or a VMware destination's host, which the
+    operator brings - and that has neither declared keys nor a pin blocks the data path's
+    strategies: its run would be refused before its first playbook. Declared keys or a pin of
+    its server clear it; with checking off nothing is judged here."""
+    source, destination = _brought(SRC), _brought(DST)
+    f = only(
+        check(source=source, destination=destination, host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert f.severity == Severity.blocker and set(f.strategies) == _DATA_PATH
+    assert "source RHOSP 17.1 (conv)" in f.message and "destination RHOSO 18.0 (conv)" in f.message
+    assert "neither declared keys nor a pin" in f.message
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(source=source, destination=destination, host_key_checking=False)
+    )
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(
+            source=_brought(SRC, ssh_host_keys=[public_key(1)]),
+            destination=_pinned(destination),
+            host_key_checking=True,
+        )
+    )
+    # a VMware source: the destination's host is the operator's, whatever manage says
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware, conversion_host=None)
+    f = only(
+        check(source=vcenter, destination=DST, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN"
+    )
+    assert "destination RHOSO 18.0" in f.message and "source" not in f.message.split(":")[1]
+    # the kit uses the destination's host alone: a VMware source's own is never judged
+    f = only(
+        check(source=_brought(vcenter), destination=DST, host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert "source" not in f.message.split(":")[1]
+
+
+def test_finding_conv_host_key_unknown_for_a_pin_of_another_server():
+    """SDD §9.3, §10, §26.4, §26.5: a pin belongs to one server. When the validation's provider
+    check found the host resolving to another server - its status message "conversion host
+    replaced: ..." -, the pin no longer applies, and the host blocks until the operator declares
+    its keys, or deletes it and a pre-staging creates and pins it again - also a host Seamless
+    manages."""
+    replaced = _pinned(SRC).model_copy(
+        update={
+            "status_message": "conversion host replaced: conv-src is now server srv-2; its pin "
+            "belongs to server srv-conv-1"
+        }
+    )
+    f = only(check(source=replaced, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN")
+    assert f.severity == Severity.blocker
+    assert "is now server srv-2; its pin belongs to server srv-conv-1" in f.message
+    declared = replaced.model_copy(
+        update={
+            "conversion_host": ConversionHostConfig(name="conv-src", ssh_host_keys=[public_key(2)])
+        }
+    )
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN" for x in check(source=declared, host_key_checking=True)
+    )
+
+
+def test_finding_conv_host_key_unknown_not_for_a_host_seamless_will_create():
+    """SDD §9.3, §26.3: a host Seamless manages gets its key injected when its pre-staging creates
+    it, or its console read and pinned when it exists: no finding without a pin. Nor for a
+    strategy without a conversion host (no provider has one: CONV_HOST_MISSING says so)."""
+    managed_src = SRC.model_copy(update={"conversion_host": ConversionHostConfig(name="conv-src")})
+    managed_dst = DST.model_copy(update={"conversion_host": ConversionHostConfig(name="conv-dst")})
+    found = check(source=managed_src, destination=managed_dst, host_key_checking=True)
+    assert all(x.code != "CONV_HOST_KEY_UNKNOWN" for x in found)
+    missing = check(
+        source=SRC.model_copy(update={"conversion_host": None}),
+        destination=DST.model_copy(update={"conversion_host": None}),
+        host_key_checking=True,
+    )
+    assert all(x.code != "CONV_HOST_KEY_UNKNOWN" for x in missing)
+    assert any(x.code == "CONV_HOST_MISSING" for x in missing)
+
+
+def test_finding_conv_host_keys_unchecked_while_checking_is_off():
+    """SDD §9.3, §26.5, §26.8: with SEAMLESS_ANSIBLE_HOST_KEY_CHECKING false, the data path
+    authenticates no conversion host: a warning for the strategies that use one, never a
+    blocker; none while checking is on, and none for a plan whose providers have no conversion
+    host."""
+    f = only(check(host_key_checking=False), "CONV_HOST_KEYS_UNCHECKED")
+    assert f.severity == Severity.warning and set(f.strategies) == _DATA_PATH
+    assert "SEAMLESS_ANSIBLE_HOST_KEY_CHECKING" in f.message
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in check(host_key_checking=True))
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in check())
+    bare_providers = check(
+        source=SRC.model_copy(update={"conversion_host": None}),
+        destination=DST.model_copy(update={"conversion_host": None}),
+        host_key_checking=False,
+    )
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in bare_providers)
 
 
 def test_finding_handover_backend_unmapped():

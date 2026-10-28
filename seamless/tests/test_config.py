@@ -81,10 +81,13 @@ def test_settings_parses_types(tmp_path):
     assert s.dashboard_dir == tmp_path / "dist"
 
 
-def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_on():
-    """Audit B-02 (SDD §15.1): the run's ANSIBLE_HOST_KEY_CHECKING comes from an explicit
-    setting - off by default while SEC-02 is open - never from the control plane's environment."""
-    assert Settings.from_env({}).ansible_host_key_checking is False
+def test_settings_ansible_host_key_checking_is_on_by_default_and_can_be_turned_off():
+    """SDD §15.1, §26.8 (plan task ST7; audit B-02): every hop of the data path is pinned since
+    plan task ST6, so the conversion hosts' keys are checked by default - the run's
+    ANSIBLE_HOST_KEY_CHECKING and every hop's StrictHostKeyChecking=yes -, and `false` stays the
+    way out; never the control plane's own environment."""
+    assert Settings.from_env({}).ansible_host_key_checking is True
+    assert Settings().ansible_host_key_checking is True
     on = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "true"})
     assert on.ansible_host_key_checking is True
     off = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "false"})

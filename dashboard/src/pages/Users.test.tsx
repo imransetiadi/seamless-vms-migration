@@ -28,7 +28,7 @@ describe('dashboard user access', () => {
     expect(tokenField).toHaveFocus();
     const token = (tokenField as HTMLTextAreaElement).value;
     const identity = { name: 'new.operator', role: 'operator' };
-    expect(await createTestClient(view.server, token).get('/me')).toEqual(identity);
+    expect(await createTestClient(view.server, token).get('/me')).toEqual({ ...identity, host_key_checking: true });
     await waitFor(() => expect(view.queryClient.getQueryData(queryKeys.users)).toContainEqual(identity));
     expect(JSON.stringify(view.queryClient.getQueryData(queryKeys.users))).not.toContain(token);
     await user.click(screen.getByRole('button', { name: 'Copy token' }));
@@ -43,7 +43,7 @@ describe('dashboard user access', () => {
     await user.type(await screen.findByLabelText('API token'), token);
     await user.click(screen.getByRole('button', { name: 'Sign in' }));
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    expect(login.queryClient.getQueryData(queryKeys.me)).toEqual(identity);
+    expect(login.queryClient.getQueryData(queryKeys.me)).toEqual({ ...identity, host_key_checking: true });
   });
 
   it('keeps token selectable when clipboard access fails', async () => {

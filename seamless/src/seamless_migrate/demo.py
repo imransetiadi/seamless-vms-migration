@@ -9,6 +9,8 @@ approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrat
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 from datetime import UTC, datetime
 
@@ -71,6 +73,17 @@ DEMO_APPROVAL_COMMENTS = (
     "Agreed with the application team for tonight's window; rollback steps reviewed.",
 )
 
+
+def _demo_host_key(host: str) -> str:
+    """A synthetic ed25519 public key of the demo conversion host ``host``, in OpenSSH's one-line
+    form: what an operator declares after reading it out of band (SDD §10, §26.3). Made up from the
+    name, so no private half exists anywhere."""
+    kind = b"ssh-ed25519"
+    point = hashlib.sha256(b"seamless demo conversion host " + host.encode()).digest()
+    blob = b"".join(len(part).to_bytes(4, "big") + part for part in (kind, point))
+    return f"ssh-ed25519 {base64.b64encode(blob).decode()} {host}"
+
+
 DEMO_PROVIDERS = (
     Provider(
         id="rhosp17-finance",
@@ -112,6 +125,8 @@ DEMO_PROVIDERS = (
             flavor="m1.large",
             external_network="public",
             address="192.0.2.50",
+            # the VMware plan's host, which the operator brings: its keys declared (SDD §26.3)
+            ssh_host_keys=[_demo_host_key("os-migrate-conv-dst")],
         ),
         gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),
@@ -130,6 +145,7 @@ DEMO_PROVIDERS = (
             flavor="m1.large",
             external_network="public",
             address="192.0.2.60",
+            ssh_host_keys=[_demo_host_key("os-migrate-conv-dc3")],
         ),
         gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),

@@ -104,6 +104,7 @@ def extents_rehearsal(tmp_path, monkeypatch):
     from seamless_migrate.providers.openstack import OpenStackProvider
     from tests.factories import make_disk, make_vm
     from tests.fake_ansible import install
+    from tests.key_support import public_key
     from tests.test_executor_ansible import CEPH_FSID, CEPH_KEY
 
     pytest.importorskip("openstack")
@@ -143,6 +144,14 @@ def extents_rehearsal(tmp_path, monkeypatch):
         "SEAMLESS_LAB_ANSIBLE_PLAYBOOK": str(fake),
         "SEAMLESS_LAB_MAPPINGS": json.dumps({"networks": {"app-net": "rhoso-app"}}),
         "SEAMLESS_LAB_PRESTAGE": "1",
+        # host keys are checked by default since plan task ST7 (SDD §26.5): the lab declares its
+        # conversion hosts' keys as the operator reads them out of band; here synthetic ones
+        "SEAMLESS_LAB_CONVERSION_HOSTS": json.dumps(
+            {
+                "source": {"name": "seamless-conv-src", "ssh_host_keys": [public_key(1)]},
+                "destination": {"name": "seamless-conv-dst", "ssh_host_keys": [public_key(2)]},
+            }
+        ),
         "SEAMLESS_LAB_DESTRUCTIVE": "1",
         "SEAMLESS_LAB_CHECKSUM_CMD": "printf 'deadbeef\\ndeadbeef\\n'",
         "SEAMLESS_LAB_CE02_PASSES": "3",

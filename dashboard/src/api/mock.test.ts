@@ -215,8 +215,8 @@ describe('mock API', () => {
   });
 
   it('maps tokens to roles and rejects unknown tokens', async () => {
-    await expect(setup('viewer').client.get('/me')).resolves.toEqual({ name: 'dimas', role: 'viewer' });
-    await expect(setup(null).client.get('/me')).resolves.toEqual({ name: 'anonymous', role: 'admin' });
+    await expect(setup('viewer').client.get('/me')).resolves.toEqual({ name: 'dimas', role: 'viewer', host_key_checking: true });
+    await expect(setup(null).client.get('/me')).resolves.toEqual({ name: 'anonymous', role: 'admin', host_key_checking: true });
     await expect(setup('nonsense').client.get('/me')).rejects.toMatchObject({ status: 401 });
   });
 
@@ -2543,7 +2543,7 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
   it('says on GET /health that authentication is off: no token is the anonymous admin (SDD §12, §13.1)', async () => {
     const { client } = setup(null);
     expect(await client.get<{ auth_disabled: boolean }>('/health')).toMatchObject({ auth_disabled: true });
-    expect(await client.get('/me')).toEqual({ name: 'anonymous', role: 'admin' });
+    expect(await client.get('/me')).toEqual({ name: 'anonymous', role: 'admin', host_key_checking: true });
   });
 
   it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {

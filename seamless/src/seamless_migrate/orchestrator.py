@@ -1292,6 +1292,14 @@ class Orchestrator:
         dst_impl = self.providers.get(destination)
         src_caps = await self._caps(source, actor)
         dst_caps = await self._caps(destination, actor)
+        # as the checks left them: their pins, and a host they found replaced (SDD §9.3, §10)
+        as_checked = {
+            p.id: p
+            for p in (
+                await self._provider(plan.source_provider_id, ProviderRole.source),
+                await self._provider(plan.destination_provider_id, ProviderRole.destination),
+            )
+        }
         try:
             src_inv = await src_impl.inventory()
             dst_inv = await dst_impl.inventory()
@@ -1406,6 +1414,9 @@ class Orchestrator:
                 lb_pools=lb_pairs,
                 # the misses its checks found so far (SDD §28.9)
                 sync_passes=current.sync_passes if current is not None else None,
+                # the conversion hosts' keys, as the checks just found them (SDD §9.3, §26.5)
+                host_key_checking=self.settings.ansible_host_key_checking,
+                checked=as_checked,
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)

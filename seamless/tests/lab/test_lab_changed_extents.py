@@ -17,7 +17,9 @@ destination server is created. Use a disposable test server only.
 
 Optional: SEAMLESS_LAB_CEPH_CLIENT (seamless); SEAMLESS_LAB_PRESTAGE=1 pre-stages the plan first
 (the conversion hosts, from SEAMLESS_LAB_CONVERSION_HOSTS, a JSON {"source": {...},
-"destination": {...}} of ConversionHostConfig); SEAMLESS_LAB_CHECKSUM_CMD, a command that prints
+"destination": {...}} of ConversionHostConfig - declare each host's `ssh_host_keys` there, as
+host keys are checked by default, SDD §26.5, unless a pre-staging pinned them);
+SEAMLESS_LAB_CHECKSUM_CMD, a command that prints
 the source volume's checksum and the destination's, one per line, the operator's own way to read
 both (an ssh to each conversion host, for one); SEAMLESS_LAB_WRITER_CMD, a command that writes to
 the source VM's disks while it runs (the 2 or 10 MiB/s fio writer of LAB-CE01/CE02), stopped after

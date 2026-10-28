@@ -6,6 +6,7 @@ import type { CephAccess, ConversionHostConfig, Distribution, Provider, Provider
 import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
 import { formatRelative, namesText } from '../lib/format';
+import { declaredKeyProblems, declaredKeys } from '../lib/hostKeys';
 import { inventoryGpuFlavors, sameVgpuProfiles, vgpuProfileErrors, vgpuProfileMap, type VgpuProfileRow } from '../lib/gpu';
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
 import { isBlank, providerLabel } from '../lib/providerUse';
@@ -50,6 +51,8 @@ interface FormState {
   hostNetwork: string;
   hostUser: string;
   hostCidr: string;
+  /** The conversion host's public keys its operator declares, one OpenSSH line each (SDD §4.2, §16, §26.3). */
+  hostKeys: string;
   privateKey: string;
   privateKeyLabel: string;
   /** A secret managed outside Seamless (SDD §13.3): its name, for the credentials and for the key. */
@@ -83,6 +86,7 @@ type FieldKey =
   | 'appSecret'
   | 'hostName'
   | 'hostAddress'
+  | 'hostKeys'
   | 'privateKey'
   | 'secretName'
   | 'keySecretName'
@@ -182,6 +186,7 @@ function initialState(provider: Provider | undefined): FormState {
     hostNetwork: host?.external_network ?? '',
     hostUser: host?.ssh_user ?? 'cloud-user',
     hostCidr: host?.ssh_allowed_cidr ?? '',
+    hostKeys: (host?.ssh_host_keys ?? []).join('\n'),
     privateKey: '',
     privateKeyLabel: '',
     secretName: secretName ?? '',
@@ -381,6 +386,13 @@ function judgedAgain(errors: Errors, rows: readonly VgpuProfileRow[] | null): Er
   if (!Object.keys(errors).some(isRow)) return errors;
   const kept = Object.fromEntries(Object.entries(errors).filter(([field]) => !isRow(field))) as Errors;
   return { ...kept, ...rowProblems(rows ?? []) };
+}
+
+/** Whether two conversion hosts are the same, whatever the order of their fields; no declared key is none (older fixtures omit it). */
+function sameConversionHost(a: ConversionHostConfig | null, b: ConversionHostConfig | null): boolean {
+  const canonical = (host: ConversionHostConfig | null) =>
+    host && JSON.stringify(Object.entries({ ...host, ssh_host_keys: host.ssh_host_keys ?? [] }).sort(([x], [y]) => (x < y ? -1 : 1)));
+  return canonical(a) === canonical(b);
 }
 
 /** The platform mark: two letters in a square, the one memorable element of the provider UI. */
@@ -643,6 +655,11 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (!key && !cephKeyStored) e.cephKey = "Add the Ceph user's key, as ceph auth get-key prints it.";
       else if (key && !cephKeyLooksRight(key)) e.cephKey = 'This is not a Ceph key: base64 of at least 16 bytes, without spaces.';
     }
+    // a line that is no ed25519, ECDSA or RSA public key, by its number - never quoted: it may be a private key (SDD §4.2, §16)
+    if (preset.kind !== 'vmware') {
+      const problems = declaredKeyProblems(form.hostKeys);
+      if (problems.length) e.hostKeys = problems.join('; ');
+    }
     // what the API refuses of a declared vGPU profile, and a flavor declared twice (SDD §4.2, §16, §22.3)
     return declaresGpuProfiles ? { ...e, ...rowProblems(form.gpuProfiles) } : e;
   };
@@ -666,8 +683,11 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       ssh_user: form.hostUser.trim() || 'cloud-user',
       ssh_allowed_cidr: blank(form.hostCidr),
       ssh_key_secret: !form.hostManaged && form.keySource === 'external' ? form.keySecretName.trim() : (existing?.ssh_key_secret ?? null),
+      // the list whole (SDD §12); a vCenter's form takes none and keeps what the provider has
+      ssh_host_keys: declaredKeys(form.hostKeys),
     };
-    const empty = host.manage && !host.name && !host.flavor && !host.image && !host.external_network && !host.ssh_allowed_cidr && !existing;
+    const empty =
+      host.manage && !host.name && !host.flavor && !host.image && !host.external_network && !host.ssh_allowed_cidr && !host.ssh_host_keys?.length && !existing;
     return empty ? null : host;
   };
 
@@ -693,7 +713,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setErrors(found);
     setFailure(null);
     if (Object.keys(found).length) {
-      if (['hostName', 'hostAddress', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
+      if (['hostName', 'hostAddress', 'hostKeys', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
       requestAnimationFrame(() => summaryRef.current?.focus());
       return;
     }
@@ -726,12 +746,15 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (current) {
         const patch: ProviderPatch = {};
         for (const [key, value] of Object.entries(fields) as Array<[keyof ProviderPatch, unknown]>) {
-          // declared vGPU profiles are one map in any order of their pairs: a PATCH resets the check report (SDD §12, §16)
+          // declared vGPU profiles are one map in any order of their pairs, a conversion host one object in any order of
+          // its fields: a PATCH resets the check report (SDD §12, §16)
           const same =
             key === 'gpu_profiles'
               ? sameVgpuProfiles(value as Record<string, string>, current.gpu_profiles ?? {})
               : key === 'ceph'
                 ? sameCephAccess(value as CephAccess | null, current.ceph ?? null)
+              : key === 'conversion_host'
+                ? sameConversionHost(value as ConversionHostConfig | null, current.conversion_host)
                 : JSON.stringify(value) === JSON.stringify(current[key]);
           if (!same) (patch as Record<string, unknown>)[key] = value;
         }
@@ -1212,6 +1235,20 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                     inputClassName="font-mono"
                   />
                 </div>
+                {preset.kind !== 'vmware' && (
+                  <TextAreaField
+                    id={id('hostKeys')}
+                    label="Host keys"
+                    value={form.hostKeys}
+                    onChange={(e) => set('hostKeys', e.target.value)}
+                    placeholder="e.g. ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… conv-host"
+                    hint="The host's public keys, one per line: ed25519, ECDSA or RSA, read out of band (its /etc/ssh/ssh_host_*_key.pub). They win over the keys a check pins; leave it empty to pin them from the host's console."
+                    error={errors.hostKeys}
+                    spellCheck={false}
+                    autoComplete="off"
+                    wrap="off"
+                  />
+                )}
                 {!form.hostManaged && (
                   <Segmented
                     label="SSH key from"
