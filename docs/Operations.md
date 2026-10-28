@@ -324,6 +324,14 @@ version, then resume the plans.
 The first pre-staging after an upgrade from a version before issue #112's fix adopts the conversion key: see
 section 7.1.
 
+**To 0.5.0**, which checks the conversion hosts' SSH host keys on every hop (`SEAMLESS_ANSIBLE_HOST_KEY_CHECKING`,
+on by default; SDD §26.8): drain first (section 5). A cutover the upgrade cuts off resumes only once its hosts are
+pinned - it checks them before the stop, and one whose source VM was already stopped is rolled back. After the
+upgrade, run the check on each provider, or let the first pre-staging do it: a host 0.4.0 made is pinned once from
+its console. A host whose console no longer prints the block blocks its plans with `CONV_HOST_KEY_UNKNOWN` until you
+declare its keys (section 7.2). 0.4.0's link keys go with the first 0.5.0 run on each host pair; a link you made by
+hand stays yours to remove.
+
 ---
 
 ## 7. Troubleshooting
@@ -428,6 +436,53 @@ Other cases:
   The next pre-staging on that pair also replaces its keypair.
 - **Re-keyed hosts** keep the earlier key authorized. Once no plan of that key is in flight, remove its line by hand
   (Security.md §6.4).
+
+### 7.2 The conversion hosts' SSH host keys (0.5.0)
+
+Every hop of the data path checks a conversion host against a key known before the first connection (SDD §26): the
+key Seamless injected when it created the host, the key its console printed at first boot, or the keys you declare.
+The provider page shows each host's **Host keys** - the fingerprints, where they came from (`Declared`, the pin's
+`injected` or `console`), the server and the time - and warns while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`
+(then no hop checks a key, and validation adds the warning `CONV_HOST_KEYS_UNCHECKED` to every plan).
+
+**Declaring a host's keys.** For a host you bring (`conversion_host.manage: false`, a VMware destination's
+conversion host), or one whose console does not print the `SSH HOST KEY KEYS` block, read the keys on the host
+itself - on its console, or over a connection you trust for another reason:
+
+```bash
+cat /etc/ssh/ssh_host_ed25519_key.pub   # and ecdsa or rsa, if sshd offers those
+```
+
+Paste them, one per line, into **Host keys** of the provider form (`PATCH /api/v1/providers/{id}` →
+`conversion_host.ssh_host_keys`). A line that is no public key is refused by name, never quoted back. Declared keys
+win over the pin; clear them to go back to it.
+
+**A plan blocked by `CONV_HOST_KEY_UNKNOWN`.** The plan needs a host that has neither declared keys nor a pin and
+that Seamless will not create, or whose pin belongs to another server than the one the provider's host resolves to.
+Declare the keys as above; or, for a host Seamless manages, delete it and start the plan again: the pre-staging
+creates it with an injected key and pins it.
+
+**A refused key.** A run that meets another key fails at once and for good: the migration's reason starts with
+`host key refused:` and names the side, the server, the address, the pinned and the offered fingerprints, and the
+event `conversion_host.key_refused` (Events, under Providers and Security) carries the same - alert on it, since a
+refused key may be an attack. A cutover checks both hosts and its link before the source VM stops, so the source keeps
+running; one whose source was already stopped rolls back. Find out why the key changed before anything else:
+
+- **The host was rebuilt or replaced** (the reason `conversion host replaced:`, or the provider's check reporting
+  it): a conversion host deleted and created again under its name and address is a new server, and the old pin does
+  not apply. Declare the new host's keys, or delete it and let a pre-staging create and pin it again.
+- **The image regenerated its keys** (a host Seamless created that "does not present" its injected key): check the
+  image's cloud-init (`ssh_deletekeys`, `ssh_keys` honoured; SDD §26.3), then delete the host and pre-stage again.
+- **Neither**: treat the host's network as compromised (Security.md §13), and do not declare the offered key.
+
+Seamless never accepts a refused key on its own: no prompt, no `accept-new`, no new pin for the same server. The way
+out is always a declared key or a host pre-staged again.
+
+**The link between the hosts.** Each run makes its own link key on the destination host and writes one restricted
+line into the source host's `~/.ssh/authorized_keys` (comment `seamless-link workload=<server id> run=<run>`); the run
+removes both when it ends. A run also removes its migration's earlier lines and every expired one, and the first
+0.5.0 run on a host pair removes 0.4.0's `CONVERSION LINK KEY` block and the destination's `~/.ssh/id_rsa` when it
+holds the plan's old link key. A link you made by hand - another comment, another key - is yours to remove.
 
 ---
 
