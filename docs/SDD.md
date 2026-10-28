@@ -2547,7 +2547,11 @@ follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Ea
 source is stopped. A `warm` pass takes the model's `snapshot + max(scan, Δ/L)` (the scan as §9.1 models it) and records as
 its `duration_s` the part after the snapshot, as the collection's warm sync does, so a pass that ran as the model predicts
 reads back the plan's `S`; `previous_pass_duration` is the previous pass's whole time, its snapshot included (review
-RV38A-05). A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
+RV38A-05). A migration with tracked disks (`Migration.tracked_disks`, §28.6, plan task CE11) records each pass's
+extent use (§28.5): its first pass scans every disk (`first_pass`), a later pre-copy pass checks each tracked disk
+(`checked`, `query_s` = `q`, no miss) and scans the others (`not_tracked`), taking `snapshot + q + max(scan, Δ/L)`
+and recording the part after the snapshot; its final pass reads the tracked disks (`read`) and takes §28.6's term,
+`snapshot + max(scan_U, q + max(Δf/S, Δf/L))`. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
 cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
 downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
 `PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
@@ -3601,6 +3605,11 @@ PoolMember { load_balancer: str, pool: str,     # their names, else their ids
 * `VMwareProvider` reads neither: its inventory holds both reads `ok` and empty. The demo's OpenStack
   `FakeSourceProvider` reads its stack and pools (below, "The demo's network cut-over", plan task N11); its VMware one
   reads neither.
+* **The demo's Ceph** (§28.4, plan task CE11): the fake OpenStack source's `rbd` pools report the `ceph_fsid` of the
+  demo cluster (`DEMO_CEPH_FSID`) and their Ceph pool, the fake destination's its own cluster's; the demo's RHOSP source
+  provider declares that access (`ceph`, its key as written) and its finance plan tracks extents (`extent_tracking`),
+  so its Ceph VMs' migrations carry `tracked_disks` and the simulator records their passes' extent use (§7.4), while
+  its NetApp VMs (`portal-01`, `app-01`, `app-02`) scan in full (`EXTENT_TRACKING_PARTIAL` names their volumes, §9.3).
 * **Data minimization** (as §22.12 for Placement): the names of a stack, a resource, a group, a pool and a load
   balancer, and a member's address, are customer data. The read keeps them for the finding that shows them to the
   operator (§9.3), logs neither them nor a failure's message text, and the advisor sends Jev finding codes and
@@ -8401,6 +8410,6 @@ The owner took each default as written on 2026-10-23 (D1):
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §4.2, §5.3, §9.1, §16 (binding) | CE8 |
 | the findings of §28.9 | §9.3 (binding), §16 | CE9 |
 | the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
-| the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 | CE11 |
+| the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 (binding) | CE11 |
 | QASuite (FR-26 rows, LAB-CE cases, PERF-E2E-SM1b), Security.md, Operations.md, Performance.md | QASuite, Security.md, Operations.md, Performance.md | CE12 |
 | the lab; the Technology Preview label goes when LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass | QASuite §13 | CE13 |
