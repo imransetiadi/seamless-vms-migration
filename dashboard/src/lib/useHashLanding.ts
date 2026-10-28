@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
+import { hashTarget } from './navigation';
 
 /**
  * A link to a part of a page (`#policy-…`, `#findings`) lands on it once the page shows it: scrolled to and
@@ -9,7 +10,7 @@ export function useHashLanding(ready: boolean): void {
   const { hash } = useLocation();
   useEffect(() => {
     if (!ready || hash.length < 2) return;
-    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
+    const target = hashTarget(hash);
     target?.scrollIntoView?.({ block: 'start' });
     target?.focus({ preventScroll: true });
   }, [hash, ready]);

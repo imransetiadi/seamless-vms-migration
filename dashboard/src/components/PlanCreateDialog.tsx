@@ -812,6 +812,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
             {inventory.error && <ErrorBanner error={inventory.error} title="Cannot read the source inventory" onRetry={() => void inventory.refetch()} />}
             {source && vms.length > 0 && (
               <VmTable
+                key={form.sourceId}
                 vms={vms}
                 providerKind={source.kind}
                 selected={form.vmIds}

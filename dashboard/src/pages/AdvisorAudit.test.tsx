@@ -179,6 +179,49 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument();
   });
 
+  it('returns focus to Search when the last older page removes its button and filters hide the table', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 1000; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: {} });
+    }
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', server });
+    await auditTable();
+    const search = screen.getByLabelText('Search');
+    await user.type(search, 'no-matching-event');
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument());
+    await waitFor(() => expect(search).toHaveFocus());
+  });
+
+  it('keeps focus on Search when an older page finishes after the user moved there', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 1000; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: {} });
+    }
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    renderWithApp(<AdvisorAudit />, {
+      route: '/advisor/audit', server,
+      wrapFetch: (mock) => async (input, init) => {
+        if (new URL(String(input), 'http://localhost').searchParams.has('before')) await pending;
+        return mock(input, init);
+      },
+    });
+    await auditTable();
+    const search = screen.getByLabelText('Search');
+    await user.type(search, 'policy edit 1');
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    await user.clear(search);
+    await user.type(search, 'policy edit 2');
+    release();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument());
+    // The page schedules its focus recovery on the next frame.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    expect(search).toHaveFocus();
+  });
+
   it('filters by action, actor and text', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });
@@ -193,6 +236,23 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     await user.selectOptions(screen.getByLabelText('Actor'), 'all');
     await user.type(screen.getByLabelText('Search'), 'web-02');
     expect(shown()).toHaveLength(2);
+  });
+
+  it('clears all filters from an empty result and keeps focus when its reset button disappears', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit' });
+    const total = within(await auditTable()).getAllByRole('row').length;
+    await user.selectOptions(screen.getByLabelText('Action'), 'decision.fallback');
+    await user.selectOptions(screen.getByLabelText('Actor'), 'system:advisor');
+    await user.type(screen.getByLabelText('Search'), 'no-match');
+    expect(screen.getByText('No audit events match')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByLabelText('Action')).toHaveValue('all');
+    expect(screen.getByLabelText('Actor')).toHaveValue('all');
+    expect(screen.getByLabelText('Search')).toHaveValue('');
+    expect(screen.getByLabelText('Search')).toHaveFocus();
+    expect(within(await auditTable()).getAllByRole('row')).toHaveLength(total);
+    expect(screen.queryByRole('button', { name: 'Clear filters' })).not.toBeInTheDocument();
   });
 
   it('downloads the shown events as CSV and as JSON', async () => {

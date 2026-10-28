@@ -9,6 +9,27 @@ async function signIn(page: Page, path = '/') {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
 }
 
+test('sign-in keeps the pending token stable and becomes editable after rejection', async ({ page }) => {
+  await page.goto('/login');
+  const token = page.getByLabel('API token', { exact: true });
+  await token.fill('not-a-valid-token');
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  await token.press('Enter');
+  await expect(token).toHaveAttribute('readonly');
+  await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toHaveAttribute('aria-busy', 'true');
+  await token.press('Enter');
+  await page.clock.runFor(500);
+  await expect(page.getByRole('alert')).toContainText('The token was rejected.');
+  await expect(token).not.toHaveAttribute('readonly');
+  await expect(token).toBeFocused();
+  await expect(token).toHaveValue('not-a-valid-token');
+  await token.fill('admin');
+  await token.press('Enter');
+  await page.clock.runFor(500);
+  await expect(page).toHaveURL(/\/$/);
+});
+
 test('a failed page chunk keeps navigation and offers an explicit reload', async ({ page }) => {
   await signIn(page);
   await page.route(/\/assets\/Plans-.*\.js$/, (route) => route.abort());
@@ -110,6 +131,27 @@ test('closing changed plan input asks before discarding it', async ({ page }) =>
   await expect(page.getByRole('alertdialog')).toBeHidden();
 });
 
+for (const width of [320, 1440]) {
+  test(`an error summary keeps reverse Tab inside the plan dialog at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page, '/plans');
+    await page.getByRole('button', { name: 'New plan', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'New migration plan', exact: true });
+    const submit = dialog.getByRole('button', { name: /^Create plan/ });
+    await submit.click();
+    await expect(dialog.getByRole('alert')).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(submit).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(dialog.getByRole('link', { name: 'Enter a plan name.', exact: true })).toBeFocused();
+    await expect(page.locator('#root')).toHaveAttribute('inert', '');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
+    await expect(page.locator('#root')).not.toHaveAttribute('inert');
+    await expect(page.getByRole('button', { name: 'New plan', exact: true })).toBeFocused();
+  });
+}
+
 test('Plans validates URL filters and keeps status and sorting after reload', async ({ page }) => {
   await signIn(page, '/plans?status=unknown&sort=unknown&direction=unknown');
   await expect(page.getByLabel('Status', { exact: true })).toHaveValue('all');
@@ -141,6 +183,135 @@ test('compact navigation keeps identity, role and demo context visible', async (
     expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
   }
 });
+
+for (const width of [320, 1440]) {
+  test(`activity filters recover empty results without losing focus at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page);
+    for (const theme of ['light', 'dark']) {
+      await page.goto('/events');
+      await page.evaluate((value) => { document.documentElement.className = value; }, theme);
+      await page.getByRole('button', { name: 'Pause live updates', exact: true }).click();
+      await page.getByLabel('Category', { exact: true }).selectOption('security');
+      await page.getByLabel('Plan', { exact: true }).selectOption('plan-c81d44a0');
+      await page.getByLabel('Show progress updates', { exact: true }).check();
+      const search = page.getByLabel('Search events', { exact: true });
+      await search.fill('no-matching-event');
+      await expect(page.getByText('No events match', { exact: true })).toBeVisible();
+      const clear = page.getByRole('button', { name: 'Clear filters', exact: true });
+      expect((await clear.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      await clear.click();
+      await expect(search).toBeFocused();
+      await expect(search).toHaveValue('');
+      await expect(page.getByLabel('Category', { exact: true })).toHaveValue('all');
+      await expect(page.getByLabel('Plan', { exact: true })).toHaveValue('');
+      await expect(page.getByLabel('Show progress updates', { exact: true })).not.toBeChecked();
+      await expect(page).not.toHaveURL(/plan=/);
+      await expect(page.getByRole('button', { name: 'Resume live updates', exact: true })).toBeVisible();
+      await expect(page.getByRole('list', { name: 'Events, newest first', exact: true })).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+
+      await page.goto('/advisor/audit');
+      await page.getByRole('table', { name: 'Advisor audit events, newest first', exact: true }).waitFor();
+      await page.evaluate((value) => { document.documentElement.className = value; }, theme);
+      await page.getByLabel('Action', { exact: true }).selectOption('decision.fallback');
+      await page.getByLabel('Actor', { exact: true }).selectOption('system:advisor');
+      const auditSearch = page.getByLabel('Search', { exact: true });
+      await auditSearch.fill('no-matching-event');
+      await expect(page.getByText('No audit events match', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
+      await expect(auditSearch).toBeFocused();
+      await expect(auditSearch).toHaveValue('');
+      await expect(page.getByLabel('Action', { exact: true })).toHaveValue('all');
+      await expect(page.getByLabel('Actor', { exact: true })).toHaveValue('all');
+      await expect(page.getByRole('table', { name: 'Advisor audit events, newest first', exact: true })).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Clear filters', exact: true })).toBeHidden();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+    }
+  });
+}
+
+for (const width of [320, 768, 1440]) {
+  test(`detail section jumps keep focus and headings clear at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page, '/migrations/mig-5d7e2b4a12');
+    for (const [path, label] of [
+      ['/migrations/mig-5d7e2b4a12', 'Migration sections'],
+      ['/plans/plan-c81d44a0', 'Plan sections'],
+    ]) {
+      await page.goto(path!);
+      const nav = page.getByRole('navigation', { name: label! });
+      await expect(nav).toBeVisible();
+      for (const link of await nav.getByRole('link').all()) {
+        const hash = (await link.getAttribute('href'))!;
+        expect((await link.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+        await link.focus();
+        await page.keyboard.press('Enter');
+        await expect(page.locator(hash)).toBeFocused();
+        expect((await page.locator(hash).boundingBox())!.y).toBeGreaterThanOrEqual((await nav.boundingBox())!.y + (await nav.boundingBox())!.height);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+      }
+      await page.reload();
+      const hash = new URL(page.url()).hash;
+      await expect(page.locator(hash)).toBeFocused();
+      // Repeating a native fragment link must still land after manually scrolling away.
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await nav.locator(`a[href="${hash}"]`).click();
+      await expect(page.locator(hash)).toBeFocused();
+    }
+  });
+}
+
+test('search and select controls keep 44px touch targets in both themes', async ({ page }) => {
+  await signIn(page, '/plans');
+  for (const width of [320, 768, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate((value) => { document.documentElement.className = value; }, theme);
+      for (const control of [page.getByLabel('Search plans'), page.getByLabel('Status', { exact: true })]) {
+        expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+    }
+  }
+});
+
+for (const width of [320, 768, 1440]) {
+  test(`VM selection stays reviewable, touchable and keyboard-safe at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page, '/inventory/rhosp17-dc1');
+    const search = page.getByLabel('Search VMs');
+    const selectedOnly = page.getByRole('checkbox', { name: 'Selected only', exact: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate((value) => { document.documentElement.className = value; }, theme);
+      for (const name of ['Select web-01', 'Select db-pg-01']) {
+        const checkbox = page.getByRole('checkbox', { name, exact: true });
+        const target = checkbox.locator('..');
+        const box = (await target.boundingBox())!;
+        expect(box.height).toBeGreaterThanOrEqual(44);
+        expect(box.width).toBeGreaterThanOrEqual(44);
+        await target.click();
+        await expect(checkbox).toBeChecked();
+      }
+      await search.fill('db-pg-01');
+      await expect(page.getByRole('status').filter({ hasText: '2 selected (1 not shown)' })).toBeVisible();
+      await selectedOnly.check();
+      await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
+      await expect(search).toBeFocused();
+      await selectedOnly.check();
+      const table = page.getByRole('table', { name: /^VMs on/ });
+      await expect(table.getByRole('row')).toHaveCount(3);
+      await page.getByRole('checkbox', { name: 'Select web-01', exact: true }).click();
+      await expect(search).toBeFocused();
+      await expect(table.getByRole('row')).toHaveCount(2);
+      await page.getByRole('button', { name: 'Clear selection', exact: true }).click();
+      await expect(search).toBeFocused();
+      await expect(selectedOnly).not.toBeChecked();
+      await expect(page.getByRole('button', { name: 'Create plan', exact: true })).toHaveAttribute('aria-disabled', 'true');
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+    }
+  });
+}
 
 test('a disabled action near the bottom keeps its explanation inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });

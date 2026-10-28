@@ -5,3 +5,15 @@ export const KEEP_FOCUS = { keepFocus: true } as const;
 export function keepsFocus(state: unknown): boolean {
   return typeof state === 'object' && state !== null && (state as { keepFocus?: unknown }).keepFocus === true;
 }
+
+/** A malformed URL fragment must not prevent the page from rendering. */
+export function hashTarget(hash: string): HTMLElement | null {
+  if (hash.length < 2) return null;
+  let id: string;
+  try {
+    id = decodeURIComponent(hash.slice(1));
+  } catch {
+    return null;
+  }
+  return document.getElementById(id);
+}

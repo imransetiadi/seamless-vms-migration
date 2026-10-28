@@ -38,6 +38,10 @@
 
 **Color Notes:** Dark tech + status green
 
+Light theme uses softer surfaces: background `#E8EDF3`, card `#F1F4F8`, muted `#DCE3ED`, and border/chart grid
+`#C5CFDC`. Text remains `#1E293B` with secondary text `#475569`; input boundaries, status colours and focus rings
+retain their contrast. Use these tokens for page, sidebar, cards and forms rather than pure white surfaces (SDD §16).
+
 ### Typography
 
 - **Heading Font:** Fira Code

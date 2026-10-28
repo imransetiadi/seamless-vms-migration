@@ -9,6 +9,27 @@ const FINANCE = 'Finance — approval required';
 const card = (name: string) => screen.getByRole('article', { name });
 
 describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
+  it('keeps focus inside the policy dialog after retrying its failed scope list', async () => {
+    const user = userEvent.setup({ delay: null });
+    let failed = true;
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', wrapFetch: (mock) => (input, init) => {
+      if (failed && new URL(String(input), 'http://localhost').pathname.endsWith('/providers')) {
+        return Promise.resolve(new Response(JSON.stringify({ error: { code: 'unavailable', message: 'offline' } }), { status: 400 }));
+      }
+      return mock(input, init);
+    } });
+    await user.click(await screen.findByRole('button', { name: 'New policy' }));
+    const dialog = screen.getByRole('dialog', { name: 'New policy' });
+    await user.selectOptions(within(dialog).getByLabelText('Applies to'), 'providers');
+    const alert = await within(dialog).findByRole('alert');
+    failed = false;
+    await user.click(within(alert).getByRole('button', { name: 'Retry' }));
+    await within(dialog).findByRole('checkbox', { name: 'RHOSP 17.1 — DC1' });
+    await waitFor(() => expect(within(dialog).getByRole('heading', { name: 'New policy' })).toHaveFocus());
+    await user.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
   it('scrolls to and focuses the policy a link names, the built-in default too (SDD §16, ADV-20)', async () => {
     const view = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies#policy-pol-finance', token: 'viewer' });
     const finance = await screen.findByRole('article', { name: 'Finance — approval required' });

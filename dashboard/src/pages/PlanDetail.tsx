@@ -36,6 +36,7 @@ import { KpiTile } from '../components/KpiTile';
 import { MigrationsTable } from '../components/MigrationsTable';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { SectionNav } from '../components/SectionNav';
 import { LoadingBlock } from '../components/Skeleton';
 import { ProbeWarnings } from '../components/ProbeWarnings';
 import { PlanStatusBadge } from '../components/StatusBadge';
@@ -55,9 +56,18 @@ import { destinationName, providerLabel } from '../lib/providerUse';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
+import { useHashLanding } from '../lib/useHashLanding';
 import { usePlanFindings } from '../lib/usePlanFindings';
 
 type Confirm = 'validate' | 'start' | 'pause' | 'waves' | 'cancel' | null;
+
+const PLAN_SECTIONS = [
+  ['plan-metrics', 'Summary'],
+  ['plan-settings', 'Settings'],
+  ['plan-waves', 'Waves'],
+  ['plan-migrations', 'Migrations'],
+  ['plan-findings', 'Findings'],
+] as const;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -300,6 +310,7 @@ export default function PlanDetail() {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const afterActionRef = useRef<HTMLElement | null>(null);
   usePageTitle(plan.data?.name ?? 'Plan');
+  useHashLanding(Boolean(plan.data) && !plan.error);
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
   const { rows: findings, groups: findingGroups } = usePlanFindings(list);
@@ -475,8 +486,10 @@ export default function PlanDetail() {
           <p className="text-foreground">{NOTHING_MIGRATED_NEXT}</p>
         </div>
       )}
+      <SectionNav label="Plan sections" sections={PLAN_SECTIONS} />
+
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
-      <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
+      <section id="plan-metrics" tabIndex={-1} aria-label="Plan metrics" className="mb-4 grid scroll-mt-20 grid-cols-2 gap-3 outline-offset-2 focus:outline-2 focus:outline-ring md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
         <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
         {/* Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19) */}
@@ -508,11 +521,11 @@ export default function PlanDetail() {
         <FinalizeQueue plan={p} destination={destinationName(providers.data, p)} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} focusAfterRef={headingRef} />
 
-        <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
+        <Panel id="plan-settings" title="Settings" description="What the orchestrator will do for every VM in this plan">
           <SettingsSummary plan={p} providers={providers.data ?? []} policy={policy?.policy} builtIn={policy?.builtIn} />
         </Panel>
 
-        <Panel title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">
+        <Panel id="plan-waves" title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">
           <WavesBoard
             plan={p}
             migrations={migrationsUnknown ? null : list}
@@ -524,7 +537,7 @@ export default function PlanDetail() {
           />
         </Panel>
 
-        <Panel title="Migrations" description="Strategy, estimated downtime and pre-flight findings per VM">
+        <Panel id="plan-migrations" title="Migrations" description="Strategy, estimated downtime and pre-flight findings per VM">
           {migrations.isPending && <LoadingBlock label="Loading migrations…" rows={5} />}
           {migrations.error && <ErrorBanner error={migrations.error} title="Migrations are unavailable" onRetry={() => void migrations.refetch()} />}
           {migrations.data && (
@@ -548,7 +561,7 @@ export default function PlanDetail() {
           )}
         </Panel>
 
-        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-hidden">
+        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-offset-2 focus:outline-2 focus:outline-ring">
           <Panel
             title="Findings"
             description={

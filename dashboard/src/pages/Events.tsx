@@ -174,6 +174,18 @@ export default function Events() {
   const [showProgress, setShowProgress] = useState(false);
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filtersActive = query !== '' || category !== 'all' || planId !== '' || showProgress;
+  const clearFilters = () => {
+    setQuery('');
+    setCategory('all');
+    setShowProgress(false);
+    const next = new URLSearchParams(params);
+    next.delete('plan');
+    setParams(next, { replace: true });
+    setLimit(PAGE);
+    searchRef.current?.focus();
+  };
   const [limit, setLimit] = useState(PAGE);
   const counter = useRef(0);
   const listRef = useRef<HTMLOListElement>(null);
@@ -259,6 +271,7 @@ export default function Events() {
     setOlderError(null);
     try {
       const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
+      const restoreFocus = document.activeElement === moreRef.current;
       const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
       // the history it was read below stays loaded too: when the newest history is read again, its window moves up
       // and would otherwise leave a gap between it and these pages
@@ -267,7 +280,7 @@ export default function Events() {
       setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
       // the start of the trail removes the button: focus moves to the list, never to the page (SDD §16)
       requestAnimationFrame(() => {
-        if (!moreRef.current) listRef.current?.focus();
+        if (restoreFocus && !moreRef.current && document.activeElement === document.body) (listRef.current ?? searchRef.current)?.focus();
       });
     } catch (error) {
       setOlderError(error);
@@ -362,6 +375,7 @@ export default function Events() {
             Search events
           </label>
           <input
+            ref={searchRef}
             id={searchId}
             type="search"
             className="input"
@@ -405,6 +419,7 @@ export default function Events() {
           <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => setShowProgress(e.target.checked)} />
           Show progress updates
         </label>
+        {filtersActive && <Button size="lg" onClick={clearFilters}>Clear filters</Button>}
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">

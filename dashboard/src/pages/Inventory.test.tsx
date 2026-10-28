@@ -82,6 +82,24 @@ describe('Inventory', () => {
     expect(screen.getByRole('main')).toHaveFocus();
   });
 
+  it('resets VM filters when switching between cached provider inventories', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1', path: '/inventory/:providerId' });
+    await screen.findByLabelText('Search VMs');
+    const provider = screen.getByLabelText('Provider');
+    await user.selectOptions(provider, 'vcenter-hq');
+    await screen.findByRole('table', { name: /^VMs on vCenter HQ/ });
+    await user.selectOptions(provider, 'rhosp17-dc1');
+    await user.selectOptions(screen.getByLabelText('Project'), 'shop');
+    await user.type(screen.getByLabelText('Search VMs'), 'web-01');
+    await user.selectOptions(provider, 'vcenter-hq');
+    expect(screen.getByLabelText('Search VMs')).toHaveValue('');
+    expect(screen.getByRole('table', { name: /^VMs on vCenter HQ/ })).toBeInTheDocument();
+    await user.selectOptions(provider, 'rhosp17-dc1');
+    expect(screen.getByLabelText('Project')).toHaveValue('all');
+    expect(provider).toHaveFocus();
+  });
+
   it('offers a provider stored with a blank name by its id, with its role, and names its table so (SDD §1 naming, §4.2, review RV21-06)', async () => {
     const server = createTestServer();
     server.providers.find((p) => p.id === 'rhosp17-dc1')!.name = '   ';

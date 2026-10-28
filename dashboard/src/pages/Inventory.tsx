@@ -421,7 +421,7 @@ export default function Inventory() {
             )}
             <VmTable
               // a link to one VM by its source id (`?vm=`, SDD §16) opens the table searching for its name
-              key={wanted ?? ''}
+              key={`${providerId}:${wanted ?? ''}`}
               initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}
