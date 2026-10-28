@@ -3180,6 +3180,9 @@ Finding catalog (code — severity — condition):
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
+| `CEPH_ACCESS_MISSING` | warning (warm) | the plan tracks extents (`extent_tracking`, §28.9) and its source has no Ceph access (`ceph`), no key (`ceph.key_updated_at` null) or no `rbd` pool whose `ceph_fsid` is its own in its check report (§10): every pass scans in full; the message says which. Not judged for a VMware source, which refuses the switch |
+| `EXTENT_TRACKING_PARTIAL` | info (warm) | the plan tracks extents and its source has access, and a disk of the VM does not qualify (§28.3, §28.4): not a Cinder volume (an image copy, an ephemeral disk), encrypted, a `pool` the source credential cannot read, or a pool that is no `rbd` pool of the cluster; the message names each disk and why. Its final pass scans those disks in full |
+| `EXTENT_TRACKING_MISSED` | warning (warm) | a `checked` pass of this migration found changes outside a disk's extents (`SyncPass.extents[dev].missed` > 0, §4.2, §28.5): the disk scans in full for the rest of the migration; the message names the devices, and the remediation asks for the Ceph releases of the source's compute nodes and cluster (§28.4) |
 
 The GPU rows read the VM's GPUs (a VM recorded without `gpus`, its flavor's extra specs as §22.2 reads them). Since
 plan task G4 a GPU VM's server is created with its GPU flavor, which its plan names and nothing matches (§22.4): its
@@ -8313,7 +8316,7 @@ present, a live migration, the scratch storage of a pull-mode job, and the read 
 
 * **The plan switch** (binding in §4.2 and §12 since plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
   VMware source. `PATCH /plans/{id}` may change it at any time: off, the next pass scans; on, the next pass checks.
-* **Findings** (proposed; each enters §9.3 with plan task CE9, with its catalog entry, its tests and the mock):
+* **Findings** (binding in §9.3 since plan task CE9, each with its catalog entry, its tests and the mock):
   * CEPH_ACCESS_MISSING, warning (warm): the plan tracks extents, and its source has no Ceph access, no key, or no
     `rbd` pool whose fsid is its own: every pass scans in full;
   * EXTENT_TRACKING_PARTIAL, info (warm): the plan tracks extents, and a disk of the VM does not qualify (not a Cinder
@@ -8388,7 +8391,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
-| the findings of §28.9 | §9.3, §16 | CE9 |
+| the findings of §28.9 | §9.3 (binding), §16 | CE9 |
 | the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
 | the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 | CE11 |
 | QASuite (FR-26 rows, LAB-CE cases, PERF-E2E-SM1b), Security.md, Operations.md, Performance.md | QASuite, Security.md, Operations.md, Performance.md | CE12 |
