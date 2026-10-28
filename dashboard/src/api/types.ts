@@ -854,6 +854,11 @@ export interface Migration {
   estimates: Estimate[];
   /** Per-stream scan throughput measured by the last delta pass (SDD §9.1 calibration), null before it. */
   observed_scan_bps: number | null;
+  /** The disks (ids) the final pass is expected to read from extents (SDD §9.1, §28.6): a tracked plan's qualifying
+   * disks at validation, less those a pass scanned for a lasting reason. */
+  tracked_disks: string[];
+  /** The longest extent query of the last checked pass (SDD §9.1 calibration), null before one. */
+  observed_extent_query_s: number | null;
   /** Mappings matched automatically by pre-flight, e.g. the smallest fitting flavor (`MAP_FLAVOR_AUTO`). */
   resolved_mappings: Mappings;
   findings: Finding[];

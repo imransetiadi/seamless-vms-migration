@@ -138,8 +138,10 @@ from .planning.estimator import (
     estimate_forced_downtime,
     final_downtime_parts,
     hooks_part,
+    observed_extent_query_s,
     observed_scan_rate,
     params_for_plan,
+    tracked_disks,
     whole_pass_seconds,
 )
 from .planning.gpu import PoolKey, gpu_flavor, gpu_units, pool_key, pool_name, vm_gpus
@@ -153,10 +155,12 @@ from .planning.preflight import (
     has_blocker,
     keep_detached_volumes,
     keypair_prestaged,
+    qualifying_disks,
     quota_share,
     resolve_mappings,
     run_preflight,
     server_gpu_flavor,
+    tracking_ready,
 )
 from .planning.probes import suggest_probes
 from .planning.selector import HELD_VOLUMES_REASON, eligibility, select_strategy
@@ -1418,6 +1422,11 @@ class Orchestrator:
             )
             # the DNS record's TTL, apart from the downtime (SDD §9.1)
             ttl = ttls.get(vm.source_id)
+            # the disks a tracked plan's final pass is expected to read from extents (SDD §28.6)
+            checked_source = source.model_copy(update={"capabilities": src_caps})
+            tracked = (
+                qualifying_disks(vm, checked_source) if tracking_ready(plan, checked_source) else []
+            )
             estimates = [
                 estimate(
                     vm,
@@ -1426,6 +1435,7 @@ class Orchestrator:
                     plan.downtime_slo_s,
                     hooks_s=hooks_s,
                     dns_tail_s=float(ttl) if ttl is not None else None,
+                    tracked=tracked,
                 ).model_copy(update={"eligible": not why, "reasons": list(why)})
                 for strategy, why in reasons.items()
             ]
@@ -1521,6 +1531,7 @@ class Orchestrator:
                     migration_id=migration_id,
                     why=why,
                     estimates=estimates,
+                    tracked_disks=tracked,
                     findings=findings,
                     resolved=resolved,
                     hold=hold,
@@ -1541,6 +1552,7 @@ class Orchestrator:
                     hold=hold,
                     recommended=rec_id if also is not None else None,
                     also=also,
+                    tracked_disks=tracked,
                 )
             # recorded only when this validation took the choice (ready or blocked now): one that
             # went in flight or was cancelled meanwhile was left alone, without the record
@@ -1613,6 +1625,7 @@ class Orchestrator:
         hold: str | None = None,
         recommended: str | None = None,
         also: Joined | None = None,
+        tracked_disks: list[str] | None = None,
     ) -> Migration:
         """A new migration, created already assessed (SDD §5.4): its history from pending through
         validating to ready or blocked in one write with migration.created, the phase events and
@@ -1639,6 +1652,7 @@ class Orchestrator:
         final = self._assess(
             migration, plan, vm, strategy, why, estimates, findings, resolved, hold, recommended
         )
+        migration.tracked_disks = list(tracked_disks or [])  # SDD §28.6, plan task CE8
         migration, _ = await self._transitions(
             migration,
             0,
@@ -1711,6 +1725,7 @@ class Orchestrator:
         hold: str | None = None,
         recommended: str | None = None,
         also: Joined | None = None,
+        tracked_disks: list[str] | None = None,
     ) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
@@ -1731,6 +1746,7 @@ class Orchestrator:
             final = self._assess(
                 m, plan, vm, strategy, why, estimates, findings, resolved, hold, recommended
             )
+            m.tracked_disks = list(tracked_disks or [])  # a fresh assessment (SDD §28.6)
             # both transitions in one write, with what joins them (SDD §5.4)
             m, v = await self._transitions(m, v, [*steps, final], actor, also=also)
         return m
@@ -2087,6 +2103,7 @@ class Orchestrator:
                 params,
                 # the post_create hooks' part of its estimate (SDD §9.1)
                 hooks_part(m.estimate),
+                m.tracked_disks,
             )
             now = self._now()
             m.force_cutover = ForceCutover(
@@ -4155,6 +4172,8 @@ class Orchestrator:
         params = params_for_plan(plan)
         if m.observed_scan_bps:
             params = replace(params, scan_bps=float(m.observed_scan_bps))
+        if m.observed_extent_query_s:
+            params = replace(params, extent_query_s=float(m.observed_extent_query_s))
         return params
 
     def _calibrate(self, m: Migration, plan: Plan, sync_pass: SyncPass) -> None:
@@ -4175,6 +4194,12 @@ class Orchestrator:
             observed = observed_scan_rate(sync_pass, m.vm, self._params(m, plan))
             if observed is not None:
                 m.observed_scan_bps = observed
+            # a disk the pass scanned for a lasting reason leaves the tracked ones, and a checked
+            # pass's longest query is the migration's q (SDD §9.1, §28.6)
+            m.tracked_disks = tracked_disks(m.vm, m.tracked_disks, [sync_pass])
+            query = observed_extent_query_s(sync_pass)
+            if query is not None:
+                m.observed_extent_query_s = query
         if sync_pass.kind == SyncPassKind.final:
             return  # the estimate stays the one the convergence rule used (SDD §5.3, ADV-16)
         # the hooks' part and the DNS tail as validation gave them (SDD §9.1)
@@ -4185,6 +4210,7 @@ class Orchestrator:
             plan.downtime_slo_s,
             hooks_s=hooks_part(m.estimate),
             dns_tail_s=m.estimate.dns_tail_s if m.estimate is not None else None,
+            tracked=m.tracked_disks,
         )
         if m.estimate is not None:
             fresh = fresh.model_copy(
@@ -4233,6 +4259,7 @@ class Orchestrator:
             whole_pass_seconds(last, m.strategy, params),
             params,
             hooks_part(m.estimate),
+            m.tracked_disks,
         )
         if final <= plan.downtime_slo_s:
             return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
@@ -4257,6 +4284,7 @@ class Orchestrator:
             whole_pass_seconds(last, m.strategy, params),
             params,
             hooks_part(m.estimate),
+            m.tracked_disks,
         )
         if m.estimate is not None:
             downtime = sum(parts.values())

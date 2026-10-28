@@ -2810,6 +2810,8 @@ export class MockServer {
       estimate: null,
       estimates: [],
       observed_scan_bps: null,
+      tracked_disks: [],
+      observed_extent_query_s: null,
       resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
       findings: [],
       checkpoint: null,

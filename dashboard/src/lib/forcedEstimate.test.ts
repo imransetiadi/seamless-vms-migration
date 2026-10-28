@@ -22,6 +22,9 @@ interface Case {
   last_pass_s: number | null;
   /** The post_create hooks' part of the migration's estimate, none when not given (SDD §9.1, plan task N10). */
   hooks_s?: number;
+  /** The disks the final pass reads from extents, and the calibrated query time (SDD §28.6, plan task CE8). */
+  tracked?: string[];
+  observed_extent_query_s?: number | null;
   expected_s: number;
 }
 
@@ -29,9 +32,27 @@ const cases = JSON.parse(raw) as Case[];
 
 describe("the Force cutover's estimated downtime, like the control plane (SDD §5.4, §16)", () => {
   it.each(cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
-    const p = paramsFor(c.plan, c.observed_scan_bps);
+    const p = paramsFor(c.plan, c.observed_scan_bps, c.observed_extent_query_s);
     const last = c.last_pass_s ?? firstPassSeconds(c.vm, c.strategy, p);
-    expect(finalDowntime(c.vm, c.strategy, last, p, c.hooks_s ?? 0)).toBeCloseTo(c.expected_s, 9);
+    expect(finalDowntime(c.vm, c.strategy, last, p, c.hooks_s ?? 0, c.tracked)).toBeCloseTo(c.expected_s, 9);
+  });
+
+  it("drops the scan term from a tracked final pass, as the API's estimator (SDD §28.6, plan task CE8)", () => {
+    const c = cases.find((x) => x.tracked && x.tracked.length > 0)!;
+    const p = paramsFor(c.plan, c.observed_scan_bps, c.observed_extent_query_s);
+    const tracked = finalDowntime(c.vm, c.strategy, c.last_pass_s!, p, 0, c.tracked);
+    const plain = finalDowntime(c.vm, c.strategy, c.last_pass_s!, p, 0, []);
+    expect(tracked).toBeCloseTo(c.expected_s, 9);
+    expect(plain - tracked).toBeGreaterThan(300); // the 200 GiB disk's scan at 500 MiB/s, less the query and the delta's read
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, observed_extent_query_s: c.observed_extent_query_s, tracked_disks: c.tracked!, sync_passes: [] as SyncPass[] };
+    const at = '2026-10-08T11:00:00Z';
+    const pass: SyncPass = { number: 2, kind: 'delta', started_at: at, ended_at: at, bytes_scanned: 0, bytes_changed: 0, bytes_transferred: 0, duration_s: c.last_pass_s! - p.snapshot_s };
+    expect(forcedDowntime({ ...m, sync_passes: [pass] }, c.plan)).toBeCloseTo(c.expected_s, 9);
+    const table = estimateCases.find((x) => x.tracked && x.tracked.length > 0)!;
+    const estimate = estimateStrategy(table.vm, 'warm', paramsFor(table.plan), table.plan.downtime_slo_s, table.tracked);
+    expect(estimate.downtime_s).toBeCloseTo(table.expected.downtime_s, 6);
+    expect(estimateStrategy(table.vm, 'warm', paramsFor(table.plan), table.plan.downtime_slo_s).downtime_s).toBeGreaterThan(estimate.downtime_s + 300);
   });
 
   it("adds the post_create hooks' part of the migration's estimate (SDD §9.1, plan task N10)", () => {
@@ -83,6 +104,8 @@ interface EstimateCase {
   vm: VMRef;
   strategy: Strategy;
   plan: PlanEstimatorSettings & Pick<Plan, 'downtime_slo_s'>;
+  /** The disks the final pass reads from extents (SDD §28.6, plan task CE8). */
+  tracked?: string[];
   expected: Omit<Estimate, 'eligible' | 'reasons'>;
 }
 
@@ -92,7 +115,7 @@ const tenth = (n: number) => Math.round(n * 10) / 10;
 
 describe("each strategy's estimate, as a validation of the control plane computes it (SDD §9.1, §16)", () => {
   it.each(estimateCases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
-    const got = estimateStrategy(c.vm, c.strategy, paramsFor(c.plan), c.plan.downtime_slo_s);
+    const got = estimateStrategy(c.vm, c.strategy, paramsFor(c.plan), c.plan.downtime_slo_s, c.tracked);
     const want = c.expected;
     expect([got.strategy, got.passes, got.final_delta_bytes, got.meets_slo]).toEqual([want.strategy, want.passes, want.final_delta_bytes, want.meets_slo]);
     for (const key of ['precopy_s', 'downtime_s', 'total_s'] as const) expect(got[key]).toBeCloseTo(want[key], 9);
@@ -104,7 +127,7 @@ describe("the offline mock's estimates: the control plane's, each part rounded t
   const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).plans[0] as Plan;
 
   it.each(estimateCases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
-    const shown = mockEstimate(c.vm, c.strategy, { ...base, ...c.plan }, []);
+    const shown = mockEstimate(c.vm, c.strategy, { ...base, ...c.plan }, [], c.tracked);
     const want = c.expected;
     expect([shown.strategy, shown.passes, shown.final_delta_bytes, shown.meets_slo]).toEqual([want.strategy, want.passes, want.final_delta_bytes, want.meets_slo]);
     for (const part of DOWNTIME_PARTS) expect(shown.downtime_parts[part]).toBe(tenth(want.downtime_parts[part]!));

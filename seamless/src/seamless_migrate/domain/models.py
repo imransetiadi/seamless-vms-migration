@@ -1484,6 +1484,11 @@ class Migration(_Model):
     estimates: list[Estimate] = Field(default_factory=list)
     #: per-stream scan throughput measured by the last warm pass (SDD §9.1 calibration)
     observed_scan_bps: float | None = None
+    #: the disks (ids) the final pass is expected to read from extents (SDD §9.1, §28.6): a
+    #: tracked plan's qualifying disks at validation, less those a pass scanned for a lasting
+    #: reason; and the longest extent query of the last checked pass (plan task CE8)
+    tracked_disks: list[str] = Field(default_factory=list)
+    observed_extent_query_s: float | None = None
     #: mappings matched automatically by pre-flight (e.g. the smallest fitting flavor)
     resolved_mappings: Mappings = Field(default_factory=Mappings)
     findings: list[Finding] = Field(default_factory=list)

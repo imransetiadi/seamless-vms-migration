@@ -1284,8 +1284,8 @@ export function buildInventories(now: number = Date.now()): Record<string, VMRef
 // -------------------------------------------------------------------------------------------
 
 /** A strategy's estimate as the API's validation computes it (§9.1, §16), each part shown to 0.1 s. */
-export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[]): Estimate {
-  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s);
+export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[], tracked?: readonly string[] | null): Estimate {
+  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s, tracked);
   const round = (n: number) => Math.round(n * 10) / 10;
   // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
   const downtime_parts = Object.fromEntries(DOWNTIME_PARTS.map((part) => [part, round(e.downtime_parts[part] ?? 0)]));
@@ -2642,6 +2642,8 @@ export function buildFixtures(now: number): Fixtures {
         estimates,
         // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not
         observed_scan_bps: syncPasses.filter((p) => p.kind !== 'full' && p.ended_at !== null).length > 0 ? 545 * MiB : null,
+        tracked_disks: [],
+        observed_extent_query_s: null,
         resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings,
         checkpoint: m.checkpoint ?? null,

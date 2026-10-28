@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import (
+    Disk,
     Finding,
     GpuDevice,
     Mappings,
@@ -711,6 +712,39 @@ def ceph_pools(source: Provider) -> dict[str, str]:
     }
 
 
+def tracking_ready(plan: Plan, source: Provider | None) -> bool:
+    """A warm plan that tracks extents with a source that can be read: a Ceph access with its
+    key and an rbd pool of its fsid, never a VMware source (SDD §28.4, §28.9)."""
+    if not plan.extent_tracking or source is None or source.kind == ProviderKind.vmware:
+        return False
+    return (
+        source.ceph is not None
+        and source.ceph.key_updated_at is not None
+        and bool(ceph_pools(source))
+    )
+
+
+def disk_tracking_problem(disk: Disk, pools: Mapping[str, str]) -> str | None:
+    """Why ``disk`` does not qualify for extent tracking (SDD §28.3, §28.4), None when it does."""
+    label = disk.name or disk.id
+    if disk.kind != "volume":
+        return f"{label} is no Cinder volume ({disk.kind})"
+    if disk.encrypted:
+        return f"{label} is encrypted"
+    if not disk.pool:
+        return f"{label} has a host the source credential cannot read"
+    if disk.pool not in pools:
+        return f"{label} is on {disk.pool}, no rbd pool of the cluster"
+    return None
+
+
+def qualifying_disks(vm: VMRef, source: Provider) -> list[str]:
+    """The ids of the VM's disks that qualify for extent tracking with ``source`` (SDD §28.3,
+    §28.4, §28.6): validation's ``Migration.tracked_disks`` of a tracked plan."""
+    pools = ceph_pools(source)
+    return [d.id for d in vm.disks if disk_tracking_problem(d, pools) is None]
+
+
 def _extent_findings(
     vm: VMRef, plan: Plan, source: Provider | None, sync_passes: Sequence[SyncPass] | None
 ) -> list[Finding]:
@@ -738,17 +772,11 @@ def _extent_findings(
             )
         )
     else:
-        problems: list[str] = []
-        for disk in vm.disks:
-            label = disk.name or disk.id
-            if disk.kind != "volume":
-                problems.append(f"{label} is no Cinder volume ({disk.kind})")
-            elif disk.encrypted:
-                problems.append(f"{label} is encrypted")
-            elif not disk.pool:
-                problems.append(f"{label} has a host the source credential cannot read")
-            elif disk.pool not in pools:
-                problems.append(f"{label} is on {disk.pool}, no rbd pool of the cluster")
+        problems = [
+            problem
+            for problem in (disk_tracking_problem(disk, pools) for disk in vm.disks)
+            if problem is not None
+        ]
         if problems:
             out.append(
                 finding(
