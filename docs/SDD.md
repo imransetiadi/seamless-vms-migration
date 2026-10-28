@@ -4729,6 +4729,12 @@ is no origin a browser sends (review RV31-03).
   `DST_DNS_INTEGRATION_MISSING`, `NET_PREFIX_SPLIT`, `NET_LB_POOL_SPLIT`, `DST_FIP_ADDRESS_UNAVAILABLE`,
   `NET_DNS_TTL_LONG` and `MAP_LB_POOL_INCOMPATIBLE`; a findings list shows the badge beside each. Binding with plan task
   N12a for the rule and the Hooks page, N12b for the plan form, N12c for the migration page and the findings.
+* Changed-extent tracking (§28, from 0.5.0, plan task CE10): every extent element - the provider form's and card's
+  Ceph access, the plan form's changed-extent tracking section and the plan page's row, the migration page's extent
+  use per pass and per disk, and the findings `CEPH_ACCESS_MISSING`, `EXTENT_TRACKING_PARTIAL` and
+  `EXTENT_TRACKING_MISSED` (§28.9) - carries a "Technology Preview" badge as the GPU elements do, its detail
+  "Technology Preview, validated in simulation: changed-extent tracking has not yet run on the lab's Ceph
+  clusters." (§28.11), until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (plan task CE13).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -4935,7 +4941,14 @@ is no origin a browser sends (review RV31-03).
   Designate, reached with the destination provider's credential, or RFC 2136, with its server and TSIG secret —, zone
   and record, with Add DNS target and Remove, a VM taken out of the plan taking its target with it; and the Octavia
   pool mappings (§8.5), each a source pool's id to a destination pool's id, with Add pool mapping and Remove — the
-  advanced settings' summary naming the network cut-over;
+  advanced settings' summary naming the network cut-over; the changed-extent tracking (plan task CE10, §28.9) under
+  "Changed-extent tracking" with a "Technology Preview" badge, for an OpenStack or RHOSO source alone - a VMware
+  source has no Ceph cluster (§28.9): the section is not shown and `extent_tracking` is sent `false` -: one switch,
+  "Track changed extents on the source Ceph cluster" (`extent_tracking`, off by default), whose hint says that the
+  warm passes diff Cinder's pass snapshots on the source cluster and that the final pass copies only what changed, so
+  the downtime loses its scan, and that the source provider needs its Ceph access and key (`CEPH_ACCESS_MISSING`
+  otherwise) - the advanced settings' summary naming it while on; the plan page's settings show "Changed extents"
+  as "Tracked on the source Ceph cluster" with the badge while the plan tracks them;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
   failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
@@ -5000,7 +5013,13 @@ is no origin a browser sends (review RV31-03).
   less than 1.0 GiB, when the estimated downtime fits the SLO, or after 5 passes", for VMware "CBT passes report no bytes:
   the estimated downtime or the pass limit decides", ADV-16; it names the running pass the
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
-  and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
+  and that the bytes they transferred stay counted, §5.4; on a plan that tracks extents, each pass's extent use per
+  disk, `SyncPass.extents`, §28.5, plan task CE10: the chart's data table gains an Extents column that reads each
+  device as "read", "checked" - with its misses, "checked, 2 missed" - or "scanned" with its reason in words - "not
+  tracked", "encrypted", "first pass", "no base", "base gone", "resized", "missed earlier", "unchecked",
+  "assumed zero", "query failed" -, and the chart's Technology Preview badge; the Disks list marks each disk from
+  the latest pass that recorded its use - "Extents read", "Extents checked", "Scanned: not tracked" - and, in the
+  warning tone, a disk whose extents missed changes, "Extents missed 3 chunks: scans in full from now on"), downtime clock (in demo mode it runs in model time,
   `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
   downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot, hooks (§9.1) — and the
   difference between estimate and actual, ADV-16; apart from them, a migration's DNS tail (`Estimate.dns_tail_s`, §9.1,
@@ -5137,7 +5156,22 @@ is no origin a browser sends (review RV31-03).
   reads `ok` with none and sends Placement nothing, §22.3; a PCI alias flavor's capacity is the Inventory's to mark
   unknown) or whose report holds no `gpu_capacity` (not checked since it was added, since a PATCH reset its report,
   §12, or since 0.3.0); a provider whose check
-  reports plain HTTP says so, naming `plain_http`'s endpoints; the form
+  reports plain HTTP says so, naming `plain_http`'s endpoints; a source's card whose provider declares Ceph access
+  (`ceph`, §28.4; plan task CE10) shows it under "Ceph access" with a "Technology Preview" badge - the cluster's fsid,
+  its monitors, its client, and whether its key is stored ("Key stored 3 days ago", else "No key stored" in the
+  warning tone, as the conversion host's missing key) - and names the `rbd` pools of its check whose `ceph_fsid` is
+  another cluster's, which stay untracked; the form takes, for an OpenStack or RHOSO source, its Ceph access under
+  "Ceph access" with the badge: a switch "Declare the source cluster's Ceph access" (off: `ceph` null, which deletes
+  a stored key, said in its hint), then the fsid (a UUID), the monitors (one per line, 1 to 9, each "host" or
+  "host:port"), the client ("seamless" by default, without "client.") and the key as `ceph auth get-key` prints it,
+  written once with `PUT /providers/{id}/ceph-key` after the provider is saved - a later step of the dialog, kept
+  apart from the provider's save and retried like the credentials - and never shown again ("A Ceph key stored
+  3 days ago. Leave the field empty to keep it; values are never shown again."), required while the access is
+  declared and no key is stored; the form refuses before anything is sent what the API refuses (§4.2, §12) - a fsid
+  that is no UUID, no monitor or more than nine, a monitor that is no address, a client with the "client." prefix or
+  of more than 64 characters, a key that is not base64 of at least 16 bytes - each in the error summary with a link
+  to its field; it sends `ceph` with `POST`, and with `PATCH` only when its fsid, monitors or client changed, never
+  `key_updated_at` (server-owned); the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first), for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
   §4.2), and for an OpenStack or RHOSO provider, source or destination alike, its declared vGPU profiles
@@ -8409,7 +8443,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §4.2, §5.3, §9.1, §16 (binding) | CE8 |
 | the findings of §28.9 | §9.3 (binding), §16 | CE9 |
-| the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
+| the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 (binding) | CE10 |
 | the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 (binding) | CE11 |
 | QASuite (FR-26 rows, LAB-CE cases, PERF-E2E-SM1b), Security.md, Operations.md, Performance.md | QASuite, Security.md, Operations.md, Performance.md | CE12 |
 | the lab; the Technology Preview label goes when LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass | QASuite §13 | CE13 |
