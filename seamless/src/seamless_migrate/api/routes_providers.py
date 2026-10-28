@@ -293,7 +293,7 @@ async def update_provider(
         await svc.db.put("provider", updated, expected_version=version)
     if provider.ceph is not None and updated.ceph is None:
         # a key without an access to use it would stay in the store for good (SDD §13.3)
-        await _delete_secret_quietly(svc, ceph_key_secret_name(provider_id), provider_id)
+        await _delete_secret_quietly(svc, ceph_key_secret_name(provider_id))
     await emit(
         svc.store,
         svc.bus,
@@ -315,13 +315,15 @@ def _with_ceph_key_time(provider: Provider, when: Any) -> Provider:
     )
 
 
-async def _delete_secret_quietly(svc: Any, name: str, provider_id: str) -> None:
-    """A managed secret removed as best effort: a store that refuses is logged, never a failure
-    of the request that no longer needs the secret (SDD §13.3)."""
+async def _delete_secret_quietly(svc: Any, name: str) -> None:
+    """A provider's Ceph key removed as best effort: a store that refuses is logged, never a
+    failure of the request that no longer needs the secret (SDD §13.3). The line names neither
+    the secret nor the provider, which the request's own event records (CodeQL py/log-injection,
+    py/clear-text-logging-sensitive-data on a line built from the path's provider id)."""
     try:
         await asyncio.to_thread(secret_store(svc.settings).delete, name)
     except SecretStoreError as exc:
-        log.warning("could not delete secret %s of provider %s: %s", name, provider_id, exc)
+        log.warning("could not delete a provider's ceph key secret: %s", exc)
 
 
 async def _store_secret(
@@ -476,7 +478,7 @@ async def set_ceph_key(
     try:
         updated = await _record_secret(request, provider_id, name, record)
     except _CephAccessGone:
-        await _delete_secret_quietly(svc, name, provider_id)
+        await _delete_secret_quietly(svc, name)
         raise ApiError(
             409, "conflict", "the provider's ceph access was removed meanwhile; set it again"
         ) from None
