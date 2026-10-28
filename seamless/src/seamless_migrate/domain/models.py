@@ -172,6 +172,51 @@ FlavorName = Annotated[str, StringConstraints(min_length=1, max_length=255)]
 ProfileName = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
 
+#: a monitor address: a host name, an IPv4 address or a bracketed IPv6 one, with an optional port
+_MONITOR = re.compile(
+    r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}))(?::[0-9]{1,5})?$"
+)
+_FSID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class CephAccess(_Model):
+    """The source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): the
+    key itself is written by ``PUT /providers/{id}/ceph-key`` and never read back."""
+
+    #: the cluster's fsid, a UUID; a pool whose location_info names another is untracked
+    fsid: str
+    #: 1-9 monitor addresses, "host" or "host:port", the conversion host reaches
+    monitors: list[str] = Field(min_length=1, max_length=9)
+    #: the Ceph user without "client."
+    client: str = Field(default="seamless", pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    #: server-owned: set by PUT …/ceph-key; POST and PATCH ignore it
+    key_updated_at: UTCDateTime | None = None
+
+    @field_validator("fsid")
+    @classmethod
+    def _uuid(cls, fsid: str) -> str:
+        if not _FSID.match(fsid.strip().lower()):
+            raise ValueError("fsid: a Ceph cluster's fsid is a UUID")
+        return fsid.strip().lower()
+
+    @field_validator("monitors")
+    @classmethod
+    def _addresses(cls, monitors: list[str]) -> list[str]:
+        for monitor in monitors:
+            if not _MONITOR.match(monitor):
+                raise ValueError('monitors: each is a monitor address, "host" or "host:port"')
+        return monitors
+
+    @field_validator("client")
+    @classmethod
+    def _user_without_prefix(cls, client: str) -> str:
+        """The user as Ceph's own commands name it in a keyring or `--id`: ``seamless``, never
+        ``client.seamless`` (the keyring section's name)."""
+        if client.lower().startswith("client."):
+            raise ValueError('client: the Ceph user without its "client." prefix')
+        return client
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -199,6 +244,9 @@ class Provider(_Model):
     #: its operator declares that the cloud's OVN BGP agent announces tenant networks
     #: (expose_tenant_networks), which no API shows: NET_PREFIX_SPLIT (SDD §4.2, §9.3, §23.6)
     announces_tenant_networks: bool = False
+    #: the source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): refused on
+    #: vmware and on a destination; its key is written by PUT …/ceph-key (§12, §13.3)
+    ceph: CephAccess | None = None
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -234,6 +282,11 @@ class Provider(_Model):
                     "announces_tenant_networks: an OpenStack BGP declaration cannot be made for "
                     "vmware"
                 )
+            if self.ceph is not None:
+                raise ValueError("ceph: a Ceph access cannot be declared for vmware")
+        if self.ceph is not None and self.role == ProviderRole.destination:
+            # the extents are the source cluster's alone (§28.4)
+            raise ValueError("ceph: a Ceph access can be declared on a source provider alone")
         return self
 
     @property

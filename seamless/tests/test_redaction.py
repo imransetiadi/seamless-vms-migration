@@ -65,6 +65,9 @@ FIXTURE = (
     "password: 'Fake''Pass Tango-20'\n"  # gitleaks:allow
     '{\\"password\\": \\"Fake\\nPass Uniform-21\\"}\n'  # gitleaks:allow
     '{\\"token\\": \\"Fake\\\\\\"Pass Victor-22, x\\", \\"port\\": 5432}\n'  # gitleaks:allow
+    # a Ceph keyring and a bare CephX key, as `ceph auth get-key` prints it (SDD §13.4, CE6)
+    "[client.seamless]\n\tkey = AQFakeCephKeyXray24FakeCephKeyXray24Fa==\n"  # gitleaks:allow
+    "rbd --id seamless --key AQFakeCephKeyWhiskey23FakeCephKeyWhisk== ls\n"  # gitleaks:allow
 )
 #: The reviewed snapshot of ``redact(FIXTURE)``.
 SNAPSHOT = (
@@ -91,12 +94,14 @@ SNAPSHOT = (
     "password: [REDACTED]\n"
     '{\\"password\\": [REDACTED]}\n'
     '{\\"token\\": [REDACTED], \\"port\\": 5432}\n'
+    "[client.seamless]\n\tkey = [REDACTED]\n"
+    "rbd --id seamless --key [REDACTED] ls\n"
 )
 #: Every fake secret of the fixture: none may survive anywhere it is sent.
 SECRETS = re.compile(
     r"Fake(?:Pass|Cloud|Romeo|Juliet|Kilo|Lima|Oscar|@Pass)|fake-(?:api|typesafe)|FAKE\.bearer|"
     r"fakeKeystone|7f3c0a1b|AKIAFAKE|MIIEFAKE|eyJhbGci|Pass-November|admin\n      password|"
-    r"Sierra-19|Tango-20|Uniform-21|Victor-22"
+    r"Sierra-19|Tango-20|Uniform-21|Victor-22|AQFake|Xray24|Whiskey23"
 )
 
 
@@ -1219,3 +1224,47 @@ async def test_no_placement_provider_name_or_uuid_leaves_the_capacity_read(caplo
     for name in (*hosts, *gpus, *uuids.values()):
         assert not [k for k in kept if name in k], name
         assert name not in caplog.text, name
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[client.seamless]\n\tkey = AQFakeCephKeyForTestsOnlyNotRealAtAll0==\n"  # gitleaks:allow
+        '\tcaps mon = "profile rbd"\n',
+        "key=AQFakeCephKeyForTestsOnlyNotRealAtAll0==\n",  # gitleaks:allow
+        "    key = AQFakeCephKeyForTestsOnlyNotRealAtAll0==   \n",  # gitleaks:allow
+        "get-key client.seamless: AQFakeCephKeyForTestsOnlyNotRealAtAll0==",  # gitleaks:allow
+        '{"key": "AQFakeCephKeyForTestsOnlyNotRealAtAll0=="}',  # gitleaks:allow
+        "rbd --key AQFakeCephKeyForTestsOnlyNotRealAtAll0== ls",  # gitleaks:allow
+    ],
+    ids=["keyring", "no spaces", "padded", "bare after a colon", "json", "cli flag"],
+)
+def test_a_ceph_keyring_line_and_a_bare_ceph_key_are_redacted(text):
+    """SDD §13.4, §28.8 (plan task CE6): a keyring's `key = <base64>` line loses everything after
+    its `=`, and a CephX key - AQ, 36 base64 characters, == - goes wherever it stands; the caps
+    lines and the rest of the text stay, and a second pass changes nothing."""
+    out = redact(text)
+    assert "AQFakeCephKey" not in out and "[REDACTED]" in out, out
+    assert "FakeCephKeyForTestsOnlyNotRealAtAll0" not in out
+    if "caps mon" in text:
+        assert '\tcaps mon = "profile rbd"\n' in out
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SSH_KEY = /data/conversion/ssh.key\n",
+        "keypair = os_migrate_conv\n",
+        "key_name: os_migrate_conv\n",
+        '{"key": "volume_type", "value": "tripleo"}\n',
+        "AQUA=blue AQ12==\n",
+        "the keys of the report: fsid, monitors, client\n",
+    ],
+    ids=["ssh_key var", "keypair", "key_name", "json key word", "short AQ", "prose"],
+)
+def test_what_is_not_a_ceph_key_line_stays(text):
+    """SDD §13.4 (plan task CE6): the keyring pattern reads a line that starts with `key` and `=`
+    alone, and the bare pattern a CephX key's exact shape - a variable or field whose name holds
+    the word, and a shorter AQ run, are not secrets and stay."""
+    assert redact(text) == text

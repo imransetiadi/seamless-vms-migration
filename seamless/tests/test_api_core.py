@@ -288,6 +288,12 @@ ROUTES = [
     ),
     (
         "PUT",
+        "/api/v1/providers/src-osp/ceph-key",
+        Role.admin,
+        {"key": "AQFakeCephKeyForTestsOnlyNotRealAtAll0=="},  # gitleaks:allow (no key material)
+    ),
+    (
+        "PUT",
         "/api/v1/providers/src-osp/conversion-key",
         Role.admin,
         {

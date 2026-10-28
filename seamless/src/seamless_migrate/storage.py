@@ -120,3 +120,16 @@ def resolve_destination(
     if wanted and split_host(chosen)[1] != wanted:
         raise StorageError(f"backend_map names {target}, but the {what} is {chosen}")
     return chosen
+
+
+def ceph_location(location_info: str | None) -> tuple[str | None, str | None]:
+    """The cluster's fsid and the Ceph pool a Cinder RBD pool's ``location_info`` names, as the
+    driver writes it - ``cluster:conf:fsid:user:pool`` -, or ``(None, None)`` when it is missing or
+    of another form (SDD §10, §28.4): the provider check reports them per ``rbd`` entry."""
+    parts = (location_info or "").split(":")
+    if len(parts) != 5:
+        return None, None
+    _, _, fsid, _, pool = (part.strip() for part in parts)
+    if not fsid or not pool:
+        return None, None
+    return fsid, pool

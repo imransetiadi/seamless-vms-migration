@@ -302,6 +302,10 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{22,}"), REDACTED),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), REDACTED),
     (re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"), REDACTED),
+    # Ceph keys (SDD §13.4, §28.8): a keyring's `key = <base64>` line, whole after its `=`, and a
+    # bare CephX key as `ceph auth get-key` prints it - AQ, 36 base64 characters and == (28 bytes)
+    (re.compile(r"(?im)^([ \t]*key[ \t]*=[ \t]*)\S+"), r"\1" + REDACTED),
+    (re.compile(r"\bAQ[A-Za-z0-9+/]{36}==(?![A-Za-z0-9+/=])"), REDACTED),
 )
 
 

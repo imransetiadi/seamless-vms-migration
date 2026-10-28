@@ -146,3 +146,18 @@ def test_resolve_destination_refuses_mismatch_missing_pool_and_other():
     # without the destination's pool list a NetApp target cannot be checked
     with pytest.raises(StorageError, match="pools"):
         resolve_destination("netapp_block", "flex_a", "hostgroup@ontap-iscsi", [])
+
+
+def test_location_info_gives_the_fsid_and_the_ceph_pool():
+    """SDD §10, §28.4 (plan task CE6): Cinder's RBD driver reports `cluster:conf:fsid:user:pool`;
+    anything else - missing, another driver's text - gives no fsid and no pool."""
+    from seamless_migrate.storage import ceph_location
+
+    fsid = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+    assert ceph_location(f"ceph:/etc/ceph/ceph.conf:{fsid}:openstack:volumes") == (fsid, "volumes")
+    assert ceph_location(f"overcloud:/etc/ceph/ceph.conf:{fsid}:cinder:vms") == (fsid, "vms")
+    assert ceph_location(None) == (None, None)
+    assert ceph_location("") == (None, None)
+    assert ceph_location("ontap:10.0.0.5:/cinder_vol") == (None, None)
+    assert ceph_location(f"ceph:/etc/ceph/ceph.conf:{fsid}:openstack:") == (None, None)
+    assert ceph_location("ceph:/etc/ceph/ceph.conf::openstack:volumes") == (None, None)

@@ -278,3 +278,9 @@ def credentials_secret_name(provider_id: str) -> str:
 
 def conversion_key_secret_name(provider_id: str) -> str:
     return f"provider-{provider_id}-ssh"
+
+
+def ceph_key_secret_name(provider_id: str) -> str:
+    """The source cluster's Ceph key, written by ``PUT /providers/{id}/ceph-key`` (SDD §13.3,
+    §28.4): a provider id never holds a ``.``, so the name is no other provider's own."""
+    return f"provider-{provider_id}.ceph"
