@@ -355,6 +355,9 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         # port with its MAC, all its fixed IPs and its security groups (§6.6, §7.2, §7.3, §9.2);
                                         # "nova": one fixed IP per port, new MAC
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
+       extent_tracking: bool = false,  # the warm passes diff the source cluster's RBD snapshots (§28, plan task CE7):
+                                        # refused (422) for a VMware source; changeable at any time - off, the next
+                                        # pass scans, on, the next pass checks (§28.9)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
        migration_counts: dict[Phase, int],  # read-only, never stored: how many of the plan's migrations are in each
@@ -391,7 +394,18 @@ Hook { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
-           bytes_transferred: int = 0, duration_s: float|null }
+           bytes_transferred: int = 0, duration_s: float|null,
+           extents: dict[str, ExtentUse] = {} }   # per device, how the pass used the disk's extents (§28.5, plan
+                                                   # task CE7), read from the warm state's pass (§6.3); {} when the
+                                                   # plan does not track extents
+
+ExtentUse { mode: "read"|"checked"|"scanned",   # read: the chunks the extents name alone; checked: a full scan that
+                                                 # compared the extents with what changed; scanned: a full scan alone
+            reason: str|null = null,             # scanned: why - first_pass, not_tracked, encrypted, no_base, base_gone,
+                                                 # resized, missed, unchecked, assumed_zero or query_failed (§28.5)
+            query_s: float|null = null,          # the extent query's seconds
+            missed: int = 0,                     # checked: chunks that changed outside the extents
+            assumed_zero: bool = false }         # the pass skipped the chunks it assumed zero (§6.2)
 
 Finding { code: str, severity: Severity, message: str, remediation: str|null,
           strategies: list[Strategy] = [] }      # empty = applies to every strategy
@@ -1761,6 +1775,16 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
   `clouds.yaml` os-migrate writes into the data dir.
+* The Ceph files (§28.4, plan task CE7): a warm plan that tracks extents (`extent_tracking`) whose source declares
+  `ceph` and holds its key (`provider-{id}.ceph`, §13.3) gets, beside `secrets.yml` and deleted with it, the run's
+  `ceph.conf` (the fsid and `mon_host`) and `ceph.keyring` (`[client.<client>]`, the key), both 0600, named to the
+  roles by `os_migrate_warm_ceph_conf` and `os_migrate_warm_ceph_keyring` with `os_migrate_warm_ceph_client`,
+  `os_migrate_warm_ceph_pools` - the source check's `rbd` entries whose `ceph_fsid` is the provider's, Cinder pool to
+  Ceph pool (§10) - and `os_migrate_warm_extents_precopy: check` for a pre-copy or sync run, `os_migrate_warm_extents_final:
+  read` for the cutover; the pre-staging gets `os_migrate_conversion_host_ceph_client: true` (§6.5). The key reaches
+  neither `vars.yml` nor a log line. A plan without tracking, or whose source has no Ceph access, no key or no `rbd`
+  pool of its fsid, passes no Ceph file and no extent variable: every pass scans. Each pass's `extents` is read from
+  the warm state's pass (§6.3) into `SyncPass.extents` (§4.2).
 * Command: `ansible-playbook -i <inventory> <playbook> -e @vars.yml -e @secrets.yml`, environment
   `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.json` is **not** used; instead stdout lines are logged and
   progress is read by tailing the os-migrate per-workload `state_file` JSON (`{dev: pct}`) and the
@@ -8189,7 +8213,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
 
 ### 28.5 Passes, blocksync and what the manifest proves
 
-* **How a pass used a disk's extents** (proposed `SyncPass.extents: dict[str, ExtentUse] = {}`, per device, §4.2):
+* **How a pass used a disk's extents** (`SyncPass.extents: dict[str, ExtentUse] = {}`, per device, binding in §4.2 since plan task CE7):
   ```text
   ExtentUse { mode: "read"|"checked"|"scanned",  # read: only the chunks the extents name; checked: a full scan that
                                                  # compared the extents with what changed; scanned: a full scan alone
@@ -8287,7 +8311,7 @@ present, a live migration, the scratch storage of a pull-mode job, and the read 
 
 ### 28.9 Checks, findings and the plan switch
 
-* **The plan switch** (proposed, §4.2 with plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
+* **The plan switch** (binding in §4.2 and §12 since plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
   VMware source. `PATCH /plans/{id}` may change it at any time: off, the next pass scans; on, the next pass checks.
 * **Findings** (proposed; each enters §9.3 with plan task CE9, with its catalog entry, its tests and the mock):
   * CEPH_ACCESS_MISSING, warning (warm): the plan tracks extents, and its source has no Ceph access, no key, or no
@@ -8362,7 +8386,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
 | the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
-| `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 | CE7 |
+| `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
 | the findings of §28.9 | §9.3, §16 | CE9 |
 | the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
