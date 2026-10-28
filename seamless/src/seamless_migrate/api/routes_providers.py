@@ -358,8 +358,12 @@ async def _record_secret(
             try:
                 store = secret_store(svc.settings)
                 await asyncio.to_thread(store.delete, name)
-            except SecretStoreError:
-                log.warning("secret %s of a deleted provider could not be removed", name)
+            except SecretStoreError as exc:
+                # neither the secret's name nor the provider's id: both come from the request's
+                # path (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
+                log.warning(
+                    "the secret of a provider deleted meanwhile could not be removed: %s", exc
+                )
             raise
         updated = provider.model_copy(update={**update(provider), **_SERVER_OWNED})
         try:
@@ -574,7 +578,9 @@ async def delete_provider(
             await asyncio.to_thread(secret_store(svc.settings).delete, name)
         except SecretStoreError as exc:
             left.append(name)
-            log.warning("could not delete secret %s of provider %s: %s", name, provider_id, exc)
+            # provider.deleted names the secret left (secret_left); the line names nothing the
+            # request's path gave (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
+            log.warning("a secret of a deleted provider could not be removed: %s", exc)
     await emit(
         svc.store,
         svc.bus,
