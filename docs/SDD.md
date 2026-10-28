@@ -492,6 +492,10 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             sync_passes: list[SyncPass] = [], sync_bytes_dropped: int = 0,
             estimate: Estimate|null, estimates: list[Estimate] = [],
             observed_scan_bps: float|null, resolved_mappings: Mappings = {},
+            tracked_disks: list[str] = [],       # the disks (ids) the final pass is expected to read from extents (§9.1,
+                                                 # §28.6): validation lists a tracked plan's qualifying disks; a pass
+                                                 # that scanned one for a lasting reason removes it (plan task CE8)
+            observed_extent_query_s: float|null, # the longest extent query of the last checked pass (§9.1 calibration)
             findings: list[Finding] = [], checkpoint: str|null,
             downtime_started_at: datetime|null, downtime_ended_at: datetime|null,
             actual_downtime_s: float|null, approvals: list[Approval] = [],
@@ -2991,6 +2995,7 @@ class EstimatorParams:
     change_rate_bps: float = 2097152.0   # 2 MiB/s default guest write rate
     shutdown_s: float = 60.0; boot_s: float = 120.0; create_s: float = 60.0
     snapshot_s: float = 30.0; handover_per_volume_s: float = 20.0
+    extent_query_s: float = 10.0          # q: one extent query on the source conversion host (§28.6; a duration override)
     v2v_s: float = 300.0; v2v_inplace_s: float = 120.0
     convergence_threshold_bytes: int = 1073741824; max_passes: int = 5
     parallel_disks: int = 4; max_aggregate_scan_bps: float | None = None
@@ -3008,7 +3013,7 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 | Strategy | Pre-copy | Downtime |
 |---|---|---|
 | `cold` | 0, passes = 0 | `shutdown + snapshot + U/L + create + boot` |
-| `warm` | `T1 = snapshot + max(U/L, scan)` (fresh destination volumes are not read: `--assume-zero`); then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` (total passes, including pass 1, never exceed `max_passes`) | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
+| `warm` | `T1 = snapshot + max(U/L, scan)` (fresh destination volumes are not read: `--assume-zero`); then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` (total passes, including pass 1, never exceed `max_passes`). A migration with tracked disks (`Migration.tracked_disks`, §28.6, plan task CE8): its checked passes cost their query too, `Tk = snapshot + q + max(scan, Δk/L)` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)`; with tracked disks `T` and the others `U`: `shutdown + snapshot + max(scan_U, q + max(Δf/S, Δf/L)) + create + boot`, `scan_U` the scan term over `U` alone (0 when `U` is empty) - the SLO rule (§5.3), a Force cutover's figure (§5.4) and the dashboard's port (§16) take the same term |
 | `storage_handover` | 0 | `shutdown + V·handover_per_volume + create + boot` |
 | `vmware_cold` | 0 | `shutdown + U/L + v2v + create + boot` |
 | `vmware_warm` | `T1 = U/L`; `Δk = min(D, c·T(k−1))`, `Tk = 10 + Δk/L` (same loop) | `shutdown + Δf/L + v2v_inplace + create + boot` |
@@ -3039,7 +3044,9 @@ only; the interval is the time between the two snapshots), and the observed per-
 with `B = bytes_scanned` (the pass lasts as long as its largest disk's scan or its streams' share, whichever is
 longer, so a pass that ran as predicted reads back the `S` it was predicted with; review PL-07), taken from
 **delta/final passes only** (pass 1 is usually link-bound and would understate it) — replaces `scan_bps` for that
-migration's estimate (stored as `Migration.observed_scan_bps: float | null`). A pass at the aggregate ceiling
+migration's estimate (stored as `Migration.observed_scan_bps: float | null`); a pass that read any disk from extents
+(an `ExtentUse` of mode `read`, §28.5) never calibrates `S`, and a `checked` pass's longest `query_s` replaces `q`
+(`Migration.observed_extent_query_s`, plan task CE8). A pass at the aggregate ceiling
 (`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. Nor does a pass the link
 may have bound - one that lasted at most 10 % longer than its changes take over the link (`duration_s <=
 1.1 · bytes_transferred / L`, a margin for the sync's own setup): the `S` it reads is only a lower bound, which may
@@ -5373,8 +5380,9 @@ is no origin a browser sends (review RV31-03).
   when it ends, in the API's words, and a read counts for three ticks, as the API demo's do at its default speed (§7.4,
   §22.7). Its estimates are §9.1's, as a
   validation computes them: the control plane's `estimate` with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
-  ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
-  (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
+  ported to `src/lib/forcedEstimate.ts` - the tracked final pass's term among them, with the migration's
+  `tracked_disks` and `observed_extent_query_s` (§28.6, plan task CE8) - and checked against a case table the control
+  plane generates (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
   sum, and the API's `meets_slo`.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
@@ -8256,7 +8264,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
 
 ### 28.6 Estimator, calibration and convergence
 
-* **The final pass** (proposed, §9.1 with plan task CE8): with `T` the disks it is expected to read from extents and
+* **The final pass** (binding in §4.2, §9.1 and §16 since plan task CE8): with `T` the disks it is expected to read from extents and
   `U` the others, `copy_s = snapshot + max(scan_U, q + max(Δf/S, Δf/L))`, `scan_U` being the scan term over `U` alone
   (0 when `U` is empty) and `q` the new `EstimatorParams.extent_query_s` (default 10 s, `TODO(LAB): confirm`; a
   duration override with the others' bounds). Validation puts a qualifying disk of a plan that tracks extents in `T`;
@@ -8390,7 +8398,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
-| `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
+| `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §4.2, §5.3, §9.1, §16 (binding) | CE8 |
 | the findings of §28.9 | §9.3 (binding), §16 | CE9 |
 | the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
 | the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 | CE11 |
