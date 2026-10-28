@@ -639,3 +639,30 @@ def test_a_plans_network_cutover_settings_round_trip():
     for body in refused:
         with pytest.raises(ValidationError):
             NetworkCutover.model_validate(body)
+
+
+def test_a_sync_pass_keeps_its_extent_use_per_device():
+    """SDD §4.2, §28.5 (plan task CE7): a pass records how it used each disk's extents - the
+    mode, the reason, the query's time, the misses and whether it assumed zeros -, {} for a plan
+    that does not track extents, and round-trips through JSON."""
+    from seamless_migrate.domain.models import ExtentUse, SyncPass, utcnow
+
+    use = {
+        "/dev/vda": ExtentUse(mode="checked", query_s=1.5, missed=2),
+        "/dev/vdb": ExtentUse(mode="scanned", reason="first_pass", assumed_zero=True),
+    }
+    sync_pass = SyncPass(number=1, kind=SyncPassKind.delta, started_at=utcnow(), extents=use)
+    assert SyncPass.model_validate_json(sync_pass.model_dump_json()) == sync_pass
+    assert sync_pass.extents["/dev/vda"].reason is None
+    assert sync_pass.extents["/dev/vdb"].model_dump() == {
+        "mode": "scanned",
+        "reason": "first_pass",
+        "query_s": None,
+        "missed": 0,
+        "assumed_zero": True,
+    }
+    assert SyncPass(number=2, kind=SyncPassKind.final, started_at=utcnow()).extents == {}
+    with pytest.raises(ValueError):
+        ExtentUse(mode="guessed")
+    with pytest.raises(ValueError):
+        ExtentUse(mode="checked", missed=-1)

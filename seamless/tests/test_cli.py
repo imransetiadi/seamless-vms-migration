@@ -1052,3 +1052,44 @@ def test_plan_apply_names_catalog_hooks_alone_like_post(env, capsys):
     assert cli.main(["plan", "apply", "-f", str(path)]) == 0
     [plan] = store.list("plan", Plan)
     assert plan.network_cutover.hooks == {"pre_stop": ["drain-lb"]}
+
+
+def test_plan_apply_carries_extent_tracking(env, capsys):
+    """SDD §28.9 (plan task CE7): a plan's YAML turns extent tracking on and off like PATCH, and
+    a VMware source refuses it as the API does."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    doc = {
+        "name": "Tracked tier",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "extent_tracking": True,
+    }
+    path = env / "plan.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    plan_id = capsys.readouterr().out.strip().split()[-1]
+    assert store.get("plan", plan_id, Plan).extent_tracking is True
+    path.write_text(yaml.safe_dump({**doc, "extent_tracking": False}))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    capsys.readouterr()
+    assert store.get("plan", plan_id, Plan).extent_tracking is False
+    store.put(
+        "provider",
+        make_provider(
+            id="vc-dc2",
+            kind=ProviderKind.vmware,
+            cloud=None,
+            endpoint="https://vcenter.dc2.example/sdk",
+            conversion_host=None,
+        ),
+    )
+    bad = env / "vmware.yaml"
+    bad.write_text(yaml.safe_dump({**doc, "name": "vmware", "source_provider_id": "vc-dc2"}))
+    assert cli.main(["plan", "apply", "-f", str(bad)]) == 1
+    assert "extent_tracking" in capsys.readouterr().err

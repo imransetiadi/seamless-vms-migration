@@ -889,6 +889,9 @@ class PlanSpec(_Model):
     #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its
     #: security groups (SDD §6.6, §7.2, §9.2); "nova": one fixed IP per port and a new MAC
     port_creation_mode: Literal["nova", "neutron"] = "nova"
+    #: the warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28; plan task CE7):
+    #: refused for a VMware source (the routes), changeable at any time (§28.9)
+    extent_tracking: bool = False
     #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
     #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
     nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
@@ -1065,6 +1068,17 @@ class Plan(PlanSpec):
         return None
 
 
+class ExtentUse(_Model):
+    """How a pass used a disk's extents (SDD §4.2, §28.5): read the listed chunks alone, checked
+    them against a full scan, or scanned the disk alone, with the reason of §28.5."""
+
+    mode: Literal["read", "checked", "scanned"]
+    reason: str | None = None
+    query_s: float | None = Field(default=None, ge=0)
+    missed: int = Field(default=0, ge=0)
+    assumed_zero: bool = False
+
+
 class SyncPass(_Model):
     number: int = Field(ge=1)
     kind: SyncPassKind
@@ -1074,6 +1088,8 @@ class SyncPass(_Model):
     bytes_changed: int = 0
     bytes_transferred: int = 0
     duration_s: float | None = None
+    #: per device, how the pass used the disk's extents; {} without tracking (SDD §4.2, §28.5)
+    extents: dict[str, ExtentUse] = Field(default_factory=dict)
 
 
 class Finding(_Model):

@@ -62,6 +62,15 @@ SCRIPT = textwrap.dedent(
         record["servers"] = [
             (r.get("params") or {{}}).get("name")
             for r in resources if r.get("type") == "openstack.compute.Server"]
+    # the run's Ceph files as the playbook finds them (SDD 7.2, 28.4): each one's mode, or None
+    record["ceph_files"] = {{}}
+    for key in ("os_migrate_warm_ceph_conf", "os_migrate_warm_ceph_keyring"):
+        ceph_path = merged.get(key)
+        if ceph_path:
+            mode = None
+            if os.path.exists(ceph_path):
+                mode = oct(stat.S_IMODE(os.stat(ceph_path).st_mode))
+            record["ceph_files"][os.path.basename(ceph_path)] = mode
     # what decides how Ansible's ssh checks a host's key and shares its connections (SDD 7.2)
     record["env"] = {{key: os.environ.get(key) for key in (
         "ANSIBLE_HOST_KEY_CHECKING", "ANSIBLE_SSH_CONTROL_PATH_DIR", "ANSIBLE_SSH_CONTROL_PATH")}}
@@ -209,7 +218,9 @@ SCRIPT = textwrap.dedent(
             state["passes"].append({{"number": n, "kind": kind,
                 "started_at": "2026-10-08T10:00:00Z", "ended_at": "2026-10-08T10:05:00Z",
                 "bytes_scanned": 1000, "bytes_changed": 1000 // n,
-                "bytes_transferred": 900 // n, "duration_s": 300.0 / n}})
+                "bytes_transferred": 900 // n, "duration_s": 300.0 / n,
+                # how the pass used each disk's extents, as a test says (SDD 6.3, 28.5)
+                "extents": json.loads(os.environ.get("ANSIBLE_FAKE_EXTENTS", "{{}}"))}})
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))
