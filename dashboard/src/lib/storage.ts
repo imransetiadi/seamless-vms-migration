@@ -12,6 +12,8 @@ export interface StorageBackend {
   vendor: string | null;
   protocol: string | null;
   family: StorageFamily;
+  /** An rbd pool's cluster, from Cinder's `location_info` (SDD §10, §28.4); null when the check did not read it. */
+  cephFsid: string | null;
 }
 
 export const FAMILY_LABELS: Record<StorageFamily, string> = {
@@ -36,7 +38,7 @@ export function storageBackends(capabilities: Record<string, unknown>): StorageB
     const pool = text(e.pool);
     if (!pool) return [];
     const family = FAMILIES.includes(e.family as StorageFamily) ? (e.family as StorageFamily) : 'other';
-    return [{ pool, vendor: text(e.vendor), protocol: text(e.protocol), family }];
+    return [{ pool, vendor: text(e.vendor), protocol: text(e.protocol), family, cephFsid: text(e.ceph_fsid) }];
   });
 }
 

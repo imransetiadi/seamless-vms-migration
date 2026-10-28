@@ -60,6 +60,8 @@ interface FormState {
   prestage: string[];
   /** Recreate ports through Neutron with their MAC, every fixed IP and their security groups (SDD §4.2 port_creation_mode). */
   keepPorts: boolean;
+  /** The warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28.9): an OpenStack or RHOSO source alone. */
+  extentTracking: boolean;
   /** Optional estimator overrides (SDD §9.1): empty = planning default. */
   scanMiBps: string;
   parallelDisks: string;
@@ -129,6 +131,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     keepWarmMinutes: '15',
     prestage: [...DEFAULT_PRESTAGE],
     keepPorts: false,
+    extentTracking: false,
     scanMiBps: '',
     parallelDisks: '',
     changeMiBps: '',
@@ -229,6 +232,7 @@ function formFromPlan(plan: Plan): FormState {
     keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
     prestage: plan.prestage_resources.filter(isOfferedPrestage),
     keepPorts: plan.port_creation_mode === 'neutron',
+    extentTracking: plan.extent_tracking ?? false,
     scanMiBps: plan.estimator_overrides.scan_bps ? plainRate(plan.estimator_overrides.scan_bps) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     changeMiBps: plan.estimator_overrides.change_rate_bps ? plainRate(plan.estimator_overrides.change_rate_bps) : '',
@@ -294,10 +298,12 @@ function readOnlyReason(editable: boolean, reasonId: string): { 'aria-describedb
   return editable ? {} : { 'aria-describedby': reasonId };
 }
 
-function Fieldset({ legend, children }: { legend: string; children: ReactNode }) {
+function Fieldset({ legend, aside, children }: { legend: string; aside?: ReactNode; children: ReactNode }) {
   return (
     <fieldset className="flex min-w-0 flex-col gap-3">
       <legend className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{legend}</legend>
+      {/* beside the legend and outside it, so the group keeps its name: a status badge such as Technology Preview (SDD §16) */}
+      {aside && <div className="-mt-2">{aside}</div>}
       {children}
     </fieldset>
   );
@@ -610,6 +616,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
         prestage_resources: [...OFFERED_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isOfferedPrestage(r))],
         port_creation_mode: f.keepPorts ? 'neutron' : 'nova',
+        // a VMware source has no Ceph cluster: never sent true for one (SDD §28.9)
+        extent_tracking: source?.kind !== 'vmware' && f.extentTracking,
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
           ...DEFAULT_VERIFICATION,
@@ -1016,7 +1024,11 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </Fieldset>
 
           <details id={id('advanced')} className="rounded-md border border-border px-3 py-2" open={advancedHasErrors || undefined}>
-            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, pre-staging, verification, storage handover and network cut-over</summary>
+            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">
+              {form.extentTracking && source?.kind !== 'vmware'
+                ? 'Advanced: window, mappings, sync, pre-staging, verification, storage handover, network cut-over and changed-extent tracking'
+                : 'Advanced: window, mappings, sync, pre-staging, verification, storage handover and network cut-over'}
+            </summary>
             <div className="mt-3 flex flex-col gap-4 pb-2">
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField
@@ -1217,6 +1229,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   </p>
                 </div>
               </Fieldset>
+              {source?.kind !== 'vmware' && (
+                <Fieldset legend="Changed-extent tracking" aside={<TechPreviewBadge feature="extents" />}>
+                  <div>
+                    <Checkbox
+                      label="Track changed extents on the source Ceph cluster"
+                      checked={form.extentTracking}
+                      describedBy={id('extents-note')}
+                      onChange={(on) => set('extentTracking', on)}
+                    />
+                    <p id={id('extents-note')} className="pl-7 text-xs text-muted-foreground">
+                      Off by default. The warm passes diff Cinder's pass snapshots with rbd diff on the source cluster, and the final pass copies only what changed, so the
+                      downtime loses its scan. Needs the source provider's Ceph access and key; a disk that cannot use extents scans in full, as today.
+                    </p>
+                  </div>
+                </Fieldset>
+              )}
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Linux and other guests. Comma separated, e.g. 22, 443." />
                 <TextField

@@ -22,7 +22,7 @@ describe('storage backends (SDD §7.3.1, §10)', () => {
   it('reads the capability defensively and splits Cinder hosts', () => {
     expect(storageBackends({})).toEqual([]);
     expect(storageBackends({ storage_backends: 'nope' })).toEqual([]);
-    expect(storageBackends({ storage_backends: [{ pool: 'x' }, null] })).toEqual([{ pool: 'x', vendor: null, protocol: null, family: 'other' }]);
+    expect(storageBackends({ storage_backends: [{ pool: 'x' }, null] })).toEqual([{ pool: 'x', vendor: null, protocol: null, family: 'other', cephFsid: null }]);
     expect(splitHost('hostgroup@ontap-nfs#198.51.100.50:/cinder')).toEqual(['hostgroup@ontap-nfs', '198.51.100.50:/cinder']);
     expect(splitHost('hostgroup@ceph')).toEqual(['hostgroup@ceph', null]);
   });

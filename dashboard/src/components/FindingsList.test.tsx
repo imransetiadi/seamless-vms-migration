@@ -48,3 +48,18 @@ describe('the findings lists', () => {
     );
   });
 });
+
+describe('the extent findings (SDD §16, §28.9, plan task CE10)', () => {
+  it("mark each extent finding with the Technology Preview badge, whose detail says the tracking has not yet run on the lab's Ceph clusters", () => {
+    render(
+      <MemoryRouter>
+        <FindingsList findings={[finding('EXTENT_TRACKING_MISSED', 'db-01'), finding('CEPH_ACCESS_MISSING', 'db-02'), finding('EXTENT_TRACKING_PARTIAL', 'db-03')]} />
+      </MemoryRouter>,
+    );
+    const badges = screen.getAllByRole('button', { name: 'Technology Preview' });
+    expect(badges).toHaveLength(3);
+    for (const badge of badges) {
+      expect(badge).toHaveAccessibleDescription("Technology Preview, validated in simulation: changed-extent tracking has not yet run on the lab's Ceph clusters.");
+    }
+  });
+});

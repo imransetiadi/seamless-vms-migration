@@ -19,6 +19,7 @@ import type {
   Estimate,
   Event,
   EvidenceItem,
+  ExtentUse,
   Finding,
   GpuCapacity,
   GpuDevice,
@@ -2030,6 +2031,7 @@ export function defaultPlanFields(now: number) {
     description: null,
     mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
     default_strategy: 'auto' as const,
+    extent_tracking: false,
     strategy_overrides: {},
     selection_policy: 'min_downtime' as const,
     downtime_slo_s: 600,
@@ -2618,9 +2620,33 @@ export function buildFixtures(now: number): Fixtures {
       );
       const bytesTotal = m.strategy === 'storage_handover' ? 0 : vm.used_bytes;
       const progress = m.progress ?? 0;
+      // a tracked plan's qualifying disks: the source cluster's Cinder RBD volumes, not encrypted (SDD §28.4, §28.6, plan task CE10)
+      const clusterOf = new Map(
+        ((source.capabilities.storage_backends as Array<{ pool?: unknown; family?: unknown; ceph_fsid?: unknown }> | undefined) ?? [])
+          .filter((b) => b.family === 'rbd' && typeof b.pool === 'string')
+          .map((b) => [b.pool as string, typeof b.ceph_fsid === 'string' ? b.ceph_fsid : null]),
+      );
+      const trackedDisks =
+        plan.extent_tracking && source.ceph && m.strategy === 'warm'
+          ? vm.disks.filter((d) => d.kind === 'volume' && !d.encrypted && d.pool && clusterOf.get(d.pool) === source.ceph!.fsid).map((d) => d.id)
+          : [];
+      // how a pass used each disk's extents, as the simulator records it (SDD §28.5): the first pass scans every disk, a
+      // later one checks the tracked disks (the final pass reads them) and scans the others
+      const extentUse = (kind: SyncPass['kind'], first: boolean): Record<string, ExtentUse> => {
+        const uses: Record<string, ExtentUse> = {};
+        if (!trackedDisks.length) return uses;
+        for (const d of vm.disks) {
+          const device = d.device ?? d.id;
+          if (first) uses[device] = { mode: 'scanned', reason: 'first_pass', query_s: null, missed: 0, assumed_zero: false };
+          else if (trackedDisks.includes(d.id)) uses[device] = { mode: kind === 'final' ? 'read' : 'checked', reason: null, query_s: kind === 'final' ? 8.4 : 9.6, missed: 0, assumed_zero: false };
+          else uses[device] = { mode: 'scanned', reason: d.encrypted ? 'encrypted' : 'not_tracked', query_s: null, missed: 0, assumed_zero: false };
+        }
+        return uses;
+      };
       const syncPasses: SyncPass[] = scheduled.map(({ spec: p, start, end }, i) => {
         const changed = Math.round(p.changedGiB * GiB);
         return {
+          ...(trackedDisks.length && end !== null ? { extents: extentUse(p.kind, i === 0) } : {}),
           number: i + 1,
           kind: p.kind,
           started_at: iso(start),
@@ -2651,8 +2677,9 @@ export function buildFixtures(now: number): Fixtures {
         estimates,
         // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not
         observed_scan_bps: syncPasses.filter((p) => p.kind !== 'full' && p.ended_at !== null).length > 0 ? 545 * MiB : null,
-        tracked_disks: [],
-        observed_extent_query_s: null,
+        tracked_disks: trackedDisks,
+        // a checked pass calibrates the query time (SDD §28.6)
+        observed_extent_query_s: trackedDisks.length && syncPasses.some((p) => p.kind !== 'full' && p.kind !== 'final' && p.ended_at !== null) ? 9.6 : null,
         resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings,
         checkpoint: m.checkpoint ?? null,

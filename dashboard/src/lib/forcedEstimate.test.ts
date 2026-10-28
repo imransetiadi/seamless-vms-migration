@@ -59,7 +59,8 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
     const c = cases.find((x) => x.hooks_s)!;
     const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
     const estimate = { ...base.estimate!, downtime_parts: { ...base.estimate!.downtime_parts, hooks_s: c.hooks_s } };
-    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[] };
+    // an untracked case: the seed's first migration tracks its own disks (SDD §28.6, plan task CE10)
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[], tracked_disks: [], observed_extent_query_s: null };
     expect(forcedDowntime({ ...m, estimate }, c.plan)).toBeCloseTo(c.expected_s, 9);
     expect(forcedDowntime({ ...m, estimate }, c.plan) - forcedDowntime(m, c.plan)).toBeCloseTo(c.hooks_s!, 9);
   });
@@ -67,7 +68,8 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
   it('takes the last pass that ended, or the expected first pass while none has', () => {
     const c = cases.find((x) => x.last_pass_s === null && x.strategy === 'warm')!;
     const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
-    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[] };
+    // an untracked case: the seed's first migration tracks its own disks (SDD §28.6, plan task CE10)
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[], tracked_disks: [], observed_extent_query_s: null };
     expect(forcedDowntime(m, c.plan)).toBeCloseTo(c.expected_s, 9);
     const at = '2026-10-08T11:00:00Z';
     const pass = (number: number, duration_s: number, ended_at: string | null): SyncPass => ({
@@ -87,7 +89,8 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
   it('does not drop when the expected first pass ends as expected (SDD §5.4, review RV39-07)', () => {
     const c = cases.find((x) => x.last_pass_s === null && x.strategy === 'warm')!;
     const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
-    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[] };
+    // an untracked case: the seed's first migration tracks its own disks (SDD §28.6, plan task CE10)
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[], tracked_disks: [], observed_extent_query_s: null };
     const p = paramsFor(c.plan, c.observed_scan_bps);
     const at = '2026-10-08T11:00:00Z';
     // the first pass as long as expected records the part after its snapshot

@@ -103,6 +103,7 @@ import {
   ADVISOR_NOTES_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
+  CephAccess,
   DECISION_TYPES,
   FORCE_REASON_MIN,
   MAX_PROBE_PATH,
@@ -567,6 +568,13 @@ function overrideProblems(overrides: Record<string, unknown>): string[] {
 /** The pre-flight codes a plan may acknowledge for a VM, as the API's ACKNOWLEDGEABLE_FINDINGS (SDD §4.2, §9.3). */
 const ACKNOWLEDGEABLE_FINDINGS: readonly string[] = ['SRC_VM_AUTOSCALED'];
 
+/** `extent_tracking` is refused for a VMware source, which has no Ceph cluster (SDD §28.9, plan task CE7). */
+function refuseExtentTracking(spec: Record<string, unknown>, source: Provider | undefined): void {
+  if (spec.extent_tracking === true && source?.kind === 'vmware') {
+    throw new HttpError(422, 'validation_error', 'extent_tracking: a VMware source has no Ceph cluster to read extents from');
+  }
+}
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
   // the model validates the body first (pydantic's words, five at most), then the API's checks run in their order
   const bounds = PLAN_BOUNDS.flatMap(([field, op, limit]) => {
@@ -873,7 +881,44 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
 }
 
 /** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
-export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks']);
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
+
+/** A Ceph cluster's fsid and a monitor address, as the API's model reads them (SDD §4.2, §28.4). */
+const CEPH_FSID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CEPH_MONITOR = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]{0,252})(?::[0-9]{1,5})?$/;
+
+/**
+ * A provider's Ceph access as the API's model reads it (SDD §4.2, §28.4): an OpenStack or RHOSO source's alone; its
+ * fsid a UUID, 1 to 9 monitor addresses, its client without "client.".
+ */
+function checkCeph(fields: Record<string, unknown>): void {
+  const ceph = fields.ceph;
+  if (ceph === undefined || ceph === null) return;
+  if (typeof ceph !== 'object' || Array.isArray(ceph)) throw new HttpError(422, 'validation_error', 'ceph: Input should be a valid dictionary');
+  if (fields.kind === 'vmware') throw new HttpError(422, 'validation_error', 'Value error, ceph: a Ceph access cannot be declared for vmware');
+  if (fields.role !== 'source') throw new HttpError(422, 'validation_error', 'Value error, ceph: a Ceph access can be declared on a source provider alone');
+  const c = ceph as Record<string, unknown>;
+  if (typeof c.fsid !== 'string' || !CEPH_FSID.test(c.fsid.trim().toLowerCase())) {
+    throw new HttpError(422, 'validation_error', "Value error, fsid: a Ceph cluster's fsid is a UUID");
+  }
+  if (!Array.isArray(c.monitors) || c.monitors.length < 1 || c.monitors.length > 9) {
+    throw new HttpError(422, 'validation_error', 'ceph.monitors: List should have at least 1 item and at most 9');
+  }
+  if (c.monitors.some((m) => typeof m !== 'string' || !CEPH_MONITOR.test(m))) {
+    throw new HttpError(422, 'validation_error', 'Value error, monitors: each is a monitor address, "host" or "host:port"');
+  }
+  const client = c.client === undefined ? 'seamless' : c.client;
+  if (typeof client !== 'string' || client.toLowerCase().startsWith('client.') || !/^[A-Za-z0-9._-]{1,64}$/.test(client)) {
+    throw new HttpError(422, 'validation_error', 'Value error, client: the Ceph user without its "client." prefix');
+  }
+}
+
+/** The stored access: `key_updated_at` is server-owned, a client's value ignored (SDD §4.2). */
+function cephStored(input: unknown, keyAt: string | null): CephAccess | null {
+  if (!input) return null;
+  const c = input as Record<string, unknown>;
+  return { fsid: String(c.fsid).trim().toLowerCase(), monitors: (c.monitors as string[]).slice(), client: c.client === undefined ? 'seamless' : String(c.client), key_updated_at: keyAt };
+}
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -1852,7 +1897,7 @@ export class MockServer {
         const provider = this.providers.find((p) => p.id === id);
         if (!provider) {
           // like the API (SDD §12, §13.2): the route's role first, then the lookup
-          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
+          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key' || sub === 'ceph-key') && method === 'PUT');
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
           if (!sub && method === 'PATCH') this.refusePatchBody(input);
@@ -1867,6 +1912,7 @@ export class MockServer {
         if (!sub && method === 'PATCH') return this.patchProvider(this.require(token, 'admin', path), provider, input);
         if (sub === 'credentials' && method === 'PUT') return this.setCredentials(this.require(token, 'admin', path), provider, input);
         if (sub === 'conversion-key' && method === 'PUT') return this.setConversionKey(this.require(token, 'admin', path), provider, input);
+        if (sub === 'ceph-key' && method === 'PUT') return this.setCephKey(this.require(token, 'admin', path), provider, input);
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
           const users = this.plansThatNeed(id);
@@ -2263,13 +2309,14 @@ export class MockServer {
     if (typeof input.name !== 'string') throw new HttpError(422, 'validation_error', input.name === undefined ? 'name: Field required' : 'name: Input should be a valid string');
     if (isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
-    // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
-    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
+    // like the API: provider-{id}, provider-{id}-ssh and provider-{id}-ceph must stay apart from every other provider's (SDD §13.3)
+    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh` || id === `${p.id}-ceph` || p.id === `${id}-ceph`);
     if (clash) {
-      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
+      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id>, provider-<id>-ssh and provider-<id>.ceph`);
     }
     checkDistribution(input);
     checkDeclarations(input);
+    checkCeph(input);
     readBooleans(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
@@ -2284,10 +2331,12 @@ export class MockServer {
       policy_profile: null,
       gpu_profiles: {},
       announces_tenant_networks: false,
+      ceph: null,
     };
     const provider = {
       ...defaults,
       ...(input as unknown as Provider),
+      ceph: cephStored(input.ceph, null),
       capabilities: {},
       status: 'unknown',
       status_message: null,
@@ -2319,10 +2368,30 @@ export class MockServer {
     if ('name' in input && typeof input.name !== 'string') throw new HttpError(422, 'validation_error', 'name: Input should be a valid string');
     checkDistribution({ ...provider, ...input });
     checkDeclarations({ ...provider, ...input });
+    checkCeph({ ...provider, ...input });
     readBooleans(input);
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
+    // a declared access keeps its stored key's time; null deletes the key with it (SDD §28.4)
+    if ('ceph' in input) input = { ...input, ceph: cephStored(input.ceph, input.ceph ? (provider.ceph?.key_updated_at ?? null) : null) };
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort(), ...secretNames(provider) } });
+    return ok(provider);
+  }
+
+  /** PUT /providers/{id}/ceph-key: write-only, as the API (SDD §12, §28.4); the mock keeps no value, only the stamp. */
+  private setCephKey(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    if (typeof input.key !== 'string') throw new HttpError(422, 'validation_error', input.key === undefined ? 'key: Field required' : 'key: Input should be a valid string');
+    if (input.key.length < 16) throw new HttpError(422, 'validation_error', 'key: String should have at least 16 characters');
+    if (input.key.length > 512) throw new HttpError(422, 'validation_error', 'key: String should have at most 512 characters');
+    if (!provider.ceph) throw new HttpError(422, 'validation_error', 'provider has no ceph access: set `ceph` before its key');
+    const key = pyStrip(input.key);
+    const padding = key.endsWith('==') ? 2 : key.endsWith('=') ? 1 : 0;
+    if (/\s/.test(key) || key.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(key) || (key.length * 3) / 4 - padding < 16) {
+      throw new HttpError(422, 'validation_error', 'key must be the base64 key `ceph auth get-key` prints');
+    }
+    const secret = `provider-${provider.id}.ceph`;
+    provider.ceph = { ...provider.ceph, key_updated_at: new Date(this.now()).toISOString() };
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `ceph key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['key'] } });
     return ok(provider);
   }
 
@@ -2637,6 +2706,7 @@ export class MockServer {
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
+    refuseExtentTracking(input, source);
     this.refuseUnknownHooks(input);
     const now = this.now();
     const plan: Plan = {
@@ -2713,6 +2783,7 @@ export class MockServer {
     }
     // like the API (SDD §12): the plan it would store is checked, kept fields included
     refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
+    refuseExtentTracking({ ...(plan as unknown as Record<string, unknown>), ...input }, this.providers.find((p) => p.id === (input.source_provider_id ?? plan.source_provider_id)));
     this.refuseUnknownHooks({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';

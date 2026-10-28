@@ -1480,3 +1480,36 @@ describe('MigrationDetail', () => {
     expect(screen.queryByText(`${first.vm.name}: streamed note`)).not.toBeInTheDocument();
   });
 });
+
+describe("each disk's extent use on the migration page (SDD §16, §28.5, plan task CE10)", () => {
+  it('names a disk whose extents missed changes', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy === 'warm' && x.phase === 'awaiting_cutover' && x.sync_passes.length >= 2);
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    const vda = m.vm.disks[0]!;
+    const last = m.sync_passes.at(-1)!;
+    last.extents = { [vda.device ?? vda.id]: { mode: 'checked', reason: null, query_s: 9.5, missed: 3, assumed_zero: false } };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const disks = await screen.findByRole('list', { name: 'Disks' });
+    const row = within(disks).getByText(vda.device ?? vda.id, { exact: false }).closest('li')!;
+    expect(row).toHaveTextContent('Extents missed 3 chunks: scans in full from now on');
+    expect(within(row).getByText('Technology Preview')).toBeInTheDocument();
+  });
+
+  it("marks each disk from the latest pass that recorded its use, and nothing on a plan that does not track (SDD §16)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy === 'warm' && x.phase === 'awaiting_cutover' && x.sync_passes.length >= 2);
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    const vda = m.vm.disks[0]!;
+    const device = vda.device ?? vda.id;
+    m.sync_passes.at(-1)!.extents = { [device]: { mode: 'read', reason: null, query_s: 8.1, missed: 0, assumed_zero: false } };
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const disks = await screen.findByRole('list', { name: 'Disks' });
+    expect(within(disks).getByText(device, { exact: false }).closest('li')).toHaveTextContent('Extents read');
+    unmount();
+    for (const p of m.sync_passes) p.extents = {};
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const again = await screen.findByRole('list', { name: 'Disks' });
+    expect(again).not.toHaveTextContent(/Extents/);
+  });
+});

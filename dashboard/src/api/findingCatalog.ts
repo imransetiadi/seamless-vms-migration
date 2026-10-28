@@ -36,6 +36,9 @@ export const NETWORK_CODES: ReadonlySet<string> = new Set([
   'MAP_LB_POOL_INCOMPATIBLE',
 ]);
 
+/** The findings of changed-extent tracking (SDD §28.9): each carries the Technology Preview badge (SDD §16, plan task CE10). */
+export const EXTENT_CODES: ReadonlySet<string> = new Set(['CEPH_ACCESS_MISSING', 'EXTENT_TRACKING_PARTIAL', 'EXTENT_TRACKING_MISSED']);
+
 export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['severity']; strategies: Strategy[]; remediation: string }>> = {
   SRC_VM_ERROR_STATE: {
     severity: 'blocker',

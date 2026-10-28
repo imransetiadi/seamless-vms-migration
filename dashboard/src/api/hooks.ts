@@ -473,6 +473,11 @@ export function useSetConversionKey() {
   );
 }
 
+/** PUT /providers/{id}/ceph-key (admin, write-only; SDD §28.4, plan task CE10). */
+export function useSetCephKey() {
+  return useProviderWrite((api, { id, key }: { id: string; key: string }) => api.put<Provider>(`/providers/${enc(id)}/ceph-key`, { key }));
+}
+
 /** The outcome of Check all: the providers checked, and every check request that failed. */
 export interface CheckAllResult {
   checked: Provider[];

@@ -177,3 +177,32 @@ describe('SyncPassChart', () => {
     expect(caption(container)).not.toHaveTextContent(/no longer listed/);
   });
 });
+
+/** How a pass used a device's extents (SDD §28.5). */
+function use(mode: 'read' | 'checked' | 'scanned', reason: string | null = null, missed = 0) {
+  return { mode, reason, query_s: mode === 'scanned' ? null : 9.5, missed, assumed_zero: false };
+}
+
+describe("each pass's extent use (SDD §16, §28.5, plan task CE10)", () => {
+  it("marks each pass's disks as read, checked or scanned with the reason", () => {
+    const passes: SyncPass[] = [
+      { ...pass(1, 'full'), extents: { '/dev/vda': use('scanned', 'first_pass'), '/dev/vdb': use('scanned', 'not_tracked') } },
+      { ...pass(2), extents: { '/dev/vda': use('checked', null, 2), '/dev/vdb': use('scanned', 'not_tracked') } },
+      { ...pass(3, 'final'), extents: { '/dev/vda': use('read'), '/dev/vdb': use('scanned', 'not_tracked') } },
+    ];
+    const { container } = render(<SyncPassChart passes={passes} />);
+    expect(container.querySelector('thead')).toHaveTextContent('Extents');
+    const rows = [...container.querySelectorAll('tbody tr')].map((tr) => tr.textContent ?? '');
+    expect(rows[0]).toContain('/dev/vda scanned (first pass); /dev/vdb scanned (not tracked)');
+    expect(rows[1]).toContain('/dev/vda checked, 2 missed; /dev/vdb scanned (not tracked)');
+    expect(rows[2]).toContain('/dev/vda read; /dev/vdb scanned (not tracked)');
+    // an extent element: its Technology Preview badge (SDD §16, §28.11)
+    expect(screen.getByText('Technology Preview')).toBeInTheDocument();
+  });
+
+  it('shows no Extents column and no badge for passes that recorded no extent use', () => {
+    const { container } = render(<SyncPassChart passes={[pass(1, 'full'), pass(2)]} />);
+    expect(container.querySelector('thead')).not.toHaveTextContent('Extents');
+    expect(screen.queryByText('Technology Preview')).not.toBeInTheDocument();
+  });
+});

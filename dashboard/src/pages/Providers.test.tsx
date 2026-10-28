@@ -785,3 +785,79 @@ describe("Providers: a destination's GPU capacity (SDD §16, §22.11; plan task 
     expect(screen.getAllByRole('group', { name: 'GPU capacity' }).map((group) => group.closest('article'))).toEqual([screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })]);
   });
 });
+
+describe("a source's Ceph access (SDD §16, §28.4, plan task CE10)", () => {
+  // a key-shaped base64 string without key material (write-only, never displayed)
+  const CEPH_KEY = 'AQBrK3NnRVhBTVBMRQAAAAAAAAAAAAAAAAAAAA=='; // gitleaks:allow
+  const FSID = '0f1e2d3c-4b5a-4968-8777-665544332211';
+
+  it("edits a source's Ceph access and writes its key once", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage('admin');
+    // community-lab: an OpenStack source of the seed without Ceph access
+    const source = server.providers.find((p) => p.id === 'community-lab')!;
+    expect([source.role, source.ceph ?? null]).toEqual(['source', null]);
+    const card = await screen.findByRole('article', { name: source.name });
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'Ceph access' });
+    expect(within(section).getByText('Technology Preview')).toBeInTheDocument();
+    await user.click(within(section).getByRole('checkbox', { name: /declare the source cluster's ceph access/i }));
+    await user.type(within(section).getByLabelText(/^cluster fsid/i), FSID);
+    await user.type(within(section).getByLabelText(/^monitors/i), 'mon-a.example.com\nmon-b.example.com:6789');
+    expect(within(section).getByLabelText(/^ceph user/i)).toHaveValue('seamless');
+    await user.type(within(section).getByLabelText(/^ceph key/i), CEPH_KEY);
+    expect(dialog).not.toHaveTextContent(CEPH_KEY);
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(source.ceph).toEqual({ fsid: FSID, monitors: ['mon-a.example.com', 'mon-b.example.com:6789'], client: 'seamless', key_updated_at: expect.any(String) });
+    expect(JSON.stringify(server.providers)).not.toContain(CEPH_KEY);
+    // one write of the key, named by its secret and key, never its value (SDD §28.8)
+    const writes = server.events.filter((e) => e.kind === 'provider.credentials_updated');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.data).toMatchObject({ provider_id: 'community-lab', secret: 'provider-community-lab.ceph', keys: ['key'] });
+    expect(JSON.stringify(writes)).not.toContain(CEPH_KEY);
+    expect(within(await screen.findByRole('article', { name: source.name })).getByRole('group', { name: 'Ceph access' })).toHaveTextContent(/Key stored/);
+  });
+
+  it('never shows a Ceph key again', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    // a source whose access and key are stored, and that no running plan holds (a PATCH of one is refused, SDD §12)
+    const source = server.providers.find((p) => p.id === 'community-lab')!;
+    source.ceph = { fsid: FSID, monitors: ['mon-a.example.com'], client: 'seamless', key_updated_at: '2026-10-01T08:00:00Z' };
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: source.name });
+    const group = within(card).getByRole('group', { name: 'Ceph access' });
+    expect(group).toHaveTextContent(/Key stored/);
+    expect(within(group).getByText('Technology Preview')).toBeInTheDocument();
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'Ceph access' });
+    expect(within(section).getByRole('checkbox', { name: /declare the source cluster's ceph access/i })).toBeChecked();
+    expect(within(section).getByText(/^A Ceph key stored .*never shown again\.$/)).toBeInTheDocument();
+    expect(within(section).getByLabelText(/^ceph key/i)).toHaveValue('');
+    expect(JSON.stringify(source)).not.toMatch(/"key":/);
+    // saving without a key keeps the stored one: nothing is written, and its time stays
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated')).toHaveLength(0);
+    expect(source.ceph?.key_updated_at).toBe('2026-10-01T08:00:00Z');
+  });
+
+  it("marks a pool whose fsid is not the provider's", async () => {
+    const server = createTestServer();
+    const rhosp = server.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    const backends = rhosp.capabilities.storage_backends as Array<Record<string, unknown>>;
+    rhosp.capabilities = {
+      ...rhosp.capabilities,
+      storage_backends: [
+        ...backends,
+        { pool: 'overcloud@tripleo_ceph_dr#volumes-dr', vendor: 'Ceph', protocol: 'ceph', family: 'rbd', ceph_fsid: 'ffffffff-0000-4000-8000-000000000001', ceph_pool: 'volumes-dr' },
+      ],
+    };
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    expect(within(card).getByRole('group', { name: 'Ceph access' })).toHaveTextContent('On another cluster, untracked: overcloud@tripleo_ceph_dr#volumes-dr');
+  });
+});

@@ -1153,6 +1153,7 @@ describe('mock API', () => {
       'destination_provider_id',
       'downtime_slo_s',
       'estimator_overrides',
+      'extent_tracking',
       'finalize_warning_h',
       'handover',
       'keep_warm_interval_s',
@@ -1183,6 +1184,7 @@ describe('mock API', () => {
     expect([...PROVIDER_EDITABLE].sort()).toEqual([
       'announces_tenant_networks',
       'ca_cert_path',
+      'ceph',
       'cloud',
       'conversion_host',
       'credentials_secret',
@@ -4141,5 +4143,67 @@ describe("the mock's cutover gate for GPU capacity, as the API demo's (SDD §5.4
     tick();
     expect(plain.phase).toBe('cutover');
     expect(plain.gpu_wait).toBeNull();
+  });
+});
+
+describe("the mock's Ceph access and tracked passes (SDD §12, §28.4, §28.5, plan task CE10)", () => {
+  // a key-shaped base64 string without key material, as `ceph auth get-key` prints one
+  const CEPH_KEY = 'AQBrK3NnRVhBTVBMRQAAAAAAAAAAAAAAAAAAAA=='; // gitleaks:allow
+  it("answers a source with Ceph access and a tracked plan's passes", async () => {
+    const { server, client } = setup('admin');
+    const source = await client.get<Provider>('/providers/rhosp17-dc1');
+    expect(source.ceph).toMatchObject({ fsid: expect.any(String), client: 'seamless', key_updated_at: expect.any(String) });
+    expect(JSON.stringify(source)).not.toMatch(/"key":/);
+    // the key is write-only: refused unless base64 of at least 16 bytes, stamped, never returned (SDD §12, §28.4)
+    const before = source.ceph!.key_updated_at;
+    await expect(client.put('/providers/rhosp17-dc1/ceph-key', { key: 'not base64!' })).rejects.toMatchObject({ status: 422 });
+    await expect(client.put('/providers/rhosp17-dc1/ceph-key', { key: 'AQ==' })).rejects.toMatchObject({ status: 422 });
+    const keyed = await client.put<Provider>('/providers/rhosp17-dc1/ceph-key', { key: CEPH_KEY });
+    expect(keyed.ceph?.key_updated_at).not.toBe(before);
+    expect(JSON.stringify(keyed)).not.toContain('AQBrK3Nn');
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated').at(-1)?.data).toMatchObject({
+      provider_id: 'rhosp17-dc1',
+      secret: 'provider-rhosp17-dc1.ceph',
+      keys: ['key'],
+    });
+    // a provider without access has no key to write; an operator may not write one
+    await expect(client.put('/providers/community-lab/ceph-key', { key: CEPH_KEY })).rejects.toMatchObject({ status: 422 });
+    await expect(setup('operator').client.put('/providers/rhosp17-dc1/ceph-key', { key: CEPH_KEY })).rejects.toMatchObject({ status: 403 });
+    // Ceph access is an OpenStack or RHOSO source's alone, as the API refuses it (SDD §4.2, §28.4)
+    const ceph = { fsid: source.ceph!.fsid, monitors: ['mon-a.example.com'], client: 'seamless' };
+    const vcenter = server.providers.find((p) => p.id === 'vcenter-hq')!;
+    await expect(client.post('/providers', { ...vcenter, id: 'vc-ceph', name: 'vCenter with Ceph', ceph })).rejects.toMatchObject({ status: 422 });
+    const rhoso = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    await expect(client.post('/providers', { ...rhoso, id: 'dst-ceph', name: 'A destination with Ceph', ceph })).rejects.toMatchObject({ status: 422 });
+    await expect(client.patch('/providers/community-lab', { ceph: { ...ceph, fsid: 'not-a-uuid' } })).rejects.toMatchObject({ status: 422 });
+    await expect(client.patch('/providers/community-lab', { ceph: { ...ceph, monitors: [] } })).rejects.toMatchObject({ status: 422 });
+    await expect(client.patch('/providers/community-lab', { ceph: { ...ceph, client: 'client.seamless' } })).rejects.toMatchObject({ status: 422 });
+    // key_updated_at is server-owned: a PATCH keeps the stored key's time and ignores a client's
+    const patched = await client.patch<Provider>('/providers/community-lab', { ceph: { ...ceph, key_updated_at: '2020-01-01T00:00:00Z' } });
+    expect(patched.ceph).toEqual({ ...ceph, key_updated_at: null });
+    // an id that would read another provider's Ceph secret is refused (SDD §13.3)
+    await expect(client.post('/providers', { ...rhoso, id: 'community-lab-ceph', name: 'Clash' })).rejects.toMatchObject({ status: 409 });
+    // extent tracking is refused for a VMware source (SDD §28.9)
+    const vmwarePlan = { name: 'From vCenter', source_provider_id: 'vcenter-hq', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    await expect(client.post('/plans', { ...vmwarePlan, extent_tracking: true })).rejects.toMatchObject({ status: 422, message: 'extent_tracking: a VMware source has no Ceph cluster to read extents from' });
+    const vcPlan = await client.post<Plan>('/plans', vmwarePlan);
+    await expect(client.patch(`/plans/${vcPlan.id}`, { extent_tracking: true })).rejects.toMatchObject({ status: 422 });
+    expect((await client.patch<Plan>(`/plans/${vcPlan.id}`, { extent_tracking: false })).extent_tracking).toBe(false);
+    // a tracked plan's warm migrations record each pass's extent use and the disks the final pass reads (SDD §28.5, §28.6)
+    const tracked = server.plans.find((p) => p.extent_tracking)!;
+    const migrations = await client.get<Migration[]>('/migrations', { query: { plan_id: tracked.id } });
+    const warm = migrations.filter((m) => m.strategy === 'warm' && m.sync_passes.length >= 2);
+    expect(warm.length).toBeGreaterThan(0);
+    for (const m of warm) {
+      expect(m.tracked_disks.length).toBeGreaterThan(0);
+      const devices = m.tracked_disks.map((id) => m.vm.disks.find((d) => d.id === id)!.device);
+      const [first, ...later] = m.sync_passes;
+      expect(Object.values(first!.extents ?? {}).map((u) => [u.mode, u.reason])).toEqual(m.vm.disks.map(() => ['scanned', 'first_pass']));
+      for (const p of later) for (const device of devices) expect(p.extents?.[device!]?.mode).toBe(p.kind === 'final' ? 'read' : 'checked');
+    }
+    // a plan that does not track records no extent use
+    const untracked = server.migrations.find((m) => m.strategy === 'warm' && !server.plans.find((p) => p.id === m.plan_id)!.extent_tracking)!;
+    expect(untracked.sync_passes.every((p) => !p.extents || Object.keys(p.extents).length === 0)).toBe(true);
+    expect(untracked.tracked_disks).toEqual([]);
   });
 });

@@ -95,6 +95,51 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
   );
 }
 
+/** A source's Ceph access (SDD §16, §28.4, plan task CE10): what it declares, whether its key is stored, and the check's rbd pools of another cluster. */
+function CephAccessSummary({ provider }: { provider: Provider }) {
+  const headingId = useId();
+  const ceph = provider.ceph;
+  if (!ceph) return null;
+  const elsewhere = storageBackends(provider.capabilities).filter((b) => b.family === 'rbd' && b.cephFsid !== null && b.cephFsid !== ceph.fsid);
+  return (
+    <div role="group" aria-labelledby={headingId} className="flex min-w-0 flex-col gap-1.5 rounded-md border border-border px-3 py-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <h4 id={headingId} className="text-sm font-medium text-foreground">
+          Ceph access
+        </h4>
+        <TechPreviewBadge feature="extents" />
+      </div>
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+        <dt className="text-muted-foreground">Cluster</dt>
+        <dd className="min-w-0 wrap-break-word">
+          <code>{ceph.fsid}</code>
+        </dd>
+        <dt className="text-muted-foreground">Monitors</dt>
+        <dd className="num min-w-0 wrap-break-word">{ceph.monitors.join(', ')}</dd>
+        <dt className="text-muted-foreground">User</dt>
+        <dd>
+          <code>{ceph.client}</code>
+        </dd>
+        <dt className="text-muted-foreground">Key</dt>
+        <dd>
+          {ceph.key_updated_at ? (
+            <span className="inline-flex items-center gap-1">
+              <KeyRound aria-hidden className="size-3.5 text-status-success" />
+              Key stored{' '}
+              <time dateTime={ceph.key_updated_at} title={formatDateTime(ceph.key_updated_at)}>
+                {formatRelative(ceph.key_updated_at)}
+              </time>
+            </span>
+          ) : (
+            <span className="text-status-warning">No key stored</span>
+          )}
+        </dd>
+      </dl>
+      {elsewhere.length > 0 && <RowWarning>{`On another cluster, untracked: ${elsewhere.map((b) => b.pool).join(', ')}`}</RowWarning>}
+    </div>
+  );
+}
+
 /** A warning under a card row, in the row's words (SDD §16). */
 function RowWarning({ children }: { children: string }) {
   return (
@@ -354,6 +399,7 @@ function ProviderCard({
       </dl>
 
       {provider.role === 'destination' && provider.kind !== 'vmware' && <GpuCapacitySummary provider={provider} />}
+      {provider.ceph && <CephAccessSummary provider={provider} />}
 
       <Capabilities capabilities={provider.capabilities} />
 
