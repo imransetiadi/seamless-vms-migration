@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
-import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, networkContext, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
+import { DEMO_CEPH_FSID, DEMO_PROD_CEPH_FSID, buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, networkContext, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
 import type { MemberRead, StackRead } from './mockData';
 import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
@@ -901,5 +901,30 @@ describe("the mock's floating IP warning under keep_address, as the API's (SDD �
     const keep = { ...plan, network_cutover: { ...auto.network_cutover, floating_ips: 'keep_address' as const } };
     expect(codes(auto)).toContain('MAP_FIP_ADDRESS_CHANGE');
     expect(codes(keep)).not.toContain('MAP_FIP_ADDRESS_CHANGE');
+  });
+});
+
+describe("the mock's demo seed, as the API's demo (SDD §7.4, §10, §28.4, plan task CE11)", () => {
+  it("seeds the demo source's Ceph access and a tracked plan", () => {
+    const fixtures = buildFixtures(now);
+    const source = fixtures.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    expect(source.ceph).toEqual({
+      fsid: DEMO_CEPH_FSID,
+      monitors: ['ceph-mon-0.dc1.example.com', 'ceph-mon-1.dc1.example.com'],
+      client: 'seamless',
+      key_updated_at: expect.any(String),
+    });
+    type Backend = { family: string; ceph_fsid?: string | null; ceph_pool?: string | null };
+    const rbd = (source.capabilities.storage_backends as Backend[]).filter((b) => b.family === 'rbd');
+    expect(rbd.length).toBeGreaterThan(0);
+    for (const b of rbd) expect([b.ceph_fsid, typeof b.ceph_pool]).toEqual([DEMO_CEPH_FSID, 'string']);
+    const prod = fixtures.providers.find((p) => p.id === 'rhoso-prod')!;
+    const prodRbd = (prod.capabilities.storage_backends as Backend[]).filter((b) => b.family === 'rbd');
+    expect(prodRbd.length).toBeGreaterThan(0);
+    expect(prodRbd.every((b) => b.ceph_fsid === DEMO_PROD_CEPH_FSID)).toBe(true);
+    const tracked = fixtures.plans.filter((p) => p.extent_tracking);
+    expect(tracked.map((p) => p.source_provider_id)).toEqual(['rhosp17-dc1']);
+    // a VMware source never tracks extents (SDD §28.9)
+    expect(fixtures.plans.filter((p) => p.source_provider_id === 'vcenter-hq').every((p) => !p.extent_tracking)).toBe(true);
   });
 });

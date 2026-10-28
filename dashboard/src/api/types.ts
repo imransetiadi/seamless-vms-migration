@@ -129,6 +129,19 @@ export interface ConversionHostConfig {
 
 /** A conversion host's pinned host keys (SDD §4.2, §26.4): server-owned - the provider check writes it (§10), the API
  * returns it and never writes it. */
+/** The source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): its key is written by
+ * `PUT /providers/{id}/ceph-key` and never read back. */
+export interface CephAccess {
+  /** The cluster's fsid, a UUID. */
+  fsid: string;
+  /** 1-9 monitor addresses, "host" or "host:port". */
+  monitors: string[];
+  /** The Ceph user without "client."; "seamless" by default. */
+  client: string;
+  /** Server-owned: when the key was last written; null before. */
+  key_updated_at: Timestamp | null;
+}
+
 export interface HostKeyPin {
   /** The Nova server whose keys they are: the pin applies to it alone. */
   server_id: string;
@@ -176,6 +189,8 @@ export interface Provider {
   /** Server-owned: its conversion host's pinned host keys (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it.
    * Older fixtures omit it (null). */
   conversion_host_pin?: HostKeyPin | null;
+  /** The source cluster's Ceph access (SDD §4.2, §28.4): an OpenStack or RHOSO source alone. Older fixtures omit it (null). */
+  ceph?: CephAccess | null;
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
@@ -547,6 +562,9 @@ export interface Plan {
    * groups (SDD §6.6); `nova`: one fixed IP per port and a new MAC.
    */
   port_creation_mode: PortCreationMode;
+  /** The warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28.9): refused for a VMware source. Older
+   * fixtures omit it (false). */
+  extent_tracking?: boolean;
   /** Per VM (source id), per NIC MAC (lower case): its RHOSO network and addresses; OpenStack sources (SDD §4.2). */
   nic_overrides: Record<string, Record<string, NicOverride>>;
   /**
@@ -576,6 +594,17 @@ export interface SyncPass {
   bytes_changed: number;
   bytes_transferred: number;
   duration_s: number | null;
+  /** Per device, how the pass used the disk's extents (SDD §4.2, §28.5); {} or omitted without tracking. */
+  extents?: Record<string, ExtentUse>;
+}
+
+/** How a pass used a disk's extents (SDD §4.2, §28.5). */
+export interface ExtentUse {
+  mode: 'read' | 'checked' | 'scanned';
+  reason: string | null;
+  query_s: number | null;
+  missed: number;
+  assumed_zero: boolean;
 }
 
 export interface Finding {

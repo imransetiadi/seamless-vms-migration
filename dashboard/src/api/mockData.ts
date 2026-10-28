@@ -395,25 +395,31 @@ const MOCK_POOLS: Record<string, string> = {
   lvm: 'lab@lvm#lvm',
 };
 
-const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other') => ({
+/** The demo clusters' fsids (SDD §10, §28.4, plan task CE11): an rbd pool reports its cluster's and its Ceph pool. */
+export const DEMO_CEPH_FSID = '6f8c2d4e-1b3a-4c5d-9e7f-0a1b2c3d4e5f';
+export const DEMO_PROD_CEPH_FSID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+
+const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other', ceph?: { fsid: string; pool: string }) => ({
   pool,
   vendor: family === 'netapp_nfs' ? 'NetApp' : 'Open Source',
   protocol: family === 'netapp_nfs' ? 'nfs' : family === 'rbd' ? 'ceph' : 'iSCSI',
   family,
+  // an rbd entry alone carries them, as the API's check (SDD §10): null without location_info
+  ...(family === 'rbd' ? { ceph_fsid: ceph?.fsid ?? null, ceph_pool: ceph?.pool ?? null } : {}),
 });
 
 const DC1_STORAGE = [
-  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd'),
-  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd'),
-  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd'),
-  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'volumes' }),
+  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'volumes-ssd' }),
+  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'tripleo-ceph' }),
+  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'tripleo-ceph-ssd' }),
   backend('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1', 'netapp_nfs'),
 ];
 
 const PROD_STORAGE = [
-  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd'),
-  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd'),
-  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd'),
+  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-hdd' }),
+  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-nvme' }),
+  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-ssd' }),
   // the same ONTAP export, mounted through the RHOSO storage network's LIF
   backend('hostgroup@ontap-nfs#198.51.100.60:/cinder_dc1', 'netapp_nfs'),
 ];
@@ -1037,6 +1043,8 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
+      // the demo cluster's Ceph access, its key as written (SDD §10, §28.4, plan task CE11)
+      ceph: { fsid: DEMO_CEPH_FSID, monitors: ['ceph-mon-0.dc1.example.com', 'ceph-mon-1.dc1.example.com'], client: 'seamless', key_updated_at: iso(now - 30 * 24 * 60 * 60_000) },
       capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }, iso(now - 4 * 60_000)),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
@@ -2120,7 +2128,8 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'running',
     createdAgo: 3 * D,
-    overrides: {
+    // the demo's finance plan tracks its Ceph volumes' extents (SDD §28, plan task CE11)
+    overrides: { extent_tracking: true,
       mappings: { networks: { 'tenant-infra': 'tenant-infra' }, flavors: { 'g1.a10': 'm1.large' }, volume_types: { 'tripleo-ceph': 'ceph-hdd', 'tripleo-ceph-ssd': 'ceph-ssd' }, projects: {} },
       // PRD G1: warm cutovers within 15 minutes.
       downtime_slo_s: 900,

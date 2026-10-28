@@ -10,11 +10,13 @@ approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrat
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from .config import Settings
 from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
     AdvisorPolicy,
+    CephAccess,
     ConversionHostConfig,
     DnsTarget,
     Mappings,
@@ -31,6 +33,7 @@ from .orchestrator import Orchestrator
 from .planning.probes import is_database, suggest_probes
 from .providers.base import ProviderError
 from .providers.fake import (
+    DEMO_CEPH_FSID,
     DEMO_DESTINATION_POOL,
     DEMO_DNS_NEW_ADDRESS,
     DEMO_DNS_VM,
@@ -79,6 +82,12 @@ DEMO_PROVIDERS = (
         distribution="rhosp",
         conversion_host=ConversionHostConfig(
             name="os-migrate-conv-src", flavor="m1.large", external_network="public"
+        ),
+        # the demo cluster's Ceph access, its key as written (SDD §10, §28.4, plan task CE11)
+        ceph=CephAccess(
+            fsid=DEMO_CEPH_FSID,
+            monitors=["ceph-mon-0.dc1.example.com", "ceph-mon-1.dc1.example.com"],
+            key_updated_at=datetime(2026, 10, 1, 9, 0, tzinfo=UTC),
         ),
     ),
     Provider(
@@ -152,6 +161,8 @@ async def _plans(settings: Settings) -> list[Plan]:
             downtime_slo_s=600,
             require_approval=False,
             auto_cutover=True,
+            # the finance plan tracks its Ceph volumes' extents (SDD §28, plan task CE11)
+            extent_tracking=True,
             keep_warm_interval_s=120,
             verification=VerificationConfig(timeout_s=120),
             probe_overrides={vm_id: probes for vm_id, probes in probed.items() if probes},
