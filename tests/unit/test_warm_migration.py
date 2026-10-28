@@ -34,6 +34,8 @@ STATE_KEYS = {
     "dest_volumes",
     "passes",
     "pending_snapshot",
+    "extent_bases",
+    "extents_off",
     "destination_server_id",
 }
 PASS_KEYS = {
@@ -45,6 +47,7 @@ PASS_KEYS = {
     "bytes_changed",
     "bytes_transferred",
     "duration_s",
+"extents",
 }
 SNAPSHOT_ENTRY_KEYS = {
     "source_id",
@@ -56,6 +59,7 @@ SNAPSHOT_ENTRY_KEYS = {
     "bootable",
     "name",
     "volume_type",
+"name_id", "host", "encrypted",
 }
 CREATE_CALLS = ("create_volume_snapshot", "create_volume", "create_server_image", "attach_volume")
 
@@ -107,7 +111,7 @@ class Scenario:
         return WarmState.load(self.state_dir, "srv-1")
 
     def snapshot(self, transfer_uuid="uuid-1", **kwargs):
-        return warm_migration.OpenstackWarmSnapshot(
+        return _RememberingSnapshot(self, warm_migration.OpenstackWarmSnapshot(
             self.src,
             "src-conv",
             "/keys/conversion",
@@ -117,7 +121,7 @@ class Scenario:
             self.state(),
             shell_factory=self.shells,
             **kwargs
-        )
+        ))
 
     def sync(self, transfer_uuid="uuid-1", **kwargs):
         return warm_migration.OpenstackWarmSync(
@@ -139,6 +143,23 @@ class Scenario:
         sync_pass = self.sync(transfer_uuid, **kwargs).sync(pass_kind)
         self.snapshot(transfer_uuid).cleanup()
         return sync_pass
+
+
+class _RememberingSnapshot:
+    """The scenario's snapshot module: ``create`` also leaves its volume map at
+    ``scenario.shells.last_volume_map`` for the tests that read the devices it chose."""
+
+    def __init__(self, scenario, snapshot):
+        self._scenario = scenario
+        self._snapshot = snapshot
+
+    def create(self):
+        volume_map = self._snapshot.create()
+        self._scenario.shells.last_volume_map = copy.deepcopy(volume_map)
+        return volume_map
+
+    def __getattr__(self, name):
+        return getattr(self._snapshot, name)
 
 
 def receive_commands(scenario):
@@ -233,6 +254,8 @@ def test_warm_state_roundtrip_atomic(tmp_path):
         "passes": [],
         "pending_snapshot": None,
         "destination_server_id": None,
+        "extent_bases": {},
+        "extents_off": [],
     }
 
     state.server_name = "vm1"
@@ -432,7 +455,10 @@ def test_snapshot_create_is_idempotent_per_transfer_uuid(tmp_path):
     state = scenario.state()
     assert state.server_name == "vm1"
     assert state.transfer_uuid == "uuid-1"
-    assert state.pending_snapshot == {"transfer_uuid": "uuid-1", "volume_map": volume_map}
+    # the pass the snapshot is for: its cleanup reads whether it completed (SDD 6.3, CE4)
+    assert state.pending_snapshot == {
+        "transfer_uuid": "uuid-1", "pass": 1, "volume_map": volume_map,
+    }
 
     before = len(scenario.src.calls)
     again = scenario.snapshot("uuid-1")
@@ -1480,3 +1506,325 @@ def test_the_gates_refusal_fails_a_warm_pass_through_a_link_at_once(tmp_path):
         "link refused by the source conversion host (os_migrate_conv_src at %s): its gate refused "
         "volume vol-x, which is not the run's" % SRC_CONV
     )
+
+
+# --------------------------------------------------------------------------------------------
+# extent tracking: the bases, the modes and the reasons (SDD 6.3, 6.4, 28.4, 28.5; plan task CE4)
+
+CHUNK = 4194304
+RBD_DIFF = json.dumps(
+    [
+        {"offset": 0, "length": CHUNK, "exists": True},
+        {"offset": 2 * CHUNK, "length": CHUNK, "exists": True},
+    ]
+)
+TRACKED_POOL = "hostgroup@ceph#ceph"
+
+
+def tracking_receiver(missed=0, fail_on=None):
+    """A blocksync receive whose summary counts the extents of a check or read pass, and, given
+    ``fail_on`` (a word of the command), a failed pass."""
+
+    def receive(command):
+        words = " ".join(command)
+        if fail_on is not None and fail_on in words:
+            return fake.receive_process(error="injected failure")
+        summary = {
+            "ok": True, "chunks": 4, "chunks_changed": 1, "bytes_scanned": 1000,
+            "bytes_changed": 100, "bytes_transferred": 60, "duration_s": 0.25,
+        }
+        if "--extents-mode" in words:
+            summary["extent_chunks"] = 2
+            summary["missed_chunks"] = missed
+        return fake.FakeProcess(0, json.dumps(summary) + "\n", "")
+
+    return receive
+
+
+def tracked(tmp_path, missed=0, rbd=RBD_DIFF, fail_on=None, pool=TRACKED_POOL):
+    """A Scenario whose volumes sit on a tracked Ceph pool, with the run's Ceph files and an rbd
+    that answers ``rbd`` to every diff."""
+    scenario = Scenario(tmp_path, receive=tracking_receiver(missed, fail_on))
+    scenario.shells.out = lambda cmd: rbd if "rbd" in cmd and "diff" in cmd else None
+    for volume in scenario.src.volumes.values():
+        volume["os-vol-host-attr:host"] = pool
+        volume["os-vol-mig-status-attr:name_id"] = volume["id"] + "-nid"
+    conf = tmp_path / "ceph.conf"
+    conf.write_text("[global]\nfsid = 0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e\n")
+    keyring = tmp_path / "keyring"
+    keyring.write_text("[client.seamless]\n\tkey = fake-no-key-material\n")
+    scenario.ceph = {
+        "ceph_conf": str(conf),
+        "ceph_keyring": str(keyring),
+        "ceph_client": "seamless",
+        "ceph_pools": {TRACKED_POOL: "volumes"},
+        "extent_query_timeout": 30,
+    }
+    return scenario
+
+
+def tracked_pass(scenario, transfer_uuid, pass_kind="auto", extents="check", keep_base=True, **kw):
+    scenario.snapshot(transfer_uuid).create()
+    sync_pass = scenario.sync(transfer_uuid, extents=extents, **scenario.ceph, **kw).sync(pass_kind)
+    scenario.snapshot(transfer_uuid).cleanup(keep_base=keep_base)
+    return sync_pass
+
+
+def sender_words(scenario, source_dev):
+    """The sender's argv of the last receive command whose sender reads ``source_dev`` - an
+    earlier pass's temporary volume may have had the same path."""
+    for argv in reversed(receive_commands(scenario)):
+        sender = argv[argv.index("--") + 1:]
+        remote = shlex.split(" ".join(sender[sender.index("cloud-user@" + SRC_CONV) + 1:]))
+        if remote[remote.index("--device") + 1] == source_dev:
+            return remote
+    raise AssertionError("no sender reads %s" % source_dev)
+
+
+def test_a_completed_pass_keeps_its_snapshot_as_the_next_base(tmp_path):
+    """SDD 6.3, 6.4, 28.4: with keep_base the completed pass's snapshot of each volume disk stays
+    as the device's base - the temporary volume still goes - recorded with the pass, the source
+    and destination volumes, the size and name_id, and that the pass read the destination in
+    full."""
+    scenario = tracked(tmp_path)
+    source_map = scenario.snapshot("uuid-1").create()
+    assert scenario.state().pending_snapshot["pass"] == 1
+    scenario.sync("uuid-1", extents="check", **scenario.ceph).sync("auto")
+    scenario.snapshot("uuid-1").cleanup(keep_base=True)
+
+    state = scenario.state()
+    assert state.pending_snapshot is None
+    boot = state.extent_bases["/dev/vda"]
+    assert boot == {
+        "snapshot_id": source_map["/dev/vda"]["snap_id"],
+        "pass": 1,
+        "source_volume_id": "vol-boot",
+        "size": 20,
+        "name_id": "vol-boot-nid",
+        "dest_volume_id": state.dest_volumes["/dev/vda"]["dest_id"],
+        "full_read": True,
+    }
+    assert state.extent_bases["/dev/vdb"]["source_volume_id"] == "vol-data"
+    assert boot["snapshot_id"] in scenario.src.snapshots  # the base stays
+    assert source_map["/dev/vda"]["tmp_volume_id"] not in scenario.src.volumes
+    assert state.extents_off == []
+
+
+def test_the_previous_base_is_deleted_once_the_next_pass_completes(tmp_path):
+    """SDD 28.4: a volume holds one base at a time: the next completed pass's snapshot replaces
+    it, and the earlier one is deleted."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    first = scenario.state().extent_bases["/dev/vda"]["snapshot_id"]
+    tracked_pass(scenario, "uuid-2")
+    second = scenario.state().extent_bases["/dev/vda"]["snapshot_id"]
+    assert second != first and second in scenario.src.snapshots
+    assert first not in scenario.src.snapshots
+    assert scenario.state().extent_bases["/dev/vda"]["pass"] == 2
+
+
+def test_a_failed_pass_keeps_the_previous_base(tmp_path):
+    """SDD 28.5: a failed pass leaves the bases where they were - its own snapshot goes, the last
+    completed pass's stays - so the next pass diffs from the last completed pass."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    base = scenario.state().extent_bases["/dev/vda"]["snapshot_id"]
+    scenario.shells.receive = tracking_receiver(fail_on="receive")
+    failed_map = scenario.snapshot("uuid-2").create()
+    with pytest.raises(RuntimeError):
+        scenario.sync("uuid-2", extents="check", **scenario.ceph).sync("auto")
+    scenario.snapshot("uuid-2").cleanup(keep_base=True)
+
+    state = scenario.state()
+    assert state.extent_bases["/dev/vda"]["snapshot_id"] == base and base in scenario.src.snapshots
+    assert failed_map["/dev/vda"]["snap_id"] not in scenario.src.snapshots
+    assert state.pending_snapshot is None
+
+
+def test_a_pass_with_a_base_checks_its_extents(tmp_path):
+    """SDD 28.5: the first pass scans; a later pre-copy pass of a disk with a base queries its
+    extents, writes them beside the sender's script on the source host and runs the sender with
+    --extents FILE --extents-mode check, recording the pass as checked."""
+    scenario = tracked(tmp_path)
+    first = tracked_pass(scenario, "uuid-1")
+    assert first["extents"]["/dev/vda"] == {
+        "mode": "scanned", "reason": "first_pass", "query_s": None, "missed": 0, "assumed_zero": False,
+    }
+    second = tracked_pass(scenario, "uuid-2")
+    use = second["extents"]["/dev/vda"]
+    assert use["mode"] == "checked" and use["reason"] is None and use["missed"] == 0
+    assert use["query_s"] is not None and use["query_s"] >= 0
+    sender = sender_words(scenario, scenario.shells.last_volume_map["/dev/vda"]["source_dev"])
+    assert sender[sender.index("--extents-mode") + 1] == "check"
+    path = sender[sender.index("--extents") + 1]
+    copied = dict(c for shell in scenario.shells.at(SRC_CONV) for c in shell.copied)
+    assert json.loads(copied[path]) == [[0, CHUNK], [2 * CHUNK, CHUNK]]
+    script = sender[sender.index("send") - 1]
+    assert path.rsplit("/", 1)[0] == script.rsplit("/", 1)[0]  # beside the sender's script
+
+
+def test_a_final_pass_reads_extents_after_a_clean_check(tmp_path):
+    """SDD 28.5: the final pass reads the listed chunks alone when the disk has a base from a pass
+    that read the destination in full, a checked pass ran and none missed."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    tracked_pass(scenario, "uuid-2")
+    final = tracked_pass(scenario, "uuid-3", pass_kind="final", extents="read", keep_base=False)
+    assert final["kind"] == "final"
+    assert final["extents"]["/dev/vda"]["mode"] == "read"
+    assert final["extents"]["/dev/vdb"]["mode"] == "read"
+    sender = sender_words(scenario, scenario.shells.last_volume_map["/dev/vda"]["source_dev"])
+    assert sender[sender.index("--extents-mode") + 1] == "read"
+
+
+def test_a_final_pass_without_a_clean_check_scans_in_full(tmp_path):
+    """SDD 28.5: with no checked pass of the disk yet, the final pass scans it in full (reason
+    unchecked), given read or not."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    final = tracked_pass(scenario, "uuid-2", pass_kind="final", extents="read", keep_base=False)
+    use = final["extents"]["/dev/vda"]
+    assert (use["mode"], use["reason"]) == ("scanned", "unchecked")
+    assert "--extents" not in sender_words(scenario, scenario.shells.last_volume_map["/dev/vda"]["source_dev"])
+
+
+def test_a_check_with_a_miss_turns_tracking_off_for_the_disk(tmp_path):
+    """SDD 28.5: a check whose sender found changed chunks the extents do not list records the
+    misses and turns tracking off for that disk until the migration ends; the other disk goes on."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    scenario.shells.receive = tracking_receiver(missed=3)
+    second = tracked_pass(scenario, "uuid-2")
+    assert second["extents"]["/dev/vda"]["missed"] == 3
+    assert second["extents"]["/dev/vda"]["mode"] == "checked"
+    assert sorted(scenario.state().extents_off) == ["/dev/vda", "/dev/vdb"]
+    scenario.shells.receive = tracking_receiver(missed=0)
+    third = tracked_pass(scenario, "uuid-3")
+    assert (third["extents"]["/dev/vda"]["mode"], third["extents"]["/dev/vda"]["reason"]) == ("scanned", "missed")
+
+
+def test_a_base_from_an_assume_zero_pass_is_never_read_from(tmp_path):
+    """SDD 28.5: a base pass that skipped the chunks it assumed zero did not read the destination
+    in full, so the next pass scans (assumed_zero) and leaves a base that can be read from."""
+    scenario = tracked(tmp_path)
+    first = tracked_pass(scenario, "uuid-1", assume_zero=True)
+    assert first["extents"]["/dev/vda"]["assumed_zero"] is True
+    assert scenario.state().extent_bases["/dev/vda"]["full_read"] is False
+    second = tracked_pass(scenario, "uuid-2")
+    assert (second["extents"]["/dev/vda"]["mode"], second["extents"]["/dev/vda"]["reason"]) == ("scanned", "assumed_zero")
+    assert scenario.state().extent_bases["/dev/vda"]["full_read"] is True
+    third = tracked_pass(scenario, "uuid-3")
+    assert third["extents"]["/dev/vda"]["mode"] == "checked"
+
+
+def test_a_base_cinder_no_longer_has_scans_in_full(tmp_path):
+    """SDD 28.5: a base snapshot Cinder no longer has (deleted behind Seamless's back) makes the
+    pass scan in full (base_gone); the completed pass leaves a new base."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    gone = scenario.state().extent_bases["/dev/vda"]["snapshot_id"]
+    del scenario.src.snapshots[gone]
+    second = tracked_pass(scenario, "uuid-2")
+    assert (second["extents"]["/dev/vda"]["mode"], second["extents"]["/dev/vda"]["reason"]) == ("scanned", "base_gone")
+    assert second["extents"]["/dev/vdb"]["mode"] == "checked"
+    assert scenario.state().extent_bases["/dev/vda"]["pass"] == 2
+
+
+def test_a_resized_or_moved_volume_scans_in_full(tmp_path):
+    """SDD 28.5: a source volume whose size or name_id changed since its base (resized, or moved
+    to another back-end object) scans in full."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    scenario.src.volumes["vol-data"]["size"] = 12
+    scenario.src.volumes["vol-boot"]["os-vol-mig-status-attr:name_id"] = "vol-boot-moved"
+    second = tracked_pass(scenario, "uuid-2")
+    for dev in ("/dev/vda", "/dev/vdb"):
+        assert (second["extents"][dev]["mode"], second["extents"][dev]["reason"]) == ("scanned", "resized"), dev
+    assert scenario.state().extent_bases["/dev/vdb"]["size"] == 12
+    assert scenario.state().extent_bases["/dev/vda"]["name_id"] == "vol-boot-moved"
+
+
+def test_a_volume_of_another_cluster_or_backend_scans_in_full(tmp_path):
+    """SDD 28.4: a volume whose Cinder pool is not among the tracked ones (another cluster, or a
+    backend that is not RBD) is not tracked: every pass scans it."""
+    scenario = tracked(tmp_path, pool="hostgroup@netapp#flex")
+    tracked_pass(scenario, "uuid-1")
+    second = tracked_pass(scenario, "uuid-2")
+    assert (second["extents"]["/dev/vda"]["mode"], second["extents"]["/dev/vda"]["reason"]) == ("scanned", "not_tracked")
+    assert "--extents" not in sender_words(scenario, scenario.shells.last_volume_map["/dev/vda"]["source_dev"])
+
+
+def test_an_encrypted_volume_scans_in_full(tmp_path):
+    """SDD 28.3: an encrypted volume is left out - the diff is of the image's bytes, which the
+    conversion host reads decrypted."""
+    scenario = tracked(tmp_path)
+    scenario.src.volumes["vol-data"]["encrypted"] = True
+    tracked_pass(scenario, "uuid-1")
+    second = tracked_pass(scenario, "uuid-2")
+    assert (second["extents"]["/dev/vdb"]["mode"], second["extents"]["/dev/vdb"]["reason"]) == ("scanned", "encrypted")
+    assert second["extents"]["/dev/vda"]["mode"] == "checked"
+
+
+def test_a_failed_query_scans_in_full_and_the_pass_completes(tmp_path):
+    """SDD 28.5: tracking never fails a pass: a query rbd cannot answer scans the disk in full
+    (query_failed) and the pass completes with its base."""
+    scenario = tracked(tmp_path, rbd="not json at all")
+    tracked_pass(scenario, "uuid-1")
+    second = tracked_pass(scenario, "uuid-2")
+    use = second["extents"]["/dev/vda"]
+    assert (use["mode"], use["reason"]) == ("scanned", "query_failed") and use["query_s"] >= 0
+    assert scenario.state().extent_bases["/dev/vda"]["pass"] == 2
+
+
+def test_each_pass_records_its_extent_use_per_device(tmp_path):
+    """SDD 6.3, 28.5: a tracking pass records an ExtentUse per device in the state file's pass;
+    a pass without tracking records {}."""
+    scenario = tracked(tmp_path)
+    first = tracked_pass(scenario, "uuid-1")
+    assert set(first["extents"]) == {"/dev/vda", "/dev/vdb"}
+    for use in first["extents"].values():
+        assert set(use) == {"mode", "reason", "query_s", "missed", "assumed_zero"}
+    assert scenario.state().passes[0]["extents"] == first["extents"]
+    off = tracked_pass(scenario, "uuid-2", extents="off", keep_base=False)
+    assert off["extents"] == {} and scenario.state().passes[1]["extents"] == {}
+
+
+def test_a_rollback_that_deletes_the_destination_server_clears_the_bases(tmp_path):
+    """SDD 28.5: the rollback of a cutover that created a server clears the bases - that server
+    wrote to the volumes - and tracking starts over."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    scenario.state().extents_off  # exists
+    scenario.dst.add_server("dst-srv", "vm1")
+    warm_migration.record_destination_server(scenario.state_dir, "srv-1", "dst-srv")
+    result = warm_migration.WarmRollback(scenario.dst, scenario.state(), timeout=5).run()
+    assert result["deleted_server_id"] == "dst-srv"
+    state = scenario.state()
+    assert state.extent_bases == {} and state.extents_off == []
+    assert state.dest_volumes  # the volumes stay recorded without delete_volumes
+
+
+def test_rollback_and_cleanup_delete_the_base_snapshots(tmp_path):
+    """SDD 6.4, 28.4: the snapshot module's cleanup without keep_base - the rollback's, the
+    cancel's and the cutover's after its final pass - deletes every base snapshot and clears the
+    record, pending snapshot or none."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    bases = [b["snapshot_id"] for b in scenario.state().extent_bases.values()]
+    assert all(b in scenario.src.snapshots for b in bases)
+    assert scenario.snapshot("uuid-2").cleanup(keep_base=False) is True
+    assert not any(b in scenario.src.snapshots for b in bases)
+    state = scenario.state()
+    assert state.extent_bases == {} and state.extents_off == []
+    assert scenario.snapshot("uuid-3").cleanup(keep_base=False) is False  # nothing left
+
+
+def test_a_cleanup_that_keeps_the_bases_changes_nothing_without_a_snapshot(tmp_path):
+    """SDD 6.4 (plan task CE4): keep_base with no pending snapshot has nothing to remove - the
+    bases stay - so the module reports no change and deletes nothing."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    bases = [b["snapshot_id"] for b in scenario.state().extent_bases.values()]
+    assert scenario.snapshot("uuid-2").cleanup(keep_base=True) is False
+    assert all(b in scenario.src.snapshots for b in bases)
+    assert scenario.state().extent_bases and scenario.state().pending_snapshot is None

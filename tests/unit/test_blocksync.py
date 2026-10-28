@@ -1500,3 +1500,28 @@ def test_extents_that_miss_a_write_leave_it_to_a_read_and_a_check_finds_it(tmp_p
     assert rc == 0, err
     assert summary["missed_chunks"] == 1
     assert read(dst) == source
+
+
+def test_the_gate_admits_the_runs_extents_file_beside_its_script(gate):
+    """SDD 6.2, 28.5 (plan task CE4): a send over a disk's extents names the file beside the
+    sender's script, written there by the sync, with its mode; the gate rebuilds those words
+    too. A file anywhere else, another name or another mode is refused."""
+    beside = os.path.dirname(GATE_SCRIPT) + "/extents-" + VOLUME + ".json"
+    for mode in ("check", "read"):
+        words = send_words() + ["--extents", beside, "--extents-mode", mode]
+        gate.execs.clear()
+        status, out, err = gate.run(" ".join(shlex.quote(w) for w in words))
+        assert status == 0 and err == "", (mode, err)
+        assert gate.execs == [("sudo", words)]
+    for extra, reason in (
+        (["--extents", "/tmp/extents-x.json", "--extents-mode", "check"],
+         "/tmp/extents-x.json, which is no extents file beside the script"),
+        (["--extents", GATE_SCRIPT, "--extents-mode", "check"],
+         blocksync._gate_word(GATE_SCRIPT) + ", which is no extents file beside the script"),
+        (["--extents", beside, "--extents-mode", "write"], "send with --extents-mode write"),
+        (["--extents", beside], "send with other options"),
+        (["--extents-mode", "check", "--extents", beside], "send with other options"),
+    ):
+        status, out, err = gate.run(" ".join(shlex.quote(w) for w in send_words() + extra))
+        assert status == 2 and out == "", extra
+        assert err == "seamless-link gate refused: %s\n" % reason

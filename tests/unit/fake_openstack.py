@@ -303,6 +303,9 @@ class FakeCloud:
         del self.volumes[name_or_id]
         return True
 
+    def get_volume_snapshot(self, name_or_id):
+        return self.snapshots.get(name_or_id)
+
     def delete_volume_snapshot(self, name_or_id=None, wait=False, timeout=None):
         self.record("delete_volume_snapshot", name_or_id=name_or_id)
         if any(v.get("snapshot_id") == name_or_id for v in self.volumes.values()):
@@ -597,13 +600,14 @@ def receive_process(scanned=1000, changed=100, transferred=60, returncode=0, err
 class FakeShell:
     """RemoteShell replacement bound to a FakeCloud conversion host."""
 
-    def __init__(self, cloud, address, ssh_user, key_path=None, receive=None, val=None):
+    def __init__(self, cloud, address, ssh_user, key_path=None, receive=None, val=None, out=None):
         self.cloud = cloud
         self.address = address
         self.ssh_user = ssh_user
         self.key_path = key_path
         self.receive = receive
         self.val = val
+        self.out = out
         self.commands = []
         self.copied = []
 
@@ -625,6 +629,11 @@ class FakeShell:
 
     def cmd_out(self, command, **kwargs):
         self.commands.append(list(command))
+        if self.out is not None:
+            # a test's answer to a command (an rbd diff, for one); None leaves it to the fake
+            answer = self.out(list(command))
+            if answer is not None:
+                return answer
         if command[:2] == ["mktemp", "-d"]:
             # as mktemp: the template's X's made random, here the same on every call
             return shlex.split(command[2])[0].replace("XXXXXXXXXX", "Rnd0Ab12Cd")
@@ -683,15 +692,18 @@ class FakeShell:
 class ShellFactory:
     """``shell_factory`` for OpenStackVolumeBase: one FakeShell per call."""
 
-    def __init__(self, clouds, receive=None, val=None):
+    def __init__(self, clouds, receive=None, val=None, out=None):
         self.clouds = clouds
         self.receive = receive
         self.val = val
+        self.out = out
         self.shells = []
 
     def __call__(self, address, ssh_user, key_path=None, **pin):
         cloud = next(c for c in self.clouds if address in c.addresses)
-        shell = FakeShell(cloud, address, ssh_user, key_path, receive=self.receive, val=self.val)
+        shell = FakeShell(
+            cloud, address, ssh_user, key_path, receive=self.receive, val=self.val, out=self.out
+        )
         # what a pinned module gives RemoteShell: known_hosts, side, server (Seamless Migrate
         # SDD 6.6); {} for a module without ssh_known_hosts, which passes upstream's three
         shell.pin = pin
