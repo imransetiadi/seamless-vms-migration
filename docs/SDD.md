@@ -159,6 +159,13 @@ DecisionStatus = auto_applied | pending_approval | approved | overridden | below
 ReasonCode     = ABOVE_THRESHOLD_AUTO_APPLY | POLICY_REQUIRES_APPROVAL | INSUFFICIENT_EVIDENCE |
                  APPROVED_BY_USER | OVERRIDDEN_BY_USER | BELOW_THRESHOLD_DEFAULT_KEPT |
                  ADVISOR_UNAVAILABLE_FALLBACK
+NotifyTopic    = approval | downtime | problem | outcome | progress   (§24.5; what a subscription chooses)
+NotifyTrigger  = approval.cutover | approval.wave | approval.advisor | downtime.started | downtime.ended |
+                 problem.failed | problem.data_inconsistent | problem.source_running |
+                 outcome.completed | outcome.rolled_back | outcome.finalized |
+                 progress.plan_started | progress.plan_paused | progress.plan_completed | progress.plan_cancelled |
+                 progress.plan_finalized | progress.wave_started | progress.wave_completed
+                 # §24.5: a trigger's topic is the part before its dot; a message's `type` and its audit's `trigger`
 ```
 
 ### 4.2 Models
@@ -376,6 +383,27 @@ Hook { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which
        timeout_s: int = 300,        # 1-1800 (§23.3)
        revert: str|null = null,     # the hook a rollback runs to undo this one: another hook of the catalog
        created_at: datetime, updated_at: datetime }   # server-owned
+
+NotificationChannel { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which subscriptions name
+                      kind: "email"|"slack"|"webhook", description: str|null = null,   # (§24.3)
+                      recipients: list[str] = [],   # email: 1-50 addresses (required), each an RFC 5322 addr-spec in
+                                                    # its dot-atom form of at most 254 characters; else none
+                      url: str|null = null,         # webhook: an https:// URL without user information (required);
+                                                    # else none; a Slack webhook's URL lives in the secret alone
+                      redact_names: bool = false,   # its messages name the VM, the plan and the wave by their ids
+                                                    # (§24.11 decision 8)
+                      enabled: bool = true,         # false: its cursor follows the events and it sends nothing (§24.6)
+                      created_at: datetime, updated_at: datetime }   # server-owned; its secret is notify-{name}
+                                                    # (§13.3), which the admin never names
+
+NotificationSubscription { id: str ("sub-<8 hex>"), channel: str,   # a channel's name (§24.4)
+                           plan_id: str|null,   # null: every plan (admin)
+                           topics: list[NotifyTopic] = ["approval", "downtime", "problem"],   # 1 or more, each once
+                           created_by: str, created_at: datetime }   # server-owned
+
+NotificationCursor { channel: str, seq: int,   # the last event the channel handled (§24.6); 0 before any
+                     last_outcome: "sent"|"failed"|null, last_outcome_at: datetime|null,
+                     last_reason: str|null, failures_in_a_row: int = 0 }
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
@@ -3718,7 +3746,8 @@ that does not own the tables start the control plane — the application role of
 `events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
-`advisor_policy` (§14.6), `user` (§13.1), `hook` (§23.3, its id its name).
+`advisor_policy` (§14.6), `user` (§13.1), `hook` (§23.3, its id its name), `notification_channel` (§24.3, its id its
+name), `notification_subscription` (§24.4) and `notification_cursor` (§24.6, its id the channel's name).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
@@ -6693,6 +6722,12 @@ NotificationCursor { channel: str, seq: int,   # the last event the channel hand
 
 The document kinds `notification_channel` (its id is its name), `notification_subscription` and `notification_cursor`
 (its id is the channel's name) join §11's.
+
+The three models, `NotifyTopic` and the triggers' names (`NotifyTrigger`) are binding in §4.1, §4.2 and §11 since plan
+task NT2. The models hold the rules of this section a document can carry on its own: an email channel's 1–50
+recipients, each an addr-spec in its dot-atom form, a webhook's URL under a webhook hook's rule, no other kind's fields,
+a subscription's topics at least one and each once; what needs the catalog, the plans or the secret store (an unknown
+channel or plan, the `notify-` names, a Slack secret's URL) is the routes' (NT3).
 
 ### 24.4 Subscriptions and roles
 
