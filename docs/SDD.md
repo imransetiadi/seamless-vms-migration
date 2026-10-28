@@ -204,6 +204,10 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # announces tenant networks (expose_tenant_networks),
                                                        # which no API shows (§23.6): NET_PREFIX_SPLIT (§9.3);
                                                        # refused on vmware (422)
+           ceph: CephAccess|null,                      # the source cluster's Ceph access, as its operator
+                                                       # declares it (§28.4, plan task CE6): refused on kind
+                                                       # vmware and on role destination (422); its key is
+                                                       # written by PUT …/ceph-key (§12, §13.3)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
@@ -217,6 +221,14 @@ HostKeyPin { server_id: str,                 # the Nova server whose keys they a
              source: "injected"|"console",   # injected at the server's creation (§26.3), or read from its
                                              # console (§10)
              pinned_at: datetime }
+
+CephAccess { fsid: str,                      # the cluster's fsid, a UUID; a pool whose location_info names
+                                             # another is untracked (§28.4)
+             monitors: list[str],            # 1-9 monitor addresses, "host" or "host:port", the conversion
+                                             # host reaches
+             client: str = "seamless",       # the Ceph user without "client." (1-64 letters, digits, ".",
+                                             # "-" or "_")
+             key_updated_at: datetime|null } # server-owned: set by PUT …/ceph-key; POST and PATCH ignore it
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -3417,7 +3429,10 @@ RHOSO 18.0, §21; `check()` reports `{"admin": bool,
 "roles": [the role names of the credential's token, sorted; left out when they cannot be read], "compute_microversion": str,
 "block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
-"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
+"family": "rbd"|"netapp_nfs"|"netapp_block"|"other", "ceph_fsid"?: str|null, "ceph_pool"?: str|null}], "tls": bool,
+"plain_http": [str]}` - an `rbd` entry alone carries `ceph_fsid` and `ceph_pool`, from the pool's `location_info`
+(`cluster:conf:fsid:user:pool`, Cinder's RBD driver), null when it is missing or not of that form (§28.4, plan task
+CE6) -, both backend lists empty
 without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
 the compute probe; a report without it leaves the role half unjudged there, and a run reads the roles live, §7.2,
 §7.3 step 0, review 20); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
@@ -3859,6 +3874,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
+| PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
@@ -4034,9 +4050,13 @@ is resolved the same way by `security.secrets.resolve_private_key(name) -> str` 
 
 **Credentials entered in the dashboard** (`PUT /providers/{id}/credentials`, `PUT …/conversion-key`,
 admin) are written to the platform's **secret store** — never to the database, never returned — under
-the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key) — so `POST /providers`
-refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh`, or `{other}` is `{id}-ssh`):
-its credentials would overwrite, and its deletion remove, the other's key. The
+the secret name `provider-{id}` (credentials), `provider-{id}-ssh` (conversion-host key) and `provider-{id}.ceph`
+(the Ceph key, `PUT …/ceph-key`, §28.4) — so `POST /providers`
+refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh` or `{other}-ceph`, or `{other}`
+is `{id}-ssh` or `{id}-ceph`: a provider id never holds a `.`, but the `SEAMLESS_SECRET_*` variables read `.` and `-`
+alike, audit AP-04):
+its credentials would overwrite, and its deletion remove, the other's key. `ceph` set to null by PATCH, and the
+provider's deletion, delete `provider-{id}.ceph`. The
 provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
 time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
@@ -4122,6 +4142,8 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
 * PEM blocks - and a block a cut fell inside, an END line with no BEGIN line before it (a console's last lines, §7.5),
   from the text's start to that END line (review RV52-X1, PR #58 review);
+* Ceph keys (§28.4, §28.8, plan task CE6): a keyring's `key = <base64>` line, whole after its `=`, and a bare CephX key
+  - `AQ`, 36 base64 characters and `==`, the 28 bytes `ceph auth get-key` prints - wherever it stands;
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
 * the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
@@ -8140,8 +8162,8 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   conversion host sits on its own tenant network behind a router (§6.5), while a director-deployed RHOSP 17.1 keeps
   Ceph on the isolated Storage network (`TODO(LAB): confirm`): the operator routes it there, or uses an existing
   conversion host (`manage` false) that reaches Ceph (owner decision 4). The temporary volume stays the read path.
-* **Credentials** (proposed, §4.2 and §12 with plan task CE6): `Provider.ceph: CephAccess|null`, on an OpenStack or
-  RHOSO source alone (422 on a VMware provider or a destination):
+* **Credentials** (binding in §4.2, §10, §12, §13.3 and §13.4 since plan task CE6): `Provider.ceph: CephAccess|null`,
+  on an OpenStack or RHOSO source alone (422 on a VMware provider or a destination):
   ```text
   CephAccess { fsid: str,                 # the cluster's fsid; a pool whose location_info names another is untracked
                monitors: list[str],       # 1-9 monitor addresses ("host" or "host:port") the conversion host reaches
@@ -8339,7 +8361,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 (binding) | CE3 |
 | the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
 | the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
-| `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 | CE6 |
+| `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
 | the findings of §28.9 | §9.3, §16 | CE9 |
