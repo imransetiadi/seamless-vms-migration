@@ -1295,6 +1295,9 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_source_stop_poll_s` | `5` | — (seconds between the reads of the wait above; the cold role takes the same default) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 | `os_migrate_conversion_link_per_run` | `false` | — (each run makes its own link, §6.4; the cold role's default too) |
+| `os_migrate_conversion_host_ceph_client` | `false` | — (`conversion_host_content`, plan task CE5): install `ceph-common` on the source conversion host (`os_migrate_conv_src`) for the extent queries of a plan that tracks extents (§28.4); the control plane sets it per plan (CE7). Nothing is installed on the destination host, or without it |
+| `os_migrate_conversion_host_ceph_repository_rhel` | `rhceph-6-tools-for-rhel-<major>-x86_64-rpms` | — the Red Hat Ceph Tools repository `subscription-manager` enables on RHEL before `ceph-common` (`TODO(LAB): confirm` the repository of the lab's RHCS) |
+| `os_migrate_conversion_host_ceph_repository_centos` | `centos-release-ceph-reef` (Stream 10: `-squid`) | — the CentOS Storage SIG release package installed on CentOS Stream, Rocky Linux and AlmaLinux before `ceph-common` (`TODO(LAB): confirm` each); Ubuntu 24.04's archive needs none |
 | `os_migrate_conversion_link_expiry_s` | `604800` | `expiry_s` of `conversion_host_link` (the cold role's default too) |
 
 Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
@@ -5748,6 +5751,10 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   subscription; CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9 with EPEL) and on Ubuntu 24.04 LTS or later (apt:
   `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`), and fails on any other OS (§6.5; T7, in
   D15's order). Every image keeps Python 3.6 or later for blocksync (§6.2, D7); an Ubuntu image's user is `ubuntu`.
+* For a plan that tracks extents (§28.4, plan task CE5) the same role installs `ceph-common` on the source conversion
+  host alone, when `os_migrate_conversion_host_ceph_client` is set: from the Red Hat Ceph Tools repository on RHEL,
+  the CentOS Storage SIG on CentOS Stream, Rocky Linux and AlmaLinux, and Ubuntu 24.04's own archive (§6.5; the
+  repository of each image `TODO(LAB): confirm`).
 * VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
 
 ### 21.7 API changes the design absorbs (today)
@@ -8159,7 +8166,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   mode, fixed in 17.2.0) needs a diff that starts inside an object, which `rbd diff` never makes. §28.5's checks are the
   guard.
 * **Where it runs:** the source conversion host, with `ceph-common` (installed by `conversion_host_content` for a plan
-  that tracks extents; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
+  that tracks extents - binding in §6.5 and §21.6 since plan task CE5; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
   conversion host sits on its own tenant network behind a router (§6.5), while a director-deployed RHOSP 17.1 keeps
   Ceph on the isolated Storage network (`TODO(LAB): confirm`): the operator routes it there, or uses an existing
   conversion host (`manage` false) that reaches Ceph (owner decision 4). The temporary volume stays the read path.
@@ -8366,7 +8373,7 @@ The owner took each default as written on 2026-10-23 (D1):
 | blocksync protocol v2, `--extents` and `--extents-mode`, the check's counts | §6.2 (binding) | CE2 |
 | the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 (binding) | CE3 |
 | the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5 (binding); §7.2 with CE7 | CE4 |
-| the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
+| the Ceph client on the source conversion host | §6.5, §21.6 (binding) | CE5 |
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 | CE6 |
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
