@@ -440,6 +440,7 @@ QASuite §9 (PERF-E2E). Downtime is `actual_downtime_s` over ≥ 10 runs.
 | P-L 200 GiB, cold | LAB-C01 (on P-L) | `cold`, 1 G | 1,253 s (20.9 min) | none (reference) | — | *to be filled* |
 | P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes, the measured shutdown added to the clock (SDD §7.3) | — | *to be filled* |
 | VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 3 → *to be filled* | *to be filled* |
+| **Tracked (0.5.0): P-M 100 GiB, P-L 200 GiB, P-XL 500 GiB and a 1 TiB disk, 2 MiB/s writer, `extent_tracking`** | **LAB-CE01** | `warm`, 10 G and 1 G (≥ 10 and 5 runs per size) | §4.6: 282–289 s (10 G); 1 G: P-L 287 s, P-XL 297 s, 1 TiB 314 s (`q` = 10 s) | **PERF-E2E-SM1b**: median ≤ 300 s per size; each estimate ±30 % (G2); `q` and `F` recorded | 1 scan + checked passes → *to be filled* | *to be filled* (with the measured `q`, `observed_extent_query_s`) |
 
 ### 6.4 Calibrating the estimator
 
