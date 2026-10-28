@@ -71,3 +71,24 @@
     name: libvirtd
     state: started
     enabled: true
+
+# The Ceph client for the extent queries (Seamless Migrate SDD 6.5, 28.4; plan task CE5): on the
+# source conversion host of a plan that tracks extents, from the Red Hat Ceph Tools repository.
+- name: Install the Ceph client for the extent queries
+  when:
+    - os_migrate_conversion_host_ceph_client | bool
+    - inventory_hostname == 'os_migrate_conv_src'
+  block:
+    - name: Enable the Red Hat Ceph Tools repository
+      ansible.builtin.command:
+        argv:
+          - subscription-manager
+          - repos
+          - "--enable={{ os_migrate_conversion_host_ceph_repository_rhel }}"
+      register: conversion_host_content_ceph_repository
+      changed_when: "'is enabled for this system' in conversion_host_content_ceph_repository.stdout"
+
+    - name: Install ceph-common
+      ansible.builtin.package:
+        name: ceph-common
+        state: present

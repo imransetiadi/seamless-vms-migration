@@ -975,6 +975,10 @@ dst: blocksync receive ⇐ ssh ⇐ blocksync send      dst: create server from d
 src: detach + delete tmp volumes, snapshots        → control plane verification
 ```
 
+A plan that tracks extents (§28, plan task CE4) keeps the Cinder snapshot of each disk's last completed pass as
+its *base* instead of deleting it with the pass's temporary volume, until the next pass of the disk completes;
+the cutover's cleanup after the final pass, a rollback and a cancel's cleanup delete the bases (§6.3, §6.4).
+
 The source VM is never detached from its volumes during pre-copy. Multi-volume snapshots are not
 atomic during pre-copy; this is harmless because the final pass happens after shutdown.
 
@@ -1096,9 +1100,21 @@ gets the file:
   "dest_volumes": { "/dev/vda": {"dest_id": "…", "size": 20, "bootable": true, "name": "…"} },
   "passes": [ { "number": 1, "kind": "full", "started_at": "…", "ended_at": "…",
                 "bytes_scanned": 0, "bytes_changed": 0, "bytes_transferred": 0, "duration_s": 0.0 } ],
-  "pending_snapshot": null | { "transfer_uuid": "…", "volume_map": { … } },
-  "destination_server_id": null }
+  "pending_snapshot": null | { "transfer_uuid": "…", "pass": 2, "volume_map": { … } },
+  "destination_server_id": null,
+  "extent_bases": { "/dev/vda": { "snapshot_id": "…", "pass": 1, "source_volume_id": "…", "size": 20,
+                                  "name_id": "…", "dest_volume_id": "…", "full_read": true } },
+  "extents_off": [] }
 ```
+
+`pending_snapshot.pass` is the number of the pass the snapshot is for (the next one when it was made): the
+snapshot's cleanup reads from it whether that pass completed. `extent_bases` (plan task CE4, §28.4): per device,
+the base of the next extent query - the Cinder snapshot the last completed pass copied, that pass's number, the
+source volume's id, size and `name_id`, the destination volume's id, and whether that pass read the destination in
+full (`false` after an `assume_zero` pass: a base never read from, §28.5). `extents_off` lists the devices whose
+check found a miss: tracking stays off for them until the migration ends (§28.5). Both are `{}`/`[]` for a plan that
+does not track extents, and the cutover's cleanup after the final pass, a rollback that deletes a recorded destination
+server and the rollback role's cleanup clear them (§6.4).
 
 A warm pass records each destination volume it creates (`dest_volumes`) as soon as Cinder accepted it, before it
 waits for it; a volume whose record cannot be written (a full disk) is deleted, once Cinder settled it, before the pass
@@ -1139,8 +1155,8 @@ existed (Seamless 0.1.0) has no file.
 
 | Module | Cloud | Purpose |
 |---|---|---|
-| `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
-| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts - each copy in a private directory, its SHA-256 checked before sudo runs it ("The helper script" below) -, run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding; with `link`, the run's own link, below, whose script the source host runs and which gets no copy), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. The map's entries also carry `name_id` (the volume's `os-vol-mig-status-attr:name_id`, null when the credential cannot read it), `host` (its `os-vol-host-attr:host`, the Cinder pool) and `encrypted`, which the sync's extent tracking reads (§28.4), and `base_gone: true` when the device's recorded base snapshot (§6.3) no longer exists `available` on the same volume - `state: present` checks each base. `keep_base: true` (plan task CE4; false by default) with `state: absent`: when the pass the pending snapshot was made for completed (`pending_snapshot.pass` is the last recorded pass), each volume disk's snapshot stays as the device's base in `extent_bases` - its temporary volume still goes - and the previous base's snapshot is deleted; a pass that did not complete leaves the bases as they were and its snapshot goes as before. `keep_base: false` deletes the pending snapshot and every base snapshot, and clears `extent_bases` and `extents_off`: the cutover's cleanup after its final pass and the rollback's use it. |
+| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts - each copy in a private directory, its SHA-256 checked before sudo runs it ("The helper script" below) -, run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding; with `link`, the run's own link, below, whose script the source host runs and which gets no copy), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. Extent tracking (plan task CE4; SDD §28.4, §28.5): `extents` (`off`, the default, `check` or `read`), `ceph_conf` and `ceph_keyring` (the run's 0600 files, copied to the source conversion host for each query and removed after it, §6.4 the query), `ceph_client`, `ceph_pools` (Cinder pool, the volume's `host`, to Ceph pool) and `extent_query_timeout` (seconds, 300 by default). With `check` or `read`, each volume disk's mode and reason follow §28.5 - `scanned` with `first_pass`, `not_tracked` (no `ceph_pools` entry for its pool, or an image-booted boot disk), `encrypted`, `no_base`, `base_gone`, `resized`, `missed`, `unchecked`, `assumed_zero` or `query_failed`; else `checked` (the sender runs with `--extents FILE --extents-mode check`), or `read` on a final pass given `read` whose disk has a base from a pass that read the destination in full, a `checked` pass before it and no miss (`--extents-mode read`); `read` on another pass checks -, the extents file written beside the sender's script on the source host, and the pass records `extents` per device (`ExtentUse`: `mode`, `reason`, `query_s`, `missed`, `assumed_zero`), `{}` with `off`. A miss adds the device to `extents_off`. Tracking never fails a pass. |
 | `conversion_host_link` | src, dst (conversion hosts) | A run's own link from the dst to the src conversion host (§26.6, plan task ST6; "The link" below): `state: present` makes it - first removing the workload's earlier entries, every expired one and 0.4.0's static link -, or, given `link`, writes the run's `volume_ids` or `ports` into its entry; `state: absent` removes it, or without `link` every entry of the workload. Returns `link`. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; when the state file records no server, or the server it records is gone - deleted since, while a re-run's create whose answer was lost left the earlier id recorded (review RV4-04) - the single server named like the workload that holds one of the recorded volumes, attached through Nova and not to the destination conversion host: built from them, it is the migration's own even when Nova's answer to its create was lost, while a same-named server holding none of them is another one and is kept - review RV3-06; several such servers are an error) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and empties the warm state: the file stays, holding no volume, pass or server (`state_cleared`), as the sign that the workload's migration recorded it (§6.3), and a pending source snapshot's record stays for its cleanup; with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
@@ -1292,6 +1308,13 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_warm_workers` | `4` | `workers` |
 | `os_migrate_warm_parallel_disks` | `4` | `parallel_disks` |
 | `os_migrate_warm_assume_zero` | `false` | `assume_zero` — honoured for `full`/`delta` passes that create the destination volumes, never for `final` (§6.2) |
+| `os_migrate_warm_extents_precopy` | `"off"` | `extents` of the pre-copy passes: `"off"` or `check` (plan task CE4, §28.5); quoted, since YAML reads a bare `off` as false. Also `keep_base` of the pre-copy's snapshot cleanup: true unless `"off"` |
+| `os_migrate_warm_extents_final` | `"off"` | `extents` of the cutover's final pass: `"off"` or `read`; the cutover's cleanup after the final pass deletes the bases (`keep_base: false`), its rescue keeps them unless `"off"` |
+| `os_migrate_warm_ceph_conf` | `""` | `ceph_conf` - the run's minimal `ceph.conf` (§28.4, plan task CE7) |
+| `os_migrate_warm_ceph_keyring` | `""` | `ceph_keyring` - the run's keyring (0600) |
+| `os_migrate_warm_ceph_client` | `seamless` | `ceph_client` |
+| `os_migrate_warm_ceph_pools` | `{}` | `ceph_pools` - Cinder pool to Ceph pool, the provider's tracked pools |
+| `os_migrate_warm_extent_query_timeout` | `300` | `extent_query_timeout` |
 | `os_migrate_warm_python_interpreter` | `python3` | `python_interpreter` |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | `state_dir` |
 | `os_migrate_workloads_preserve_volume_type` | `false` | `preserve_volume_type` |
@@ -1302,6 +1325,9 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_source_stop_poll_s` | `5` | — (seconds between the reads of the wait above; the cold role takes the same default) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 | `os_migrate_conversion_link_per_run` | `false` | — (each run makes its own link, §6.4; the cold role's default too) |
+| `os_migrate_conversion_host_ceph_client` | `false` | — (`conversion_host_content`, plan task CE5): install `ceph-common` on the source conversion host (`os_migrate_conv_src`) for the extent queries of a plan that tracks extents (§28.4); the control plane sets it per plan (CE7). Nothing is installed on the destination host, or without it |
+| `os_migrate_conversion_host_ceph_repository_rhel` | `rhceph-6-tools-for-rhel-<major>-x86_64-rpms` | — the Red Hat Ceph Tools repository `subscription-manager` enables on RHEL before `ceph-common` (`TODO(LAB): confirm` the repository of the lab's RHCS) |
+| `os_migrate_conversion_host_ceph_repository_centos` | `centos-release-ceph-reef` (Stream 10: `-squid`) | — the CentOS Storage SIG release package installed on CentOS Stream, Rocky Linux and AlmaLinux before `ceph-common` (`TODO(LAB): confirm` each); Ubuntu 24.04's archive needs none |
 | `os_migrate_conversion_link_expiry_s` | `604800` | `expiry_s` of `conversion_host_link` (the cold role's default too) |
 
 Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
@@ -5842,6 +5868,10 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   subscription; CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9 with EPEL) and on Ubuntu 24.04 LTS or later (apt:
   `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`), and fails on any other OS (§6.5; T7, in
   D15's order). Every image keeps Python 3.6 or later for blocksync (§6.2, D7); an Ubuntu image's user is `ubuntu`.
+* For a plan that tracks extents (§28.4, plan task CE5) the same role installs `ceph-common` on the source conversion
+  host alone, when `os_migrate_conversion_host_ceph_client` is set: from the Red Hat Ceph Tools repository on RHEL,
+  the CentOS Storage SIG on CentOS Stream, Rocky Linux and AlmaLinux, and Ubuntu 24.04's own archive (§6.5; the
+  repository of each image `TODO(LAB): confirm`).
 * VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
 
 ### 21.7 API changes the design absorbs (today)
@@ -8231,7 +8261,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   keeps creating and deleting every snapshot. A source credential that cannot read a volume's host and `name_id` (admin
   reads under the default policies, as `Disk.pool` is, §4.2) leaves the disk untracked.
 * **The base:** the Cinder snapshot the last completed pass copied stays, instead of being deleted with its temporary
-  volume, until the next pass of the disk completes. The warm state records per device (§6.3, proposed `extent_bases`)
+  volume, until the next pass of the disk completes. The warm state records per device (§6.3, `extent_bases`, binding since plan task CE4)
   the snapshot's id, the pass's number, the source volume's id, size and `name_id`, the destination volume's id and
   whether that pass read the destination in full. A volume holds one more snapshot than today (two during a pass): the
   source project's snapshot quota must allow it (Operations.md). The cutover deletes the bases with the final
@@ -8255,7 +8285,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   mode, fixed in 17.2.0) needs a diff that starts inside an object, which `rbd diff` never makes. §28.5's checks are the
   guard.
 * **Where it runs:** the source conversion host, with `ceph-common` (installed by `conversion_host_content` for a plan
-  that tracks extents; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
+  that tracks extents - binding in §6.5 and §21.6 since plan task CE5; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
   conversion host sits on its own tenant network behind a router (§6.5), while a director-deployed RHOSP 17.1 keeps
   Ceph on the isolated Storage network (`TODO(LAB): confirm`): the operator routes it there, or uses an existing
   conversion host (`manage` false) that reaches Ceph (owner decision 4). The temporary volume stays the read path.
@@ -8292,8 +8322,13 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
                                                  # compared the extents with what changed; scanned: a full scan alone
               reason: str|null = null,           # scanned: why (below)
               query_s: float|null = null,        # the extent query's time
-              missed: int = 0 }                  # checked: chunks that changed outside the extents
+              missed: int = 0,                   # checked: chunks that changed outside the extents
+              assumed_zero: bool = false }       # the pass skipped the chunks it assumed zero (§6.2): a base from
+                                                 # it is never read from (plan task CE4)
   ```
+  The modules' side - the bases kept and deleted, each pass's modes and reasons, the sync's options and the roles'
+  variables - is binding in §6.1, §6.3, §6.4 and §6.5 since plan task CE4; the control plane's `SyncPass.extents`
+  follows with plan task CE7.
   `{}` when the plan does not track extents. The reasons: `first_pass`, `not_tracked` (§28.4), `encrypted`, `no_base`,
   `base_gone` (Cinder no longer has the base `available`), `resized` (the size or `name_id` changed), `missed` (an
   earlier check of this migration missed), `unchecked` (no check of the disk passed yet), `assumed_zero` (the base pass
@@ -8456,8 +8491,8 @@ The owner took each default as written on 2026-10-23 (D1):
 | PRD: FR-26 rewritten with its acceptance criteria and release, NFR-05 for passes that read extents, SM-1b and G1's scan removal moved to 0.5.0, PRD §9's 0.2.0 item moved; D1 decided | PRD, §20 | CE1 |
 | blocksync protocol v2, `--extents` and `--extents-mode`, the check's counts | §6.2 (binding) | CE2 |
 | the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 (binding) | CE3 |
-| the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
-| the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
+| the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5 (binding); §7.2 with CE7 | CE4 |
+| the Ceph client on the source conversion host | §6.5, §21.6 (binding) | CE5 |
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
 | `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
 | `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §4.2, §5.3, §9.1, §16 (binding) | CE8 |

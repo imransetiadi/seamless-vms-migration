@@ -235,3 +235,87 @@ def test_the_content_install_allows_local_forwarding_only_on_a_source_host(tmp_p
     assert effective.returncode == 0, effective.stderr
     lines = effective.stdout.splitlines()
     assert "allowtcpforwarding local" in lines and "permittunnel no" in lines
+
+
+# --------------------------------------------------------------------------------------------
+# the Ceph client for the extent queries (SDD 6.5, 21.6, 28.4; plan task CE5)
+
+CEPH_BLOCK = "Install the Ceph client for the extent queries"
+FAMILIES = ("rhel.yml", "centos.yml", "ubuntu.yml")
+
+
+def _ceph_block(tasks_file):
+    blocks = [t for t in _load("tasks", tasks_file) if t.get("name") == CEPH_BLOCK]
+    assert len(blocks) == 1, (tasks_file, blocks)
+    return blocks[0]
+
+
+def _holds(block, host, tracking, major="9"):
+    """Whether the block's conditions hold for ``host`` with the tracking variable set so."""
+    loader = DataLoader()
+    defaults = loader.load_from_file(os.path.join(ROLE, "defaults", "main.yml"))
+    variables = dict(defaults)
+    variables.update({
+        "inventory_hostname": host,
+        "ansible_distribution_major_version": major,
+        "os_migrate_conversion_host_ceph_client": tracking,
+    })
+    templar = Templar(loader=loader, variables=variables)
+    return all(
+        templar.template(trust_as_template("{{ (%s) | bool }}" % condition))
+        for condition in block["when"]
+    )
+
+
+def _packages(task):
+    module = task.get("ansible.builtin.package") or task.get("ansible.builtin.apt") or {}
+    names = module.get("name")
+    return [names] if isinstance(names, str) else list(names or [])
+
+
+def test_the_source_conversion_host_gets_the_ceph_client_when_a_plan_tracks_extents():
+    """SDD 6.5, 28.4: with os_migrate_conversion_host_ceph_client the source conversion host of
+    every image family gets ceph-common; the destination host never does."""
+    for tasks_file in FAMILIES:
+        block = _ceph_block(tasks_file)
+        assert _holds(block, "os_migrate_conv_src", True), tasks_file
+        assert not _holds(block, "os_migrate_conv_dst", True), tasks_file
+        installed = [p for t in block["block"] for p in _packages(t)]
+        assert "ceph-common" in installed, (tasks_file, installed)
+
+
+def test_no_ceph_client_is_installed_without_tracking():
+    """SDD 6.5: the variable is false by default - a plan that does not track extents installs
+    nothing - and no task outside the block names ceph-common."""
+    defaults = _load("defaults", "main.yml")
+    assert defaults["os_migrate_conversion_host_ceph_client"] is False
+    for tasks_file in FAMILIES:
+        block = _ceph_block(tasks_file)
+        for host in ("os_migrate_conv_src", "os_migrate_conv_dst"):
+            assert not _holds(block, host, False), (tasks_file, host)
+        others = [t for t in _load("tasks", tasks_file) if t.get("name") != CEPH_BLOCK]
+        assert not any("ceph-common" in _packages(t) for t in others), tasks_file
+
+
+def test_the_ceph_client_comes_from_each_image_familys_repository():
+    """SDD 21.6: RHEL enables the Red Hat Ceph Tools repository with subscription-manager, the
+    rest of the RHEL family installs the CentOS Storage SIG release package first, and Ubuntu
+    24.04 takes ceph-common from its archive with no repository step."""
+    rhel = _ceph_block("rhel.yml")["block"]
+    enable = rhel[0]["ansible.builtin.command"]["argv"]
+    assert enable[:2] == ["subscription-manager", "repos"]
+    assert enable[2] == "--enable={{ os_migrate_conversion_host_ceph_repository_rhel }}"
+    assert _packages(rhel[1]) == ["ceph-common"]
+    loader = DataLoader()
+    defaults = loader.load_from_file(os.path.join(ROLE, "defaults", "main.yml"))
+    for major, rhel_repo, sig in (("9", "rhceph-6-tools-for-rhel-9-x86_64-rpms", "centos-release-ceph-reef"),
+                                  ("10", "rhceph-6-tools-for-rhel-10-x86_64-rpms", "centos-release-ceph-squid")):
+        templar = Templar(loader=loader, variables={"ansible_distribution_major_version": major})
+        assert templar.template(trust_as_template(defaults["os_migrate_conversion_host_ceph_repository_rhel"])) == rhel_repo
+        assert templar.template(trust_as_template(defaults["os_migrate_conversion_host_ceph_repository_centos"])) == sig
+    centos = _ceph_block("centos.yml")["block"]
+    assert _packages(centos[0]) == ["{{ os_migrate_conversion_host_ceph_repository_centos }}"]
+    assert _packages(centos[1]) == ["ceph-common"]
+    ubuntu = _ceph_block("ubuntu.yml")["block"]
+    assert len(ubuntu) == 1 and _packages(ubuntu[0]) == ["ceph-common"]
+    assert ubuntu[0]["ansible.builtin.apt"]["update_cache"] is True

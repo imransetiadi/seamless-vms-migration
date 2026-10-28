@@ -31,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import blocksync
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import extents as extent_query
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.server_port import (
     port_description,
 )
@@ -99,6 +100,8 @@ class WarmState:
         passes=None,
         pending_snapshot=None,
         destination_server_id=None,
+        extent_bases=None,
+        extents_off=None,
     ):
         self.state_dir = state_dir
         self.server_id = _checked_server_id(server_id)
@@ -108,6 +111,11 @@ class WarmState:
         self.passes = passes if passes is not None else []
         self.pending_snapshot = pending_snapshot
         self.destination_server_id = destination_server_id
+        # per device, the base of the next extent query - the last completed pass's snapshot -
+        # and the devices whose check missed, tracking off until the migration ends (SDD 6.3,
+        # 28.4, 28.5)
+        self.extent_bases = extent_bases if extent_bases is not None else {}
+        self.extents_off = list(extents_off) if extents_off is not None else []
 
     @staticmethod
     def path_for(state_dir, server_id):
@@ -139,6 +147,8 @@ class WarmState:
             passes=data.get("passes") or [],
             pending_snapshot=data.get("pending_snapshot"),
             destination_server_id=data.get("destination_server_id"),
+            extent_bases=data.get("extent_bases") or {},
+            extents_off=data.get("extents_off") or [],
         )
 
     def exists(self):
@@ -153,6 +163,8 @@ class WarmState:
             "passes": self.passes,
             "pending_snapshot": self.pending_snapshot,
             "destination_server_id": self.destination_server_id,
+            "extent_bases": self.extent_bases,
+            "extents_off": self.extents_off,
         }
 
     def save(self):
@@ -325,6 +337,8 @@ def blocksync_receive_command(
     source_script=None,
     sha256=None,
     source_gate=False,
+    extents_path=None,
+    extents_mode=None,
 ):
     """Shell words that run ``blocksync receive`` on the destination host.
 
@@ -353,6 +367,9 @@ def blocksync_receive_command(
     ]
     if source_serial:
         sender_remote += ["--expect-serial", source_serial]
+    if extents_path:
+        # the extents file beside the sender's script, which the link's gate admits (SDD 28.5)
+        sender_remote += ["--extents", extents_path, "--extents-mode", extents_mode]
     sender = ["sudo", "-n", "-u", ssh_user, "--"] + list(source_ssh)
     if sha256 and not source_gate:
         sender += script_check_words(sha256, source_script)
@@ -372,7 +389,9 @@ def blocksync_receive_command(
     return check + [shlex.quote(word) for word in receiver + ["--"] + sender]
 
 
-def _snapshot_entry(source_id, size, bootable, name, volume_type):
+def _snapshot_entry(
+    source_id, size, bootable, name, volume_type, name_id=None, host=None, encrypted=False
+):
     return {
         "source_id": source_id,
         "tmp_volume_id": None,
@@ -383,6 +402,26 @@ def _snapshot_entry(source_id, size, bootable, name, volume_type):
         "bootable": bool(bootable),
         "name": name,
         "volume_type": volume_type,
+        # what the sync's extent tracking reads (SDD 6.4, 28.4): the volume's name_id (its RBD
+        # image's name), its Cinder pool and whether it is encrypted
+        "name_id": name_id,
+        "host": host,
+        "encrypted": bool(encrypted),
+    }
+
+
+#: the reasons a pass scans a disk in full, each a word of SDD 28.5
+EXTENT_OPTIONS = ("off", "check", "read")
+
+
+def _extent_use(assumed_zero=False):
+    """A device's ExtentUse before the pass decided anything (SDD 28.5)."""
+    return {
+        "mode": "scanned",
+        "reason": None,
+        "query_s": None,
+        "missed": 0,
+        "assumed_zero": bool(assumed_zero),
     }
 
 
@@ -510,10 +549,13 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
             self._cleanup_pending()
         self.changed = True
         self.volume_map = self._discover_volumes()
+        self._mark_gone_bases(self.volume_map)
         self.state.server_name = self.ser_server.params().get("name")
         self.state.transfer_uuid = self.transfer_uuid
         self.state.pending_snapshot = {
             "transfer_uuid": self.transfer_uuid,
+            # the pass this snapshot is for: its cleanup reads from it whether the pass completed
+            "pass": len(self.state.passes) + 1,
             "volume_map": self.volume_map,
         }
         self.state.save()
@@ -527,13 +569,93 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
         self.state.save()
         return self.volume_map
 
-    def cleanup(self):
-        """Remove the pending snapshot's resources; False if there is none."""
-        if self.state.pending_snapshot is None:
-            return False
+    def cleanup(self, keep_base=False):
+        """Remove the pending snapshot's resources - with ``keep_base`` a completed pass's
+        snapshots stay as the devices' bases (SDD 6.4, 28.4) - and, without ``keep_base``, every
+        base's snapshot; False when there was nothing to remove."""
+        pending = self.state.pending_snapshot
+        if pending is None and (keep_base or not (self.state.extent_bases or self.state.extents_off)):
+            return False  # nothing to remove: no snapshot, and the bases stay or do not exist
         self.changed = True
-        self._cleanup_pending()
+        kept = self._keep_bases(pending) if keep_base and pending is not None else set()
+        if pending is not None:
+            self._cleanup_pending(kept)
+        if not keep_base:
+            self._delete_bases()
         return True
+
+    def _mark_gone_bases(self, volume_map):
+        """A device whose recorded base snapshot Cinder no longer has ``available`` on the same
+        volume gets ``base_gone``: the sync scans it in full (SDD 6.4, 28.5)."""
+        for dev, base in sorted(self.state.extent_bases.items()):
+            entry = volume_map.get(dev)
+            if entry is None:
+                continue
+            snapshot = self.conn.get_volume_snapshot(base["snapshot_id"])
+            if (
+                snapshot is None
+                or getattr(snapshot, "status", None) != "available"
+                or getattr(snapshot, "volume_id", None) != base["source_volume_id"]
+            ):
+                self.log.warning(
+                    "The base snapshot %s of %s is gone or no longer available: the next pass "
+                    "scans the disk in full",
+                    base["snapshot_id"],
+                    dev,
+                )
+                entry["base_gone"] = True
+
+    def _keep_bases(self, pending):
+        """The completed pass's snapshot of each volume disk becomes the device's base, and the
+        previous base's snapshot goes (SDD 28.4); a pass that did not complete keeps the bases
+        as they were (SDD 28.5). Returns the snapshot ids kept."""
+        number = pending.get("pass")
+        passes = self.state.passes
+        if not passes or passes[-1].get("number") != number:
+            self.log.info("Pass %s did not complete: the extent bases stay as they were", number)
+            return set()
+        use = passes[-1].get("extents") or {}
+        kept = set()
+        for dev in sorted(pending.get("volume_map") or {}):
+            entry = pending["volume_map"][dev]
+            recorded = self.state.dest_volumes.get(dev)
+            if not entry.get("snap_id") or not entry.get("source_id") or recorded is None:
+                continue
+            previous = self.state.extent_bases.get(dev)
+            self.state.extent_bases[dev] = {
+                "snapshot_id": entry["snap_id"],
+                "pass": number,
+                "source_volume_id": entry["source_id"],
+                "size": entry.get("size"),
+                "name_id": entry.get("name_id"),
+                "dest_volume_id": recorded["dest_id"],
+                # read in full unless the pass assumed zeros; a pass that recorded no extent
+                # use is never read from either (SDD 28.5)
+                "full_read": dev in use and not use[dev].get("assumed_zero", False),
+            }
+            kept.add(entry["snap_id"])
+            self.state.save()
+            if previous is not None and previous["snapshot_id"] != entry["snap_id"]:
+                self._delete_base_snapshot(previous["snapshot_id"], dev)
+        return kept
+
+    def _delete_base_snapshot(self, snapshot_id, dev):
+        self.log.info("Deleting the earlier base snapshot %s of %s", snapshot_id, dev)
+        if not self.conn.delete_volume_snapshot(
+            name_or_id=snapshot_id, wait=True, timeout=self.timeout
+        ):
+            self.log.warning("The base snapshot %s of %s was gone already", snapshot_id, dev)
+
+    def _delete_bases(self):
+        """Every base's snapshot deleted and the record cleared: the cutover's cleanup after its
+        final pass, a rollback's and a cancel's (SDD 6.4, 28.4)."""
+        for dev, base in sorted(self.state.extent_bases.items()):
+            self._delete_base_snapshot(base["snapshot_id"], dev)
+            del self.state.extent_bases[dev]
+            self.state.save()
+        if self.state.extents_off:
+            self.state.extents_off = []
+            self.state.save()
 
     def _description(self):
         return "Seamless Migrate warm transfer %s of server %s" % (
@@ -555,6 +677,9 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
                 volume["bootable"],
                 volume["name"],
                 volume["volume_type"],
+                name_id=volume.get("os-vol-mig-status-attr:name_id"),
+                host=volume.get("os-vol-host-attr:host"),
+                encrypted=volume.get("encrypted"),
             )
         if BOOT_DEVICE not in volume_map:
             if not sourcevm.image:
@@ -639,7 +764,8 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
             "source",
         )
 
-    def _cleanup_pending(self):
+    def _cleanup_pending(self, kept=()):
+        """The pending snapshot's resources removed, but the snapshots in ``kept``, the bases."""
         pending = self.state.pending_snapshot
         self.volume_map = pending.get("volume_map") or {}
         stale_uuid = pending.get("transfer_uuid")
@@ -658,7 +784,9 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
                 entry["tmp_volume_id"] = None
                 entry["source_dev"] = None
                 self.state.save()
-            if entry.get("snap_id"):
+            if entry.get("snap_id") in kept:
+                self.log.info("Keeping snapshot %s of %s as its base", entry["snap_id"], dev)
+            elif entry.get("snap_id"):
                 self.log.info("Deleting temporary snapshot %s", entry["snap_id"])
                 self.conn.delete_volume_snapshot(
                     name_or_id=entry["snap_id"], wait=True, timeout=self.timeout
@@ -711,6 +839,12 @@ class OpenstackWarmSync(_WarmVolumeBase):
         src_ssh_user=None,
         ssh_known_hosts=None,
         link=None,
+        extents="off",
+        ceph_conf=None,
+        ceph_keyring=None,
+        ceph_client="seamless",
+        ceph_pools=None,
+        extent_query_timeout=extent_query.QUERY_TIMEOUT_S,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -746,6 +880,18 @@ class OpenstackWarmSync(_WarmVolumeBase):
         self.dest_script = None
         self.source_script = self.link["script"] if self.link else None
         self.script_sha256 = None
+        # extent tracking (SDD 6.4, 28.4, 28.5): off, or check (a full pass that counts the
+        # changed chunks the extents miss) or read (the final pass over the listed chunks alone)
+        if extents not in EXTENT_OPTIONS:
+            raise ValueError("extents must be one of %s, got %r" % (", ".join(EXTENT_OPTIONS), extents))
+        self.extents = extents
+        self.ceph = {
+            "conf": ceph_conf,
+            "keyring": ceph_keyring,
+            "client": ceph_client,
+            "pools": dict(ceph_pools or {}),
+            "timeout": extent_query_timeout,
+        }
 
     # --- public ----------------------------------------------------------
 
@@ -799,17 +945,25 @@ class OpenstackWarmSync(_WarmVolumeBase):
                 "assume_zero": bool(assume_zero and dev in created),
                 "progress": 0.0,
             }
+        uses = self._plan_extents(kind, source_map)
         summaries = []
         error = None
         try:
             self._attach_destination_volumes()
             self._install_blocksync()
+            self._prepare_extents(uses, source_map)
             summaries = self._run_receivers()
         except BaseException as err:
             error = err
             raise
         finally:
             self._finish_pass(error)
+        for dev, summary in zip(sorted(self.volume_map), summaries):
+            if dev in uses and "missed_chunks" in summary:
+                uses[dev]["missed"] = int(summary["missed_chunks"] or 0)
+                if uses[dev]["missed"] and dev not in self.state.extents_off:
+                    # the extents missed a change: tracking is off for the disk (SDD 28.5)
+                    self.state.extents_off.append(dev)
         sync_pass = {
             "number": number,
             "kind": kind,
@@ -819,11 +973,120 @@ class OpenstackWarmSync(_WarmVolumeBase):
             "bytes_changed": sum(int(s["bytes_changed"]) for s in summaries),
             "bytes_transferred": sum(int(s["bytes_transferred"]) for s in summaries),
             "duration_s": round(time.monotonic() - started, 3),
+            "extents": uses,
         }
         self.state.passes.append(sync_pass)
         self.state.transfer_uuid = self.transfer_uuid
         self.state.save()
         return sync_pass
+
+    # --- extent tracking (SDD 28.4, 28.5) ----------------------------------
+
+    def _plan_extents(self, kind, source_map):
+        """Each device's ExtentUse before anything ran: the reason it scans in full, else
+        checked, or read on a final pass given read after a clean check. {} with extents off."""
+        uses = {}
+        if self.extents == "off":
+            return uses
+        for dev in sorted(source_map):
+            entry = source_map[dev]
+            use = _extent_use(self.volume_map[dev]["assume_zero"])
+            reason = self._scan_reason(dev, entry)
+            if reason is None and kind == "final" and self.extents == "read":
+                if self._clean_check(dev):
+                    use["mode"] = "read"
+                else:
+                    reason = "unchecked"
+            if reason is None and use["mode"] == "scanned":
+                use["mode"] = "checked"
+            use["reason"] = reason
+            uses[dev] = use
+        return uses
+
+    def _scan_reason(self, dev, entry):
+        """Why the pass scans ``dev`` in full, a reason of SDD 28.5, or None when it has a base
+        it can diff from."""
+        if not entry.get("source_id") or not self.ceph["pools"].get(entry.get("host") or ""):
+            return "not_tracked"
+        if entry.get("encrypted"):
+            return "encrypted"
+        if dev in self.state.extents_off:
+            return "missed"
+        base = self.state.extent_bases.get(dev)
+        if base is None:
+            return "first_pass" if not self.state.passes else "no_base"
+        if entry.get("base_gone"):
+            return "base_gone"
+        recorded = self.state.dest_volumes.get(dev) or {}
+        if (
+            base.get("source_volume_id") != entry["source_id"]
+            or base.get("dest_volume_id") != recorded.get("dest_id")
+        ):
+            return "no_base"
+        if base.get("size") != entry.get("size") or base.get("name_id") != entry.get("name_id"):
+            return "resized"
+        if not base.get("full_read"):
+            return "assumed_zero"
+        return None
+
+    def _clean_check(self, dev):
+        """At least one checked pass of ``dev`` ran and none found a miss (SDD 28.5)."""
+        checks = [
+            (p.get("extents") or {}).get(dev)
+            for p in self.state.passes
+            if (p.get("extents") or {}).get(dev, {}).get("mode") == "checked"
+        ]
+        return bool(checks) and all(not c.get("missed") for c in checks)
+
+    def _prepare_extents(self, uses, source_map):
+        """The extents of each device that diffs: queried on the source host, written beside the
+        sender's script there, named for the sender; a query that failed scans the disk (SDD
+        28.5). Tracking never fails the pass; a refused host key does (SDD 6.6)."""
+        for dev in sorted(uses):
+            use = uses[dev]
+            if use["mode"] == "scanned":
+                continue
+            entry = source_map[dev]
+            base = self.state.extent_bases[dev]
+            found = extent_query.query_extents(
+                self._source_shell(),
+                ceph_conf=self.ceph["conf"],
+                ceph_keyring=self.ceph["keyring"],
+                ceph_client=self.ceph["client"],
+                pool=self.ceph["pools"][entry["host"]],
+                volume_id=entry["source_id"],
+                name_id=entry.get("name_id") or entry["source_id"],
+                size_gib=entry["size"],
+                base_snapshot_id=base["snapshot_id"],
+                snapshot_id=entry["snap_id"],
+                timeout=self.ceph["timeout"],
+            )
+            use["query_s"] = found["query_s"]
+            if found["extents"] is None:
+                use["mode"], use["reason"] = "scanned", found["reason"]
+                continue
+            path = "%s/extents-%s.json" % (
+                self.source_script.rsplit("/", 1)[0],
+                entry["tmp_volume_id"],
+            )
+            fd, local_path = tempfile.mkstemp(prefix="seamless-extents-", suffix=".json")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(found["extents"], f)
+                status = self._source_shell().scp_to(local_path, path)
+            finally:
+                os.unlink(local_path)
+            if status != 0:
+                self.log.warning(
+                    "Could not copy the extents of %s to the source conversion host (scp exit "
+                    "status %s): the pass scans it in full",
+                    dev,
+                    status,
+                )
+                use["mode"], use["reason"] = "scanned", extent_query.QUERY_FAILED
+                continue
+            self.volume_map[dev]["extents_path"] = path
+            self.volume_map[dev]["extents_mode"] = "read" if use["mode"] == "read" else "check"
 
     def block_device_mapping(self):
         """BDM of the destination volumes of the server's current disks."""
@@ -1062,6 +1325,8 @@ class OpenstackWarmSync(_WarmVolumeBase):
             source_script=self.source_script,
             sha256=self.script_sha256,
             source_gate=bool(self.link),
+            extents_path=mapping.get("extents_path"),
+            extents_mode=mapping.get("extents_mode"),
         )
         self.log.info("Synchronising %s: %s", dev, " ".join(command))
         self._update_progress(dev, 0.0)
@@ -1277,6 +1542,18 @@ class WarmRollback:
             result["deleted_server_id"] = destination.id
         if recorded and self.state.destination_server_id is not None:
             self.state.destination_server_id = None
+            self.state.save()
+        if recorded and destination is not None and (self.state.extent_bases or self.state.extents_off):
+            # that server wrote to the volumes: no base holds (SDD 28.5); the source-side
+            # cleanup of the rollback role removes the snapshots themselves
+            self.log.info(
+                "Clearing the extent bases of %s after deleting server %s (snapshots %s)",
+                self.state.server_id,
+                destination.id,
+                ", ".join(b["snapshot_id"] for b in self.state.extent_bases.values()) or "none",
+            )
+            self.state.extent_bases = {}
+            self.state.extents_off = []
             self.state.save()
         result["deleted_port_ids"] = self._delete_ports(result["deleted_server_id"])
         if result["deleted_port_ids"]:

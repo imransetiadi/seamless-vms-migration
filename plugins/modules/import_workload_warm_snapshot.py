@@ -79,6 +79,16 @@ options:
     default: present
     choices: [present, absent]
     type: str
+  keep_base:
+    description:
+      - With C(state=absent), keep the completed pass's snapshot of each volume disk as the
+        disk's base for the next extent query, deleting the previous base (Seamless Migrate
+        SDD 6.4, 28.4); a pass that did not complete keeps the bases as they were. False, the
+        default, also deletes every base snapshot - the cutover's cleanup after its final pass
+        and the rollback's.
+    required: false
+    default: false
+    type: bool
   transfer_uuid:
     description:
       - Identifier of this pass. Generated when omitted (C(state=present)) or
@@ -186,6 +196,7 @@ def run_module():
         ssh_known_hosts=dict(type="path", required=False, default=None),
         state_dir=dict(type="str", required=True),
         state=dict(type="str", default="present", choices=["present", "absent"]),
+        keep_base=dict(type="bool", default=False),
         transfer_uuid=dict(type="str", default=None),
         src_conversion_host_address=dict(type="str", default=None),
         boot_volume_prefix=dict(type="str", default=None),
@@ -205,13 +216,18 @@ def run_module():
         module.fail_json(msg=str(err))
 
     pending = state.pending_snapshot
-    if params["state"] == "absent" and pending is None:
+    if (
+        params["state"] == "absent"
+        and pending is None
+        and not (state.extent_bases or state.extents_off)
+    ):
         module.exit_json(changed=False, transfer_uuid=params["transfer_uuid"])
 
     transfer_uuid = params["transfer_uuid"]
     if transfer_uuid is None:
         if params["state"] == "absent":
-            transfer_uuid = pending["transfer_uuid"]
+            # bases to delete without a pending snapshot: the cutover's or a rollback's cleanup
+            transfer_uuid = pending["transfer_uuid"] if pending else "cleanup-" + str(uuid.uuid4())
         else:
             transfer_uuid = str(uuid.uuid4())
 
@@ -237,7 +253,7 @@ def run_module():
             module.exit_json(
                 changed=snapshot.changed, transfer_uuid=transfer_uuid, volume_map=volume_map
             )
-        snapshot.cleanup()
+        snapshot.cleanup(keep_base=params["keep_base"])
     except Exception as err:  # pylint: disable=broad-except
         module.fail_json(
             msg="Warm snapshot (%s) of server %s failed: %s"
