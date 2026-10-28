@@ -4608,8 +4608,8 @@ is no origin a browser sends (review RV31-03).
   & Swiss Style*, density 8/10, motion 3/10. Dark theme (default): background `#0F172A`, card
   `#1B2336`, muted `#272F42`, border `#475569`, foreground `#F8FAFC`, muted foreground `#94A3B8`,
   primary `#1E293B`, accent/CTA `#22C55E` (text on accent `#0F172A`), destructive `#EF4444`, ring
-  `#FFFFFF`. Light theme: background `#F8FAFC`, foreground `#1E293B`, card `#FFFFFF`, muted
-  `#E9EFF8`, muted foreground `#475569`, border `#E2E8F0`, primary `#2563EB`, accent `#EA580C`,
+  `#FFFFFF`. Light theme: soft background `#E8EDF3`, foreground `#1E293B`, card `#F1F4F8`, muted
+  `#DCE3ED`, muted foreground `#475569`, border `#C5CFDC`, primary `#2563EB`, accent `#EA580C`,
   destructive `#DC2626`, ring `#2563EB`. Status colors are always paired with an icon and a text
   label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids), bundled with the
   dashboard (`@fontsource` woff2 files, Latin, the weights in use) and served by the control plane like the rest of
