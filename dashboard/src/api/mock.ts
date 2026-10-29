@@ -1199,6 +1199,8 @@ export class MockServer {
     auth_disabled: true,
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
+    // one replica, which leads: it took the orchestrator's lease when the mock started (SDD §12, §16, §25.6)
+    leader: { leading: true, holder: 'seamless-mock-5e1f0a2b', epoch: 1, since: null },
   };
   /** SEAMLESS_ANSIBLE_HOST_KEY_CHECKING as `GET /me` tells it (SDD §12, §15.1): true by default; tests turn it off. */
   hostKeyChecking = true;
@@ -1246,6 +1248,7 @@ export class MockServer {
 
   constructor(options: MockServerOptions = {}) {
     this.now = options.now ?? (() => Date.now());
+    this.health.leader.since = new Date(this.now()).toISOString();
     this.rand = prng(options.seed ?? 42);
     const fixtures = buildFixtures(this.now());
     this.providers = fixtures.providers;
