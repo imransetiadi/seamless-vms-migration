@@ -361,6 +361,20 @@ else:
     answer(params, changed=False, server=server)
 '''
 
+#: the vendored floating_ip module: each call's arguments are kept in floating_ips.json; what the
+#: module does with them is openstack.cloud's, not modelled here
+FLOATING_IP_STUB = '''
+params = arguments()
+calls_file = os.path.join(NOVA, "floating_ips.json")
+calls = []
+if os.path.exists(calls_file):
+    with open(calls_file) as f:
+        calls = json.load(f)
+with open(calls_file, "w") as f:
+    json.dump(calls + [params], f)
+answer(params, changed=True)
+'''
+
 
 def deploy_play():
     """The deploy playbook's includes of the role, one per side with that side's variables, as
@@ -407,6 +421,7 @@ def run_deploy(root, name, servers=None, **variables):
         ("keypair", NOOP_STUB),
         ("server_info", SERVER_INFO_STUB),
         ("server", SERVER_STUB),
+        ("floating_ip", FLOATING_IP_STUB),
     ):
         with open(os.path.join(modules, module + ".py"), "w") as f:
             f.write(STUB_HEAD % nova + body)
@@ -667,3 +682,91 @@ def test_a_host_key_that_is_no_ed25519_key_fails_the_role_before_its_server_task
     assert refused, shown(out, secrets)
     leaks = leaked(out, secrets)
     assert leaks == [], "the output shows %s" % leaks
+
+
+# --- a host's floating IP (Seamless Migrate SDD 6.5, 7.2; the owner's decision of 2026-10-30) ----
+
+#: upstream's arguments of create_fip.yml's floating_ip task without an address, once those it omits
+#: are gone; the task with an address passes floating_ip_address as well
+UPSTREAM_FLOATING_IP_ARGUMENTS = sorted([
+    "server", "network", "nat_destination", "state", "wait", "timeout", "reuse", "cloud",
+])
+
+
+def floating_ip_calls(root, name):
+    """The floating_ip module's calls of run_deploy's run ``root/name``, each its arguments."""
+    path = os.path.join(root, name, "nova", "floating_ips.json")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return json.load(f)
+
+
+def floating_ips_asked(calls):
+    """{host: (the address its call names - None without one -, its reuse)} of the calls."""
+    return dict((call["server"], (call.get("floating_ip_address"), call["reuse"])) for call in calls)
+
+
+@needs_ansible_playbook
+def test_without_an_address_a_host_takes_a_detached_floating_ip_as_upstream(tmp_path):
+    """Seamless Migrate SDD 6.5: os_migrate_conversion_floating_ip_reuse is true by default, and a
+    side that does not set os_migrate_{src,dst}_conversion_floating_ip_reuse keeps upstream's
+    floating IP tasks: without an address reuse true - the module takes a floating IP the
+    project holds detached when there is one -, with an address that address and reuse true;
+    each call has exactly upstream's arguments."""
+    assert load("defaults", "main.yml")["os_migrate_conversion_floating_ip_reuse"] is True
+    rc, out = run_deploy(
+        str(tmp_path), "upstream",
+        os_migrate_src_conversion_manage_fip=True,
+        os_migrate_dst_conversion_manage_fip=True,
+        os_migrate_dst_conversion_floating_ip_address="192.0.2.10",
+    )[:2]
+    assert rc == 0, out
+    calls = floating_ip_calls(str(tmp_path), "upstream")
+    assert floating_ips_asked(calls) == {
+        "os_migrate_conv_src": (None, True),
+        "os_migrate_conv_dst": ("192.0.2.10", True),
+    }, calls
+    assert [sorted(call) for call in calls] == [
+        UPSTREAM_FLOATING_IP_ARGUMENTS,
+        sorted(UPSTREAM_FLOATING_IP_ARGUMENTS + ["floating_ip_address"]),
+    ], calls
+
+
+@needs_ansible_playbook
+def test_a_side_whose_floating_ip_reuse_is_false_asks_for_a_new_floating_ip(tmp_path):
+    """Seamless Migrate SDD 6.5, 7.2 (the owner's decision of 2026-10-30, SDD 26.10 decision 14):
+    deploy_conversion_hosts.yml passes a side's os_migrate_{src,dst}_conversion_floating_ip_reuse
+    as the role's os_migrate_conversion_floating_ip_reuse, and the floating IP task without an
+    address passes it as reuse, a boolean also when it comes as text (-e name=false): false asks
+    the module for a new floating IP, never one the project holds detached - the control plane's
+    choice for a host in a plan's project. The other side keeps upstream's reuse true, and a side
+    with an address keeps upstream's task, whatever the variable says."""
+    rc, out = run_deploy(
+        str(tmp_path), "project",
+        os_migrate_src_conversion_manage_fip=True,
+        os_migrate_dst_conversion_manage_fip=True,
+        os_migrate_src_conversion_floating_ip_reuse=False,
+    )[:2]
+    assert rc == 0, out
+    calls = floating_ip_calls(str(tmp_path), "project")
+    assert floating_ips_asked(calls) == {
+        "os_migrate_conv_src": (None, False),
+        "os_migrate_conv_dst": (None, True),
+    }, calls
+    assert [sorted(call) for call in calls] == [UPSTREAM_FLOATING_IP_ARGUMENTS] * 2, calls
+
+    rc, out = run_deploy(
+        str(tmp_path), "text",
+        os_migrate_src_conversion_manage_fip=True,
+        os_migrate_dst_conversion_manage_fip=True,
+        os_migrate_src_conversion_floating_ip_address="192.0.2.20",
+        os_migrate_src_conversion_floating_ip_reuse=False,
+        os_migrate_dst_conversion_floating_ip_reuse="false",
+    )[:2]
+    assert rc == 0, out
+    calls = floating_ip_calls(str(tmp_path), "text")
+    assert floating_ips_asked(calls) == {
+        "os_migrate_conv_src": ("192.0.2.20", True),
+        "os_migrate_conv_dst": (None, False),
+    }, calls
