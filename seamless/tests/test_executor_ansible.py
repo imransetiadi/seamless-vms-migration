@@ -2968,6 +2968,59 @@ async def test_cancelled_step_kills_playbook_and_removes_secrets(env, monkeypatc
         raise AssertionError("the playbook process survived the cancel")
 
 
+async def test_each_playbook_registers_its_process_group_while_it_runs(env, monkeypatch):
+    """SDD §7.1, §25.4 layer 3: each playbook of a step runs in a session of its own - its process
+    group its pid -, and the executor registers that group with its book from the playbook's start
+    until it ended. While a playbook hangs the book holds its group, and the book's kill, from
+    another thread as a deposition sends it, ends it; once a step ended the book holds none."""
+    from seamless_migrate.executors.base import ProcessGroups
+
+    groups = ProcessGroups()
+    seen: list[tuple[str, int]] = []
+    add, discard = groups.add, groups.discard
+
+    def registered(pgid):
+        seen.append(("add", pgid))
+        add(pgid)
+
+    def unregistered(pgid):
+        seen.append(("discard", pgid))
+        discard(pgid)
+
+    monkeypatch.setattr(groups, "add", registered)
+    monkeypatch.setattr(groups, "discard", unregistered)
+    executor = AnsibleExecutor(env.settings, providers=env.registry, poll_s=0.02, groups=groups)
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    monkeypatch.setenv("ANSIBLE_FAKE_HANG_ON", "import_workloads.yml")
+    task = asyncio.ensure_future(executor.run(StepName.CUTOVER, ctx))
+    hung: list[dict] = []
+    for _ in range(200):  # until the import playbook hangs
+        await asyncio.sleep(0.05)
+        hung = [r for r in read_log(env.log) if r["playbook"] == "import_workloads.yml"]
+        if hung:
+            break
+    assert hung, "the import playbook never started"
+    pid = hung[0]["pid"]
+    await asyncio.sleep(0.2)
+    assert groups.groups() == frozenset({pid})
+    os.kill(pid, 0)  # it runs
+    assert await asyncio.to_thread(groups.kill) == [pid]
+    with pytest.raises((PermanentStepError, TransientStepError)):
+        await asyncio.wait_for(task, 15)
+    assert groups.groups() == frozenset()
+
+    monkeypatch.delenv("ANSIBLE_FAKE_HANG_ON")
+    groups.open()  # the kill closed the book: the replica leads again
+    seen.clear()
+    before = len(read_log(env.log))
+    await executor.run(StepName.CUTOVER, ctx)
+    runs = read_log(env.log)[before:]
+    assert len(runs) >= 2
+    assert all(run["pgid"] == run["pid"] for run in runs), "each in a session of its own"
+    assert seen == [(op, run["pid"]) for run in runs for op in ("add", "discard")]
+    assert groups.groups() == frozenset()
+
+
 class FailingImpl:
     """Provider implementation whose every call fails with ProviderError."""
 

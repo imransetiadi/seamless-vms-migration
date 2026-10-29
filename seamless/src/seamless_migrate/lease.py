@@ -3,29 +3,31 @@
 One row of ``leases`` elects the replica that runs the orchestrator. Every time the lease sets or
 compares is the database's - ``now()`` on PostgreSQL, ``'now'`` on SQLite - and no statement sends
 one, so the replicas' clocks may disagree by any amount. The epoch that each takeover raises fences
-a server's writes (``Store(fenced=True)``, §25.4). The elector that renews the lease on a schedule
-is §25.3's (plan task HA3); ``seamless serve`` takes it once at its start (§15).
+a server's writes (``Store(fenced=True)``, §25.4). A server's elector (``seamless_migrate.leader``,
+§8; plan task HA3) campaigns and renews on a schedule, on an engine of its own (``lease_engine``),
+and writes ``leader.acquired`` and ``leader.released`` in the transactions that take and release
+the lease. No statement sends RETURNING, which RHEL 9's SQLite (3.34.1) does not have.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
+import math
 import secrets
 import socket
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
-from .store import ORCHESTRATOR_LEASE, SQLITE_BUSY_TIMEOUT_MS, leases
+from .store import ORCHESTRATOR_LEASE, SQLITE_BUSY_TIMEOUT_MS, build_engine, leases
 
 log = logging.getLogger(__name__)
 
@@ -109,11 +111,43 @@ def replica_address(port: int, host: str | None = None) -> str:
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
 
+#: PostgreSQL's lock_timeout (lock_not_available) and statement_timeout (query_canceled)
+_WAITS_ENDED = frozenset({"55P03", "57014"})
+
+
 def _lock_wait_ended(exc: sa.exc.OperationalError) -> bool:
-    """Whether a statement gave up waiting for a lock: PostgreSQL's lock_timeout (SQLSTATE 55P03),
-    SQLite's wait for another connection's write lock."""
+    """Whether a statement gave up waiting within the retry period: PostgreSQL's lock_timeout
+    (SQLSTATE 55P03) or statement_timeout (57014), SQLite's wait for another connection's write
+    lock."""
     cause = exc.orig
-    return getattr(cause, "sqlstate", None) == "55P03" or "database is locked" in str(cause)
+    return getattr(cause, "sqlstate", None) in _WAITS_ENDED or "database is locked" in str(cause)
+
+
+@dataclass(frozen=True)
+class Taken:
+    """What a campaign took (SDD §11): the epoch, and the holder and epoch it took over from -
+    None for the first lease."""
+
+    epoch: int
+    previous_holder: str | None
+    previous_epoch: int | None
+
+
+def lease_engine(url: str, retry_s: float | None = None) -> Engine:
+    """The elector's own engine (SDD §8): one connection outside the store's pool, its connects
+    bounded by the retry period - PostgreSQL's ``connect_timeout``, whole seconds and 2 at least;
+    each transaction bounds its statements and its lock waits (``Lease._bounded``)."""
+    retry = RETRY_S if retry_s is None else float(retry_s)
+    if make_url(url).get_backend_name() == "sqlite":
+        return build_engine(url)
+    return sa.create_engine(
+        url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=retry,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": max(2, math.ceil(retry))},
+    )
 
 
 class Lease:
@@ -169,62 +203,84 @@ class Lease:
             expired=bool(row.expired),
         )
 
-    def campaign(self) -> int | None:
+    def campaign(self, record: Callable[[sa.Connection, Taken], None] | None = None) -> int | None:
         """One try for the lease: the epoch this replica took, else None (SDD §11). With no row it
         inserts one with epoch 1; an expired lease it locks FOR UPDATE - which waits for every write
         of the old epoch in flight - and takes in that transaction with the next epoch, where it is
-        still expired; a valid one it never locks. A try whose lock wait outlasts the retry period
-        takes nothing."""
-        with self.engine.connect() as conn:
-            with conn.begin():
-                row = conn.execute(
-                    sa.select(leases.c.epoch, self._expired().label("expired")).where(
-                        leases.c.name == self.name
-                    )
-                ).first()
-            if row is None:
-                with conn.begin():
-                    conn.execute(self._first(conn.dialect.name))
-                    # an INSERT's rowcount is no driver's promise, and RHEL 9's SQLite (3.34.1) has
-                    # no RETURNING: the row this transaction reads back as its holder's, or none
-                    first = conn.execute(
-                        sa.select(leases.c.epoch).where(
-                            leases.c.name == self.name, leases.c.holder == self.holder
+        still expired; a valid one it never locks. ``record`` runs in the transaction that took the
+        lease - a server's leader.acquired (§8): when it fails, nothing is taken. A try whose wait
+        outlasts the retry period takes nothing."""
+        try:
+            with self.engine.connect() as conn:
+                with self._bounded(conn, write=False):
+                    row = conn.execute(
+                        sa.select(leases.c.epoch, self._expired().label("expired")).where(
+                            leases.c.name == self.name
                         )
-                    ).scalar()
-                return None if first is None else int(first)
-            if not row.expired:
-                return None
-            try:
-                with self._bounded(conn):
-                    locked = conn.execute(
-                        sa.select(leases.c.epoch)
-                        .where(leases.c.name == self.name, self._expired())
-                        .with_for_update()
                     ).first()
-                    if locked is None:
-                        return None  # renewed or taken since it was read
-                    # the row is this transaction's until it ends, so its next epoch is known
-                    # without RETURNING, which RHEL 9's SQLite (3.34.1) does not have
-                    taken = int(locked.epoch) + 1
-                    conn.execute(
-                        leases.update()
-                        .where(leases.c.name == self.name)
-                        .values(
-                            holder=self.holder,
-                            address=self.address,
-                            epoch=taken,
-                            acquired_at=db_now(),
-                            renewed_at=db_now(),
-                            expires_at=self._later(),
-                        )
-                    )
-                    return taken
-            except sa.exc.OperationalError as exc:
-                if not _lock_wait_ended(exc):
-                    raise
-                log.info("lease %s: a lock on its row outlasted this try", self.name)
+                if row is None:
+                    return self._take_first(conn, record)
+                if not row.expired:
+                    return None
+                return self._take_over(conn, record)
+        except sa.exc.OperationalError as exc:
+            if not _lock_wait_ended(exc):
+                raise
+            log.info("lease %s: a lock on its row outlasted this try", self.name)
+            return None
+
+    def _take_first(
+        self, conn: sa.Connection, record: Callable[[sa.Connection, Taken], None] | None
+    ) -> int | None:
+        """The first holder's row, epoch 1, where there was none; None when another replica's
+        insert came first."""
+        with self._bounded(conn):
+            conn.execute(self._first(conn.dialect.name))
+            # an INSERT's rowcount is no driver's promise, and RHEL 9's SQLite (3.34.1) has no
+            # RETURNING: the row this transaction reads back as its holder's, or none
+            first = conn.execute(
+                sa.select(leases.c.epoch).where(
+                    leases.c.name == self.name, leases.c.holder == self.holder
+                )
+            ).scalar()
+            if first is None:
                 return None
+            taken = Taken(int(first), None, None)
+            if record is not None:
+                record(conn, taken)
+        return taken.epoch
+
+    def _take_over(
+        self, conn: sa.Connection, record: Callable[[sa.Connection, Taken], None] | None
+    ) -> int | None:
+        """The expired lease, locked and taken with the next epoch; None when it was renewed or
+        taken since it was read."""
+        with self._bounded(conn):
+            locked = conn.execute(
+                sa.select(leases.c.epoch, leases.c.holder)
+                .where(leases.c.name == self.name, self._expired())
+                .with_for_update()
+            ).first()
+            if locked is None:
+                return None  # renewed or taken since it was read
+            # the row is this transaction's until it ends, so its next epoch is known without
+            # RETURNING, which RHEL 9's SQLite (3.34.1) does not have
+            taken = Taken(int(locked.epoch) + 1, str(locked.holder), int(locked.epoch))
+            conn.execute(
+                leases.update()
+                .where(leases.c.name == self.name)
+                .values(
+                    holder=self.holder,
+                    address=self.address,
+                    epoch=taken.epoch,
+                    acquired_at=db_now(),
+                    renewed_at=db_now(),
+                    expires_at=self._later(),
+                )
+            )
+            if record is not None:
+                record(conn, taken)
+        return taken.epoch
 
     def _first(self, dialect: str) -> Any:
         """The row of the first holder, epoch 1; of two inserting at once, one takes it and the
@@ -247,16 +303,33 @@ class Lease:
     def renew(self, epoch: int) -> bool:
         """Push the expiry a lease past the database's now, where the lease is this replica's at
         ``epoch``; False when it renewed nothing - the lease was taken (SDD §11). It changes no key
-        column, so it waits for no write."""
-        return self._own(epoch, renewed_at=db_now(), expires_at=self._later())
+        column, so it waits for no write. A renewal whose wait outlasts the retry period raises,
+        as a database error does: the lease may still be this replica's (§11, plan task HA3)."""
+        with self.engine.connect() as conn, self._bounded(conn):
+            renewed = conn.execute(self._own(epoch, renewed_at=db_now(), expires_at=self._later()))
+            return renewed.rowcount == 1
 
-    def release(self, epoch: int) -> bool:
+    def release(self, epoch: int, record: Callable[[sa.Connection], None] | None = None) -> bool:
         """Expire this replica's lease at ``epoch`` now, so another one takes it at its next try;
-        False when it was no longer this replica's (SDD §11)."""
-        return self._own(epoch, expires_at=db_now())
+        False when it was no longer this replica's (SDD §11). ``record`` runs in the same
+        transaction where the lease was released - a server's leader.released (§8): when it fails,
+        nothing is released."""
+        try:
+            with self.engine.connect() as conn, self._bounded(conn):
+                if conn.execute(self._own(epoch, expires_at=db_now())).rowcount != 1:
+                    return False
+                if record is not None:
+                    record(conn)
+                return True
+        except sa.exc.OperationalError as exc:
+            if not _lock_wait_ended(exc):
+                raise
+            log.info("lease %s: a lock on its row outlasted this replica's release", self.name)
+            return False
 
-    def _own(self, epoch: int, **values: Any) -> bool:
-        statement = (
+    def _own(self, epoch: int, **values: Any) -> Any:
+        """The update of this replica's lease at ``epoch``: no row once another one took it."""
+        return (
             leases.update()
             .where(
                 leases.c.name == self.name,
@@ -265,23 +338,26 @@ class Lease:
             )
             .values(**values)
         )
-        try:
-            with self.engine.connect() as conn, self._bounded(conn):
-                return conn.execute(statement).rowcount == 1
-        except sa.exc.OperationalError as exc:
-            if not _lock_wait_ended(exc):
-                raise
-            log.info("lease %s: a lock on its row outlasted this replica's update", self.name)
-            return False
 
     @contextlib.contextmanager
-    def _bounded(self, conn: sa.Connection) -> Iterator[None]:
-        """One transaction on ``conn`` whose wait for a lock lasts at most the retry period:
-        PostgreSQL's ``lock_timeout``, SQLite's busy timeout around ``BEGIN IMMEDIATE``."""
+    def _bounded(self, conn: sa.Connection, *, write: bool = True) -> Iterator[None]:
+        """One transaction on ``conn`` whose statements and lock waits last at most the retry
+        period: PostgreSQL's ``statement_timeout`` and ``lock_timeout`` (SDD §8); on SQLite a
+        ``write`` holds the database's write lock from its start (``BEGIN IMMEDIATE``), waited for
+        within its busy timeout, and a read takes none."""
         ms = max(1, round(self.retry_s * 1000))
         if conn.dialect.name != "sqlite":
             with conn.begin():
-                conn.execute(sa.select(sa.func.set_config("lock_timeout", f"{ms}ms", True)))
+                conn.execute(
+                    sa.select(
+                        sa.func.set_config("lock_timeout", f"{ms}ms", True),
+                        sa.func.set_config("statement_timeout", f"{ms}ms", True),
+                    )
+                )
+                yield
+            return
+        if not write:
+            with conn.begin():
                 yield
             return
         raw = conn.connection.dbapi_connection
@@ -295,24 +371,4 @@ class Lease:
             raw.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
 
 
-async def take(lease: Lease) -> int:
-    """Try the lease every retry period until this replica takes it; the epoch it took (SDD §15):
-    a server writes nothing before."""
-    said = False
-    while True:
-        epoch = await asyncio.to_thread(lease.campaign)
-        if epoch is not None:
-            log.info("took the orchestrator lease with epoch %d as %s", epoch, lease.holder)
-            return epoch
-        if not said:
-            held = await asyncio.to_thread(lease.read)
-            log.warning(
-                "another server holds the orchestrator lease (%s, epoch %s): waiting for it",
-                held.holder if held else "nobody",
-                held.epoch if held else None,
-            )
-            said = True
-        await asyncio.sleep(lease.retry_s)
-
-
-__all__ = ["RETRY_S", "Lease", "LeaseRow", "new_holder", "replica_address", "take"]
+__all__ = ["RETRY_S", "Lease", "LeaseRow", "Taken", "lease_engine", "new_holder", "replica_address"]

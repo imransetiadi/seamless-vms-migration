@@ -359,11 +359,11 @@ def test_a_write_of_an_old_epoch_writes_nothing(any_store, write):
 
 
 async def test_a_server_process_without_the_lease_writes_nothing(any_store, tmp_path, monkeypatch):
-    """SDD §11, §15: the store `seamless serve` builds is fenced. While another replica holds the
-    lease, the server writes nothing - its start waits: no demo seed, no orchestrator - and its
-    store refuses a write; once the lease is released the server takes it at its next try, with
-    the next epoch and a holder of its host name and 8 hex digits, and runs as before. Its stop
-    releases the lease."""
+    """SDD §8, §11, §15: the store `seamless serve` builds is fenced. While another replica holds
+    the lease, the server writes nothing - it serves as a follower (plan task HA3): no demo seed,
+    no orchestrator - and its store refuses a write; once the lease is released the server takes
+    it at its next try, with the next epoch and a holder of its host name and 8 hex digits, runs
+    the demo seed and its orchestrator. Its stop releases the lease."""
     monkeypatch.setattr(lease_module, "RETRY_S", 0.05)
     other = lease_of(any_store, A, 30.0)
     assert other.campaign() == 1
@@ -390,8 +390,8 @@ async def test_a_server_process_without_the_lease_writes_nothing(any_store, tmp_
 
     task = asyncio.create_task(serve())
     try:
+        await asyncio.wait_for(started.wait(), 30)  # a follower serves at once
         await asyncio.sleep(0.5)
-        assert not started.is_set()
         assert not services.orchestrator.health()["running"]
         assert contents(any_store) == ([], [])
         with pytest.raises(Fenced):
@@ -399,7 +399,10 @@ async def test_a_server_process_without_the_lease_writes_nothing(any_store, tmp_
         assert contents(any_store) == ([], [])
 
         assert other.release(1)
-        await asyncio.wait_for(started.wait(), 30)
+        for _ in range(600):  # its next try takes the lease, then the seed and the orchestrator run
+            if services.orchestrator.health()["running"]:
+                break
+            await asyncio.sleep(0.05)
         assert server.epoch == 2
         row = other.read()
         assert row.epoch == 2 and not row.expired

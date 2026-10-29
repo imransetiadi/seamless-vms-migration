@@ -7,7 +7,7 @@ from typing import Any
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy
 from .ansible import AnsibleExecutor
-from .base import Executor
+from .base import Executor, ProcessGroups
 from .handover import HandoverExecutor
 from .simulated import SimulatedExecutor
 
@@ -21,12 +21,16 @@ class ExecutorRouter:
         ansible: Any = None,
         handover: Any = None,
         providers: Any = None,
+        groups: ProcessGroups | None = None,
     ) -> None:
         self.settings = settings
         self._simulated = simulated
         self._ansible = ansible
         self._handover = handover
         self._providers = providers
+        #: the replica's book of its playbooks' process groups, handed to the executor that runs
+        #: them (SDD §7.1)
+        self.groups = groups if groups is not None else ProcessGroups()
 
     @property
     def simulated(self) -> Any:
@@ -37,7 +41,9 @@ class ExecutorRouter:
     @property
     def ansible(self) -> Any:
         if self._ansible is None:
-            self._ansible = AnsibleExecutor(self.settings, providers=self._providers)
+            self._ansible = AnsibleExecutor(
+                self.settings, providers=self._providers, groups=self.groups
+            )
         return self._ansible
 
     @property

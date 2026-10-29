@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import sqlalchemy as sa
 
 from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
@@ -38,7 +39,9 @@ from seamless_migrate.domain.models import (
     Event,
     Finding,
     ForceCutover,
+    Hook,
     Migration,
+    NetworkCutover,
     Nic,
     PhaseChange,
     Plan,
@@ -59,6 +62,8 @@ from seamless_migrate.executors.base import (
     TransientStepError,
 )
 from seamless_migrate.executors.simulated import SimulatedExecutor
+from seamless_migrate.hooks import HookRun
+from seamless_migrate.lease import Lease
 from seamless_migrate.orchestrator import (
     VM_CLAIMS,
     BadRequest,
@@ -80,12 +85,17 @@ from tests.jev_fakes import fixture_responder, load_fixture, session_factory, to
 from tests.key_support import fingerprint, installation_key, plan_key, public_key
 from tests.orch_support import (
     DST_PROVIDER,
+    REPLICAS,
     SRC_PROVIDER,
     Clock,
     ScriptedExecutor,
     StaticDestination,
+    StaticSource,
     build_harness,
+    build_replica,
+    lead,
     make_settings,
+    until,
 )
 from tests.test_knowledge import memory_with
 
@@ -7036,6 +7046,531 @@ async def test_resume_mid_cutover_is_idempotent(tmp_path, store):
     assert done.destination_server_id == "dst-1"
     kinds = h2.kinds()
     assert kinds.count("migration.downtime_started") == 1
+
+
+# -- takeovers: a new leader resumes what a restart resumes (SDD §8, §25.4, §25.5; plan task HA3) --
+@pytest.fixture
+async def replicas(any_store, tmp_path):
+    """``replicas(holder, vms, **kw)``: a replica on ``any_store``'s database - its orchestrator
+    over ``kw``'s doubles, ``leadership`` its leadership's options - and its leadership, not
+    started. Every one is stopped at the end."""
+    made = []
+
+    def replica(holder, vms, *, leadership=None, **kw):
+        h = build_replica(tmp_path, any_store.url, vms, **kw)
+        led = lead(h, holder, **(leadership or {}))
+        made.append((h, led))
+        return h, led
+
+    yield replica
+    for h, led in made:
+        await led.stop()
+        h.store.dispose()
+
+
+def _cut_off(leadership, monkeypatch) -> None:
+    """From now the replica reaches its database no more (SDD §25.5): its renewals and its
+    campaigns fail."""
+
+    def unreachable(*args, **kwargs):
+        raise sa.exc.OperationalError("leases", {}, ConnectionError("the database is out of reach"))
+
+    monkeypatch.setattr(leadership.elector.lease, "renew", unreachable)
+    monkeypatch.setattr(leadership.elector.lease, "campaign", unreachable)
+
+
+async def _lost(h, leadership, monkeypatch) -> None:
+    """The leader loses its database: deposed at its renew deadline, its orchestrator stopped -
+    its steps cancelled, nothing written after (SDD §8, §25.4)."""
+    _cut_off(leadership, monkeypatch)
+    await until(lambda: leadership.last_deposition is not None, 10, "the deposition")
+    await until(lambda: not h.orch.health()["running"], 10, "the deposed leader's stop")
+
+
+def _lease_now(store):
+    """The lease row as the database reads it now, by an observer that never campaigns."""
+    return Lease(store.engine, "observer", "192.0.2.99:8080", 30.0).read()
+
+
+def _leader_events(store, kind):
+    return [e for e in store.events(since_seq=0, limit=100000) if e.kind == kind]
+
+
+def _refusing_events(kind, refused):
+    """A cursor hook that refuses each insert of an event of ``kind``, as a store briefly down
+    would, inside the transaction that writes it."""
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("INSERT INTO EVENTS") and (
+            kind in context.compiled_parameters[0].values()
+        ):
+            refused.append(statement)
+            raise RuntimeError("the store was briefly unavailable")
+
+    return refuse
+
+
+class _FipSource(StaticSource):
+    """A source whose floating IP calls a move makes are recorded (SDD §8.3)."""
+
+    def __init__(self, vms, calls):
+        super().__init__(vms)
+        self.calls = calls
+
+    async def floating_ip_port(self, address):
+        self.calls.append(("floating_ip_port", address))
+        return "port-src-1"
+
+    async def disassociate_floating_ip(self, address):
+        self.calls.append(("disassociate_floating_ip", address))
+
+
+class _FipDestination(StaticDestination):
+    """A destination whose floating IP calls a move makes are recorded (SDD §8.3)."""
+
+    def __init__(self, calls):
+        super().__init__()
+        self.calls = calls
+
+    async def reserve_floating_ip(self, address):
+        self.calls.append(("reserve_floating_ip", address))
+
+    async def server_port(self, server_id, fixed_ip):
+        self.calls.append(("server_port", server_id))
+        return "port-dst-1"
+
+    async def associate_floating_ip(self, address, port_id):
+        self.calls.append(("associate_floating_ip", address))
+
+
+class _RecordingHooks:
+    """A hook runner that records the runs it is asked for, each succeeding (SDD §8.2)."""
+
+    def __init__(self):
+        self.runs = []
+
+    async def run(self, hook, context, run_dir, log=None):
+        self.runs.append((hook.name, context["point"]))
+        return HookRun(
+            hook=hook.name,
+            kind=hook.kind,
+            point=str(context["point"]),
+            idempotency_key=str(context["idempotency_key"]),
+            outcome="succeeded",
+            duration_s=0.0,
+        )
+
+
+class _Leadership:
+    """A replica's leadership as its orchestrator asks it (SDD §8): whether it leads, and the
+    depositions the check before an action asks for."""
+
+    def __init__(self, leads):
+        self._leads = leads
+        self.deposed = []
+
+    def leads(self):
+        return self._leads
+
+    def depose(self, reason):
+        self.deposed.append(reason)
+
+
+async def test_a_deposed_leader_starts_no_step_hook_or_floating_ip_move(any_store, tmp_path):
+    """SDD §8, §25.4 layer 2: before each step attempt, hook and floating IP move a server's
+    orchestrator checks its renew deadline and reads the epoch in the lease row. A deposed one -
+    its deadline past, or the lease at another epoch than its store's, which deposes it - starts
+    none: no pass, no pre_stop hook, no floating IP move. Its drivers end as a stop ends them,
+    nothing is recorded, and the migrations wait where they were for the next leader."""
+    any_store.put("provider", SRC_PROVIDER)
+    any_store.put("provider", DST_PROVIDER)
+    any_store.put("hook", Hook(name="drain-lb", kind="playbook", playbook="/opt/hooks/drain.yml"))
+    nic = Nic(network="app-net", mtu=1500, fixed_ips=["10.0.0.3"], floating_ips=["203.0.113.10"])
+    vms = [vm(1), vm(2), vm(3, nics=[nic]), vm(4)]
+    plan = plan_for(
+        vms,
+        status=PlanStatus.running,
+        network_cutover=NetworkCutover(
+            floating_ips="keep_address", hooks={"pre_stop": ["drain-lb"]}
+        ),
+    )
+    any_store.put("plan", plan)
+    # web-01's next action is a pass, web-02's its cutover's pre_stop hook, web-03's a floating IP's
+    # move (SDD §8.2, §8.3); web-04 completed and its source runs again, which a tick's source watch
+    # would record (§8.1)
+    for v, phase, strategy, server in (
+        (vms[0], P.precopy, Strategy.warm, None),
+        (vms[1], P.cutover, Strategy.cold, None),
+        (vms[2], P.verifying, Strategy.cold, "dst-3"),
+        (vms[3], P.completed, Strategy.cold, "dst-4"),
+    ):
+        migration = make_migration(
+            plan_id=plan.id, vm=v, phase=phase, strategy=strategy, destination_server_id=server
+        )
+        any_store.put("migration", migration, expected_version=0)
+    written = (any_store.versions("migration"), any_store.versions("plan"))
+    a = Lease(any_store.engine, "seamless-a", REPLICAS["seamless-a"], 30.0)
+    assert a.campaign() == 1
+    for leads, lease in ((False, 1), (True, 2)):
+        if lease == 2:  # another replica took the lease; this one does not know it yet
+            assert a.release(1)
+            assert (
+                Lease(any_store.engine, "seamless-b", REPLICAS["seamless-b"], 30.0).campaign() == 2
+            )
+        calls, hooks = [], _RecordingHooks()
+        settings = make_settings(tmp_path, source_watch_s=0)  # a source watch at every tick
+        executor = ScriptedExecutor(settings)
+        h = build_replica(
+            tmp_path,
+            any_store.url,
+            vms,
+            settings=settings,
+            executor=executor,
+            source=_FipSource(vms, calls),
+            destination=_FipDestination(calls),
+            hook_runner=hooks,
+        )
+        h.store.epoch = 1  # the epoch it led with
+        h.orch.leadership = leadership = _Leadership(leads)
+        try:
+            await h.orch.start()
+            await asyncio.sleep(0.5)  # fifty ticks
+            # a person's finalize, whose step deletes or keeps the source: refused, 409 (SDD §8)
+            completed = await h.by_vm(plan.id, "vm-4")
+            with pytest.raises(NotAllowed, match="finalize refused"):
+                await h.orch.finalize(completed.id, "sari", confirm="web-04")
+        finally:
+            await h.orch.stop()
+            h.store.dispose()
+        assert executor.calls == [] and executor.prestaged == [], (leads, lease)
+        assert hooks.runs == [] and calls == [], (leads, lease)
+        assert (any_store.versions("migration"), any_store.versions("plan")) == written
+        assert any_store.events(since_seq=0, limit=100) == []
+        if lease == 2:
+            assert leadership.deposed and all(
+                "the lease is at epoch 2, this replica's is 1" in why for why in leadership.deposed
+            )
+        else:
+            assert leadership.deposed == [], "it knew it does not lead"
+
+
+async def test_a_takeover_resumes_a_cutover_once_and_keeps_its_open_clock(
+    replicas, any_store, tmp_path, monkeypatch
+):
+    """SDD §8, §25.5: the leader's cutover stopped its source and opened the downtime clock, then
+    the leader lost its database - deposed at its renew deadline, its step cancelled, it writes
+    nothing more. The follower takes the lease once it expired and resumes the cutover through
+    start(), as a restart does: one source stop, one destination server, the first stop's time
+    kept."""
+    settings = make_settings(tmp_path)
+    cloud = {"stops": 0, "servers": {}}
+    crash_point = asyncio.Event()
+
+    async def cutover(ctx):
+        m = ctx.migration
+        if m.downtime_started_at is None:  # executor state: the source still runs
+            cloud["stops"] += 1
+            await ctx.mark_downtime_start()
+        await crash_point.wait()  # the leader loses its database here
+        if m.vm.name not in cloud["servers"]:  # os-migrate skips existing servers by name
+            cloud["servers"][m.vm.name] = f"dst-{len(cloud['servers']) + 1}"
+        return StepResult(destination_server_id=cloud["servers"][m.vm.name])
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover})
+    a_h, a = replicas("seamless-a", [vm(1)], executor=executor, settings=settings)
+    b_h, b = replicas(
+        "seamless-b",
+        [vm(1)],
+        executor=executor,
+        settings=settings,
+        source=a_h.source,
+        destination=a_h.destination,
+    )
+    any_store.put("provider", SRC_PROVIDER)
+    any_store.put("provider", DST_PROVIDER)
+    plan = plan_for([vm(1)], default_strategy=Strategy.cold)
+    any_store.put("plan", plan)
+    await a.start()
+    await b.start()
+    await a_h.orch.validate_plan(plan.id, "alice")
+    await a_h.orch.start_plan(plan.id, "alice")
+    mid = (await a_h.by_vm(plan.id, "vm-1")).id
+    await until(lambda: cloud["stops"] == 1, 10, "the source's stop")
+    await a_h.wait_kind("migration.downtime_started")
+    first = await a_h.migration(mid)
+    assert first.phase == P.cutover and first.downtime_started_at is not None
+
+    await _lost(a_h, a, monkeypatch)
+    crash_point.set()
+    done = await b_h.wait_phase(mid, P.completed, timeout=20)
+    assert cloud["stops"] == 1 and len(cloud["servers"]) == 1
+    assert done.downtime_started_at == first.downtime_started_at
+    assert b_h.history(done).count(P.cutover) == 1
+    assert done.destination_server_id == "dst-1"
+    assert b_h.kinds().count("migration.downtime_started") == 1
+    taken = _leader_events(any_store, "leader.acquired")[-1].data
+    assert (taken["holder"], taken["epoch"], taken["cause"], taken["resumes"]) == (
+        "seamless-b",
+        2,
+        "expired",
+        1,
+    )
+
+
+async def test_a_takeover_counts_the_old_leaders_cutovers_against_the_cap(
+    replicas, any_store, tmp_path, monkeypatch
+):
+    """SDD §5.4, §8, §25.5: the cutover gate reads the store, so the old leader's migration still
+    in cutover counts against max_concurrent_cutovers at the new leader: with a cap of one the other
+    VM waits in ready until the resumed cutover ended, and cuts over after it."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    first: list[str] = []
+    release = asyncio.Event()
+
+    async def cutover(ctx):
+        source_id = ctx.migration.vm.source_id
+        if not first:
+            first.append(source_id)
+        if source_id == first[0]:
+            if ctx.migration.downtime_started_at is None:
+                await ctx.mark_downtime_start()
+            await release.wait()
+        return StepResult(destination_server_id=f"dst-{source_id}")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover})
+    vms = [vm(1), vm(2)]
+    a_h, a = replicas("seamless-a", vms, executor=executor, settings=settings)
+    b_h, b = replicas(
+        "seamless-b",
+        vms,
+        executor=executor,
+        settings=settings,
+        source=a_h.source,
+        destination=a_h.destination,
+    )
+    any_store.put("provider", SRC_PROVIDER)
+    any_store.put("provider", DST_PROVIDER)
+    plan = plan_for(vms, default_strategy=Strategy.cold)
+    any_store.put("plan", plan)
+    await a.start()
+    await b.start()
+    await a_h.orch.validate_plan(plan.id, "alice")
+    await a_h.orch.start_plan(plan.id, "alice")
+    await until(lambda: bool(first), 10, "the first cutover")
+    one = await a_h.by_vm(plan.id, first[0])
+    other = await a_h.by_vm(plan.id, "vm-2" if first[0] == "vm-1" else "vm-1")
+    assert (one.phase, other.phase) == (P.cutover, P.ready)
+
+    await _lost(a_h, a, monkeypatch)
+    await until(lambda: b.epoch == 2, 10, "the takeover")
+    ticks = b_h.orch.health()["ticks"]
+    await until(
+        lambda: b_h.orch.health()["ticks"] > ticks + 20, 10, "twenty ticks of the new leader"
+    )
+    assert (await b_h.migration(other.id)).phase == P.ready, (
+        "the old leader's cutover holds the slot"
+    )
+    assert (other.id, StepName.CUTOVER) not in executor.calls
+    release.set()
+    done_one = await b_h.wait_phase(one.id, P.completed, timeout=20)
+    done_other = await b_h.wait_phase(other.id, P.completed, timeout=20)
+    began = next(c.at for c in done_other.phase_history if c.to_phase == P.cutover)
+    ended = next(c.at for c in done_one.phase_history if c.to_phase == P.verifying)
+    assert began >= ended
+
+
+async def test_a_takeover_resumes_the_rollback_the_old_leader_began(
+    replicas, any_store, tmp_path, monkeypatch
+):
+    """SDD §8, §25.5: the old leader's cutover failed after the source stopped, and its automatic
+    rollback - saved with the failure - had begun when the leader lost its database. The new
+    leader resumes the rollback from its checkpoint: the source runs again once, and the migration
+    is rolled back with its clock closed."""
+    settings = make_settings(tmp_path)
+    runs = {"started": 0, "ended": 0}
+    hold = asyncio.Event()
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("the import failed after the source stopped")
+
+    async def rollback(ctx):
+        runs["started"] += 1
+        await hold.wait()  # the leader loses its database meanwhile
+        await ctx.mark_downtime_end()  # the source runs again
+        runs["ended"] += 1
+        return StepResult()
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: cutover, StepName.ROLLBACK: rollback}
+    )
+    a_h, a = replicas("seamless-a", [vm(1)], executor=executor, settings=settings)
+    b_h, b = replicas(
+        "seamless-b",
+        [vm(1)],
+        executor=executor,
+        settings=settings,
+        source=a_h.source,
+        destination=a_h.destination,
+    )
+    any_store.put("provider", SRC_PROVIDER)
+    any_store.put("provider", DST_PROVIDER)
+    plan = plan_for([vm(1)], default_strategy=Strategy.cold)
+    any_store.put("plan", plan)
+    await a.start()
+    await b.start()
+    await a_h.orch.validate_plan(plan.id, "alice")
+    await a_h.orch.start_plan(plan.id, "alice")
+    mid = (await a_h.by_vm(plan.id, "vm-1")).id
+    await until(lambda: runs["started"] == 1, 10, "the rollback")
+    began = await a_h.migration(mid)
+    assert began.phase == P.rolling_back and began.downtime_started_at is not None
+
+    await _lost(a_h, a, monkeypatch)
+    assert runs == {"started": 1, "ended": 0}
+    hold.set()
+    done = await b_h.wait_phase(mid, P.rolled_back, timeout=20)
+    assert runs == {"started": 2, "ended": 1}
+    history = b_h.history(done)
+    assert history[history.index(P.cutover) :] == [
+        P.cutover,
+        P.failed,
+        P.rolling_back,
+        P.rolled_back,
+    ]
+    assert done.downtime_ended_at is not None
+    assert b_h.kinds().count("migration.downtime_ended") == 1
+    taken = _leader_events(any_store, "leader.acquired")[-1].data
+    assert (taken["holder"], taken["resumes"]) == ("seamless-b", 1)
+
+
+async def test_a_takeover_is_recorded_with_its_epoch_and_cause(
+    replicas, any_store, tmp_path, monkeypatch
+):
+    """SDD §4.3, §11, §25.8: the transaction that takes the lease writes leader.acquired - the
+    holder and the epoch it took, the holder and the epoch before it, the cause and how many
+    migrations in a resumable phase it resumes; no plan or migration: `first` for the first lease,
+    `released` after a release, `expired` after a lease that lapsed. A takeover whose event cannot
+    be written takes nothing."""
+    settings = make_settings(tmp_path)
+
+    async def pass_that_waits(ctx):
+        await asyncio.Event().wait()
+
+    executor = ScriptedExecutor(settings, hooks={StepName.PRECOPY: pass_that_waits})
+    any_store.put("provider", SRC_PROVIDER)
+    any_store.put("provider", DST_PROVIDER)
+    vms = [vm(i) for i in range(1, 5)]
+    vms[3] = vms[3].model_copy(update={"power_state": "stopped"})
+    plan = plan_for(vms, status=PlanStatus.paused)
+    any_store.put("plan", plan)
+    # two migrations a takeover resumes; one in ready and one completed it does not (SDD §8)
+    for v, phase in zip(vms, (P.precopy, P.precopy, P.ready, P.completed), strict=True):
+        any_store.put(
+            "migration", make_migration(plan_id=plan.id, vm=v, phase=phase), expected_version=0
+        )
+
+    def replica(holder):
+        return replicas(holder, vms, executor=executor, settings=settings)
+
+    _, a = replica("seamless-a")
+    b_h, b = replica("seamless-b")
+    await a.start()
+    await b.start()
+    refused: list[str] = []
+    refuse = _refusing_events("leader.acquired", refused)
+    sa.event.listen(b.elector.lease.engine, "before_cursor_execute", refuse)
+    try:
+        await a.stop()  # it releases its lease
+        await until(lambda: len(refused) >= 3, 10, "three tries of the follower")
+        row = _lease_now(any_store)
+        assert (row.holder, row.epoch, row.expired) == ("seamless-a", 1, True), "taken alone"
+        assert b.epoch is None
+    finally:
+        sa.event.remove(b.elector.lease.engine, "before_cursor_execute", refuse)
+    await until(lambda: b.epoch == 2, 10, "the takeover once its event is written")
+    await _lost(b_h, b, monkeypatch)
+    _, c = replica("seamless-c")
+    await c.start()
+    await until(lambda: c.epoch == 3, 10, "the takeover of the lapsed lease")
+    taken = _leader_events(any_store, "leader.acquired")
+    assert [e.data for e in taken] == [
+        {
+            "holder": "seamless-a",
+            "epoch": 1,
+            "previous_holder": None,
+            "previous_epoch": None,
+            "cause": "first",
+            "resumes": 2,
+        },
+        {
+            "holder": "seamless-b",
+            "epoch": 2,
+            "previous_holder": "seamless-a",
+            "previous_epoch": 1,
+            "cause": "released",
+            "resumes": 2,
+        },
+        {
+            "holder": "seamless-c",
+            "epoch": 3,
+            "previous_holder": "seamless-b",
+            "previous_epoch": 2,
+            "cause": "expired",
+            "resumes": 2,
+        },
+    ]
+    assert all((e.plan_id, e.migration_id, e.actor) == (None, None, "system") for e in taken)
+    assert "seamless-b" in taken[1].message and "epoch 2" in taken[1].message
+
+
+async def test_a_release_is_recorded_with_the_lease_it_ends(
+    replicas, any_store, tmp_path, monkeypatch
+):
+    """SDD §4.3, §11, §25.3: a leader's stop releases its lease and writes leader.released - the
+    holder and the epoch it ends, no plan or migration - in one transaction: when the event cannot
+    be written the lease is not released either, and lapses by itself. A replica whose lease
+    another one took, though it did not know, releases nothing at its stop."""
+    _, a = replicas("seamless-a", [])
+    _, b = replicas("seamless-b", [])
+    await a.start()
+    await b.start()
+    refused: list[str] = []
+    refuse = _refusing_events("leader.released", refused)
+    sa.event.listen(a.elector.lease.engine, "before_cursor_execute", refuse)
+    try:
+        await a.stop()
+    finally:
+        sa.event.remove(a.elector.lease.engine, "before_cursor_execute", refuse)
+    assert refused
+    row = _lease_now(any_store)
+    assert (row.holder, row.epoch, row.expired) == ("seamless-a", 1, False), "released alone"
+    assert _leader_events(any_store, "leader.released") == []
+    await until(lambda: b.epoch == 2, 10, "the takeover of the lapsed lease")
+    assert _leader_events(any_store, "leader.acquired")[-1].data["cause"] == "expired"
+
+    await b.stop()
+    [released] = _leader_events(any_store, "leader.released")
+    assert released.data == {"holder": "seamless-b", "epoch": 2}
+    assert (released.plan_id, released.migration_id, released.actor) == (None, None, "system")
+    assert "seamless-b" in released.message and "epoch 2" in released.message
+    row = _lease_now(any_store)
+    assert (row.holder, row.epoch, row.expired) == ("seamless-b", 2, True)
+
+    # a lease of a second and a renew deadline past it: it does not know when it lost the lease
+    _, c = replicas("seamless-c", [], leadership={"lease_s": 1.0, "renew_deadline_s": 30.0})
+    _, d = replicas("seamless-d", [])
+    await c.start()
+    await d.start()
+    assert c.epoch == 3
+    assert _leader_events(any_store, "leader.acquired")[-1].data["cause"] == "released"
+    _cut_off(c, monkeypatch)
+    await until(lambda: d.epoch == 4, 10, "the takeover of the lapsed lease")
+    assert c.leads() and c.epoch == 3
+    await c.stop()
+    assert [e.data["epoch"] for e in _leader_events(any_store, "leader.released")] == [2]
+    row = _lease_now(any_store)
+    assert (row.holder, row.epoch, row.expired) == ("seamless-d", 4, False)
 
 
 def _tie_advisor(selected: str, confidence: float):
