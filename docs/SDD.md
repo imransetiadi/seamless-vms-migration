@@ -2658,6 +2658,17 @@ reads its A100-3-20C pool full on the gate's first two reads of it (§10), so a 
 waits at its gate - `gpu_wait` set, `migration.gpu_wait` announcing the wait and its end, the source running - and
 cuts over on the gate's third read (§5.4 rule 5, §22.7).
 
+**Notifications** (plan task NT10, §24.9). In demo mode every sender records instead of sending (§24.11 decision 11):
+`senders_for` (§8.7) gives each channel kind a recording sender, which renders the kind's format as the real sender
+renders it - the email as the relay would receive it, the Slack payload as JSON, the Standard Webhooks document as
+the body a webhook signs - and answers `sent`, so the notifier records the message as `notification.sent` (§24.7),
+its title in the event's message. Nothing leaves the process, whatever a channel names: a recording sender opens no
+connection and needs no secret - the notifier reads none for it, so the demo's Slack channel needs no URL - and the
+demo server (`seamless serve --demo`) takes the relay `relay.example.com` and the sender `seamless@example.com`
+while `SEAMLESS_SMTP_HOST` and `SEAMLESS_SMTP_FROM` are unset (§15.1): a relay of the demo's fakes, as its clouds
+are, which nothing reaches, so an email channel registers, edits and renders as with a real relay. A channel's test
+(§8.7) answers `sent` through the same senders.
+
 ### 7.5 Verification (`seamless_migrate.verification`)
 
 Not an executor step: the orchestrator calls `Verifier.verify(ctx) -> VerificationResult` with
@@ -3103,7 +3114,10 @@ route waits for it.
   `sent`, `failed` (final) or `retry` (a timeout, a connection or TLS error, HTTP 408, 429 or 5xx, a temporary SMTP
   4yz reply), with a reason, an optional `Retry-After` and an email's refused count. The notifier reads the channel's
   secret (`notify-{name}`, §13.3) each time it sends, so a rotation needs no restart. Plan tasks NT6–NT8 bring the
-  email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`.
+  email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`. In
+  demo mode `senders_for` gives every kind a recording sender instead, which renders the message and answers `sent`;
+  a sender that needs no secret, as a recording one, is handed none, and the notifier reads none for it (§7.4, plan
+  task NT10).
 * **The email sender** (plan task NT6; §24.3, §24.5): `smtplib` in at most two threads of the notifier's own, never
   asyncio's default pool; `SEAMLESS_SMTP_SECURITY` `starttls` opens the session in plain text, requires the STARTTLS
   extension (a relay without it fails the message with `no_starttls`, and nothing but EHLO went in clear text) and
@@ -3703,6 +3717,19 @@ No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
   `SRC_VM_LB_MEMBER` - the portal pool's members are the helper's -, and with each web server's `NET_LB_POOL_SPLIT`
   when its waves split the portal pool: `web-03` shares no app tag with the `portal` pair (§9.4). The plan runs no
   hook: the demo catalog holds none, since a hook runs code with the control plane's reach (§23.9).
+
+**The demo's notification channels** (plan task NT10, §24.9). After its plans the seed adds one channel of each kind,
+as an admin adds one, each with its `channel.created` event by `demo`: `app-owners` (email to
+`finance-app-owners@example.com` and `dc2-service-owners@example.org`), `migration-team` (Slack: a Slack channel's URL
+lives only in its secret, which the demo neither holds nor needs, §7.4) and `change-hub` (a webhook to
+`https://change-hub.example.com/hooks/seamless`). It subscribes each to the two seeded plans with the default topics
+`approval`, `downtime` and `problem` (§24.4), each subscription with its `subscription.created` event. So each channel
+starts at its own creation, after the seed's other events (§24.6), and every demo cutover notifies its downtime on
+each: its `downtime.started` and `downtime.ended` messages are recorded as `notification.sent` and listed on the
+Events page, and each channel's state - its last outcome `sent` - shows on the Notifications page (§16); a cutover
+that waits for an approver notifies `approval`, and a failed one `problem`. A channel the store holds is left as it
+is, its subscriptions with it: a restart adds nothing and keeps what an admin changed, and a demo database seeded
+before plan task NT10 gets the channels on its next start, subscribed to its seeded plans.
 
 **The fake destinations' GPUs** (plan task G9, §22.10). Each lists three GPU flavors, with the sizes of the
 dashboard's mock (§16): `g1.a100-4c` (8 vCPUs, 32 GiB, 200 GB; `resources:VGPU=1` and
@@ -4836,7 +4863,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
-| `SEAMLESS_SMTP_HOST`, `SEAMLESS_SMTP_FROM` | unset, unset | the installation's SMTP relay and the sender's address (§8.7, §24.3): while either is unset, an email channel cannot be registered (422) and an existing one's messages fail with `no_relay` |
+| `SEAMLESS_SMTP_HOST`, `SEAMLESS_SMTP_FROM` | unset, unset | the installation's SMTP relay and the sender's address (§8.7, §24.3): while either is unset, an email channel cannot be registered (422) and an existing one's messages fail with `no_relay`. The demo server takes `relay.example.com` and `seamless@example.com` while they are unset: a relay of its fakes, which its recording senders never reach (§7.4) |
 | `SEAMLESS_SMTP_PORT`, `SEAMLESS_SMTP_SECURITY` | `587`, `starttls` | the relay's port and `starttls` or `tls` (implicit TLS, port 465); there is no plain-text mode: a relay without STARTTLS fails the message (`no_starttls`) |
 | `SEAMLESS_SMTP_CA_FILE`, `SEAMLESS_SMTP_SECRET` | unset, unset | a CA file the relay's certificate is verified against instead of the system's; the secret (§13.3) whose `username` and `password` the client authenticates with, after TLS alone - unset, it does not authenticate |
 | `SEAMLESS_PUBLIC_URL` | unset | the address people reach the dashboard at (`https://seamless.example.com`): the link a notification carries, ids alone, never a token (§8.6, §24.5); unset, a message carries no link |
@@ -7335,7 +7362,8 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
     notifications on the Events page and their state on the Notifications page.
 
 The Notifications page, the plan page's Notifications panel and the offline mock are binding in §16 since plan task
-NT9.
+NT9. The demo's recording senders and its seeded channels are binding in §7.4 and §10 since plan task NT10, with the
+demo server's relay of fakes in §15.1.
 
 ### 24.10 Validation
 
