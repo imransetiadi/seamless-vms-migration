@@ -13,8 +13,12 @@ test('sign-in keeps the pending token stable and becomes editable after rejectio
   await page.goto('/login');
   const token = page.getByLabel('API token', { exact: true });
   await token.fill('not-a-valid-token');
-  await page.clock.install();
-  await page.clock.pauseAt(new Date());
+  // the page's clock runs from install on, so a pause at the runner's "now" could already lie in
+  // its past on a busy runner ("Cannot fast-forward to the past"): pause 5 s after a known start -
+  // short of every timer the sign-in page holds (the health query's 60 s)
+  const start = new Date('2026-01-05T09:00:00Z');
+  await page.clock.install({ time: start });
+  await page.clock.pauseAt(new Date(start.getTime() + 5_000));
   await token.press('Enter');
   await expect(token).toHaveAttribute('readonly');
   await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toHaveAttribute('aria-busy', 'true');
