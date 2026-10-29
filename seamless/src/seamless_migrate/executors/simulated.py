@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..config import Settings
+from ..credentials import Step, for_step
 from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
 from ..domain.models import (
     ExtentUse,
@@ -85,6 +86,13 @@ def server_flavor(vm: VMRef, plan: Plan, source: Provider) -> str | None:
     return plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
 
 
+def _step_of(ctx: StepContext) -> Step:
+    """The row of SDD §27.5's table the simulated run is: the migration kit's for a VMware strategy,
+    else a migration's - as the Ansible executor reads it (§7.2)."""
+    vmware = Strategy(ctx.migration.strategy) in (Strategy.vmware_cold, Strategy.vmware_warm)
+    return Step.KIT if vmware else Step.MIGRATION
+
+
 class SimulatedExecutor:
     name = "simulated"
 
@@ -103,11 +111,12 @@ class SimulatedExecutor:
         """Stop or start the fake source VM the way the real steps do (SDD §7.4, §8.1)."""
         if self.providers is None:
             return
-        client = self.providers.get(ctx.source)
-        action = getattr(client, "power_on" if on else "power_off", None)
-        if action is None:
-            return
         try:
+            # the step's credential at the source (SDD §27.5)
+            client = for_step(self.providers, _step_of(ctx), ctx.source, ctx.plan)
+            action = getattr(client, "power_on" if on else "power_off", None)
+            if action is None:
+                return
             await action(ctx.migration.vm.source_id)
         except ProviderError:
             pass  # a VM the fake does not hold: nothing to stop or start, never a failed step
@@ -117,7 +126,12 @@ class SimulatedExecutor:
         GPU units (SDD §7.4, §10); None without one."""
         if self.providers is None:
             return None
-        return getattr(self.providers.get(ctx.destination), name, None)
+        try:
+            # the step's credential at the destination (SDD §27.5)
+            client = for_step(self.providers, _step_of(ctx), ctx.destination, ctx.plan)
+        except ProviderError:
+            return None  # a fake that holds no such credential (plan task TC9): nothing simulated
+        return getattr(client, name, None)
 
     def supports(self, strategy: Strategy) -> bool:
         return True

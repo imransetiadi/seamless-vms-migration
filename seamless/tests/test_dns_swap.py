@@ -253,6 +253,34 @@ async def test_a_rollback_swaps_the_record_back(tmp_path, store):
     assert actions == [("swap", "succeeded"), ("revert", "succeeded")]
 
 
+async def test_a_designate_swap_of_a_plan_with_projects_uses_its_destination_credential(
+    tmp_path, store
+):
+    """SDD §8.4, §27.5 (plan task TC5): Designate's zones are a project's, so for a plan with a
+    destination project validation's read of the record's TTL, the swap and the revert all go
+    with the plan's destination credential - never the destination provider's own."""
+    from tests.credential_support import of_project, own, with_projects
+    from tests.orch_support import DST_PROVIDER
+
+    destination = DnsDestination(records=("10.0.0.10",), pending=0)
+    vms = [moved_vm()]
+    h = build_harness(tmp_path, store, vms, destination=destination)
+    plan = dns_plan(vms)
+    store.put("plan", plan)
+    registry, t = with_projects(h, plan)
+    await run_plan(h, t.plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    assert (await h.wait_phase(mid, P.completed)).dns_swap.state == "swapped"
+    await h.orch.rollback(mid, "alice", "the application team asked for it")
+    assert (await h.wait_phase(mid, P.rolled_back)).dns_swap.state == "reverted"
+    await h.orch.stop()
+    assert destination.updates == [["10.0.0.20"], ["10.0.0.10"]]
+    dst = of_project(DST_PROVIDER, t.destination)
+    assert registry.used("dns_recordset") and set(registry.used("dns_recordset")) == {dst}
+    assert registry.used("update_dns_recordset") == [dst, dst]
+    assert not {"dns_recordset", "update_dns_recordset"} & registry.methods(own(DST_PROVIDER))
+
+
 async def test_a_failed_swap_fails_the_migration_as_a_post_create_hook_does(tmp_path, store):
     """SDD §8.4: a swap that fails - Designate's ERROR here - fails the migration in verifying,
     before the verification, as a post_create hook's failure does: auto_rollback decides (held
