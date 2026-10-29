@@ -274,6 +274,33 @@ def test_the_lease_reads_and_sets_only_the_databases_time(replicas):
     assert row.expired, "released: expired at the database's now()"
 
 
+def test_the_lease_runs_no_returning_clause(replicas):
+    """SDD §11: the SQLite of RHEL 9 - the UBI 9 image's, 3.34.1 - has no RETURNING (SQLite 3.35
+    brought it), and a campaign that sent one stopped `seamless serve` in the image. No statement
+    of a first campaign, a renewal, a takeover or a release has the clause, on either engine."""
+    a, b = lease_of(replicas[0], A), lease_of(replicas[1], B)
+    sent: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        sent.append(statement)
+
+    for store in replicas:
+        sa.event.listen(store.engine, "before_cursor_execute", record)
+    try:
+        assert a.campaign() == 1
+        assert b.campaign() is None
+        assert a.renew(1)
+        wait_expired(b)
+        assert b.campaign() == 2
+        assert b.release(2)
+    finally:
+        for store in replicas:
+            sa.event.remove(store.engine, "before_cursor_execute", record)
+    assert any(statement.lstrip().upper().startswith("INSERT") for statement in sent)
+    assert any(statement.lstrip().upper().startswith("UPDATE") for statement in sent)
+    assert [s for s in sent if re.search(r"\bRETURNING\b", s, re.IGNORECASE)] == []
+
+
 # -- the fence (SDD §11, §25.4 layer 1) ---------------------------------------------------------
 def _an_event(kind: str = "plan.updated") -> Event:
     return Event(kind=kind, message="written by a replica")
