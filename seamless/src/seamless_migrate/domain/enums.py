@@ -125,6 +125,44 @@ class ReasonCode(StrEnum):
     ADVISOR_UNAVAILABLE_FALLBACK = "ADVISOR_UNAVAILABLE_FALLBACK"
 
 
+class NotifyTopic(StrEnum):
+    """What a notification subscription chooses (SDD §4.1, §24.5, plan task NT2)."""
+
+    approval = "approval"
+    downtime = "downtime"
+    problem = "problem"
+    outcome = "outcome"
+    progress = "progress"
+
+
+class NotifyTrigger(StrEnum):
+    """The triggers of SDD §24.5 (§4.1, plan task NT2): a message's `type` and its audit's
+    `trigger`; a trigger's topic is the part of its name before the dot."""
+
+    approval_cutover = "approval.cutover"
+    approval_wave = "approval.wave"
+    approval_advisor = "approval.advisor"
+    downtime_started = "downtime.started"
+    downtime_ended = "downtime.ended"
+    problem_failed = "problem.failed"
+    problem_data_inconsistent = "problem.data_inconsistent"
+    problem_source_running = "problem.source_running"
+    outcome_completed = "outcome.completed"
+    outcome_rolled_back = "outcome.rolled_back"
+    outcome_finalized = "outcome.finalized"
+    progress_plan_started = "progress.plan_started"
+    progress_plan_paused = "progress.plan_paused"
+    progress_plan_completed = "progress.plan_completed"
+    progress_plan_cancelled = "progress.plan_cancelled"
+    progress_plan_finalized = "progress.plan_finalized"
+    progress_wave_started = "progress.wave_started"
+    progress_wave_completed = "progress.wave_completed"
+
+    @property
+    def topic(self) -> NotifyTopic:
+        return NotifyTopic(self.value.partition(".")[0])
+
+
 #: Strategies considered per source family (SDD §9.2).
 OPENSTACK_STRATEGIES = (Strategy.cold, Strategy.warm, Strategy.storage_handover)
 VMWARE_STRATEGIES = (Strategy.vmware_cold, Strategy.vmware_warm)

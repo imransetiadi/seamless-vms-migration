@@ -639,3 +639,175 @@ def test_a_plans_network_cutover_settings_round_trip():
     for body in refused:
         with pytest.raises(ValidationError):
             NetworkCutover.model_validate(body)
+
+
+def test_an_email_channel_needs_recipients_and_takes_no_url():
+    """SDD §4.2, §24.3 (plan task NT2): an email channel is one audience - 1-50 recipients, each an
+    RFC 5322 addr-spec in its dot-atom form of at most 254 characters - and names no URL; its
+    secret is notify-{name}, which the admin never chooses."""
+    from seamless_migrate.domain.models import NotificationChannel
+
+    channel = NotificationChannel(
+        name="app-owners", kind="email", recipients=["owners@example.com", "ops.team@example.org"]
+    )
+    assert channel.id == "app-owners"
+    assert channel.secret_name == "notify-app-owners"
+    assert channel.url is None and channel.description is None
+    assert channel.redact_names is False and channel.enabled is True
+    assert channel.created_at.tzinfo is not None and channel.updated_at >= channel.created_at
+    fifty = [f"owner-{i}@example.com" for i in range(50)]
+    assert NotificationChannel(name="many", kind="email", recipients=fifty).recipients == fifty
+    longest = "a" * (254 - len("@example.com")) + "@example.com"
+    assert NotificationChannel(name="long", kind="email", recipients=[longest]).recipients == [
+        longest
+    ]
+
+    refused = {
+        "no recipient": {"recipients": []},
+        "missing": {},
+        "51 recipients": {"recipients": fifty + ["one-more@example.com"]},
+        "a URL": {"recipients": ["owners@example.com"], "url": "https://mail.example.com/"},
+        "no at sign": {"recipients": ["owners.example.com"]},
+        "no local part": {"recipients": ["@example.com"]},
+        "no domain": {"recipients": ["owners@"]},
+        "a space": {"recipients": ["app owners@example.com"]},
+        "a name-addr": {"recipients": ["Owners <owners@example.com>"]},
+        "two at signs": {"recipients": ["owners@example.com@example.org"]},
+        "a dot twice": {"recipients": ["app..owners@example.com"]},
+        "a leading dot": {"recipients": [".owners@example.com"]},
+        "255 characters": {"recipients": ["a" + longest]},
+        "a control character": {"recipients": ["owners@example.com\n"]},
+    }
+    for why, body in refused.items():
+        with pytest.raises(ValidationError, match="recipients|url"):
+            NotificationChannel(name="app-owners", kind="email", **body)
+        print("refused:", why)
+    # the message names the field, never the address count alone
+    with pytest.raises(ValidationError, match="recipients: an email channel needs 1-50"):
+        NotificationChannel(name="app-owners", kind="email", recipients=[])
+
+
+def test_a_webhook_channels_url_is_https_without_user_information():
+    """SDD §4.2, §24.3 (plan task NT2): a webhook channel POSTs to its URL, which follows a webhook
+    hook's rule - https://, a host, no user information - and takes no recipients; the signing key
+    lives in its secret alone, so the document has no field for it."""
+    from seamless_migrate.domain.models import NotificationChannel
+
+    channel = NotificationChannel(name="cmdb", kind="webhook", url="https://cmdb.example.com/hook")
+    assert channel.url == "https://cmdb.example.com/hook" and channel.recipients == []
+    assert channel.secret_name == "notify-cmdb"
+    assert "signing_key" not in NotificationChannel.model_fields
+    assert "secret" not in NotificationChannel.model_fields
+
+    refused = {
+        "missing": {},
+        "http": {"url": "http://cmdb.example.com/hook"},
+        "user information": {"url": "https://token@cmdb.example.com/hook"},
+        "a password": {"url": "https://svc:s3cret@cmdb.example.com/hook"},
+        "no host": {"url": "https:///hook"},
+        "not a URL": {"url": "cmdb.example.com/hook"},
+        "recipients": {"url": "https://cmdb.example.com/hook", "recipients": ["a@example.com"]},
+    }
+    for why, body in refused.items():
+        with pytest.raises(ValidationError, match="url|recipients"):
+            NotificationChannel(name="cmdb", kind="webhook", **body)
+        print("refused:", why)
+
+
+def test_a_slack_channel_holds_no_url_in_its_document():
+    """SDD §4.2, §24.3 (plan task NT2): a Slack webhook's URL is the credential, so a Slack
+    channel's document carries neither a URL nor recipients - the URL lives in the secret
+    notify-{name} as its key `url` (plan task NT3 writes it)."""
+    from seamless_migrate.domain.models import NotificationChannel
+
+    channel = NotificationChannel(name="ops-slack", kind="slack", description="#ops")
+    assert channel.url is None and channel.recipients == []
+    assert channel.secret_name == "notify-ops-slack"
+    document = json.loads(channel.model_dump_json())
+    assert document["url"] is None and document["recipients"] == []
+    assert "hooks.slack.com" not in channel.model_dump_json()
+    for body in (
+        {"url": "https://hooks.slack.com/services/T000/B000/XXXX"},
+        {"url": "https://example.com/"},
+        {"recipients": ["ops@example.com"]},
+    ):
+        with pytest.raises(ValidationError, match="url|recipients"):
+            NotificationChannel(name="ops-slack", kind="slack", **body)
+    # the disabled and the redacting channel are documents like any other
+    quiet = NotificationChannel(name="quiet", kind="slack", enabled=False, redact_names=True)
+    assert quiet.enabled is False and quiet.redact_names is True
+    assert NotificationChannel.model_validate(json.loads(quiet.model_dump_json())) == quiet
+
+
+def test_a_channel_name_follows_the_hook_name_rule():
+    """SDD §4.2, §24.3 (plan task NT2): an admin registers channels by name under the rule of a
+    hook's name (^[a-z0-9][a-z0-9-]{1,62}$), so a secret named after one is a secret name and
+    the kind stays what it was registered as."""
+    from seamless_migrate.domain.models import HOOK_NAME, Hook, NotificationChannel
+
+    assert NotificationChannel.model_fields["name"].metadata[0].pattern == HOOK_NAME
+    for name in ("ops", "a1", "app-owners-2", "x" * 63, "0-9"):
+        assert NotificationChannel(name=name, kind="slack").name == name
+        assert Hook(name=name, kind="playbook", playbook="/h.yml").name == name
+    for name in ("", "a", "Ops", "-ops", "ops_x", "ops.x", "ops x", "x" * 64, "ops/x", "ops\n"):
+        with pytest.raises(ValidationError, match="name"):
+            NotificationChannel(name=name, kind="slack")
+        with pytest.raises(ValidationError, match="name"):
+            Hook(name=name, kind="playbook", playbook="/h.yml")
+    with pytest.raises(ValidationError, match="kind"):
+        NotificationChannel(name="ops", kind="teams")
+
+
+def test_a_subscription_defaults_to_approval_downtime_and_problem():
+    """SDD §4.1, §4.2, §24.4, §24.5 (plan task NT2): a subscription names a channel, a plan or every
+    plan (null) and its topics - approval, downtime and problem unless it says otherwise, at least
+    one and each once; a cursor starts at 0 with no outcome; each trigger's topic is the part of
+    its name before the dot."""
+    from seamless_migrate.domain.enums import NotifyTopic, NotifyTrigger
+    from seamless_migrate.domain.models import NotificationCursor, NotificationSubscription
+
+    sub = NotificationSubscription(channel="app-owners", plan_id=None, created_by="admin")
+    assert sub.topics == [NotifyTopic.approval, NotifyTopic.downtime, NotifyTopic.problem]
+    assert sub.plan_id is None and sub.created_by == "admin"
+    assert unicodedata.category(sub.id[0]) == "Ll" and len(sub.id) == len("sub-") + 8
+    assert sub.id.startswith("sub-") and int(sub.id[4:], 16) >= 0
+    assert json.loads(sub.model_dump_json())["topics"] == ["approval", "downtime", "problem"]
+    chosen = NotificationSubscription(
+        channel="ops-slack",
+        plan_id="plan-0000abcd",
+        topics=["progress", "problem"],
+        created_by="op",
+    )
+    assert chosen.topics == [NotifyTopic.progress, NotifyTopic.problem]  # in the order given
+    for body in (
+        {"topics": []},
+        {"topics": ["approval", "approval"]},
+        {"topics": ["digest"]},
+        {"channel": "Ops"},
+    ):
+        with pytest.raises(ValidationError, match="topics|channel"):
+            NotificationSubscription(
+                **{"channel": "app-owners", "plan_id": None, "created_by": "admin", **body}
+            )
+
+    cursor = NotificationCursor(channel="app-owners", seq=0)
+    assert cursor.id == "app-owners"
+    assert cursor.last_outcome is None and cursor.last_outcome_at is None
+    assert cursor.last_reason is None and cursor.failures_in_a_row == 0
+    with pytest.raises(ValidationError, match="seq"):
+        NotificationCursor(channel="app-owners", seq=-1)
+    with pytest.raises(ValidationError, match="last_outcome"):
+        NotificationCursor(channel="app-owners", seq=1, last_outcome="dropped")
+
+    assert [t.value for t in NotifyTopic] == [
+        "approval",
+        "downtime",
+        "problem",
+        "outcome",
+        "progress",
+    ]
+    assert len(NotifyTrigger) == 18
+    assert NotifyTrigger.approval_cutover.value == "approval.cutover"
+    assert NotifyTrigger("progress.wave_completed").topic == NotifyTopic.progress
+    assert {trigger.topic for trigger in NotifyTrigger} == set(NotifyTopic)
+    assert NotifyTrigger("downtime.ended").topic == NotifyTopic.downtime
