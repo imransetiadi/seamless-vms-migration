@@ -28,6 +28,7 @@ def render_metrics(
     step_stats: Mapping[str, list[float]],
     advisor_calls: Mapping[tuple[str, str], int],
     tick_stats: Mapping[str, float] | None = None,
+    notifications: Mapping[tuple[str, str], int] | None = None,
 ) -> str:
     migrations = list(migrations)
     lines: list[str] = []
@@ -56,6 +57,18 @@ def render_metrics(
     # rule 5, §22.7) - a wait leaves with the phases it lives in (domain.fsm)
     family("seamless_gpu_waits", "gauge", "Migrations whose cutover waits for GPU capacity.")
     lines.append(f"seamless_gpu_waits {sum(1 for m in migrations if m.gpu_wait is not None)}")
+
+    # SDD §18: the notification messages recorded per channel kind and outcome (§8.7, §24.7)
+    family(
+        "seamless_notifications_total",
+        "counter",
+        "Notification messages recorded as sent or failed, by channel kind.",
+    )
+    for (kind, outcome), count in sorted((notifications or {}).items()):
+        lines.append(
+            f'seamless_notifications_total{{kind="{_escape(kind)}",outcome="{_escape(outcome)}"}} '
+            f"{count}"
+        )
 
     family("seamless_bytes_transferred_total", "counter", "Bytes transferred by migrations.")
     lines.append(f"seamless_bytes_transferred_total {sum(m.bytes_transferred for m in migrations)}")

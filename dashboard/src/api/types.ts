@@ -1127,6 +1127,9 @@ export const PERSISTED_EVENT_KINDS = [
   'channel.deleted',
   'subscription.created',
   'subscription.deleted',
+  // each message's outcome, once per message (SDD §4.3, §8.7, §24.7, plan task NT5)
+  'notification.sent',
+  'notification.failed',
   'auth.denied',
   'user.created',
   'events.pruned',

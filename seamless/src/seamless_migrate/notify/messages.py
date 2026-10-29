@@ -58,7 +58,8 @@ class Message:
     """A message (SDD §24.5): the same title and lines for every kind; the fields the webhook
     document carries beside them."""
 
-    trigger: NotifyTrigger
+    #: a NotifyTrigger, or "test" for the test route's message (§8.7)
+    trigger: NotifyTrigger | str
     title: str
     lines: list[str]
     plan_id: str
@@ -79,8 +80,12 @@ class Message:
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def topic(self) -> NotifyTopic:
-        return self.trigger.topic
+    def trigger_name(self) -> str:
+        return self.trigger.value if isinstance(self.trigger, NotifyTrigger) else str(self.trigger)
+
+    @property
+    def topic(self) -> NotifyTopic | None:
+        return self.trigger.topic if isinstance(self.trigger, NotifyTrigger) else None
 
     @property
     def ending(self) -> list[str]:
@@ -399,13 +404,13 @@ def webhook_document(message: Message) -> dict[str, Any]:
     """The Standard Webhooks payload (SDD §24.5): the type, the event's time and the message as
     fields."""
     return {
-        "type": message.trigger.value,
+        "type": message.trigger_name,
         "timestamp": _when(message.event_ts),
         "data": {
             "title": message.title,
             "lines": list(message.lines),
             "link": message.link,
-            "topic": message.topic.value,
+            "topic": message.topic.value if message.topic is not None else message.trigger_name,
             "event_seq": message.event_seq,
             "event_kind": message.event_kind,
             "plan_id": message.plan_id,

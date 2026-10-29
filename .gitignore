@@ -66,3 +66,6 @@ deploy/openshift/secrets/
 
 # macOS Finder metadata (written into every folder Finder opens)
 .DS_Store
+
+# a node_modules symlink is a file, which node_modules/ does not match: NT3 committed one by mistake (811ff6d6)
+dashboard/node_modules

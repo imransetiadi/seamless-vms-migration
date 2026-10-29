@@ -58,6 +58,8 @@ class Services:
     tokens: TokenStore
     jev: Any = None
     memory: Any = None
+    #: the notifier (SDD §8.7), started and stopped with the orchestrator
+    notifier: Any = None
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
