@@ -15,7 +15,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [ARGUMENTS] [OPTIONS]
 | `openshift` | the manifests in `deploy/openshift/` (OpenShift 4.16+) | `oc` |
 
 The binding description is [SDD §17.2](SDD.md); `scripts/seamless-ctl.sh --help` prints the same options.
-Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
+Section 7 also sets up what 0.5.0 adds: the conversion hosts' host keys (7.2), changed-extent tracking (7.3) and
+notifications (7.4). Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
 Designate zones and Manila shares (SDD §23.2).
 
 ---
@@ -595,6 +596,203 @@ The checks guard at run time: every pre-copy pass of a tracked disk is a `checke
 changed outside the extents; a miss turns tracking off for that disk and raises `EXTENT_TRACKING_MISSED`. An image
 whose fast-diff feature is off or whose map is invalid still diffs, one request per object - slower, correct: `rbd
 feature enable <pool>/volume-<id> object-map fast-diff` and `rbd object-map rebuild` make it fast again.
+
+### 7.4 Notifications: the relay, Slack, a webhook receiver and the egress (0.5.0)
+
+Seamless tells people what happens to their VMs (SDD §24, FR-48–FR-51). An admin keeps a catalog of channels on the
+**Notifications** page (Activity group): email through the installation's SMTP relay, Slack incoming webhooks, and
+HTTPS webhooks signed as Standard Webhooks specify. An operator subscribes a channel to a plan on the plan's page
+(**Notifications**, **Add subscription**); an admin subscribes one to every plan on the Notifications page. A
+subscription's topics are `approval`, `downtime` and `problem` unless it asks for `outcome` and `progress` too. A
+channel sends its messages one at a time, at least once and at most one a second, and drops a message whose event is
+an hour old; no message ever delays a migration (SDD §24.6). A message names the VM, the plan, the phase, times and
+the downtime, never a credential, an address or an error's text (Security.md §8.1).
+
+**1. The SMTP relay** (email channels). The installation has one relay, which the control plane's environment
+configures (SDD §15.1, §24.3); the client is Python's `smtplib`, over TLS alone:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SEAMLESS_SMTP_HOST`, `SEAMLESS_SMTP_FROM` | unset | the relay and the sender's address; while either is unset, an email channel cannot be added (422) and an existing one's messages fail with `no_relay` |
+| `SEAMLESS_SMTP_PORT` | `587` | the relay's port |
+| `SEAMLESS_SMTP_SECURITY` | `starttls` | or `tls`, implicit TLS on port 465, which RFC 8314 prefers. There is no plain-text mode: a relay that offers no STARTTLS fails the message (`no_starttls`) |
+| `SEAMLESS_SMTP_CA_FILE` | unset | a CA file the relay's certificate is verified against instead of the system's CAs - a private CA, mounted into the container |
+| `SEAMLESS_SMTP_SECRET` | unset | the name of a secret with the keys `username` and `password`, sent after TLS alone and read at each message; unset, the client does not authenticate and the relay admits the control plane by its address |
+| `SEAMLESS_PUBLIC_URL` | unset | for every channel kind: the address people reach the dashboard at. A message ends with a link to its migration's or plan's page, ids alone and never a token; unset, it carries no link |
+
+A relay that no longer takes a password is reached through one that admits the control plane by its address: 0.5.0
+has no OAuth for SMTP, and Exchange Online turns basic SMTP authentication off by default at the end of 2026
+(SDD §24.10, `TODO(LAB): confirm`).
+
+On the **single host** the stack's `compose.yaml` hands the control plane only the variables it names, so these go
+into the git-ignored override `deploy/compose/compose.local.yaml` (deploy/compose/README.md, "Using real clouds"),
+which every later `up` and `restart` must load too:
+
+```yaml
+# deploy/compose/compose.local.yaml   (git-ignored)
+services:
+  seamless:
+    environment:
+      SEAMLESS_SMTP_HOST: smtp.example.com
+      SEAMLESS_SMTP_FROM: seamless@example.com
+      SEAMLESS_SMTP_PORT: "465"
+      SEAMLESS_SMTP_SECURITY: tls
+      SEAMLESS_SMTP_SECRET: smtp-relay              # leave it out when the relay admits this host by its address
+      SEAMLESS_PUBLIC_URL: https://seamless.example.com
+```
+
+```bash
+export SEAMLESS_EXTRA_COMPOSE_FILE=deploy/compose/compose.local.yaml   # keep it set: up and restart load it
+scripts/seamless-ctl.sh docker up
+```
+
+The secret `smtp-relay` is two 0600 files in the `seamless-secrets` volume. Write them through the container, the
+user and the password typed at prompts - the password unseen - and handed over on standard input, never on a command
+line (`$C` as [deploy/compose/README.md](../deploy/compose/README.md) defines it; on macOS add
+`--context colima-seamless` after `docker`):
+
+```bash
+read -r RELAY_USER && read -rs RELAY_PASSWORD
+printf '%s\n%s\n' "$RELAY_USER" "$RELAY_PASSWORD" | $C exec -T seamless sh -c 'umask 077 &&
+  d=/var/run/secrets/seamless/smtp-relay && mkdir -p "$d" && IFS= read -r u && IFS= read -r p &&
+  printf %s "$u" > "$d/username" && printf %s "$p" > "$d/password"'
+unset RELAY_USER RELAY_PASSWORD
+```
+
+On a **cluster** the variables go into the ConfigMap `seamless-config` (`deploy/openshift/configmap.yaml` for a
+lasting change), which the control plane reads when it starts: `restart` after a change (section 4.4). The secret is
+the Secret `seamless-smtp-relay`, labelled so that the store reads it - it reads no other Secret it did not write
+(SDD §13.3). The pipeline creates it, and replaces it on a rotation (`kubectl` alike on Kubernetes):
+
+```bash
+d=$(mktemp -d) && read -r RELAY_USER && read -rs RELAY_PASSWORD &&
+  (umask 077 && printf '%s' "$RELAY_USER" > "$d/username" && printf '%s' "$RELAY_PASSWORD" > "$d/password") &&
+  unset RELAY_USER RELAY_PASSWORD
+oc -n seamless-migrate create secret generic seamless-smtp-relay --from-file="$d/username" \
+     --from-file="$d/password" --dry-run=client -o yaml \
+  | oc label --local -f - seamless.io/provider-secret=true -o yaml | oc -n seamless-migrate apply -f -
+rm -rf "$d"
+scripts/seamless-ctl.sh openshift restart
+```
+
+**2. The egress.** On Kubernetes and OpenShift the NetworkPolicy `seamless-allow-egress-external`
+(`deploy/openshift/networkpolicy.yaml`) opens TCP 587 and 465 towards addresses outside the cluster for the relay, and
+443, which Slack and the webhook receivers use (SDD §17). A relay or a receiver on another port needs that port added
+to the rule; one inside the cluster needs a rule of its own, since the external rule excepts the cluster's own
+networks (as `configmap.yaml` says of an in-cluster agentmemory). Tighten `0.0.0.0/0` to the relay's and the
+receivers' addresses where they are fixed (Security.md §8); Slack's are not. On the single host Compose's `frontend`
+network restricts nothing: the host's firewall must let the control plane reach the relay's port and 443.
+
+**3. A Slack channel.**
+
+1. In Slack, add an incoming webhook for the Slack channel that should get the messages: a Slack app of the workspace
+   with incoming webhooks turned on, and a webhook added for that channel. Slack fixes the channel, the name and the
+   icon a webhook posts with, so one webhook is one channel of the catalog. Its URL is the credential: whoever holds it
+   posts into that Slack channel, and Slack revokes a URL it finds published (Security.md C2-16).
+2. On the Notifications page, **Add channel** with the kind Slack, then **Set secret** on its row and paste the URL.
+   Nothing shows it again: no route returns it, and `channel.updated` records `"fields": ["secret"]` alone.
+3. **Send test**: the outcome is `sent`, and the test message is in the Slack channel.
+4. Subscribe it: on a plan's page, **Notifications**, **Add subscription** (an operator); for every plan, **Add
+   every-plan subscription** on the Notifications page (an admin).
+
+The same through the API, for automation: an admin's token in a header file in a private directory, and the URL typed
+at a prompt that does not echo it, so neither reaches a command line or the shell's history (Security.md §7.2):
+
+```bash
+URL=https://seamless.apps.example.com           # the single host: http://127.0.0.1:8080
+HEADER_FILE=$(mktemp -d)/auth                   # mktemp -d makes a 0700 directory
+read -rs TOKEN && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$HEADER_FILE") && unset TOKEN
+curl -sS -X POST "$URL/api/v1/notifications/channels" -H @"$HEADER_FILE" -H 'Content-Type: application/json' \
+     -d '{"name": "ops-slack", "kind": "slack", "description": "Cutovers of the finance plans"}'
+python3 -c 'import getpass, json; print(json.dumps({"url": getpass.getpass("Slack webhook URL: ").strip()}))' \
+  | curl -sS -X PUT "$URL/api/v1/notifications/channels/ops-slack/secret" -H @"$HEADER_FILE" \
+         -H 'Content-Type: application/json' --data-binary @-
+curl -sS -X POST "$URL/api/v1/notifications/channels/ops-slack/test" -H @"$HEADER_FILE"    # {"outcome":"sent",...}
+rm -rf "$(dirname "$HEADER_FILE")"              # done: the header file goes with its directory
+```
+
+**4. A webhook channel and its receiver.**
+
+1. **Add channel** with the kind Webhook and the receiver's URL: `https://`, a host and no user information. Keep
+   tokens out of the URL - the signature proves who sent the request -; the API shows the URL in full to an admin
+   alone.
+2. The signing key: **Set secret**, then **Generate key** makes one in the browser; **Copy key**, give it to the
+   receiver, then **Save secret** - the dialog shows the key until it closes, and nothing shows it again. Or make one
+   yourself, `whsec_` and the base64 of 24 to 64 random bytes, in a file only you can read; give the receiver the same
+   key and write it, with `URL` and a `HEADER_FILE` made as in item 3:
+
+   ```bash
+   KEY_FILE=$(dirname "$HEADER_FILE")/signing.key
+   (umask 077 && python3 -c 'import base64, secrets; print("whsec_" + base64.b64encode(secrets.token_bytes(32)).decode())' > "$KEY_FILE")
+   python3 -c 'import json, sys; print(json.dumps({"signing_key": open(sys.argv[1]).read().strip()}))' "$KEY_FILE" \
+     | curl -sS -X PUT "$URL/api/v1/notifications/channels/app-hook/secret" -H @"$HEADER_FILE" \
+            -H 'Content-Type: application/json' --data-binary @-
+   rm -rf "$(dirname "$HEADER_FILE")"         # the token's header file and the key file go with their directory
+   ```
+
+3. **What the receiver checks.** Each request is a POST with `Content-Type: application/json` and three headers:
+   `webhook-id`, `webhook-timestamp` (the try's time in Unix seconds) and `webhook-signature`. A Standard Webhooks
+   library makes the first two checks; the third is the receiver's own:
+   * **The signature.** Take the body as it arrived, byte for byte, before any JSON parsing. Compute the HMAC-SHA256
+     of `webhook-id`, a `.`, `webhook-timestamp`, a `.` and the body, keyed with the bytes the base64 after `whsec_`
+     encodes; base64 it, and compare it in constant time with the value after `v1,` in `webhook-signature` (the header
+     may carry several signatures, separated by spaces: one match is enough). Refuse the request otherwise.
+   * **The timestamp.** Refuse a `webhook-timestamp` far from the receiver's own clock: a replayed request is old.
+     Each try is signed anew with its own time, so a retry passes.
+   * **The id.** Answer 2xx to a `webhook-id` already accepted, and do nothing more with it: the id, `<channel>_<seq>`
+     (`_2` after it when one event made two messages), is the same on every try and after a restart of the control
+     plane (SDD §24.6). Keep the ids longer than a copy can arrive - a message is not sent once its event is an hour
+     old, and its tries take minutes more -: two hours is enough.
+
+   Answer with a 2xx within 15 s and do the work afterwards: at 15 s the control plane gives the try up and tries
+   again. 408, 429 and a 5xx are tried again, a `Retry-After` of up to 300 s honoured; any other 4xx, 410 included,
+   and a 3xx fail the message for good - no redirect is followed. The body is the Standard Webhooks payload,
+   `{"type": "<the trigger>", "timestamp": "<the event's time>", "data": {...}}`, `type` a trigger such as
+   `downtime.started` and `data` holding `title`, `lines`, `link`, `topic`, `event_seq`, `event_kind`, `plan_id`,
+   `plan_name`, `wave_id`, `wave_name`, `migration_id`, `vm_name`, `strategy`, `phase`, `downtime_s`, `estimate_s`
+   and `slo_s` (SDD §24.5). A receiver is also the way to a service Seamless does not speak - Microsoft Teams, a
+   paging service: it turns the verified document into that service's call.
+4. **Send test**, then subscribe the channel as in item 3.
+
+A channel's secret made outside the control plane works under the channel's own name: the file `url` or
+`signing_key` in the directory `notify-<name>` of the `seamless-secrets` volume, or on a cluster the Secret
+`seamless-notify-<name>` with that key, labelled `seamless.io/provider-secret: "true"` as above (SDD §13.3, §24.3).
+
+**5. Rotating a channel's secret.** The control plane reads a channel's secret at every try, so a new one takes
+effect at the next try, with no restart (SDD §24.3).
+
+* **A Slack webhook:** add a new webhook for the same Slack channel, set it (**Set secret**, or the `PUT` of item 3),
+  **Send test**, then remove the old webhook in the Slack app's incoming webhooks, which revokes its URL. A URL that
+  leaked goes first (Security.md §13.2, playbook I): until the new one is set, the channel's messages fail at once
+  (`no_service`) and are recorded so.
+* **A signing key:** let the receiver accept a signature made with either the old or the new key, set the new one,
+  **Send test**, and drop the old key at the receiver a minute later: only a request already in flight carries it.
+* **The relay's credential:** make the new password at the relay - or, better, a new relay user -, write the secret
+  `SEAMLESS_SMTP_SECRET` names again (item 1's commands), **Send test** on an email channel, then retire the old one.
+  A message the relay refuses meanwhile fails for good (`535`).
+* **Deleting a channel** deletes the secret the store wrote for it; when the store could not, `channel.deleted` says
+  so (`secret_left`): remove it by hand - the directory `notify-<name>` in the `seamless-secrets` volume, or the
+  Secret `seamless-notify-<name>`.
+
+**6. Watching delivery.** The Notifications page shows each channel's state: its last outcome with the time and the
+reason, and its failures in a row (`GET /api/v1/notifications/channels`, each channel's `cursor`). The Events page
+lists one `notification.sent` or `notification.failed` per message, with its channel, trigger, key, tries and reason -
+never the URL, a recipient or the body. `/metrics` counts them as `seamless_notifications_total{kind,outcome}`: alert
+on `increase(seamless_notifications_total{outcome="failed"}[15m]) > 0`. **Disable** stops a channel while its
+receiver is down for maintenance: the channel skips the events meanwhile, and **Enable** sends again from then on.
+
+| Reason | Meaning and fix |
+|---|---|
+| `no_relay` | `SEAMLESS_SMTP_HOST` or `SEAMLESS_SMTP_FROM` is unset (item 1). |
+| `no_starttls` | The relay offered no STARTTLS on that port, and nothing was sent: turn STARTTLS on at the relay, or use `tls` on 465. |
+| `tls_error` | The TLS session with the relay failed, most often on a certificate the system's CAs do not verify: give its CA in `SEAMLESS_SMTP_CA_FILE`, and check that `SEAMLESS_SMTP_HOST` is a name the certificate holds. Tried again. |
+| an SMTP reply code: `451`, `530`, `535`, `550`, ... | The relay's reply: a 4yz is tried again, a 5yz is final. `530` and `535`: authentication required or refused - check the secret `SEAMLESS_SMTP_SECRET` names; `550`, `553`, `554`: the relay refuses the sender or every recipient. A message the relay accepted for some recipients is sent, and counts the others as `refused`. |
+| `no_secret` | A Slack channel whose secret is missing or whose `url` does not begin with `https://hooks.slack.com/services/`, or a webhook channel without a `signing_key` of `whsec_` and base64: set it (item 3 or 4). Nothing was sent. |
+| `no_service`, `channel_not_found`, `channel_is_archived`, `invalid_payload`, another 4xx (Slack) | The webhook was removed or revoked, its Slack channel archived or deleted, or the app removed: add a new webhook and set it (item 5). Final. |
+| `redirect` | The receiver answered a 3xx: give the channel the URL the receiver answers at itself. Final. |
+| `410`, another 4xx (a webhook) | The receiver refused the message - a signature it could not verify (its key is not the channel's), a timestamp its clock calls old. Final. |
+| `429`, a 5xx, or an error's class: `ConnectError`, `ConnectTimeout`, `ReadTimeout`, `TimeoutError`, `ConnectionRefusedError`, ... | Tried 5 times over about 5 minutes, then failed: is the egress open (item 2), and the relay or the receiver up? |
+| `expired` | Messages whose event was more than an hour old when their turn came - after an outage of the channel or of the control plane: one `notification.failed` counts them (`expired`) with their first and last `seq`. The channel goes on with the next. |
 
 ---
 
