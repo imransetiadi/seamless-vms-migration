@@ -756,7 +756,9 @@ rm -rf "$(dirname "$HEADER_FILE")"              # done: the header file goes wit
 
 A channel's secret made outside the control plane works under the channel's own name: the file `url` or
 `signing_key` in the directory `notify-<name>` of the `seamless-secrets` volume, or on a cluster the Secret
-`seamless-notify-<name>` with that key, labelled `seamless.io/provider-secret: "true"` as above (SDD §13.3, §24.3).
+`seamless-notify-<name>` with that key, labelled `seamless.io/provider-secret: "true"` as above, or the variables
+`SEAMLESS_SECRET_NOTIFY_<NAME>_URL` or `SEAMLESS_SECRET_NOTIFY_<NAME>_SIGNING_KEY` in the control plane's environment (the
+name upper-cased, every other character `_`), read after the files and the store (SDD §13.3, §24.3; since PR #151).
 
 **5. Rotating a channel's secret.** The control plane reads a channel's secret at every try, so a new one takes
 effect at the next try, with no restart (SDD §24.3).
