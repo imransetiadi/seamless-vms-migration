@@ -103,6 +103,47 @@ def test_a_steps_conversion_host_pin_is_its_credentials():
     assert host_pin(both, credential_project(Step.MIGRATION, SOURCE, make_plan())) == own_pin
 
 
+def test_declared_keys_and_the_address_are_the_providers_own_hosts():
+    """SDD §7.2, §10, §26.3, §26.4 (§26.10 decisions 12 and 13, the owner's decisions of
+    2026-10-29): the keys an operator declares and the address a host is looked up by belong to
+    the conversion host the provider's own credential reaches - for its own credential, None, the
+    provider's conversion_host.ssh_host_keys and conversion_host.address -, and to no project's
+    host, a server Seamless creates in that project: none for a project credential the provider
+    holds, nor for one it does not. A provider without a conversion host, or a host without
+    them, gives none."""
+    from seamless_migrate.credentials import declared_keys, host_address
+    from seamless_migrate.domain.models import ConversionHostConfig
+    from tests.key_support import public_key
+
+    a, gone = project(), project()
+    keys = [public_key(1, "root@conv-src"), public_key(2, "root@conv-src")]
+    host = ConversionHostConfig(name="conv-src", address="192.0.2.10", ssh_host_keys=keys)
+    provider = make_provider(
+        id="src-osp", conversion_host=host, project_credentials=project_credentials("src-osp", a)
+    )
+    assert declared_keys(provider, None) == tuple(keys)
+    assert host_address(provider, None) == "192.0.2.10"
+    for project_id in (a, gone):
+        assert declared_keys(provider, project_id) == (), project_id
+        assert host_address(provider, project_id) is None, project_id
+    for bare in (
+        provider.model_copy(update={"conversion_host": None}),
+        make_provider(conversion_host=ConversionHostConfig(name="conv-src")),
+    ):
+        assert (declared_keys(bare, None), host_address(bare, None)) == ((), None)
+
+    # the step's: the selection of §27.5, then the host its credential reaches
+    plan = make_plan(source_project=a)
+    assert declared_keys(provider, credential_project(Step.MIGRATION, SOURCE, plan)) == ()
+    assert host_address(provider, credential_project(Step.PRESTAGE, SOURCE, plan)) is None
+    assert host_address(provider, credential_project(Step.KIT, SOURCE, plan)) == "192.0.2.10"
+    plain = credential_project(Step.MIGRATION, SOURCE, make_plan())
+    assert (declared_keys(provider, plain), host_address(provider, plain)) == (
+        tuple(keys),
+        "192.0.2.10",
+    )
+
+
 async def test_the_verification_reads_placement_with_the_providers_credential():
     """SDD §7.5, §22.8, §27.5: the verification of a plan with a destination project reads the
     server with the project's credential and its allocations - Placement's - with the destination

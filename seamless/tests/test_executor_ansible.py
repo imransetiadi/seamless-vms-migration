@@ -6897,6 +6897,113 @@ async def test_a_projects_replaced_host_is_refused_and_no_other_pin_is_touched(e
     )
 
 
+async def test_a_projects_host_is_looked_up_by_its_name_in_its_project_never_by_the_address(
+    env, store
+):
+    """SDD §7.2, §10, §26.4 (§26.10 decision 13, the owner's decision of 2026-10-29): a run of a
+    plan with a project looks its host up by its name alone, with the project's credential, in
+    that project - never by conversion_host.address, the provider's own host's. A project
+    credential that sees the provider's own host at that address (an admin's) never takes it for
+    the project's host: one whose name no server of the project bears is not found, and the run
+    fails as a lookup that fails - transient, before any playbook, no console read and nothing
+    pinned -, whether the project holds a pin or none; a rollback logs it and runs without a key
+    for that host. A plan without a project still finds the provider's own host by its address,
+    and the project's host, once named in its project, runs on its project's pin."""
+    from seamless_migrate.domain.models import Provider
+    from tests.orch_support import build_harness
+
+    check_keys(env)
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    c = tenant_project()
+    source = pinned(SRC, "srv-src-1", 1)
+    unpinned = tenants(env, pinned(DST, "srv-own", 2), c)
+    destination = project_pinned(unpinned, c, "srv-c-1", 3)
+    plan = make_plan(id="plan-0000000c", mappings=MAPPINGS, destination_project=c)
+    for kind, document in (("provider", source), ("provider", destination), ("plan", plan)):
+        store.put(kind, document)
+    # no server bears the destination host's name, for the provider's credential nor in project
+    # c; the provider's own host holds its address, where every credential sees it
+    env.registry.servers = {"conv-src": "srv-src-1"}
+    env.registry.servers_of = {of_project(DST, c): {}}
+    env.registry.addresses = {"192.0.2.10": "srv-own"}
+    env.registry.consoles = {"srv-own": keys_console(public_key(2))}
+    not_found = f"no server is named conv-dst in project {c}"
+    failure = (
+        f"could not look up the destination conversion host conv-dst in RHOSO 18.0: {not_found}"
+    )
+
+    def by_address():
+        return env.registry.used("server_of_address")
+
+    for held in (destination, unpinned):  # with the project's pin, then with none
+        store.put("provider", held)
+        for step in (StepName.CUTOVER, StepName.PRECOPY):
+            ctx, rec = tenant_ctx(env, plan, source, held)
+            with pytest.raises(TransientStepError) as failed:
+                await env.executor.run(
+                    step, booked(ctx, h.orch.host_keys(plan.id, ctx.migration.id))
+                )
+            assert str(failed.value) == failure, step
+            assert rec.downtime_marks == 0 and read_log(env.log) == [], step
+    # the book's console read looks the project's host up the same way: nothing at the address
+    # is read or pinned for the project
+    await h.orch.host_keys(plan.id, "mig-1").pin_from_console(unpinned)
+    # a host without a name: looked up, and named, by its side's alias alone
+    nameless = hosted(destination, name=None)
+    store.put("provider", nameless)
+    ctx, _ = tenant_ctx(env, plan, source, nameless)
+    with pytest.raises(TransientStepError) as failed:
+        await env.executor.run(
+            StepName.PRECOPY, booked(ctx, h.orch.host_keys(plan.id, ctx.migration.id))
+        )
+    assert str(failed.value) == (
+        "could not look up the destination conversion host os_migrate_conv_dst in RHOSO 18.0: no "
+        f"server is named os_migrate_conv_dst in project {c}"
+    )
+    store.put("provider", unpinned)
+    assert of_project(DST, c) not in by_address()
+    assert [call for call in env.registry.calls if call[0] == "console_log"] == []
+    assert (
+        store.get("provider", DST.id, Provider).project_credentials == unpinned.project_credentials
+    )
+    assert "conversion_host.key_pinned" not in [e.kind for e in store.events(since_seq=0)]
+
+    # a rollback logs it and runs, without a key for that host
+    store.put("provider", destination)
+    ctx, rec = tenant_ctx(env, plan, source, destination)
+    await env.executor.run(
+        StepName.ROLLBACK, booked(ctx, h.orch.host_keys(plan.id, ctx.migration.id))
+    )
+    [call] = read_log(env.log)
+    assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == []
+    assert known_keys(call["known_hosts"], "os_migrate_conv_src") == [bare_key(public_key(1))]
+    assert [line for line in rec.logs if not_found in line] == [
+        f"could not look up the destination conversion host conv-dst in RHOSO 18.0 ({not_found}): "
+        "no pin applies to it in this run"
+    ]
+
+    # a plan without a project: the provider's own host, found by its address, on its own pin
+    ctx, _ = ctx_for(env, source=source, destination=destination)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    calls = read_log(env.log)[1:]
+    assert calls
+    for call in calls:
+        assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(2))]
+    assert by_address() == [own(DST)]
+
+    # the project's host, named in its project: its project's pin, never the address
+    env.registry.servers_of = {of_project(DST, c): {"conv-dst": "srv-c-1"}}
+    before = len(read_log(env.log))
+    ctx, _ = tenant_ctx(env, plan, source, destination)
+    await env.executor.run(StepName.SYNC, booked(ctx, h.orch.host_keys(plan.id, ctx.migration.id)))
+    calls = read_log(env.log)[before:]
+    assert calls
+    for call in calls:
+        assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(3))]
+    assert by_address() == [own(DST)]
+
+
 def keys_console(*keys):
     """A conversion host's console as cloud-init leaves it, with its keys block when keys are
     given (synthetic, its address in RFC 5737's 192.0.2.0/24)."""
@@ -7470,6 +7577,103 @@ async def test_two_projects_of_one_provider_each_keep_their_own_conversion_host_
     await h.orch.host_keys(plans[a].id).pin_injected(after, "source", "srv-a-9", [injected[a]])
     assert stored().project_credentials == kept
     assert stored().conversion_host_pin == source.conversion_host_pin and len(pins()) == 2
+
+
+async def test_a_projects_host_is_injected_and_pinned_though_its_provider_declares_keys(
+    env, store, monkeypatch
+):
+    """SDD §7.2, §26.3, §26.4 (§26.10 decision 12, the owner's decision of 2026-10-29): the keys
+    a provider declares are its own conversion host's, never a project's. On a source provider
+    that declares keys, the pre-staging of a plan with a source project injects a key into the
+    host its role creates in the project and pins that server with it on the project's
+    credential, and the plan's runs check the host against that pin - never the declared keys,
+    which that host does not present. A plan without a project keeps the provider's own host on
+    its declared keys: its pre-staging injects nothing there and its runs check that host against
+    them. The provider's own pin and its declared keys stay as they were."""
+    from seamless_migrate.domain.models import Provider
+    from tests.orch_support import build_harness
+
+    check_keys(env)
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    a = tenant_project()
+    source = tenants(env, declaring(SRC, 9), a)
+    destination = pinned(DST, "srv-dst-1", 2)
+    plan = make_plan(id="plan-0000000a", mappings=MAPPINGS, source_project=a)
+    plain = make_plan(id="plan-0000000b", mappings=MAPPINGS)
+    for kind, document in (
+        ("provider", source),
+        ("provider", destination),
+        ("plan", plan),
+        ("plan", plain),
+    ):
+        store.put(kind, document)
+    declared = [bare_key(public_key(9))]
+    # the provider's own host exists; project a holds none yet: its pre-staging's role creates it
+    env.registry.servers = {"conv-src": "srv-own", "conv-dst": "srv-dst-1"}
+    env.registry.servers_of = {of_project(SRC, a): {}}
+    seen = capture_host_keys(env, monkeypatch)
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            created=[("os_migrate_conv_src", "srv-a-1")],
+            found=[("os_migrate_conv_dst", "srv-dst-1")],
+        ),
+    )
+
+    def stored():
+        return store.get("provider", SRC.id, Provider)
+
+    def deploys():
+        return [c for c in read_log(env.log) if c["playbook"] == "deploy_conversion_hosts.yml"]
+
+    await env.executor.prestage(
+        plan,
+        stored(),
+        destination,
+        deploy_conversion_hosts=True,
+        host_keys=h.orch.host_keys(plan.id),
+    )
+    assert list(seen) == ["os_migrate_src_conversion_host_key_private_path"], (
+        "a key injected into the project's new host"
+    )
+    injected = public_half(seen.pop("os_migrate_src_conversion_host_key_private_path")[2])
+    assert known_keys(deploys()[-1]["known_hosts"], "os_migrate_conv_src") == [injected]
+    after = stored()
+    pin = after.project_credentials[a].conversion_host_pin
+    assert (pin.server_id, pin.keys, pin.source) == ("srv-a-1", [injected], "injected")
+    assert after.conversion_host_pin is None
+    assert after.conversion_host == source.conversion_host
+
+    # the plan's runs check the project's host against its project's pin alone
+    env.registry.servers_of = {of_project(SRC, a): {"conv-src": "srv-a-1"}}
+    before = len(read_log(env.log))
+    ctx, _ = tenant_ctx(env, plan, after, destination)
+    await env.executor.run(
+        StepName.PRECOPY, booked(ctx, h.orch.host_keys(plan.id, ctx.migration.id))
+    )
+    calls = read_log(env.log)[before:]
+    assert calls
+    for call in calls:
+        assert known_keys(call["known_hosts"], "os_migrate_conv_src") == [injected]
+
+    # a plan without a project: the provider's own host on its declared keys, nothing injected
+    before = len(read_log(env.log))
+    await env.executor.prestage(
+        plain,
+        after,
+        destination,
+        deploy_conversion_hosts=True,
+        host_keys=h.orch.host_keys(plain.id),
+    )
+    ctx, _ = ctx_for(env, source=after, destination=destination)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    calls = read_log(env.log)[before:]
+    assert seen == {} and "deploy_conversion_hosts.yml" in [c["playbook"] for c in calls]
+    for call in calls:
+        assert known_keys(call["known_hosts"], "os_migrate_conv_src") == declared
+    assert stored().project_credentials == after.project_credentials
+    assert stored().conversion_host_pin is None
 
 
 def offered_by(seed):

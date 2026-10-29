@@ -54,6 +54,7 @@ from .credentials import (
     Step,
     credential_project,
     for_step,
+    host_address,
     host_pin,
     implementation,
     reservation,
@@ -837,21 +838,27 @@ def _projects_report(
     return report
 
 
-async def _conversion_host_server(provider: Provider, impl: Any) -> tuple[str, str] | None:
-    """The server the provider's conversion host resolves to with ``impl``, and what found it
-    (SDD §10 "Host key pins"): by its name - the side's as the executor names the host when it has
-    none -, else by its address; None when nothing answers, or when there is no host or nothing
-    to look it up with. Raises ProviderError."""
+async def _conversion_host_server(
+    provider: Provider, impl: Any, project: str | None = None
+) -> tuple[str, str | None] | None:
+    """The server the conversion host the credential of ``project`` reaches - the provider's
+    own for None - resolves to with ``impl``, and what found it (SDD §10 "Host key pins"): by
+    its name - the side's as the executor names the host when it has none -, else by its
+    address, the provider's own host's alone: a project's host is looked up by its name in its
+    project alone (``host_address``, §26.10 decision 13). The server None, with what it was
+    looked up by, when nothing answers; None when there is no host or nothing to look it up
+    with. Raises ProviderError."""
     host = provider.conversion_host
     find = getattr(impl, "find_server", None)
     if host is None or find is None:
         return None
     found_by = host.name or CONVERSION_HOST_NAMES[str(provider.role)]
     server = await find(found_by)
+    address = host_address(provider, project)
     by_address = getattr(impl, "server_of_address", None)
-    if server is None and host.address and by_address is not None:
-        found_by, server = host.address, await by_address(host.address)
-    return None if server is None else (found_by, str(server))
+    if server is None and address and by_address is not None:
+        found_by, server = address, await by_address(address)
+    return found_by, None if server is None else str(server)
 
 
 def _replaced(found_by: str, server: str, pin: HostKeyPin) -> str | None:
@@ -862,6 +869,15 @@ def _replaced(found_by: str, server: str, pin: HostKeyPin) -> str | None:
     return (
         f"conversion host replaced: {found_by} is now server {server}; its pin belongs to server "
         f"{pin.server_id}"
+    )
+
+
+def _not_found(name: str, project: str, pin: HostKeyPin) -> str:
+    """The report of a project's conversion host whose name no server of the project bears (SDD
+    §10 "Host key pins", §26.10 decision 13), ``name`` being what it was looked up by."""
+    return (
+        f"conversion host not found: no server is named {name} in project {project}; its pin "
+        f"belongs to server {pin.server_id}"
     )
 
 
@@ -1297,17 +1313,19 @@ class Orchestrator:
         return _project_check("ok", await self._replaced_project_host(provider, project_id), read)
 
     async def _replaced_project_host(self, provider: Provider, project_id: str) -> str | None:
-        """The report of the project's conversion host found replaced (SDD §10 "Host key pins",
-        §26.4, §26.5): looked up with the project's credential, as a run of a plan with the
-        project finds it, when that credential holds a pin. None when it holds none, when the host
-        resolves to the pin's server or to none, and when the lookup fails - logged by its
-        provider error. A project host's console is never read, and nothing is pinned."""
+        """The report of the project's conversion host found replaced, or not found (SDD §10
+        "Host key pins", §26.4, §26.5): looked up with the project's credential, as a run of a
+        plan with the project finds it - by its name alone, in the project, never by the
+        provider's address (§26.10 decision 13) -, when that credential holds a pin, whatever
+        keys the provider declares (decision 12). None when it holds none, when the host resolves
+        to the pin's server, and when the lookup fails - logged by its provider error. A project
+        host's console is never read, and nothing is pinned."""
         pin = host_pin(provider, project_id)
         if pin is None:
             return None
         try:
             impl = implementation(self.providers, provider, project_id)
-            found = await _conversion_host_server(provider, impl)
+            found = await _conversion_host_server(provider, impl, project_id)
         except ProviderError as exc:
             log.warning(
                 "the conversion host of project %s of provider %s was not looked up: %s",
@@ -1316,7 +1334,12 @@ class Orchestrator:
                 redact(str(exc)),
             )
             return None
-        return None if found is None else _replaced(*found, pin)
+        if found is None:
+            return None
+        found_by, server = found
+        if server is None:
+            return _not_found(found_by, project_id, pin)
+        return _replaced(found_by, server, pin)
 
     async def _pin_conversion_host(
         self, provider: Provider, impl: Any, actor: str, project: str | None = None
@@ -1325,19 +1348,20 @@ class Orchestrator:
         the credential of ``project``, the provider's own for None - reaches (SDD §10 "Host key
         pins", §26.3, §26.4): the pin its console gives and the event that announces it, or the
         report of a pin of another server. The host's server is found by its name - the side's as
-        the executor names the host when it has none -, else by its address. Without a pin of
-        that credential (``host_pin``), its whole console pins what the parser keeps; a pin of
-        that server reads nothing more; a pin of another server is kept, neither used nor
-        replaced, and reported. Nothing of the console is logged."""
+        the executor names the host when it has none -, else, the provider's own host alone, by
+        its address (§26.10 decision 13). Without a pin of that credential (``host_pin``), its
+        whole console pins what the parser keeps; a pin of that server reads nothing more; a pin
+        of another server is kept, neither used nor replaced, and reported. Nothing of the
+        console is logged."""
         read = getattr(impl, "console_log", None)
         if provider.kind == ProviderKind.vmware or read is None:
             return None, None, None
         side = str(provider.role)
         try:
-            found = await _conversion_host_server(provider, impl)
-            if found is None:
+            found = await _conversion_host_server(provider, impl, project)
+            found_by, server = found if found is not None else ("", None)
+            if server is None:
                 return None, None, None
-            found_by, server = found
             pin = host_pin(provider, project)
             if pin is not None:
                 return None, _replaced(found_by, server, pin), None
