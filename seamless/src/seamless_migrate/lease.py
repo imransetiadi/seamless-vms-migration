@@ -184,8 +184,14 @@ class Lease:
                 ).first()
             if row is None:
                 with conn.begin():
-                    # an INSERT's rowcount is no driver's promise: the row it returns, or none
-                    first = conn.execute(self._first(conn.dialect.name)).scalar()
+                    conn.execute(self._first(conn.dialect.name))
+                    # an INSERT's rowcount is no driver's promise, and RHEL 9's SQLite (3.34.1) has
+                    # no RETURNING: the row this transaction reads back as its holder's, or none
+                    first = conn.execute(
+                        sa.select(leases.c.epoch).where(
+                            leases.c.name == self.name, leases.c.holder == self.holder
+                        )
+                    ).scalar()
                 return None if first is None else int(first)
             if not row.expired:
                 return None
@@ -198,20 +204,22 @@ class Lease:
                     ).first()
                     if locked is None:
                         return None  # renewed or taken since it was read
-                    taken = conn.execute(
+                    # the row is this transaction's until it ends, so its next epoch is known
+                    # without RETURNING, which RHEL 9's SQLite (3.34.1) does not have
+                    taken = int(locked.epoch) + 1
+                    conn.execute(
                         leases.update()
                         .where(leases.c.name == self.name)
                         .values(
                             holder=self.holder,
                             address=self.address,
-                            epoch=leases.c.epoch + 1,
+                            epoch=taken,
                             acquired_at=db_now(),
                             renewed_at=db_now(),
                             expires_at=self._later(),
                         )
-                        .returning(leases.c.epoch)
-                    ).scalar_one()
-                    return int(taken)
+                    )
+                    return taken
             except sa.exc.OperationalError as exc:
                 if not _lock_wait_ended(exc):
                     raise
@@ -219,8 +227,8 @@ class Lease:
                 return None
 
     def _first(self, dialect: str) -> Any:
-        """The row of the first holder, epoch 1, returning its epoch; of two inserting at once, one
-        takes it and the other's returns no row."""
+        """The row of the first holder, epoch 1; of two inserting at once, one takes it and the
+        other's inserts nothing."""
         insert = postgresql.insert if dialect == "postgresql" else sqlite.insert
         return (
             insert(leases)
@@ -234,7 +242,6 @@ class Lease:
                 expires_at=self._later(),
             )
             .on_conflict_do_nothing(index_elements=[leases.c.name])
-            .returning(leases.c.epoch)
         )
 
     def renew(self, epoch: int) -> bool:
