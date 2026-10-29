@@ -13,9 +13,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
+from ..credentials import implementation
 from ..domain.enums import Strategy
 from ..domain.models import Migration, Plan, Provider, SyncPass
+from ..planning.preflight import project_check, project_words
+from ..providers.base import ProviderError
 
 T = TypeVar("T")
 
@@ -116,6 +120,31 @@ class PermanentStepError(Exception):
         #: what the step reported before it failed, e.g. the simulator's ``downtime_model_s``
         #: (SDD §5.2, §7.1)
         self.details: dict[str, Any] = dict(details or {})
+
+
+async def sign_in(registry: Any, provider: Provider, project_id: str, side: str) -> None:
+    """The executors' sign-in with a plan's project credential before a step's first playbook or
+    call (SDD §7.1, §27.5, §27.7, plan task TC7): ``check_project`` (§10) of what acts with that
+    credential, one sign-in on a connection of its own. A failure - Keystone refuses it or does
+    not answer within the call's bound, the secret cannot be read, the provider holds no
+    credential for the project, its token is another project's - is a PermanentStepError before
+    anything of the step changes, never replaced by the provider's own credential; it names the
+    provider, the project and the plan's ``side``, never the credential."""
+    words = project_words(project_id, project_check(provider.capabilities, project_id))
+    whose = f"the credential of project {words} at {provider.label}, the plan's {side} project,"
+    try:
+        read = await implementation(registry, provider, project_id).check_project(project_id)
+    except ProviderError as exc:
+        raise PermanentStepError(
+            f"{whose} cannot sign in: {redact_cut(str(exc), 300)}; an admin writes a new one - "
+            "it is never replaced by the provider's own credential (SDD §27.5)"
+        ) from None
+    scoped = read.get("project_id") if isinstance(read, Mapping) else None
+    if scoped != project_id:
+        raise PermanentStepError(
+            f"{whose} signs in to project {scoped} instead: an admin writes the project's own "
+            "(SDD §27.5)"
+        )
 
 
 async def outlive_cancel(work: Awaitable[T]) -> T:

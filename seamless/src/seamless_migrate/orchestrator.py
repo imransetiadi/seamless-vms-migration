@@ -53,6 +53,7 @@ from .conversion_key import resolve as resolve_conversion_key
 from .credentials import (
     Step,
     credential_project,
+    cutover_hold,
     for_step,
     host_address,
     host_pin,
@@ -4000,6 +4001,26 @@ class Orchestrator:
             return False
         return plan.auto_cutover or m.cutover_requested
 
+    async def _cutover_held(
+        self, m: Migration, plan: Plan, now: datetime, read: dict[str, Provider] | None = None
+    ) -> str | None:
+        """Why rule 6 of the cutover gate holds ``m``'s cutover at ``now`` (SDD §5.4, §27.7, plan
+        task TC7): a project credential its step and a rollback would use, as its provider's
+        record holds it - ``read`` keeps the providers a tick read once. None for a plan that names
+        no project, which reads no provider for it and behaves as before."""
+        if plan.source_project is None and plan.destination_project is None:
+            return None
+        read = {} if read is None else read
+        sides: list[Provider] = []
+        for provider_id in (plan.source_provider_id, plan.destination_provider_id):
+            if provider_id not in read:
+                try:
+                    read[provider_id] = await self.db.get("provider", provider_id, Provider)
+                except NotFound:
+                    return f"provider {provider_id} no longer exists"
+            sides.append(read[provider_id])
+        return cutover_hold(plan, m.strategy, sides[0], sides[1], now)
+
     async def _tick_plan(
         self, plan: Plan, migs: list[Migration], counts: dict[str, int], now: datetime
     ) -> None:
@@ -4046,6 +4067,8 @@ class Orchestrator:
             key=lambda m: (waves[m.wave_id].order if m.wave_id in waves else 0, m.created_at),
         )
         gate_open: set[str] = set()
+        # the plan's providers as rule 6 reads them, once in this tick (SDD §5.4)
+        providers: dict[str, Provider] = {}
 
         # the places the destination's GPU VMs hold in this tick (SDD §22.7): each one a cutover
         # slot, a step and its wave's room, kept from the migrations of its destination behind it
@@ -4080,6 +4103,11 @@ class Orchestrator:
                 continue
             if m.advisor_hold is not None:
                 continue  # its advisor decision waits for approval: no read, no step (§14.6)
+            if await self._cutover_held(m, plan, now, providers) is not None:
+                # a credential it and a rollback would use may not last the cutover: its source
+                # keeps running, a warm one its keep-warm passes; no GPU read, no place held
+                # (SDD §5.4 rule 6)
+                continue
             gpu = bool(vm_gpus(m.vm))
             if gpu:
                 place = self._gpu_place(m, now, destination)
@@ -4193,6 +4221,10 @@ class Orchestrator:
             if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
                 # the tick saw the gate open on its snapshot; an action under this lock (e.g.
                 # set_strategy clearing the approvals) may have closed it since (SDD §5.4)
+                return False
+            if to == P.cutover and await self._cutover_held(m, plan, self._now()) is not None:
+                # a credential written since the tick's snapshot, or a check that read it, holds
+                # it now (SDD §5.4 rule 6)
                 return False
             if to == P.cutover and not await self._gpu_room_now(m):
                 # its GPU capacity read no longer counts, or a cutover it did not count started

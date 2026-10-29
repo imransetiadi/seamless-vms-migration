@@ -98,6 +98,7 @@ from .base import (
     StepResult,
     TransientStepError,
     outlive_cancel,
+    sign_in,
 )
 
 log = logging.getLogger(__name__)
@@ -1591,6 +1592,18 @@ class AnsibleExecutor:
             credential_project(step, ProviderRole.destination, plan),
         )
 
+    async def _sign_in(
+        self, step: Step, plan: Plan, source: Provider, destination: Provider
+    ) -> None:
+        """A run's sign-in with each project credential ``step`` acts with, the source's first,
+        before its first call or playbook (SDD §7.1, §27.7, plan task TC7): none on a side that
+        acts with the provider's own credential, so a plan that names no project signs in as
+        before - its playbooks and calls do."""
+        sides = (("source", source), ("destination", destination))
+        for (side, provider), project in zip(sides, self._projects(step, plan), strict=True):
+            if project is not None:
+                await sign_in(self.providers, provider, project, side)
+
     # -- prestage ------------------------------------------------------------------------------
     async def prestage(
         self,
@@ -1635,6 +1648,11 @@ class AnsibleExecutor:
             playbooks.append(_Playbook("rekey_conversion_hosts.yml"))
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
+        if playbooks:
+            # the plan's project credentials sign in before the hosts' lookups and the first
+            # playbook (SDD §7.1, §27.5's pre-staging row; the flavor import's destination is the
+            # provider's own)
+            await self._sign_in(Step.PRESTAGE, plan, source, destination)
         # a pre-staging always passes the installation's key: the orchestrator resolved it, and
         # the deploy generates it when none exists yet (SDD §7.2)
         variables = _common_openstack_vars(
@@ -1983,9 +2001,12 @@ class AnsibleExecutor:
             return await self._finalize(ctx)
         if step == StepName.ROLLBACK and strategy in VMWARE:
             return await self._vmware_rollback(ctx)
+        # the run's project credentials sign in before anything of it: one that cannot fails the
+        # step before its first call (SDD §7.1, §27.7)
+        await self._sign_in(self._step_of(ctx), ctx.plan, ctx.source, ctx.destination)
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
-        # the conversion hosts' keys first: nothing of the run happens before them (SDD §7.2)
+        # then the conversion hosts' keys: nothing else of the run happens before them (SDD §7.2)
         trust = await self._run_trust(ctx, step, rdir)
         reexport = False
         networks: list[dict[str, Any]] | None = None
@@ -2858,6 +2879,10 @@ class AnsibleExecutor:
                     "reason": "deleting a VMware source VM is not automated: delete it in vCenter",
                 }
             )
+        # the deletion acts at the source alone: its project credential signs in first (SDD §7.1)
+        project = credential_project(self._step_of(ctx), ProviderRole.source, ctx.plan)
+        if project is not None:
+            await sign_in(self.providers, ctx.source, project, "source")
         try:
             await self._client(ctx, ctx.source).delete_server(ctx.migration.vm.source_id)
         except ProviderError as exc:

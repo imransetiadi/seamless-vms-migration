@@ -1117,12 +1117,30 @@ class Reached:
         return Service()
 
 
-def _project_handover(tmp_path):
-    """setup()'s handover of a plan with projects - tenant-a's at the source, tenant-c's at the
-    destination (SDD §4.2, §27.5) - whose connections record the credential of each call."""
-    from tests.credential_support import of_project, own, project_credentials, tenant_project
+class SignsIn:
+    """A provider as the executors' sign-in reaches it (SDD §7.1, §10 check_project): a sign-in
+    with its credential for a project reads a token of that project. Wrapped in
+    tests/credential_support.py's registry, each sign-in is recorded with its credential, and one
+    of a revoked project is refused as Keystone refuses it."""
 
-    _, calls, clouds, plan, mig, settings = setup(tmp_path)
+    async def check_project(self, project_id):
+        return {"project_id": project_id, "project_name": "tenant-c", "domain": "Default"}
+
+
+def _project_handover(tmp_path, **setup_kw):
+    """setup()'s handover of a plan with projects - tenant-a's at the source, tenant-c's at the
+    destination (SDD §4.2, §27.5) - whose connections record the credential of each call, and
+    whose provider registry signs in with its project credentials (§7.1): ``executor.providers``,
+    its sign-ins in ``.calls``, a project's credential refused once it is in ``.revoked``."""
+    from tests.credential_support import (
+        CredentialRegistry,
+        of_project,
+        own,
+        project_credentials,
+        tenant_project,
+    )
+
+    _, calls, clouds, plan, mig, settings = setup(tmp_path, **setup_kw)
     a, c = tenant_project(), tenant_project()
     used: list[tuple[str, str]] = []
 
@@ -1130,7 +1148,8 @@ def _project_handover(tmp_path):
         credential = own(provider) if project_id is None else of_project(provider, project_id)
         return Reached(clouds[provider.cloud], credential, used)
 
-    executor = HandoverExecutor(settings, conn_factory=connect, poll_s=0)
+    registry = CredentialRegistry(SignsIn(), SignsIn())
+    executor = HandoverExecutor(settings, conn_factory=connect, poll_s=0, providers=registry)
     src = SRC.model_copy(update={"project_credentials": project_credentials(SRC.id, a)})
     dst = DST.model_copy(update={"project_credentials": project_credentials(DST.id, c)})
     plan = plan.model_copy(update={"source_project": a, "destination_project": c})
@@ -1179,6 +1198,65 @@ async def test_a_handover_into_a_project_acts_at_the_source_with_the_providers_c
     used.clear()
     await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
     assert {credential for credential, op in used if credential.startswith(SRC.id)} == {cred.src}
+
+
+async def test_a_handover_whose_destination_credential_cannot_sign_in_stops_nothing(tmp_path):
+    """SDD §7.1, §7.3 step 0, §27.5, §27.7 (plan task TC7): a handover into a project signs in with
+    its destination half's project credential before its first call - a resumed cutover too.
+    Keystone refusing it fails the cutover permanently before anything: no call of either cloud,
+    the source never stopped, no clock opened, never the destination provider's own credential
+    instead; the failure names the destination provider and the project, never the credential.
+    Its rollback signs in before its first call at the destination - refused, it changes nothing
+    -, and one with nothing to undo there starts the source without it."""
+    executor, calls, clouds, plan, mig, settings, src, dst, used, cred = _project_handover(
+        tmp_path, dst_crash_on="create_server"
+    )
+    registry = executor.providers
+    project = plan.destination_project
+    registry.revoked.add(project)
+    ctx, rec = make_ctx(plan, mig, src, dst, settings)
+    with pytest.raises(PermanentStepError) as failed:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert (used, calls, rec.downtime_marks) == ([], [], 0)
+    assert registry.calls == [(cred.dst, "check_project")]
+    text = str(failed.value)
+    assert DST.label in text and project in text and "HTTP 401" in text, text
+    assert "secret" not in text.lower()
+
+    # signed in, the cutover stops the source and fails at the destination's create; its resume,
+    # the credential refused again, signs in before its first call and stops nothing more
+    registry.revoked.clear()
+    with pytest.raises(PermanentStepError, match="create the server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    assert ("src", "stop_server", "srv-1") in calls
+    registry.revoked.add(project)
+    used.clear()
+    calls.clear()
+    resumed, rec = make_ctx(plan, mig, src, dst, settings)
+    with pytest.raises(PermanentStepError, match=project):
+        await executor.run(StepName.CUTOVER, resumed)
+    assert (used, calls, rec.downtime_marks) == ([], [], 0)
+
+    # its rollback has the destination's managed volumes to undo: it signs in before that, and
+    # refused it changes nothing, at the destination or the source
+    with pytest.raises(PermanentStepError, match=project):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert (used, calls) == ([], [])
+
+    # a cutover that stopped the source and failed before anything was made at the destination:
+    # its rollback starts the source with the source provider's own credential, no sign-in
+    executor, calls, clouds, plan, mig, settings, src, dst, used, cred = _project_handover(
+        tmp_path / "b", crash_on="delete_server"
+    )
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    executor.providers.revoked.add(plan.destination_project)
+    executor.providers.calls.clear()
+    used.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert result.details["source_running"] is True
+    assert executor.providers.calls == []
+    assert {credential for credential, op in used} == {cred.src}
 
 
 async def test_handover_rollback_reverses_order(tmp_path):

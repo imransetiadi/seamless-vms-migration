@@ -56,6 +56,7 @@ from .base import (
     StepResult,
     TransientStepError,
     outlive_cancel,
+    sign_in,
 )
 
 log = logging.getLogger(__name__)
@@ -535,6 +536,15 @@ class HandoverExecutor:
         """The source's and the destination's connections, each with its half's credential."""
         src = await self._conn(source, self._project(plan, ProviderRole.source))
         return src, await self._conn(destination, self._project(plan, ProviderRole.destination))
+
+    async def _sign_in(self, ctx: StepContext, side: ProviderRole) -> None:
+        """The sign-in with the project credential of ``side``'s half before its first call (SDD
+        §7.1, §27.7, plan task TC7); none for a half that acts with its provider's own credential
+        - the source's, by id -, so a plan that names no project signs in as before."""
+        project = self._project(ctx.plan, side)
+        if project is not None:
+            provider = ctx.source if side == ProviderRole.source else ctx.destination
+            await sign_in(self.providers, provider, project, str(side))
 
     async def _call(self, what: str, fn: Callable[[], T]) -> T:
         try:
@@ -1425,6 +1435,11 @@ class HandoverExecutor:
                 f"a rollback attempt recreated the source server {recreated}, which runs: roll "
                 "back to finish it"
             )
+        # each half's project credential signs in before the first call, a resumed cutover's too:
+        # one that cannot fails the attempt before anything of it - a first attempt with its
+        # source running (SDD §7.1, §27.7)
+        for side in (ProviderRole.source, ProviderRole.destination):
+            await self._sign_in(ctx, side)
         src, dst = await self._halves(ctx.source, ctx.destination, ctx.plan)
         # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
         # (SDD §7.2)
@@ -1742,6 +1757,14 @@ class HandoverExecutor:
         dst = await self._conn(ctx.destination, self._project(ctx.plan, ProviderRole.destination))
         definition = await _in_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
+        signed_in: list[bool] = []
+
+        async def at_destination() -> None:
+            """The destination half's sign-in, once, before the rollback's first call there (SDD
+            §7.1): a rollback with nothing to undo there starts the source without it."""
+            if not signed_in:
+                await self._sign_in(ctx, ProviderRole.destination)
+                signed_in.append(True)
 
         # a create only sent before a crash or a timeout left a server too (SDD §7.3)
         dest_created = journal.get("create_server") or journal.get("sent:create_server")
@@ -1754,6 +1777,7 @@ class HandoverExecutor:
                     dst.compute.delete_server(server, ignore_missing=True)
                     dst.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
 
+            await at_destination()
             await self._call(f"delete the server in {ctx.destination.label}", delete_destination)
             await _in_thread(journal.mark, "rb:delete_destination")
 
@@ -1781,6 +1805,7 @@ class HandoverExecutor:
                         if ours and (not bound or bound == deleted_server):
                             dst.network.delete_port(port, ignore_missing=True)
 
+                await at_destination()
                 await self._call(
                     f"delete the port made for {n['port_id']} in {ctx.destination.label}",
                     delete_ports,
@@ -1799,6 +1824,7 @@ class HandoverExecutor:
             dest_id = managed_at_rhoso(att["volume_id"])
             key = f"rb:unmanage_dst:{att['volume_id']}"
             if dest_id and not journal.done(key):
+                await at_destination()
                 await self._call(
                     f"unmanage {dest_id} in {ctx.destination.label}",
                     lambda v=dest_id, k=key: self._unmanage(dst, v, journal, f"sent:{k}"),
