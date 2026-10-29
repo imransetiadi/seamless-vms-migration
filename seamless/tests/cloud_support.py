@@ -43,11 +43,18 @@ DESIGNATE_URL = "https://dns.example.org"
 class InProcessCloud:
     """A cloud whose compute API's maximum is ``compute`` and block storage's ``block_storage``;
     ``roles`` are its token's, ``catalog`` replaces endpoints, ``auth_url`` is where the clouds.yaml
-    entry signs in. ``servers`` are Nova's servers of the credential's project (``{id, name}``),
-    which ``GET /servers`` and ``GET /servers/detail`` list with a ``name`` filter read as Nova
-    reads it: a regular expression searched anywhere in the name - after Nova's escape of ``|``
-    when ``nova_db`` is ``mysql`` (MySQL/MariaDB REGEXP), as sent when ``postgresql`` (``~``) - and
-    a 400 for one that is no regular expression (the API schema's ``regex`` format). ``flavors``
+    entry signs in. ``servers`` are Nova's servers (``{id, name}``, with ``project_id`` when not of
+    ``project``), which ``GET /servers`` and ``GET /servers/detail`` list - those of the project the
+    request's token is scoped to alone, as Nova lists a project-scoped token's (``tokens``), the
+    detail with the server's other keys and its project as ``tenant_id`` - with a ``name`` filter
+    read as Nova reads it: a regular expression searched anywhere in the name - after Nova's escape
+    of ``|`` when ``nova_db`` is ``mysql`` (MySQL/MariaDB REGEXP), as sent when ``postgresql``
+    (``~``) - and a 400 for one that is no regular expression (the API schema's ``regex`` format);
+    a server's GET by id answers it in that detail when it is of the token's project or the token
+    holds ``admin`` (Nova's default policy), 404 otherwise; its volume attachments are none and
+    Neutron's port list is empty, so a source's ``list_vms`` and ``get_vm`` read them, and a
+    project's GET by id answers ``project``'s or an application credential's project, 404
+    another's (``projects/{id}``, plan task TC4). ``flavors``
     are what ``GET /flavors/detail`` lists (``{name, vcpus, ram, disk, extra_specs}``).
     ``placement`` gives Placement's answers by path (``/allocation_candidates``: ``(status, body)``)
     and puts Placement in the catalog at ``placement_url``; ``placement_seen`` records each request
@@ -70,7 +77,8 @@ class InProcessCloud:
     restricted unless ``unrestricted``, and its record answers its user's GET of it
     (``users/{user_id}/application_credentials/{id}``), or ``record`` (a status) instead; ``hold``
     (a ``threading.Event``) keeps its sign-in unanswered until it is set. ``sign_ins`` records who
-    each sign-in came with - the clouds.yaml user's name or an application credential's id - and
+    each sign-in came with - the clouds.yaml user's name or an application credential's id -,
+    ``tokens`` the project and the roles of each token it answered (``{project, roles}``), and
     ``records_read`` each record read. ``connect`` is what OpenStackProvider takes as
     ``connect_fn``, a project's connection too (``project_id``)."""
 
@@ -108,6 +116,7 @@ class InProcessCloud:
     )
     app_credentials: dict[str, dict[str, Any]] = field(default_factory=dict)
     sign_ins: list[str] = field(default_factory=list)
+    tokens: dict[str, dict[str, Any]] = field(default_factory=dict)
     records_read: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -259,6 +268,7 @@ class InProcessCloud:
         answers = (
             self._sign_in_answer,
             self._record_answer,
+            self._project_answer,
             self._servers_answer,
             self._flavors_answer,
             self._placement_answer,
@@ -311,6 +321,7 @@ class InProcessCloud:
         identity = json.loads(request.body)["auth"]["identity"]
         if "application_credential" not in identity["methods"]:
             self.sign_ins.append(identity["password"]["user"]["name"])
+            self.tokens["t"] = {"project": self.project["id"], "roles": list(self.roles)}
             return 201, self._token(self.project, "u1", self.roles), {"X-Subject-Token": "t"}
         given = identity["application_credential"]
         self.sign_ins.append(given["id"])
@@ -328,7 +339,9 @@ class InProcessCloud:
         token = self._token(
             known["project"], known["user_id"], known["roles"], application_credential
         )
-        return 201, token, {"X-Subject-Token": f"t-{len(self.sign_ins)}"}
+        subject = f"t-{len(self.sign_ins)}"
+        self.tokens[subject] = {"project": known["project"]["id"], "roles": list(known["roles"])}
+        return 201, token, {"X-Subject-Token": subject}
 
     def _record_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Keystone's answer to a user's GET of an application credential's record (``users/
@@ -362,6 +375,23 @@ class InProcessCloud:
             "links": {"self": url},
         }
         return 200, {"application_credential": record}, {}
+
+    def _project_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Keystone's answer to a project's GET by id (``projects/{id}``), as a token scoped to it
+        may read it: ``project``, or an application credential's project, 404 another; None for any
+        other request (plan task TC4)."""
+        identity = self._urls()["identity"].rstrip("/") + "/projects/"
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        if request.method != "GET" or not url.startswith(identity):
+            return None
+        wanted = urllib.parse.unquote(url[len(identity) :])
+        known = [self.project, *(c["project"] for c in self.app_credentials.values())]
+        found = next((p for p in known if p["id"] == wanted), None)
+        if found is None:
+            return 404, {"error": {"code": 404, "title": "Not Found"}}, {}
+        project = {"id": found["id"], "name": found["name"], "domain_id": found["domain"]["id"]}
+        return 200, {"project": project}, {}
 
     def _flavors_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Nova's answer to a list of the flavors with their details, None for any other request."""
@@ -415,12 +445,17 @@ class InProcessCloud:
         return None
 
     def _lists_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
-        """Neutron's network, subnet, floating IP and extension lists, Nova's keypairs and Cinder's
-        volume types, as an inventory reads them; None for any other request."""
+        """Neutron's network, subnet, port (none), floating IP and extension lists, Nova's keypairs
+        and Cinder's volume types - below the catalog's project, or below none, as keystoneauth asks
+        with a token of another project than the catalog's (Cinder takes either from 3.67, plan
+        task TC4) -, as an inventory reads them; None for any other request."""
         urls = {**CATALOG, **self.catalog}
         parts = urllib.parse.urlsplit(request.url)
         url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
         network, compute = urls["network"].rstrip("/"), urls["compute"].rstrip("/")
+        block = urls["block-storage"].rstrip("/").split("/v3")[0]
+        if request.method == "GET" and url == block + "/v3/types":
+            return 200, {"volume_types": []}, {}
         query = urllib.parse.parse_qs(parts.query)
         floatingips = [
             f
@@ -432,6 +467,7 @@ class InProcessCloud:
         lists = {
             network + "/v2.0/networks": {"networks": self.networks},
             network + "/v2.0/subnets": {"subnets": self.subnets},
+            network + "/v2.0/ports": {"ports": []},
             network + "/v2.0/floatingips": {"floatingips": floatingips},
             network + "/v2.0/extensions": {"extensions": self.extensions},
             compute + "/os-keypairs": {"keypairs": [{"keypair": k} for k in self.keypairs]},
@@ -455,15 +491,39 @@ class InProcessCloud:
             return 404, {"itemNotFound": {"code": 404, "message": "Keypair not found"}}, {}
         return 200, {"keypair": found[0]}, {}
 
+    def _server_detail(self, server: dict[str, Any]) -> dict[str, Any]:
+        """A server as Nova's detail writes it: its keys, its project as ``tenant_id``."""
+        detail = {"links": [], **{k: v for k, v in server.items() if k != "project_id"}}
+        return {**detail, "tenant_id": server.get("project_id", self.project["id"])}
+
     def _servers_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
-        """Nova's answer to a list of the project's servers, None for any other request."""
+        """Nova's answer to a list of the servers of the project the request's token is scoped to,
+        to a server's GET by id - of that project, or any for a token holding ``admin`` (Nova's
+        default policy) - and to a server's volume attachments (none); None for any other
+        request."""
         method, url = request.method, request.url
         compute = {**CATALOG, **self.catalog}["compute"].rstrip("/")
         parts = urllib.parse.urlsplit(url)
         path = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
-        if method != "GET" or path not in (compute + "/servers", compute + "/servers/detail"):
+        if method != "GET" or not path.startswith(compute + "/servers"):
             return None
-        found = list(self.servers)
+        own = self.project["id"]
+        token = self.tokens.get(request.headers.get("X-Auth-Token", ""))
+        scope = token or {"project": own, "roles": list(self.roles)}
+        rest = path[len(compute + "/servers") :]
+        if re.fullmatch(r"/[^/]+/os-volume_attachments", rest):
+            return 200, {"volumeAttachments": []}, {}
+        if re.fullmatch(r"/[^/]+", rest) and rest != "/detail":
+            wanted = urllib.parse.unquote(rest[1:])
+            server = next((s for s in self.servers if s["id"] == wanted), None)
+            if server is None or (
+                server.get("project_id", own) != scope["project"] and "admin" not in scope["roles"]
+            ):
+                return 404, {"itemNotFound": {"code": 404, "message": "Instance not found"}}, {}
+            return 200, {"server": self._server_detail(server)}, {}
+        if rest not in ("", "/detail"):
+            return None
+        found = [s for s in self.servers if s.get("project_id", own) == scope["project"]]
         names = urllib.parse.parse_qs(parts.query).get("name")
         if names:
             pattern = names[0]
@@ -474,5 +534,7 @@ class InProcessCloud:
             if self.nova_db == "mysql":
                 pattern = pattern.replace("|", "\\|")  # nova/db/utils.py _safe_regex_mysql
             found = [s for s in found if re.search(pattern, s["name"])]
-        body = {"servers": [{"id": s["id"], "name": s["name"], "links": []} for s in found]}
-        return 200, body, {}
+        if rest != "/detail":
+            body = {"servers": [{"id": s["id"], "name": s["name"], "links": []} for s in found]}
+            return 200, body, {}
+        return 200, {"servers": [self._server_detail(s) for s in found]}, {}

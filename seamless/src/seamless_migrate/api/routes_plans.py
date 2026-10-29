@@ -10,6 +10,7 @@ from pydantic import TypeAdapter, ValidationError
 from ..domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     PLAN_EDITABLE_FIELDS,
+    PROJECT_FIELDS,
     REQUEST_BODY,
     Migration,
     Plan,
@@ -19,8 +20,8 @@ from ..domain.models import (
     ValidationReport,
 )
 from ..events import emit
-from ..orchestrator import PROVIDER_FIELDS, failed_provider_change_refusal, in_flight_refusal
-from ..plan_checks import PlanSpecError, check_plan_spec
+from ..orchestrator import PROVIDER_FIELDS, changed_clouds_refusal, in_flight_refusal
+from ..plan_checks import PlanSpecError, check_plan_spec, vmware_project_refusal
 from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
@@ -124,6 +125,10 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
                 "validation_error",
                 "extent_tracking: a VMware source has no Ceph cluster to read extents from",
             )
+        if role == ProviderRole.source and provider.kind == ProviderKind.vmware:
+            refusal = vmware_project_refusal(spec)
+            if refusal is not None:
+                raise ApiError(422, "validation_error", refusal)
 
 
 async def _out(request: Request, plans: list[Plan]) -> list[PlanOut]:
@@ -215,15 +220,22 @@ async def update_plan(
         busy = await svc.orchestrator.in_flight(plan_id)
         if busy:
             raise ApiError(409, "conflict", in_flight_refusal(busy, "editing the plan"))
-        if any(body.get(f, getattr(plan, f)) != getattr(plan, f) for f in PROVIDER_FIELDS):
-            # SDD §12: a failed migration's rollback acts on the clouds its attempt used
+        changed = [
+            f
+            for f in (*PROVIDER_FIELDS, *PROJECT_FIELDS)
+            if f in body and body[f] != getattr(plan, f)
+        ]
+        if changed:
+            # SDD §12, §27.4: a failed migration's rollback acts on the clouds its attempt used,
+            # with its attempt's credentials
             failed = [
                 m.vm.name
                 for m in await svc.db.list("migration", Migration, plan_id=plan_id)
                 if m.phase == Phase.failed
             ]
-            if failed:
-                raise ApiError(409, "conflict", failed_provider_change_refusal(failed))
+            refusal = changed_clouds_refusal(changed, failed)
+            if refusal is not None:
+                raise ApiError(409, "conflict", refusal)
         try:
             merged = PlanCreate.model_validate(
                 {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body},

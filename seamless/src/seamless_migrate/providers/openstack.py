@@ -677,11 +677,15 @@ class OpenStackProvider:
         provider: Provider,
         settings: Settings,
         *,
-        connect_fn: Callable[[Provider, Settings], Any] | None = None,
+        connect_fn: Callable[..., Any] | None = None,
+        project_id: str | None = None,
     ) -> None:
         self.provider = provider
         self.settings = settings
         self._connect_fn = connect_fn or connect
+        #: the Keystone project whose credential the provider acts with; None: its own credential
+        #: (SDD §10, §27.4, plan task TC4)
+        self.project_id = project_id
         self._conn: Any = None
         self._lock = threading.Lock()
         #: (until, failure): a Placement read got no answer, so none is sent before then (§22.3)
@@ -691,7 +695,11 @@ class OpenStackProvider:
     def _connection(self) -> Any:
         with self._lock:
             if self._conn is None:
-                self._conn = self._connect_fn(self.provider, self.settings)
+                self._conn = (
+                    self._connect_fn(self.provider, self.settings)
+                    if self.project_id is None
+                    else self._connect_fn(self.provider, self.settings, project_id=self.project_id)
+                )
             return self._conn
 
     async def _run(self, fn: Callable[..., T], *args: Any) -> T:
@@ -2007,11 +2015,14 @@ class _MapContext:
             _os_hint(boot_meta),
             _os_hint(image_props),
         )
+        # the server's own project as Nova reports it (tenant_id), whichever credential read it:
+        # an admin reads another project's server by id (SDD §4.2, §10, §27.1, plan task TC4)
         project_id = _attr(server, "project_id")
         return VMRef(
             source_id=str(_attr(server, "id")),
             name=str(_attr(server, "name")),
             project=self.project_name(project_id) or project_id,
+            project_id=str(project_id) if project_id else None,
             flavor=flavor_name,
             vcpus=int(vcpus or 0),
             ram_mb=int(ram or 0),

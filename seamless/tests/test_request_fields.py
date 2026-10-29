@@ -90,6 +90,14 @@ HOST = {"name": "conv-src", "flavor": "m1.large"}
             Role.operator,
             "network",
         ),
+        # the plan's VMs would land in its destination provider's own project (plan task TC4)
+        (
+            "POST",
+            "/api/v1/plans",
+            {**PLAN, "destination_projects": "0123456789abcdef0123456789abcdef"},
+            Role.operator,
+            "destination_projects",
+        ),
         # a plan-scoped policy would become a global one (audit AP-02)
         (
             "POST",

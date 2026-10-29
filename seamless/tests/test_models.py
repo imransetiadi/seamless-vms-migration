@@ -1,4 +1,5 @@
 import json
+import secrets
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
@@ -405,6 +406,23 @@ def test_vmref_gpus_default_to_an_empty_list_and_round_trip():
     recorded = make_vm().model_dump(mode="json")
     recorded.pop("gpus")
     assert VMRef.model_validate(recorded).gpus == []
+
+
+def test_a_vmref_keeps_its_projects_id():
+    """SDD §4.2, §27.4 (plan task TC4): an OpenStack VM carries its project's Keystone id beside
+    its project's name; the id survives the store's JSON as the source gave it - a rule compares
+    it, so it is never written U+FFFD as free text is -, and a VMware VM, or one recorded before,
+    carries none."""
+    tenant_a = secrets.token_hex(16)  # a Keystone id, made up for the test
+    assert make_vm().project_id is None
+    vm = make_vm(project="tenant-a", project_id=tenant_a)
+    assert (vm.project, vm.project_id) == ("tenant-a", tenant_a)
+    stored = vm.model_dump(mode="json")
+    assert stored["project_id"] == tenant_a
+    assert VMRef.model_validate(stored) == vm
+    stored.pop("project_id")
+    assert VMRef.model_validate(stored).project_id is None
+    assert make_vm(project_id="ten\x00ant").project_id == "ten\x00ant"
 
 
 def test_mappings_gpus_is_a_map_of_strings():

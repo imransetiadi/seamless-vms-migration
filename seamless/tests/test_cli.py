@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 
 import pytest
 import yaml
@@ -389,6 +390,74 @@ def test_plan_apply_refuses_new_providers_while_a_migration_is_failed(env, capsy
     # the same plan, other fields changed: allowed, as by the API
     assert cli.main(["plan", "apply", "-f", str(path)]) == 0
     assert store.get("plan", plan_id, Plan).downtime_slo_s == 900
+
+
+def test_plan_apply_carries_the_plans_projects(env, capsys):
+    """SDD §15, §12, §27.4 (plan task TC4): a plan's YAML names its source and destination projects
+    as POST /plans takes them, and an update as PATCH /plans/{id} does - a file that leaves them out
+    keeps them, null clears one, a change while a migration is failed is refused with the API's
+    message and the same projects resent are none -; a value that is no project id, and a VMware
+    source naming one, are refused as the API refuses them, storing nothing."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    tenant_a, tenant_b = secrets.token_hex(16), secrets.token_hex(16)
+    doc = yaml.safe_load(path.read_text())
+
+    def apply(document) -> int:
+        path.write_text(yaml.safe_dump(document))
+        return cli.main(["plan", "apply", "-f", str(path)])
+
+    def projects():
+        plan = store.get("plan", plan_id, Plan)
+        return plan.source_project, plan.destination_project
+
+    assert projects() == (None, None)
+    assert apply({**doc, "source_project": tenant_a, "destination_project": tenant_b}) == 0
+    assert projects() == (tenant_a, tenant_b)
+    assert apply(doc) == 0  # left out: kept, as PATCH keeps a field its body leaves out
+    assert projects() == (tenant_a, tenant_b)
+    capsys.readouterr()
+    failed = make_migration(
+        plan_id=plan_id, vm=make_vm(source_id="vm-1", name="web-01"), phase=Phase.failed
+    )
+    store.put("migration", failed)
+    assert apply({**doc, "destination_project": None}) == 1
+    assert capsys.readouterr().err.strip() == (
+        "error: roll back or cancel the failed migration (web-01) before changing the plan's "
+        "projects: its rollback acts with its attempt's credentials"
+    )
+    assert apply({**doc, "source_project": tenant_a}) == 0  # resent as stored: no change
+    assert projects() == (tenant_a, tenant_b)
+    failed.phase = Phase.rolled_back
+    store.put("migration", failed)
+    assert apply({**doc, "destination_project": None}) == 0
+    assert projects() == (tenant_a, None)
+    capsys.readouterr()
+    assert apply({**doc, "source_project": "tenant a"}) == 1
+    refused = capsys.readouterr().err
+    assert "source_project" in refused and "a Keystone project's id" in refused, refused
+    assert projects() == (tenant_a, None)
+    store.put(
+        "provider",
+        make_provider(
+            id="vc-dc2",
+            kind=ProviderKind.vmware,
+            cloud=None,
+            endpoint="https://vcenter.dc2.example/sdk",
+            conversion_host=None,
+        ),
+    )
+    why = (
+        "a VMware plan names no project: vCenter has no Keystone projects, and the migration kit "
+        "acts with its providers' own credentials"
+    )
+    vmware = {**doc, "name": "vmware", "source_provider_id": "vc-dc2"}
+    assert apply({**vmware, "destination_project": tenant_b}) == 1
+    assert capsys.readouterr().err.strip() == f"error: destination_project: {why}"
+    assert [p.name for p in store.list("plan", Plan)] == [doc["name"]]
+    # nor does an update move a plan naming a project to a vCenter, the project left out of it
+    assert apply({**doc, "source_provider_id": "vc-dc2"}) == 1
+    assert capsys.readouterr().err.strip() == f"error: source_project: {why}"
+    assert store.get("plan", plan_id, Plan).source_provider_id == "src-osp"
 
 
 def test_plan_apply_never_overwrites_a_change_it_did_not_see(env, capsys, monkeypatch):
