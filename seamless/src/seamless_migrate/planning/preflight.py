@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
@@ -21,9 +23,12 @@ from ..domain.models import (
     SyncPass,
     VMRef,
     Wave,
+    to_utc,
+    utc_text,
+    utcnow,
 )
 from ..guest_os import identify
-from ..security.host_keys import SIDE_ALIASES
+from ..security.host_keys import SIDE_ALIASES, fingerprint
 from .gpu import (
     PoolKey,
     ProfileSize,
@@ -377,6 +382,15 @@ CATALOG: dict[str, CatalogEntry] = {
         "Nothing to do: pre-staging imports the keypair (name and public key) for the "
         "destination's migration user.",
     ),
+    # the plan's project credentials and its VMs' keys (SDD §9.3, §27.6, §27.7, plan task TC6)
+    "DST_KEYPAIR_KEY_MISMATCH": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Give the destination's migration user the source's key under that name: delete its "
+        "keypair of that name and pre-stage keypairs, or create it again with the source's "
+        "public key. A user of its own for each project credential keeps two tenants' keypairs "
+        "of one name apart (Operations.md).",
+    ),
     "MAP_FLAVOR_MISSING": CatalogEntry(
         Severity.blocker,
         (),
@@ -398,7 +412,33 @@ CATALOG: dict[str, CatalogEntry] = {
     "DST_PROJECT_MISSING": CatalogEntry(
         Severity.blocker,
         (),
-        "Map the VM's project to an existing destination project (plan.mappings.projects).",
+        "Map the VM's project to a project the destination lists (plan.mappings.projects): for a "
+        "plan with a destination project, to the project its destination_project names, where "
+        "its VMs land - or name in destination_project the project the VMs go to.",
+    ),
+    "PROJECT_CREDENTIAL_EXPIRING": CatalogEntry(
+        Severity.warning,
+        (),
+        "Have an admin write a new application credential for the project before this one "
+        "expires - one that outlives the plan's cutover window, or never expires - "
+        "(PUT /providers/{id}/projects/{project_id}/credentials), then check the provider: a step "
+        "that runs after the expiry fails, a rollback included.",
+    ),
+    "PROJECT_CREDENTIAL_UNRESTRICTED": CatalogEntry(
+        Severity.warning,
+        (),
+        "Have an admin write a restricted application credential for the project in its place - "
+        "Keystone creates one restricted unless asked otherwise - and delete the unrestricted one "
+        "in Keystone: a restricted credential creates no application credential and no trust, so "
+        "a stolen run directory gives no lasting access.",
+    ),
+    "PROJECT_CREDENTIAL_ROLE_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Give the credential's user the role on the project in Keystone - member for the plan's "
+        "steps, load-balancer_member for a plan that maps Octavia pools -, create a new "
+        "application credential, which holds the roles its user has when it is created, and "
+        "write it for the project; then check the provider and validate the plan again.",
     ),
     "DST_DNS_INTEGRATION_MISSING": CatalogEntry(
         Severity.warning,
@@ -844,6 +884,35 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     if len(dst_inv.quotas) == 1:
         return next(iter(dst_inv.quotas))
     return vm.project
+
+
+def project_check(caps: Mapping[str, Any] | None, project_id: str | None) -> dict[str, Any] | None:
+    """A project credential's entry of a provider's check report (SDD §10 "The check of project
+    credentials"): its ``projects`` entry when the check left it ``ok``; None for no project, one
+    the check did not sign in with, and one whose check failed."""
+    if project_id is None:
+        return None
+    report = (caps or {}).get("projects")
+    entry = report.get(project_id) if isinstance(report, Mapping) else None
+    if isinstance(entry, Mapping) and entry.get("status") == "ok":
+        return dict(entry)
+    return None
+
+
+def project_roles(caps: Mapping[str, Any] | None, project_id: str | None) -> list[str] | None:
+    """The role names of a project credential's token as its check read them (SDD §10); None when
+    they were not read."""
+    roles = (project_check(caps, project_id) or {}).get("roles")
+    return [str(role) for role in roles] if isinstance(roles, list) else None
+
+
+def project_words(project_id: str, entry: Mapping[str, Any] | None) -> str:
+    """A project as a credential's finding or eligibility reason names it (SDD §9.2, §9.3): the
+    name its credential's check read, with its id; its id alone without a name."""
+    name = entry.get("project_name") if entry is not None else None
+    if isinstance(name, str) and name.strip() and name != project_id:
+        return f"{name} ({project_id})"
+    return project_id
 
 
 #: the GPU rows of §9.3 (SDD §22.5): what the advisor's evidence leaves out, as nothing about GPUs
@@ -1603,6 +1672,23 @@ def keypair_prestaged(
     )
 
 
+def keypair_fingerprint(public_key: str | None) -> str | None:
+    """The SHA256 fingerprint of a keypair's OpenSSH public key, as ``ssh-keygen -l`` prints it -
+    of its type and its key, never its comment (SDD §9.3 ``DST_KEYPAIR_KEY_MISMATCH``); None for
+    none, and for a key that is no OpenSSH public key - an x509 certificate, a key that does not
+    read, a key of another type than its line names -, which is not judged."""
+    fields = (public_key or "").split()
+    if len(fields) < 2:
+        return None
+    try:
+        blob = base64.b64decode(fields[1], validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if blob[4 : 4 + int.from_bytes(blob[:4], "big")] != fields[0].encode():
+        return None
+    return fingerprint(f"{fields[0]} {fields[1]}")
+
+
 def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Mappings:
     """Mappings preflight matched automatically for ``vm`` (``Migration.resolved_mappings``).
 
@@ -1801,6 +1887,9 @@ def run_preflight(
     sync_passes: Sequence[SyncPass] | None = None,
     host_key_checking: bool | None = None,
     checked: Mapping[str, Provider] | None = None,
+    src_caps: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
+    keypair_fingerprints: Mapping[str, tuple[str | None, str | None]] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1816,6 +1905,11 @@ def run_preflight(
     ``host_key_checking`` the setting SEAMLESS_ANSIBLE_HOST_KEY_CHECKING, None unjudged (§26.5);
     ``checked`` the providers as validation's checks just left them, by id - their pins, and a host
     found replaced -, else ``source`` and ``destination`` as given (§10 "Host key pins").
+    ``src_caps`` the source's capabilities as validation's check just reported them - with
+    ``dst_caps``, the ``projects`` entries of the plan's project credentials -, ``now``
+    validation's clock, and ``keypair_fingerprints`` the fingerprints of the source's and the
+    destination's key of each key name both inventories list, by name, each None unread (§9.3,
+    §27.6, §27.7, plan task TC6).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -1974,8 +2068,16 @@ def run_preflight(
     # whether the credential may put each NIC's port on its resolved network: another project's
     # takes it only when shared or external, and from a role the destination's policy profile
     # counts (SDD §6.6, §9.3, §21.5); the VMware migration kit creates every port with the NIC's
-    # MAC (§7.2)
-    roles = (dst_caps or {}).get("roles")
+    # MAC (§7.2). The roles are the plan's destination credential's: its project's for a plan
+    # with a destination project, as validation's check read them (§27.5, plan task TC6)
+    dst_project = plan.destination_project
+    if dst_project is None:
+        roles = (dst_caps or {}).get("roles")
+        credential = where
+    else:
+        roles = project_roles(dst_caps, dst_project)
+        named = project_words(dst_project, project_check(dst_caps, dst_project))
+        credential = f"project {named} at {where}"
     profile = policy_profile_of(dst_caps, destination)
     denied = []
     for nic in vm.nics:
@@ -1990,7 +2092,7 @@ def run_preflight(
         out.append(
             finding(
                 "NET_PORT_NOT_PERMITTED",
-                f"The credential of {where} may not put these NICs on their network: "
+                f"The credential of {credential} may not put these NICs on their network: "
                 + "; ".join(denied)
                 + ".",
                 remediation=_port_remediation(profile),
@@ -2020,6 +2122,7 @@ def run_preflight(
                 ),
             )
         )
+    out.extend(_keypair_key_findings(vm, src_inv, dst_inv, keypair_fingerprints, source, where))
 
     dst_flavor_names = {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
     kind = _kind_of(vm, source.kind if source is not None else None)
@@ -2346,6 +2449,10 @@ def run_preflight(
     if destination is not None and dst_caps:
         out.extend(_destination_capabilities(destination, dst_caps))
         out.extend(_release_outside_support(destination, dst_caps))
+    # the plan's project credentials as validation's checks just read them (SDD §9.3, §27.7, plan
+    # task TC6)
+    credentials = _plan_credentials(plan, src_caps, dst_caps, _source_label(source), where)
+    out.extend(_credential_findings(plan, credentials, now or utcnow()))
 
     if plan.handover.enabled:
         unmapped = [
@@ -2715,13 +2822,9 @@ def _fip_keep_findings(
         elif address in attached:
             reasons.append(f"{address} is held by a port of its project")
     extras: list[str] = []
-    roles = (dst_caps or {}).get("roles")
-    allowed = FIP_ADDRESS_ROLES.get(policy_profile_of(dst_caps, destination), ("admin",))
-    if roles is not None and not set(roles) & set(allowed) and set(mine) - detached:
-        extras.append(
-            "the credential's token has no role that may choose a floating IP's address "
-            f"({' or '.join(allowed)})"
-        )
+    why = _reservation_refusal(plan, destination, dst_caps, where)
+    if why is not None and set(mine) - detached:
+        extras.append(why)
     wanted = {
         _canonical_ip(a) for other in selected for nic in other.nics for a in nic.floating_ips
     } - detached
@@ -2743,6 +2846,182 @@ def _fip_keep_findings(
             f"Floating IPs of {vm.name} that {where} cannot keep: {text}.",
         )
     ]
+
+
+def _reservation_refusal(
+    plan: Plan, destination: Provider | None, dst_caps: Mapping[str, Any] | None, where: str
+) -> str | None:
+    """Why the credential that reserves a kept floating IP may not choose its address (SDD §8.3,
+    §9.3): for a plan with a destination project the one ``credentials.reservation`` names - its
+    project credential when that one's roles may choose an address, which needs nothing more, else
+    the destination provider's own, which reserves for the project and so needs admin whatever the
+    policy profile (§27.6, plan task TC6) -; for a plan without one the provider's own token, by
+    the roles the destination's policy profile counts. None when nothing is refused, or the
+    roles it needs were not reported."""
+    roles = (dst_caps or {}).get("roles")
+    project = plan.destination_project
+    if project is None:
+        allowed = FIP_ADDRESS_ROLES.get(policy_profile_of(dst_caps, destination), ("admin",))
+        if roles is not None and not set(roles) & set(allowed):
+            return (
+                "the credential's token has no role that may choose a floating IP's address "
+                f"({' or '.join(allowed)})"
+            )
+        return None
+    if destination is None:
+        return None
+    # imported here: the credentials module imports this one
+    from ..credentials import reservation
+
+    checked = destination.model_copy(update={"capabilities": dict(dst_caps or {})})
+    caller, _ = reservation(plan, checked)
+    if caller is not None or roles is None or "admin" in roles:
+        return None
+    named = project_words(project, project_check(dst_caps, project))
+    return (
+        f"the own credential of {where}, which reserves them for project {named} since that "
+        "project's credential may not choose a floating IP's address, lacks the admin role"
+    )
+
+
+def _keypair_key_findings(
+    vm: VMRef,
+    src_inv: SourceInventory,
+    dst_inv: DestinationInventory,
+    prints: Mapping[str, tuple[str | None, str | None]] | None,
+    source: Provider | None,
+    where: str,
+) -> list[Finding]:
+    """DST_KEYPAIR_KEY_MISMATCH (SDD §9.3, §27.6, plan task TC6): the VM's key name names a keypair
+    both credentials' users hold - both inventories list it - with another key at the destination,
+    by the fingerprints validation read; a key it could not read is not judged."""
+    key = vm.key_name
+    if not key or key not in src_inv.keypairs or key not in dst_inv.keypairs:
+        return []
+    theirs, ours = (prints or {}).get(key, (None, None))
+    if theirs is None or ours is None or theirs == ours:
+        return []
+    at = _source_label(source)
+    return [
+        finding(
+            "DST_KEYPAIR_KEY_MISMATCH",
+            f"The VM boots with keypair {key!r}, which the migration user of {where} holds with "
+            f"another key than the migration user of {at}: {ours} at {where}, {theirs} at {at}. "
+            "The migrated server would boot with that other key.",
+        )
+    ]
+
+
+#: how close to its expiry a project credential the plan uses is warned of (SDD §9.3, §27.7,
+#: owner decision 9)
+EXPIRY_WARNING_DAYS = 7
+
+
+@dataclass(frozen=True)
+class _PlanCredential:
+    """A project credential the plan uses, as validation's check read it (SDD §9.3, §10)."""
+
+    side: str
+    at: str
+    project_id: str
+    entry: dict[str, Any]
+
+
+def _plan_credentials(
+    plan: Plan,
+    src_caps: Mapping[str, Any] | None,
+    dst_caps: Mapping[str, Any] | None,
+    source: str,
+    where: str,
+) -> list[_PlanCredential]:
+    """The project credentials the plan uses (SDD §9.3, §27.7): its source_project's in the
+    source's check report, its destination_project's in the destination's, each named with its
+    provider's label. A side whose project is null - the provider's own credential, whose check
+    reads no expiry - is not judged, nor one without an ok entry, which validation refuses (§8)."""
+    out = []
+    for side, project_id, caps, at in (
+        ("source", plan.source_project, src_caps, source),
+        ("destination", plan.destination_project, dst_caps, where),
+    ):
+        entry = project_check(caps, project_id)
+        if project_id is not None and entry is not None:
+            out.append(_PlanCredential(side, at, project_id, entry))
+    return out
+
+
+def _expiry(value: Any) -> datetime | None:
+    """A project check's ``expires_at`` as a time (SDD §10): None for none, and for one that is no
+    time."""
+    if value is None:
+        return None
+    try:
+        return to_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _credential_findings(
+    plan: Plan, credentials: Sequence[_PlanCredential], now: datetime
+) -> list[Finding]:
+    """PROJECT_CREDENTIAL_EXPIRING, PROJECT_CREDENTIAL_UNRESTRICTED and
+    PROJECT_CREDENTIAL_ROLE_MISSING (SDD §9.3, §27.7, plan task TC6): one finding of a code per
+    credential the plan uses, each naming its provider, the plan's side and the project - an
+    expiry within 7 days of ``now`` or before the plan's cutover window ends; an unrestricted
+    application credential; a token without member, or without load-balancer_member for a plan
+    that maps Octavia pools. What its check did not read is not judged."""
+    out = []
+    for credential in credentials:
+        entry = credential.entry
+        # the provider, the project and the plan's side, set off by commas
+        whose = (
+            f"project {project_words(credential.project_id, entry)} at {credential.at}, the "
+            f"plan's {credential.side} project,"
+        )
+        expiry = _expiry(entry.get("expires_at"))
+        if expiry is not None:
+            soon = []
+            if expiry <= to_utc(now) + timedelta(days=EXPIRY_WARNING_DAYS):
+                soon.append(f"within {EXPIRY_WARNING_DAYS} days")
+            window = plan.cutover_window
+            if window is not None and expiry < window.end:
+                soon.append(f"before the plan's cutover window ends at {utc_text(window.end)}")
+            if soon:
+                out.append(
+                    finding(
+                        "PROJECT_CREDENTIAL_EXPIRING",
+                        f"The credential of {whose} expires at {utc_text(expiry)}, "
+                        f"{' and '.join(soon)}.",
+                    )
+                )
+        if entry.get("restricted") is False:
+            out.append(
+                finding(
+                    "PROJECT_CREDENTIAL_UNRESTRICTED",
+                    f"The application credential of {whose} is unrestricted: it may create other "
+                    "application credentials and trusts.",
+                )
+            )
+        roles = entry.get("roles")
+        if isinstance(roles, list):
+            needed = [("member", "the plan's steps in the project need")]
+            if plan.network_cutover.lb_pools:
+                needed.append(
+                    (
+                        "load-balancer_member",
+                        "the member helper needs for the Octavia pools the plan maps",
+                    )
+                )
+            lacking = [f"the role {role}, which {why}" for role, why in needed if role not in roles]
+            if lacking:
+                held = ", ".join(str(role) for role in roles) or "no role"
+                out.append(
+                    finding(
+                        "PROJECT_CREDENTIAL_ROLE_MISSING",
+                        f"The credential of {whose} lacks {', and '.join(lacking)}; its token "
+                        f"holds {held}.",
+                    )
+                )
+    return out
 
 
 def _prefix_split(
