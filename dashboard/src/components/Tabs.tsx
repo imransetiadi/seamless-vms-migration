@@ -25,7 +25,7 @@ export function Tabs({ tabs, label, className }: { tabs: TabItem[]; label: strin
 
   return (
     <div className={className}>
-      <div role="tablist" aria-label={label} className="flex gap-1 border-b border-border">
+      <div role="tablist" aria-label={label} className="flex flex-wrap gap-1 border-b border-border">
         {tabs.map((tab, index) => {
           const selected = tab.id === active;
           return (

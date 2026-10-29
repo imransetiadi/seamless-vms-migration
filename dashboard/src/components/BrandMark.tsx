@@ -3,8 +3,7 @@ import { BRAND_MARK } from '../lib/brand';
 import { cn } from '../lib/cn';
 
 /**
- * The brand mark (SDD §16), decorative: the product name is the text beside it. Size it with
- * `className` (`size-7` in the sidebar, `size-9` on the sign-in card).
+ * The brand mark (SDD §16), decorative: the product name is the text beside it.
  */
 export function BrandMark({ className }: { className?: string }) {
   // the sidebar and the mobile header each hold a mark, one of them hidden: a gradient shared by id

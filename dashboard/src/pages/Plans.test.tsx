@@ -157,7 +157,7 @@ describe('Plans page', () => {
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
     const table = await screen.findByRole('table', { name: /migration plans/i });
     expect(within(table).getAllByRole('row')).toHaveLength(server.plans.length + 1);
-    expect(within(table).getByText('Paused')).toBeInTheDocument();
+    expect(within(table).getAllByText('Paused')).toHaveLength(2);
     expect(screen.getByRole('button', { name: /new plan/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
@@ -192,9 +192,11 @@ describe('Plans page', () => {
     for (const m of server.migrations.filter((x) => x.plan_id === 'plan-2d5c8b93')) m.phase = 'rolled_back';
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
     const row = (await screen.findByRole('link', { name: 'Pilot — static content' })).closest('tr')!;
-    expect(within(row).getByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
-    // a plan that migrated its VMs keeps the plain badge
-    expect(screen.queryAllByRole('button', { name: 'Completed' })).toHaveLength(1);
+    for (const badge of within(row).getAllByRole('button', { name: 'Completed' })) {
+      expect(badge).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+    }
+    // Mobile and desktop copies belong only to the plan that migrated nothing.
+    expect(screen.queryAllByRole('button', { name: 'Completed' })).toHaveLength(2);
   });
 
   it('says the providers are unavailable when the list shows provider ids instead of names (SDD §16)', async () => {

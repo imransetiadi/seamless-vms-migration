@@ -23,9 +23,9 @@ export interface CalibrationPanelProps {
 
 function Row({ label, value, source }: { label: string; value: string; source: string }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1.5">
+    <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-3 py-1.5">
       <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="text-right">
+      <dd className="min-w-0 wrap-anywhere text-right">
         <span className="num text-sm font-medium">{value}</span>
         <span className="ml-2 text-xs text-muted-foreground">{source}</span>
       </dd>

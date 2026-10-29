@@ -220,6 +220,13 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
            conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
                                                        # set by the provider check (§10, §26.4); returned by the
                                                        # API and never written through it (§12)
+           project_credentials: dict[str, ProjectCredential] = {},
+                                                       # server-owned: an application credential per Keystone
+                                                       # project, by project id (1-64 letters, digits, - or _),
+                                                       # set by PUT and DELETE …/projects/{project_id}/
+                                                       # credentials (§12, §13.3, §27.4, plan task TC2); POST
+                                                       # ignores it, PATCH refuses it (422); none on a vmware
+                                                       # provider (422)
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
            status_message: str|null, last_checked_at: datetime|null }
 
@@ -236,6 +243,10 @@ CephAccess { fsid: str,                      # the cluster's fsid, a UUID; a poo
              client: str = "seamless",       # the Ceph user without "client." (1-64 letters, digits, ".",
                                              # "-" or "_")
              key_updated_at: datetime|null } # server-owned: set by PUT …/ceph-key; POST and PATCH ignore it
+
+ProjectCredential { secret: str,             # its secret's name, provider-{id}.project-<h> (§13.3), never
+                                             # a value
+                    updated_at: datetime }   # when an admin wrote it
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -622,7 +633,9 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
-never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
+never a value; a project credential's write (§12, §27.4, plan task TC2) carries its `project_id` and the secret's
+name too, and its deletion the provider id, `project_id`, the secret's name and `deleted` true, without key names.
+`migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
 `name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
 the source again); `migration.phase` to `failed` carries `source_stopped`, whether the downtime clock was open at the
 failure (§24.5, plan task NT4). The `channel.*` events
@@ -4148,13 +4161,15 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields and `conversion_host_pin` ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
+| PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`; that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
+| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2 with plan task TC4, §27.4; until then no plan names one) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
 | POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
@@ -4341,15 +4356,20 @@ is resolved the same way by `security.secrets.resolve_private_key(name) -> str` 
 
 **Credentials entered in the dashboard** (`PUT /providers/{id}/credentials`, `PUT …/conversion-key`,
 admin) are written to the platform's **secret store** — never to the database, never returned — under
-the secret name `provider-{id}` (credentials), `provider-{id}-ssh` (conversion-host key) and `provider-{id}.ceph`
-(the Ceph key, `PUT …/ceph-key`, §28.4) — so `POST /providers`
-refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh` or `{other}-ceph`, or `{other}`
-is `{id}-ssh` or `{id}-ceph`: a provider id never holds a `.`, but the `SEAMLESS_SECRET_*` variables read `.` and `-`
-alike, audit AP-04):
-its credentials would overwrite, and its deletion remove, the other's key. `ceph` set to null by PATCH, and the
-provider's deletion, delete `provider-{id}.ceph`. The
-provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
-time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
+the secret name `provider-{id}` (credentials), `provider-{id}-ssh` (conversion-host key), `provider-{id}.ceph`
+(the Ceph key, `PUT …/ceph-key`, §28.4) and `provider-{id}.project-<h>` (a project credential,
+`PUT …/projects/{project_id}/credentials`, §27.4: `<h>` the first 16 hex digits of the SHA-256 of the project id, so the
+name holds at most 97 lower-case letters, digits, `-` and `.`, and fits both stores) — so `POST /providers`
+refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh`, `{other}-ceph` or `{other}-project-`
+and 16 hex digits, or `{other}` is `{id}-ssh`, `{id}-ceph` or `{id}-project-` and 16 hex digits: a provider id never
+holds a `.`, but the `SEAMLESS_SECRET_*` variables read `.` and `-` alike, audit AP-04):
+its credentials would overwrite, and its deletion remove, the other's key. A project credential's entry records its
+project id, so a write whose name another project's entry holds (equal 64-bit digests) is refused (409), never written
+over. `ceph` set to null by PATCH, and the provider's deletion, delete `provider-{id}.ceph`; the provider's deletion
+deletes its project credentials' secrets too. The
+provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`, a project credential's
+`secret`) and the time (`credentials_updated_at`, `conversion_key_updated_at`, a project credential's `updated_at`)
+with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
 the change is recorded, with its `provider.credentials_updated` event — a 409 after the store already holds the
 new secret would leave the change unaudited; when the provider keeps changing under the write (50 conflicts in a
@@ -4404,7 +4424,12 @@ provider reads (data keys `credentials_secret` and `ssh_key_secret`), never thei
 provider endpoint), `username`/`password`/`project_name`/`user_domain_name`/`project_domain_name`
 (`Default` when absent) for password auth, or `application_credential_id`/`application_credential_secret`
 for application credentials, plus optional `interface` — instead of the `clouds.yaml` entry named by
-`cloud`; without one, `clouds.yaml` is used as before. A VMware secret holds `username`, `password`
+`cloud`; without one, `clouds.yaml` is used as before. A **project credential** (§27.4) builds its entry from its
+secret's `application_credential_id` and `application_credential_secret` (`auth_type` `v3applicationcredential`) and
+signs in at the auth URL of the provider's own credential - its secret's `auth_url`, or its `clouds.yaml` entry's -,
+else at the provider's endpoint: it takes no `auth_url` of its own, so it is never sent to another endpoint, and another
+key its secret holds is never read. The entry's other keys (`interface`, `region_name`, …) are the provider
+credential's: the same cloud, reached the same way, as another user. A VMware secret holds `username`, `password`
 and optional `datacenter`. Deleting a provider deletes the secrets the store manages for it.
 
 ### 13.4 AI data minimization
@@ -8229,7 +8254,8 @@ release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
 
 The proposed fields, routes, check keys, findings and gate rule stay out of the tables the SDD-reading tests parse
 (§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did; a proposed finding code is written here
-without code quotes. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their
+without code quotes. Plan task TC2's provider field, routes, secret name and deletion rules are binding in §4.2, §4.3,
+§12 and §13.3 since that task. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their
 documentation and, for Cinder's manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a
 behaviour only a lab can show, is marked `TODO(LAB): confirm`.
 
@@ -8284,8 +8310,9 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
 
 ### 27.4 The model
 
-* **On the provider** (owner decision 2), a map by Keystone project id, server-owned as `credentials_updated_at` is:
-  `PATCH /providers/{id}` refuses it (422) and `POST /providers` ignores it (§12).
+* **On the provider** (owner decision 2; binding in §4.2 since plan task TC2), a map by Keystone project id,
+  server-owned as `credentials_updated_at` is: `PATCH /providers/{id}` refuses it (422) and `POST /providers` ignores
+  it (§12).
   ```text
   Provider { ...,
              project_credentials: dict[str, ProjectCredential] = {} }   # by project id (1-64 letters, digits, - or _);
@@ -8293,7 +8320,7 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
   ProjectCredential { secret: str,           # its secret's name (below), never a value
                       updated_at: datetime }  # when an admin wrote it
   ```
-* **Routes** (proposed, admin, §12 with plan task TC2):
+* **Routes** (admin; binding in §12 and §4.3 since plan task TC2):
   * `PUT /providers/{id}/projects/{project_id}/credentials`, write-only: an application credential,
     `{application_credential_id, application_credential_secret}` (owner decision 3). It signs in at the auth URL of
     the provider's own credential, else at its endpoint (§13.3), and takes no `auth_url` of its own, so it is never sent
@@ -8303,7 +8330,8 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
     `deleted` true. 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider (§12): a
     plan neither completed nor cancelled that names it, or a completed one with VMs not finalized, rolled back or
     cancelled. `DELETE /providers/{id}` deletes them with its other managed secrets.
-* **The secret's name** is `provider-{id}.project-<h>`, `<h>` the first 16 hex digits of the SHA-256 of the project id.
+* **The secret's name** (binding in §13.3 since plan task TC2) is `provider-{id}.project-<h>`, `<h>` the first 16 hex
+  digits of the SHA-256 of the project id.
   A provider id never holds a `.` (§4.2), so the name is no provider's `provider-{x}` or `provider-{x}-ssh` and no other
   provider's project secret; it fits both stores (at most 97 characters: lower-case letters, digits, `-`, `.`, §13.3).
   The entry records its project id, so a write whose name another project's entry holds (equal 64-bit digests) is
@@ -8516,7 +8544,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | Change | Where | Task |
 |---|---|---|
 | PRD: a functional requirement for project credentials, the 0.2.0 row as delivered, a 0.5.0 row; D20 decided | PRD, §20 | TC1 |
-| `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 | TC2 |
+| `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 (binding) | TC2 |
 | the check of each project credential: the report keys `projects` and `project` | §10, §21.5 | TC3 |
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 | TC5 |

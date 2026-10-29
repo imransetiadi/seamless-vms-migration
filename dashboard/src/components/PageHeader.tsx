@@ -19,7 +19,7 @@ export interface PageHeaderProps {
 
 export function PageHeader({ title, description, actions, breadcrumbs, meta, titleRef }: PageHeaderProps) {
   return (
-    <header className="mb-4 flex min-w-0 flex-col gap-3 wrap-anywhere md:mb-6">
+    <header className="card mb-4 flex min-w-0 flex-col gap-3 wrap-anywhere p-3 sm:p-5 md:mb-6">
       {breadcrumbs && breadcrumbs.length > 0 && (
         <nav aria-label="Breadcrumb">
           <ol className="flex flex-wrap items-center gap-1 text-sm text-muted-foreground">
@@ -49,7 +49,7 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta, tit
           >
             {title}
           </h1>
-          {description && <div className="mt-1 max-w-3xl text-sm text-muted-foreground">{description}</div>}
+          {description && <div className="mt-1 max-w-prose text-sm text-muted-foreground">{description}</div>}
           {meta && <div className="mt-2 flex flex-wrap items-center gap-2">{meta}</div>}
         </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}

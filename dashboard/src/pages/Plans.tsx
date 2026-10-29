@@ -198,7 +198,7 @@ export default function Plans() {
             <thead>
               <tr>
                 <SortableHeader label="Plan" sortKey="name" sort={sort} onSort={onSort} />
-                <SortableHeader label="Status" sortKey="status" sort={sort} onSort={onSort} />
+                <SortableHeader label="Status" sortKey="status" sort={sort} onSort={onSort} className="hidden lg:table-cell" />
                 <th scope="col" className="hidden md:table-cell">
                   Source → destination
                 </th>
@@ -218,6 +218,9 @@ export default function Plans() {
                         {p.name}
                       </Link>
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>
+                      <span className="mt-1.5 inline-flex max-w-full lg:hidden">
+                        <PlanStatusBadge status={p.derived_status} nothingMigrated={nothingMigrated(p)} />
+                      </span>
                       {/* on a phone the Done and clouds columns are hidden: their facts stand under the name (SDD §16) */}
                       <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal sm:hidden">
                         {pr === null ? (
@@ -243,7 +246,7 @@ export default function Plans() {
                         {providerName.get(p.source_provider_id) ?? p.source_provider_id} → {providerName.get(p.destination_provider_id) ?? p.destination_provider_id}
                       </span>
                     </th>
-                    <td>
+                    <td className="hidden min-w-32 lg:table-cell">
                       <PlanStatusBadge status={p.derived_status} nothingMigrated={nothingMigrated(p)} />
                     </td>
                     <td className="hidden text-sm md:table-cell">

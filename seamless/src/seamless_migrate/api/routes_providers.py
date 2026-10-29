@@ -21,10 +21,12 @@ from ..domain.models import (
     ConversionHostConfig,
     Migration,
     Plan,
+    ProjectCredential,
     Provider,
     ProviderCreate,
     is_blank,
     is_notify_secret_name,
+    is_project_id,
     utcnow,
 )
 from ..events import emit
@@ -35,6 +37,7 @@ from ..security.secret_store import (
     ceph_key_secret_name,
     conversion_key_secret_name,
     credentials_secret_name,
+    project_secret_name,
     secret_store,
 )
 from ..security.secrets import valid_secret_name
@@ -50,6 +53,7 @@ from .schemas import (
     CephKeyRequest,
     ConversionKeyRequest,
     EmptyRequest,
+    ProjectCredentialsRequest,
     ProviderCredentialsRequest,
 )
 
@@ -203,26 +207,29 @@ async def create_provider(
     svc = services(request)
     await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
-    # the server-owned fields are ignored: the pin is the provider check's alone (SDD §10, §12)
+    # the server-owned fields are ignored: the pin is the provider check's alone, the project
+    # credentials their routes' (SDD §10, §12, §27.4)
     provider = body.model_copy(
         update={
             **_SERVER_OWNED,
             "credentials_updated_at": None,
             "conversion_key_updated_at": None,
             "conversion_host_pin": None,
+            "project_credentials": {},
         }
     )
     provider = _with_ceph_key_time(provider, None)
-    # the store names a provider's secrets provider-{id}, provider-{id}-ssh and provider-{id}.ceph:
-    # an id that makes them another provider's would overwrite (and on deletion remove) its key
-    # (SDD §13.3; the SEAMLESS_SECRET_ variables read `.` and `-` alike, audit AP-04)
+    # the store names a provider's secrets provider-{id}, provider-{id}-ssh, provider-{id}.ceph and
+    # provider-{id}.project-<h>: an id that makes them another provider's would overwrite (and on
+    # deletion remove) its key (SDD §13.3; the SEAMLESS_SECRET_ variables read `.` and `-` alike,
+    # audit AP-04)
     async with svc.orchestrator.provider_lock():
         clash = next(
             (
                 other.id
                 for other in await svc.db.list("provider", Provider)
-                if provider.id in (f"{other.id}-ssh", f"{other.id}-ceph")
-                or other.id in (f"{provider.id}-ssh", f"{provider.id}-ceph")
+                if _secret_suffixed(provider.id, other.id)
+                or _secret_suffixed(other.id, provider.id)
             ),
             None,
         )
@@ -231,8 +238,8 @@ async def create_provider(
                 409,
                 "conflict",
                 f"provider id {provider.id!r} would share a secret with provider {clash!r}: "
-                "Seamless stores a provider's secrets as provider-<id>, provider-<id>-ssh and "
-                "provider-<id>.ceph",
+                "Seamless stores a provider's secrets as provider-<id>, provider-<id>-ssh, "
+                "provider-<id>.ceph and provider-<id>.project-<16 hex digits>",
             )
         try:
             await svc.db.put("provider", provider, expected_version=0)
@@ -252,6 +259,14 @@ async def create_provider(
         },
     )
     return provider
+
+
+def _secret_suffixed(longer: str, shorter: str) -> bool:
+    """Whether provider id ``longer`` is ``shorter`` with an end that makes its credentials secret
+    one of ``shorter``'s as the SEAMLESS_SECRET_ variables read it - `-ssh`, `-ceph`, or `-project-`
+    and 16 hex digits - which read `.` and `-` alike (SDD §13.3, audit AP-04)."""
+    end = longer[len(shorter) :] if longer.startswith(shorter) else ""
+    return end in ("-ssh", "-ceph") or re.fullmatch(r"-project-[0-9a-f]{16}", end) is not None
 
 
 @router.get("/providers/{provider_id}", response_model=Provider)
@@ -347,47 +362,71 @@ async def _store_secret(
         raise ApiError(503, "unavailable", f"secret store: {exc}") from None
 
 
-async def _record_secret(
-    request: Request, provider_id: str, name: str, update: Callable[[Provider], dict[str, Any]]
+class _KeptChanging(Exception):
+    """The provider changed under each of RECORD_SECRET_ATTEMPTS versioned writes in a row."""
+
+
+async def _write_provider(
+    svc: Any,
+    provider_id: str,
+    update: Callable[[Provider], dict[str, Any]],
+    *,
+    reset_check: bool = True,
 ) -> Provider:
-    """The provider records a secret already in the store (SDD §13.3): a versioned write, retried
-    when a check or another write changed the provider meanwhile (they touch other fields) — the
-    update is derived from the fresh copy each time, so no concurrent change is lost — and so a
-    written secret is recorded, unless the provider keeps changing for RECORD_SECRET_ATTEMPTS
-    writes (503 naming the secret); a provider deleted meanwhile answers 404 and the secret
-    goes again."""
-    svc = services(request)
+    """A versioned write of what ``update`` derives from the provider's fresh copy - with the
+    status and the check report reset unless ``reset_check`` is false -, retried when a check or
+    another write changed the provider meanwhile (they touch other fields), so no concurrent change
+    is lost (SDD §13.3). NotFound when the provider is gone; _KeptChanging after
+    RECORD_SECRET_ATTEMPTS conflicts in a row."""
     # a conflict means another write landed, so each retry makes progress; giving up early would
     # leave a secret the store already holds unrecorded and unaudited (SDD §13.3)
     for attempt in range(RECORD_SECRET_ATTEMPTS):
         if attempt:
             await asyncio.sleep(min(0.5, 0.01 * 2**attempt) * random.uniform(0.5, 1.0))
-        try:
-            provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
-        except NotFound:
-            try:
-                store = secret_store(svc.settings)
-                await asyncio.to_thread(store.delete, name)
-            except SecretStoreError as exc:
-                # neither the secret's name nor the provider's id: both come from the request's
-                # path (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
-                log.warning(
-                    "the secret of a provider deleted meanwhile could not be removed: %s", exc
-                )
-            raise
-        updated = provider.model_copy(update={**update(provider), **_SERVER_OWNED})
+        provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+        reset = _SERVER_OWNED if reset_check else {}
+        updated = provider.model_copy(update={**update(provider), **reset})
         try:
             await svc.db.put("provider", updated, expected_version=version)
         except ConflictError:
             continue
         return updated
-    # SDD §13.3: the store holds the value; the operator sends it again once the provider settles
-    raise ApiError(
-        503,
-        "unavailable",
-        f"secret {name} is stored, but provider {provider_id} changed {RECORD_SECRET_ATTEMPTS} "
-        "times while it was being recorded; send it again",
-    )
+    raise _KeptChanging
+
+
+async def _record_secret(
+    request: Request,
+    provider_id: str,
+    name: str,
+    update: Callable[[Provider], dict[str, Any]],
+    *,
+    reset_check: bool = True,
+) -> Provider:
+    """The provider records a secret already in the store (SDD §13.3): a versioned write retried
+    as ``_write_provider`` retries it, so a written secret is recorded, unless the provider keeps
+    changing for RECORD_SECRET_ATTEMPTS writes (503 naming the secret); a provider deleted
+    meanwhile answers 404 and the secret goes again."""
+    svc = services(request)
+    try:
+        return await _write_provider(svc, provider_id, update, reset_check=reset_check)
+    except NotFound:
+        try:
+            store = secret_store(svc.settings)
+            await asyncio.to_thread(store.delete, name)
+        except SecretStoreError as exc:
+            # neither the secret's name nor the provider's id: both come from the request's path
+            # (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
+            log.warning("the secret of a provider deleted meanwhile could not be removed: %s", exc)
+        raise
+    except _KeptChanging:
+        # SDD §13.3: the store holds the value; the operator sends it again once the provider
+        # settles
+        raise ApiError(
+            503,
+            "unavailable",
+            f"secret {name} is stored, but provider {provider_id} changed "
+            f"{RECORD_SECRET_ATTEMPTS} times while it was being recorded; send it again",
+        ) from None
 
 
 @router.put("/providers/{provider_id}/credentials", response_model=Provider)
@@ -511,16 +550,199 @@ class _CephAccessGone(Exception):
     """The Ceph access was removed between the key's write and its record."""
 
 
-async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
+def _check_project_id(project_id: str) -> None:
+    """A project credential's project id is 1-64 letters, digits, `-` or `_` (SDD §4.2, §12)."""
+    if not is_project_id(project_id):
+        raise ApiError(
+            422,
+            "validation_error",
+            "project_id: a Keystone project's id, 1-64 letters, digits, '-' or '_'",
+        )
+
+
+def _without_project_check(capabilities: dict[str, Any], project_id: str) -> dict[str, Any]:
+    """The check report less the project's entry of its ``projects`` (SDD §12, §27.7), which
+    tested a credential that is replaced or gone; the rest of the report stays."""
+    projects = capabilities.get("projects")
+    if not isinstance(projects, dict) or project_id not in projects:
+        return capabilities
+    return {**capabilities, "projects": {k: v for k, v in projects.items() if k != project_id}}
+
+
+def _names_project(plan: Plan, provider_id: str, project_id: str) -> bool:
+    """Whether ``plan`` acts in the project with the provider's credential for it: its
+    ``source_project`` on its source provider, its ``destination_project`` on its destination
+    (SDD §12, §27.4). Plan task TC4 adds the two fields (§4.2): a plan stored without them names
+    no project."""
+    return (
+        plan.source_provider_id == provider_id
+        and getattr(plan, "source_project", None) == project_id
+    ) or (
+        plan.destination_provider_id == provider_id
+        and getattr(plan, "destination_project", None) == project_id
+    )
+
+
+@router.put("/providers/{provider_id}/projects/{project_id}/credentials", response_model=Provider)
+async def set_project_credentials(
+    provider_id: str,
+    project_id: str,
+    body: ProjectCredentialsRequest,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.admin)),
+) -> Provider:
+    """Write-only application credential of one Keystone project (SDD §12, §13.3, §27.4): the
+    values go to the secret store as provider-{id}.project-<h>; the provider records the secret's
+    name and the time under the project's id, and drops that project's entry of its check report
+    alone. The write holds the lock of DELETE /providers/{id}, so a deletion never interleaves."""
+    svc = services(request)
+    values = body.values()
+    blank = [key for key, value in values.items() if not value.strip()]
+    if blank:
+        raise ApiError(422, "validation_error", f"missing: {', '.join(blank)}")
+    _check_project_id(project_id)
+    name = project_secret_name(provider_id, project_id)
+    async with svc.orchestrator.provider_lock():
+        provider = await svc.db.get("provider", provider_id, Provider)  # 404 before any write
+        if provider.kind == ProviderKind.vmware:
+            raise ApiError(
+                422,
+                "validation_error",
+                "a vmware provider takes no project credential: vCenter has no Keystone projects",
+            )
+        holder = next(
+            (
+                other
+                for other, entry in provider.project_credentials.items()
+                if entry.secret == name and other != project_id
+            ),
+            None,
+        )
+        if holder is not None:
+            # equal 64-bit digests: the other project's secret is never written over (SDD §13.3)
+            raise ApiError(
+                409,
+                "conflict",
+                f"the credential of project {holder} holds the secret {name}, which project "
+                f"{project_id} would be stored as",
+            )
+        await _store_secret(request, name, values, provider_id)
+        updated = await _record_secret(
+            request,
+            provider_id,
+            name,
+            lambda fresh: {
+                "project_credentials": {
+                    **fresh.project_credentials,
+                    project_id: ProjectCredential(secret=name, updated_at=utcnow()),
+                },
+                "capabilities": _without_project_check(fresh.capabilities, project_id),
+            },
+            reset_check=False,
+        )
+    await emit(
+        svc.store,
+        svc.bus,
+        "provider.credentials_updated",
+        f"credentials of project {project_id} of provider {provider_id} updated",
+        actor=principal.name,
+        data={
+            "provider_id": provider_id,
+            "project_id": project_id,
+            "secret": name,
+            "keys": sorted(values),
+        },
+    )
+    return updated
+
+
+@router.delete("/providers/{provider_id}/projects/{project_id}/credentials", status_code=204)
+async def delete_project_credentials(
+    provider_id: str,
+    project_id: str,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.admin)),
+) -> Response:
+    """The project's credential goes (SDD §12, §13.3, §27.4): 409 while a plan needs the project,
+    judged as DELETE /providers/{id} judges a provider and under its lock, so no plan is saved
+    naming the project meanwhile. The secret goes first - a store that cannot delete it answers 503
+    and the entry stays, for the deletion to be sent again -, then the entry and that project's
+    entry of the check report."""
+    svc = services(request)
+    _check_project_id(project_id)
+    async with svc.orchestrator.provider_lock():
+        provider = await svc.db.get("provider", provider_id, Provider)  # 404 when missing
+        credential = provider.project_credentials.get(project_id)
+        if credential is None:
+            raise ApiError(
+                404,
+                "not_found",
+                f"provider {provider_id} holds no credential for project {project_id}",
+            )
+        users = await _plans_that_need(svc, provider_id, project_id)
+        if users:
+            rest = len(users) - 10
+            raise ApiError(
+                409,
+                "conflict",
+                f"project {project_id} of provider {provider_id} is used by plan(s) that still "
+                f"need it: {', '.join(users[:10])}{f' and {rest} more' if rest > 0 else ''}; a "
+                "plan needs its projects until it completes and its VMs are finalized",
+            )
+        name = credential.secret
+        try:
+            store = secret_store(svc.settings)
+            await asyncio.to_thread(store.delete, name)
+        except SecretStoreError as exc:
+            raise ApiError(503, "unavailable", f"secret store: {exc}") from None
+        try:
+            await _write_provider(
+                svc,
+                provider_id,
+                lambda fresh: {
+                    "project_credentials": {
+                        k: v for k, v in fresh.project_credentials.items() if k != project_id
+                    },
+                    "capabilities": _without_project_check(fresh.capabilities, project_id),
+                },
+                reset_check=False,
+            )
+        except _KeptChanging:
+            raise ApiError(
+                503,
+                "unavailable",
+                f"secret {name} is deleted, but provider {provider_id} changed "
+                f"{RECORD_SECRET_ATTEMPTS} times while its entry was being removed; send the "
+                "deletion again",
+            ) from None
+    await emit(
+        svc.store,
+        svc.bus,
+        "provider.credentials_updated",
+        f"credentials of project {project_id} of provider {provider_id} deleted",
+        actor=principal.name,
+        data={
+            "provider_id": provider_id,
+            "project_id": project_id,
+            "secret": name,
+            "deleted": True,
+        },
+    )
+    return Response(status_code=204)
+
+
+async def _plans_that_need(svc: Any, provider_id: str, project_id: str | None = None) -> list[str]:
     """The plans that still need the provider (SDD §12), each with why: one that has not completed
     (a failed one can start again), or a completed one with a migration that holds its VM - it can
     be rolled back until it is finalized, and its rollback needs both providers (§8.1), or a
     rolled-back one that kept its copied data, which a cancel cleans up - and a completed or
-    cancelled one with a cancelled migration whose cleanup is pending (§5.1)."""
+    cancelled one with a cancelled migration whose cleanup is pending (§5.1). With ``project_id``,
+    those of them that name the project on the provider's side alone (§27.4)."""
     plans = [
         p
         for p in await svc.db.list("plan", Plan)
         if provider_id in (p.source_provider_id, p.destination_provider_id)
+        and (project_id is None or _names_project(p, provider_id, project_id))
     ]
     completed = [p.id for p in plans if p.status in TERMINAL_PLAN_STATUSES]
     holding: Counter[str] = Counter()
@@ -560,7 +782,7 @@ async def delete_provider(
     svc = services(request)
     # SDD §12: plan creations, edits and retries check their providers under the same lock
     async with svc.orchestrator.provider_lock():
-        await svc.db.get("provider", provider_id, Provider)  # 404 when missing
+        provider = await svc.db.get("provider", provider_id, Provider)  # 404 when missing
         users = await _plans_that_need(svc, provider_id)
         if users:
             rest = len(users) - 10
@@ -583,6 +805,8 @@ async def delete_provider(
         credentials_secret_name(provider_id),
         conversion_key_secret_name(provider_id),
         ceph_key_secret_name(provider_id),
+        # its project credentials' (SDD §12, §27.4)
+        *sorted(entry.secret for entry in provider.project_credentials.values()),
     ):
         try:
             await asyncio.to_thread(secret_store(svc.settings).delete, name)
