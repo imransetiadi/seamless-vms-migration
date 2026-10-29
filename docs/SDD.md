@@ -864,7 +864,9 @@ active enters `cutover` when all hold:
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`;
 5. a GPU VM (§22.2) has a GPU capacity read that found room for its GPU flavor (§22.4), made once rules 1–4 hold and a
    cutover slot is left for it, and answered at most 60 s before the step starts (model time in demo mode, though
-   never under three ticks; §7.4, §22.7).
+   never under three ticks; §7.4, §22.7);
+6. each project credential its cutover and a rollback would act with expires no sooner than 24 hours after the tick's
+   clock, as the last check read it, and none was written since that check (§27.7, owner decision 9; below).
 
 **GPU capacity (rule 5, plan task G6).** Once rules 1–4 hold and the tick's limits leave the cutover room to start
 (`max_concurrent_migrations`, the wave's `max_parallel`, §8), the tick starts the migration's read as a task of its
@@ -878,9 +880,9 @@ reads hang holds none of another destination's slots, and while it is the only o
 two or more hang at once, their reads can hold all four until the provider ends them (each call within 300 s, §10),
 and the other destinations' GPU reads wait so long - a delayed cutover, its source running, never one on a guess
 (G6 final review). None starts for a migration
-whose advisor decision waits (`advisor_hold`, §14.6). A GPU VM whose read is out, or whose read found room and still
-counts, holds its place: the tick gives that cutover slot, a step of `max_concurrent_migrations` and its wave's room
-(`max_parallel`) to no migration of its destination behind it in the tick's order - its plan's wave order, then the
+whose advisor decision waits (`advisor_hold`, §14.6), nor for one whose credentials rule 6 holds (below). A GPU VM
+whose read is out, or whose read found room and still counts, holds its place: the tick gives that cutover slot, a
+step of `max_concurrent_migrations` and its wave's room (`max_parallel`) to no migration of its destination behind it in the tick's order - its plan's wave order, then the
 plans ticked after it -, for a cutover, a keep-warm pass or a pre-copy, until the read finds no room or fails, or its
 cutover starts. A held place costs the migrations behind it the read's time - about a second, or as long as a slow
 destination takes, within the provider's bounds (§10) - and the GPU VM's own cutover; a migration of another
@@ -910,6 +912,36 @@ logged, until the next read a minute later. Neither a Force cutover, nor `auto_c
 rule 5. Leaving `ready`, `awaiting_cutover` and its keep-warm passes (`syncing`) - a cutover, a cancel, a failure, a
 validation - drops `gpu_wait` in the same write, which the transition's `migration.phase` announces; a read still out
 then is recorded on no stay, and a retry starts with none.
+
+**The credentials (rule 6, plan task TC7; §27.7, owner decision 9).** A token dies with its application credential: a
+cutover cut off by an expiry would be rolled back with the same credential, which fails too, and the source would stay
+stopped until an admin wrote a new one. So a cutover starts only while each project credential its step and a rollback
+would act with lasts at least 24 hours more. Those are the projects the selection (§8) names on each side for the rows
+of §27.5 a cutover and its rollback act in - the migration's run, a storage handover's two halves, the network
+cut-over's floating IPs and Octavia members (§8.3, §8.5), the DNS swap (§8.4) and the verification (§7.5):
+`credentials.cutover_projects`. For every strategy they are the plan's `source_project` at its source provider and its
+`destination_project` at its destination: a storage handover acts by id at the source with the provider's own
+credential, but its network cut-over and that cut-over's return act with the plan's source credential, and the rule
+judges them whatever the plan moves. A plan that names no project has none - a VMware plan names none (§27.9) - and
+reads no provider for the rule: it behaves as before. The providers' own credentials are not judged, as their check
+reads no expiry. Each credential is judged as its provider's record holds it (`planning/preflight.credential_hold`), at
+the tick's clock: by its entry in the provider's check report (`projects`, §10), which the last check that signed in
+with it wrote - a manual check, a validation's (§8), the provider dialog's after a save (§16). It holds the cutover
+while
+* the entry is missing, or its `checked_at` is earlier than the credential's `updated_at`: the credential was written
+  since that check (a write drops the entry, §12), and holds the cutover until a check reads it;
+* the entry is `error`: its last check read no expiry, and an expiry not read never stands for none;
+* its `expires_at` is earlier than 24 hours after the tick's clock - one exactly 24 hours on lets the cutover start - or
+  does not read as a time; a null `expires_at` never expires.
+
+A project its provider holds no credential for is not judged: no step can act with it, and the step fails at its
+sign-in before it changes anything (§7.1, §27.5 "No fallback"). Rule 6 is judged once rules 1–4 hold and before rule 5,
+so a cutover it holds starts no GPU capacity read and holds no place (§22.7); and again under the locks with rules
+1–4 (§8), so a credential written after the tick's snapshot holds the cutover too. Neither a Force cutover, nor
+`auto_cutover`, nor a bypassed window skips it. Meanwhile the source keeps running: a warm migration goes on with its
+keep-warm passes, a single-shot one stays in `ready`, as under rule 5. Nothing is recorded for the hold - no field and
+no event: like the window and the approvals, it is read from the plan and its providers as the API serves them (§4.2,
+§10), and the migration page names each credential that holds the cutover and why (§16).
 
 A migration whose advisor decision waits for approval (`advisor_hold`, §14.6) starts neither its pre-copy
 nor its cutover until the decision is approved or overridden; the plan runs its other migrations meanwhile,
@@ -1878,6 +1910,29 @@ class Executor(Protocol):
 
 Executors must be **idempotent per step**: re-running a step after a crash converges to the same
 state (the orchestrator resumes from `Migration.checkpoint`).
+
+**The sign-in** (§27.5, §27.7, plan task TC7). Before a step's first playbook or provider call, the executors that act
+on a cloud - the Ansible executor and the handover executor - sign in with each project credential the step acts with,
+as the selection names it (§8): `executors.base.sign_in`, one `check_project` (§10) of what acts with that credential
+(`ProviderRegistry.get(provider, project_id)`), a sign-in on a connection of its own, never a token cached by an earlier
+step - so a credential revoked, deleted or expired since its last check is found out before the step acts. A failure -
+Keystone refuses the sign-in or does not answer within the call's bound, the secret cannot be read, the provider holds
+no credential for the project, the token is another project's - is a `PermanentStepError` before anything of the step
+changes: never retried, never replaced by the provider's own credential. Its message names the provider (its label),
+the project (the name its check read, with its id) and the plan's side, with the failure as the provider words it (an
+HTTP status or a failure's kind, §10), never a secret or the application credential's id. So a cutover whose
+destination credential cannot sign in stops nothing (§6.6, §7.3 step 0), nor does one whose source credential cannot.
+* The Ansible executor: a migration's run - a pre-copy, a sync, a cutover, a rollback, a cancel's cleanup - signs in
+  with its run's two credentials (§7.2) before its conversion hosts' lookups; a pre-staging that runs a playbook with
+  the plan's two (§27.5's pre-staging row; the flavor import's destination is the provider's own); a finalize that
+  deletes the source with the source's.
+* The handover executor: its cutover with the credential of its destination half before its first call, a resumed one
+  too; its rollback with it before its first call at the destination - a rollback that has none to make, nothing having
+  been made there, starts the source with the source provider's own credential (§7.3) without it.
+
+A step that acts with the providers' own credentials alone - a plan that names no project, a VMware run, the handover's
+source half - signs in as before: its playbooks and calls do. The simulated executor signs in with none: the demo's
+fakes take project credentials with plan task TC9 (§27.10).
 
 **Process groups** (§25.4 layer 3, plan task HA3). Each playbook the control plane runs - a step's and a playbook
 hook's (§7.2 Hooks) - starts in a session of its own, so its process group holds what it starts. Its runner registers
@@ -5735,6 +5790,15 @@ is no origin a browser sends (review RV31-03).
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
   the alert can be shown - its label follows the source's power as the migration records it, a press holding only
   until the migration's phase, attempt or recorded power changes (audit DB-02),
+  a note while rule 6 of the cutover gate holds its cutover, before it cut over (`ready`, `precopy`, `syncing` or
+  `awaiting_cutover`; §5.4, plan task TC7) — "A credential holds the cutover." with each credential that holds it,
+  judged as the API judges it from the plan's `source_project` and `destination_project` and the providers' records at
+  the browser's clock: "Project {name} ({id}) at {provider}, the plan's {side} project: " (its id alone while its
+  check read no name) and why — "expires at {time}, within 24 hours" ("expired at {time}" once it passed), "written
+  at {time}, after its last check", "written at {time}, not checked since", "its last check failed" with the check's
+  message, or "its last check read an expiry that is no time" —, that the source VM keeps running, and what lets the
+  cutover start: a check of the provider reads a credential written since, an admin writes a new one for a credential
+  that expires; never a secret's name or an application credential's id —,
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
   a Network panel — each NIC with its source network, MAC and addresses and where it goes in RHOSO (the mapped
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
@@ -8796,7 +8860,9 @@ executors, the helpers, no fallback and the registry's fingerprint - in §7.2, �
 that task; plan task TC6's findings of §27.7 - `PROJECT_CREDENTIAL_EXPIRING`, `PROJECT_CREDENTIAL_UNRESTRICTED`,
 `PROJECT_CREDENTIAL_ROLE_MISSING` and `DST_KEYPAIR_KEY_MISMATCH` -, the role halves of `NET_PORT_NOT_PERMITTED` and
 `DST_FIP_ADDRESS_UNAVAILABLE`, the handover's eligibility reason, `DST_PROJECT_MISSING`'s remediation and the
-findings lists in §9.2, §9.3 and §16 since that task. The
+findings lists in §9.2, §9.3 and §16 since that task; plan task TC7's cutover gate rule 6, the executors' sign-in
+before a step and the migration page's naming of the credential that holds a cutover in §5.4, §7.1 and §16 since that
+task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -8899,9 +8965,9 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
 
 ### 27.5 Which credential each step uses
 
-Binding in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since plan task TC5, but the executors' sign-in before a step
-(below: "a step whose credential cannot sign in fails before it changes anything"), which comes with plan task TC7
-(§7.1); the storage handover's `admin` and the findings' role halves are binding in §9.2 and §9.3 since plan task TC6.
+Binding in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since plan task TC5, and the executors' sign-in before a step
+(below: "a step whose credential cannot sign in fails before it changes anything") in §7.1 since plan task TC7; the
+storage handover's `admin` and the findings' role halves are binding in §9.2 and §9.3 since plan task TC6.
 
 A plan's **source** and **destination credentials** are the project credentials its `source_project` and
 `destination_project` name, else the providers' own. The provider's own credential acts in its own project, and in
@@ -8993,14 +9059,16 @@ another only where a service lets an admin act by id or on the project's behalf.
   credential's roles, and `DST_FIP_ADDRESS_UNAVAILABLE` takes the provider's `admin` for the reservation (§27.6).
   `storage_handover` is ineligible (§9.2) for a plan whose `destination_project` credential lacks `admin`, the reason
   naming the project. `DST_PROJECT_MISSING`'s remediation names `destination_project` too.
-* **The cutover gate** (§5.4, proposed rule 6, TC7): a cutover starts only while each credential its step and a
-  rollback would use expires, as the last check read it, no sooner than 24 hours on (owner decision 9); a credential
-  written since that check holds it until a check reads it (the provider dialog checks after a save, §16). Otherwise
-  the migration keeps syncing, as under rule 5, and its page names the credential that holds it. A token dies with its
-  application credential, so a cutover cut off by an expiry would be rolled back with the same credential, which fails
-  too, and the source would stay stopped until an admin writes a new one: the margin keeps that from happening.
-* **The executors** sign in with the plan's credentials before each step's playbooks or calls run; a failure to sign
-  in is a permanent failure before anything changes, naming the provider and the project, never the credential.
+* **The cutover gate** (binding in §5.4 as its rule 6, and the migration page's naming in §16, since plan task TC7): a
+  cutover starts only while each credential its step and a rollback would use expires, as the last check read it, no
+  sooner than 24 hours on (owner decision 9); a credential written since that check holds it until a check reads it
+  (the provider dialog checks after a save, §16). Otherwise the migration keeps syncing, as under rule 5, and its page
+  names the credential that holds it. A token dies with its application credential, so a cutover cut off by an expiry
+  would be rolled back with the same credential, which fails too, and the source would stay stopped until an admin
+  writes a new one: the margin keeps that from happening.
+* **The executors** (binding in §7.1 since plan task TC7) sign in with the plan's credentials before each step's
+  playbooks or calls run; a failure to sign in is a permanent failure before anything changes, naming the provider and
+  the project, never the credential.
 
 ### 27.8 Security
 
@@ -9101,7 +9169,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 (binding) | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 (binding) | TC5 |
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
-| the cutover gate's rule 6; the executors' sign-in failure | §5.4, §7.1 | TC7 |
+| the cutover gate's rule 6; the executors' sign-in failure; the migration page's naming of the credential that holds a cutover | §5.4, §7.1, §16 (binding) | TC7 |
 | the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 | TC8 |
 | the demo's tenant projects and its plan with a project pair | §10 | TC9 |
 | QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
