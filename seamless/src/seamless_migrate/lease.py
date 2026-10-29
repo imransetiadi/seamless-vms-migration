@@ -6,7 +6,9 @@ one, so the replicas' clocks may disagree by any amount. The epoch that each tak
 a server's writes (``Store(fenced=True)``, §25.4). A server's elector (``seamless_migrate.leader``,
 §8; plan task HA3) campaigns and renews on a schedule, on an engine of its own (``lease_engine``),
 and writes ``leader.acquired`` and ``leader.released`` in the transactions that take and release
-the lease. No statement sends RETURNING, which RHEL 9's SQLite (3.34.1) does not have.
+the lease; the leader writes its orchestrator's health into the row with each renewal and, while its
+tick loop is unhealthy, alone, and a takeover clears it (§12, §25.6; plan task HA4). No statement
+sends RETURNING, which RHEL 9's SQLite (3.34.1) does not have.
 """
 
 from __future__ import annotations
@@ -83,7 +85,8 @@ def _aware(value: datetime) -> datetime:
 
 @dataclass(frozen=True)
 class LeaseRow:
-    """The lease as one read found it; ``expired`` is the database's judgement at that read."""
+    """The lease as one read found it; ``expired`` is the database's judgement at that read, and
+    ``health`` the orchestrator's object its leader last wrote, None since a takeover (SDD §12)."""
 
     holder: str
     address: str
@@ -92,6 +95,36 @@ class LeaseRow:
     renewed_at: datetime
     expires_at: datetime
     expired: bool
+    health: dict[str, Any] | None = None
+
+
+def read_lease(engine: Engine, name: str = ORCHESTRATOR_LEASE) -> LeaseRow | None:
+    """The row as it is now on ``engine``, or None while nobody ever took the lease: the elector's
+    read on its own engine, a replica's health and relay on the store's (SDD §11, §12)."""
+    query = sa.select(
+        leases.c.holder,
+        leases.c.address,
+        leases.c.epoch,
+        leases.c.acquired_at,
+        leases.c.renewed_at,
+        leases.c.expires_at,
+        (leases.c.expires_at <= db_now()).label("expired"),
+        leases.c.health,
+    ).where(leases.c.name == name)
+    with engine.connect() as conn:
+        row = conn.execute(query).first()
+    if row is None:
+        return None
+    return LeaseRow(
+        holder=row.holder,
+        address=row.address,
+        epoch=int(row.epoch),
+        acquired_at=_aware(row.acquired_at),
+        renewed_at=_aware(row.renewed_at),
+        expires_at=_aware(row.expires_at),
+        expired=bool(row.expired),
+        health=row.health if isinstance(row.health, dict) else None,
+    )
 
 
 def new_holder(host: str | None = None) -> str:
@@ -180,28 +213,7 @@ class Lease:
 
     def read(self) -> LeaseRow | None:
         """The row as it is now, or None while nobody ever took the lease."""
-        query = sa.select(
-            leases.c.holder,
-            leases.c.address,
-            leases.c.epoch,
-            leases.c.acquired_at,
-            leases.c.renewed_at,
-            leases.c.expires_at,
-            self._expired().label("expired"),
-        ).where(leases.c.name == self.name)
-        with self.engine.connect() as conn:
-            row = conn.execute(query).first()
-        if row is None:
-            return None
-        return LeaseRow(
-            holder=row.holder,
-            address=row.address,
-            epoch=int(row.epoch),
-            acquired_at=_aware(row.acquired_at),
-            renewed_at=_aware(row.renewed_at),
-            expires_at=_aware(row.expires_at),
-            expired=bool(row.expired),
-        )
+        return read_lease(self.engine, self.name)
 
     def campaign(self, record: Callable[[sa.Connection, Taken], None] | None = None) -> int | None:
         """One try for the lease: the epoch this replica took, else None (SDD §11). With no row it
@@ -276,6 +288,8 @@ class Lease:
                     acquired_at=db_now(),
                     renewed_at=db_now(),
                     expires_at=self._later(),
+                    # the last leader's orchestrator is not this one's (SDD §12)
+                    health=sa.null(),
                 )
             )
             if record is not None:
@@ -300,14 +314,24 @@ class Lease:
             .on_conflict_do_nothing(index_elements=[leases.c.name])
         )
 
-    def renew(self, epoch: int) -> bool:
+    def renew(self, epoch: int, health: dict[str, Any] | None = None) -> bool:
         """Push the expiry a lease past the database's now, where the lease is this replica's at
-        ``epoch``; False when it renewed nothing - the lease was taken (SDD §11). It changes no key
-        column, so it waits for no write. A renewal whose wait outlasts the retry period raises,
-        as a database error does: the lease may still be this replica's (§11, plan task HA3)."""
+        ``epoch``, and with ``health`` write the orchestrator's object into the row (SDD §12);
+        False when it renewed nothing - the lease was taken (§11). It changes no key column, so it
+        waits for no write. A renewal whose wait outlasts the retry period raises, as a database
+        error does: the lease may still be this replica's (§11, plan task HA3)."""
+        values: dict[str, Any] = {"renewed_at": db_now(), "expires_at": self._later()}
+        if health is not None:
+            values["health"] = health
         with self.engine.connect() as conn, self._bounded(conn):
-            renewed = conn.execute(self._own(epoch, renewed_at=db_now(), expires_at=self._later()))
-            return renewed.rowcount == 1
+            return conn.execute(self._own(epoch, **values)).rowcount == 1
+
+    def write_health(self, epoch: int, health: dict[str, Any]) -> bool:
+        """Write the orchestrator's object into this replica's lease at ``epoch`` and renew
+        nothing: a leader whose tick loop is unhealthy lets its lease lapse, yet every replica
+        reports its orchestrator (SDD §12). False when it wrote nothing - the lease was taken."""
+        with self.engine.connect() as conn, self._bounded(conn):
+            return conn.execute(self._own(epoch, health=health)).rowcount == 1
 
     def release(self, epoch: int, record: Callable[[sa.Connection], None] | None = None) -> bool:
         """Expire this replica's lease at ``epoch`` now, so another one takes it at its next try;
@@ -371,4 +395,13 @@ class Lease:
             raw.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
 
 
-__all__ = ["RETRY_S", "Lease", "LeaseRow", "Taken", "lease_engine", "new_holder", "replica_address"]
+__all__ = [
+    "RETRY_S",
+    "Lease",
+    "LeaseRow",
+    "Taken",
+    "lease_engine",
+    "new_holder",
+    "read_lease",
+    "replica_address",
+]

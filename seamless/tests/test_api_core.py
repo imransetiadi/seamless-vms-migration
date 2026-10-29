@@ -31,6 +31,8 @@ def test_health_public_reports_db(api, monkeypatch):
     assert res.status_code == 200
     body = res.json()
     orchestrator = body.pop("orchestrator")
+    # a store without a lease (a test's): the server leads alone (SDD §12, plan task HA4)
+    assert body.pop("leader") == {"leading": True, "holder": None, "epoch": None, "since": None}
     # demo_speed: the dashboard runs a demo's downtime clock in model time (SDD §12, ADV-16)
     assert body == {
         "status": "ok",
@@ -61,6 +63,59 @@ def test_health_public_reports_db(api, monkeypatch):
     monkeypatch.undo()
     assert api.client.get("/api/v1/ready").status_code == 200
     assert api.client.get("/api/v1/ready").json()["status"] == "ok"
+
+
+def test_health_names_the_leader_and_whether_this_replica_leads(api, tmp_path, monkeypatch):
+    """SDD §12, §25.6: /health's leader says whether the replica that answers leads, and names the
+    lease's holder, its epoch and when it was taken while the lease is valid - the same on every
+    replica -, each null while no replica leads. A server whose store holds no lease (a test's)
+    leads alone."""
+    from datetime import datetime
+
+    from seamless_migrate import lease as lease_module
+    from seamless_migrate.api import app as app_module
+    from seamless_migrate.lease import Lease
+
+    nobody = {"leading": False, "holder": None, "epoch": None, "since": None}
+    assert api.client.get("/api/v1/health").json()["leader"] == {**nobody, "leading": True}
+
+    monkeypatch.setattr(lease_module, "RETRY_S", 0.1)
+    monkeypatch.setattr(app_module, "replica_address", lambda port, host=None: f"192.0.2.10:{port}")
+    url = f"sqlite:///{tmp_path / 'replicas.db'}"
+    observer = Store(url)
+
+    def replica(name: str, port: int) -> TestClient:
+        settings, _ = api_settings(tmp_path / name, db_url=url, port=port)
+        return TestClient(create_app(settings.model_copy(update={"leader_lease_s": 30.0})))
+
+    try:
+        with replica("seamless-a", 8081) as a:
+            holder = a.app.state.services.leadership.holder
+            row = Lease(observer.engine, "observer", "192.0.2.99:8080", 30.0).read()
+            assert row is not None and row.holder == holder
+            leads = a.get("/api/v1/health").json()["leader"]
+            assert {**leads, "since": None} == {
+                "leading": True,
+                "holder": holder,
+                "epoch": 1,
+                "since": None,
+            }
+            assert datetime.fromisoformat(leads["since"].replace("Z", "+00:00")) == row.acquired_at
+            with replica("seamless-b", 8082) as b:
+                assert b.get("/api/v1/health").json()["leader"] == {**leads, "leading": False}
+                # the row cannot be read: the leader names itself, a follower knows of no leader
+                for client in (a, b):
+                    services = client.app.state.services
+                    monkeypatch.setattr(services.leadership, "row", lambda: 1 / 0)
+                assert a.get("/api/v1/health").json()["leader"] == {**leads, "since": None}
+                unread = b.get("/api/v1/health").json()
+                assert unread["leader"] == nobody and unread["orchestrator"]["running"] is False
+        # the leader stopped and released its lease, and no replica here campaigns: nobody leads
+        monkeypatch.setattr(Lease, "campaign", lambda self, record=None: None)
+        with replica("seamless-c", 8083) as c:
+            assert c.get("/api/v1/health").json()["leader"] == nobody
+    finally:
+        observer.dispose()
 
 
 def test_unhandled_errors_keep_the_envelope_and_headers(tmp_path):
