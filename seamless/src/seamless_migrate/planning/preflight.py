@@ -2336,6 +2336,7 @@ def run_preflight(
         if host_key_checking is not None:
             out.extend(
                 _host_key_findings(
+                    plan,
                     (checked or {}).get(source.id, source),
                     (checked or {}).get(destination.id, destination),
                     host_key_checking,
@@ -2442,12 +2443,32 @@ def _stack_findings(
 _REPLACED = "conversion host replaced: "
 
 
-def _host_key_findings(source: Provider, destination: Provider, checking: bool) -> list[Finding]:
+def _host_report(provider: Provider, project: str | None) -> str:
+    """What the provider check last reported of the conversion host the credential of ``project``
+    reaches (SDD §10 "Host key pins"): its status message for its own credential (None), else
+    that project's entry's message; "" for none."""
+    if project is None:
+        return provider.status_message or ""
+    report = provider.capabilities.get("projects")
+    entry = report.get(project) if isinstance(report, dict) else None
+    message = entry.get("message") if isinstance(entry, dict) else None
+    return message if isinstance(message, str) else ""
+
+
+def _host_key_findings(
+    plan: Plan, source: Provider, destination: Provider, checking: bool
+) -> list[Finding]:
     """CONV_HOST_KEY_UNKNOWN and CONV_HOST_KEYS_UNCHECKED (SDD §9.3, §26.5): the conversion hosts
     the plan needs - both for an OpenStack source, a VMware source's destination host alone -
     while their keys are checked, each with declared keys or a pin of its server, or one
-    Seamless will create; else the warning that no hop checks a key."""
+    Seamless will create; else the warning that no hop checks a key. A side's host is the one the
+    plan's runs reach with their credential there: in a project the plan names, that project's,
+    judged by its pin and the check's report of it (§10, §26.4)."""
+    # the selection reads this module (FIP_ADDRESS_ROLES): it is imported when it is used
+    from ..credentials import Step, credential_project, host_pin
+
     vmware = source.kind == ProviderKind.vmware
+    step = Step.KIT if vmware else Step.MIGRATION
     needed = (
         [("destination", destination)]
         if vmware
@@ -2474,11 +2495,13 @@ def _host_key_findings(source: Provider, destination: Provider, checking: bool) 
         assert host is not None
         if host.ssh_host_keys:
             continue
-        name = f"{side} {provider.label} ({host.name or SIDE_ALIASES[side]})"
-        message = provider.status_message or ""
+        project = credential_project(step, side, plan)
+        where = f" in project {project}" if project is not None else ""
+        name = f"{side} {provider.label} ({host.name or SIDE_ALIASES[side]}{where})"
+        message = _host_report(provider, project)
         if message.startswith(_REPLACED):
             problems.append(f"{name}: {message[len(_REPLACED) :]}")
-        elif provider.conversion_host_pin is not None:
+        elif host_pin(provider, project) is not None:
             continue
         elif not host.manage or (vmware and side == "destination"):
             problems.append(

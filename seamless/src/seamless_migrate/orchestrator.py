@@ -54,9 +54,11 @@ from .credentials import (
     Step,
     credential_project,
     for_step,
+    host_pin,
     implementation,
     reservation,
     verification_view,
+    with_host_pin,
 )
 from .dns_swap import (
     DnsSwapError,
@@ -210,14 +212,15 @@ class _HostKeyBook:
     async def pin_from_console(self, provider: Provider) -> Provider:
         """The provider once its conversion host, without a pin, was pinned from its console by
         the provider check's path (§10, §26.8); as stored when nothing was pinned. The host is
-        looked up where the run reaches it: with the plan's credential (§7.2, §27.5)."""
+        looked up where the run reaches it - with the plan's credential (§7.2, §27.5) - and
+        pinned as that credential's pin (§26.4)."""
         return await self._orchestrator._pin_from_console(provider.id, self.plan_id)
 
     async def pin_injected(
         self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
     ) -> None:
         """The server the pre-staging's role created with the key the run injected, pinned with
-        it (§26.3)."""
+        it (§26.3) as the pin of the plan's credential on that side (§26.4, §27.5)."""
         await self._orchestrator._pin_injected(provider.id, side, server_id, keys, self.plan_id)
 
     async def refused(self, message: str, data: Mapping[str, Any]) -> None:
@@ -834,6 +837,34 @@ def _projects_report(
     return report
 
 
+async def _conversion_host_server(provider: Provider, impl: Any) -> tuple[str, str] | None:
+    """The server the provider's conversion host resolves to with ``impl``, and what found it
+    (SDD §10 "Host key pins"): by its name - the side's as the executor names the host when it has
+    none -, else by its address; None when nothing answers, or when there is no host or nothing
+    to look it up with. Raises ProviderError."""
+    host = provider.conversion_host
+    find = getattr(impl, "find_server", None)
+    if host is None or find is None:
+        return None
+    found_by = host.name or CONVERSION_HOST_NAMES[str(provider.role)]
+    server = await find(found_by)
+    by_address = getattr(impl, "server_of_address", None)
+    if server is None and host.address and by_address is not None:
+        found_by, server = host.address, await by_address(host.address)
+    return None if server is None else (found_by, str(server))
+
+
+def _replaced(found_by: str, server: str, pin: HostKeyPin) -> str | None:
+    """The report of a conversion host that resolves to another server than its pin's (SDD §10,
+    §26.5), ``found_by`` being what found it; None for the pin's own server."""
+    if pin.server_id == server:
+        return None
+    return (
+        f"conversion host replaced: {found_by} is now server {server}; its pin belongs to server "
+        f"{pin.server_id}"
+    )
+
+
 def _foreign_vms(plan: Plan, source: Provider, vms: Iterable[VMRef]) -> str | None:
     """Why validation refuses a plan whose VMs are not all of its source project (SDD §27.5 "One
     project pair per plan", owner decision 7, plan task TC5): its source_project, else the source
@@ -1200,8 +1231,12 @@ class Orchestrator:
             except ProviderError as exc:
                 update = {"status": "error", "status_message": redact(str(exc))[:500]}
             if update["status"] == "ok":
-                pinning, pinned = await self._pin_conversion_host(provider, impl, actor)
-                update.update(pinning)
+                # its own credential's host and pin; a project's are the project's (SDD §26.4)
+                pin, replaced, pinned = await self._pin_conversion_host(provider, impl, actor)
+                if pin is not None:
+                    update["conversion_host_pin"] = pin
+                if replaced is not None:
+                    update["status_message"] = replaced
             signed_in = await self._check_projects(provider, impl, projects)
             update["last_checked_at"] = now = self._now()
             if provider.project_credentials:
@@ -1244,8 +1279,9 @@ class Orchestrator:
         self, provider: Provider, impl: Any, project_id: str
     ) -> dict[str, Any]:
         """One project credential's entry (SDD §10, §27.7): ok with what its token and its record
-        say, else error with why - a failure, an implementation that cannot sign in with a project
-        credential, or a token scoped to another project, which is never used."""
+        say - and the report of its project's conversion host found replaced -, else error with
+        why - a failure, an implementation that cannot sign in with a project credential, or a
+        token scoped to another project, which is never used."""
         sign_in = getattr(impl, "check_project", None)
         try:
             if sign_in is None:
@@ -1258,40 +1294,53 @@ class Orchestrator:
             return _project_check(
                 "error", f"{provider.id}: its token is scoped to project {scoped}, not {project_id}"
             )
-        return _project_check("ok", None, read)
+        return _project_check("ok", await self._replaced_project_host(provider, project_id), read)
+
+    async def _replaced_project_host(self, provider: Provider, project_id: str) -> str | None:
+        """The report of the project's conversion host found replaced (SDD §10 "Host key pins",
+        §26.4, §26.5): looked up with the project's credential, as a run of a plan with the
+        project finds it, when that credential holds a pin. None when it holds none, when the host
+        resolves to the pin's server or to none, and when the lookup fails - logged by its
+        provider error. A project host's console is never read, and nothing is pinned."""
+        pin = host_pin(provider, project_id)
+        if pin is None:
+            return None
+        try:
+            impl = implementation(self.providers, provider, project_id)
+            found = await _conversion_host_server(provider, impl)
+        except ProviderError as exc:
+            log.warning(
+                "the conversion host of project %s of provider %s was not looked up: %s",
+                project_id,
+                provider.id,
+                redact(str(exc)),
+            )
+            return None
+        return None if found is None else _replaced(*found, pin)
 
     async def _pin_conversion_host(
-        self, provider: Provider, impl: Any, actor: str
-    ) -> tuple[dict[str, Any], Event | None]:
-        """What a check that answered changes of the provider's conversion host's pin, and the
-        event that announces a new one (SDD §10 "Host key pins", §26.3, §26.4). The host's server
-        is found by its name - the side's as the executor names the host when it has none -, else
-        by its address. Without a pin, its whole console pins what the parser keeps; a pin of that
-        server reads nothing more; a pin of another server is kept, neither used nor replaced, and
-        reported in the status message. Nothing of the console is logged."""
-        host = provider.conversion_host
-        find = getattr(impl, "find_server", None)
+        self, provider: Provider, impl: Any, actor: str, project: str | None = None
+    ) -> tuple[HostKeyPin | None, str | None, Event | None]:
+        """What a check that answered, or a run, learns of the conversion host that ``impl`` -
+        the credential of ``project``, the provider's own for None - reaches (SDD §10 "Host key
+        pins", §26.3, §26.4): the pin its console gives and the event that announces it, or the
+        report of a pin of another server. The host's server is found by its name - the side's as
+        the executor names the host when it has none -, else by its address. Without a pin of
+        that credential (``host_pin``), its whole console pins what the parser keeps; a pin of
+        that server reads nothing more; a pin of another server is kept, neither used nor
+        replaced, and reported. Nothing of the console is logged."""
         read = getattr(impl, "console_log", None)
-        if host is None or provider.kind == ProviderKind.vmware or find is None or read is None:
-            return {}, None
+        if provider.kind == ProviderKind.vmware or read is None:
+            return None, None, None
         side = str(provider.role)
-        found_by = host.name or CONVERSION_HOST_NAMES[side]
         try:
-            server = await find(found_by)
-            by_address = getattr(impl, "server_of_address", None)
-            if server is None and host.address and by_address is not None:
-                found_by, server = host.address, await by_address(host.address)
-            if server is None:
-                return {}, None
-            server = str(server)
-            pin = provider.conversion_host_pin
+            found = await _conversion_host_server(provider, impl)
+            if found is None:
+                return None, None, None
+            found_by, server = found
+            pin = host_pin(provider, project)
             if pin is not None:
-                if pin.server_id == server:
-                    return {}, None
-                return {
-                    "status_message": f"conversion host replaced: {found_by} is now server "
-                    f"{server}; its pin belongs to server {pin.server_id}"
-                }, None
+                return None, _replaced(found_by, server, pin), None
             keys = console_keys(await read(server, None))
         except ProviderError as exc:
             log.warning(
@@ -1299,18 +1348,19 @@ class Orchestrator:
                 provider.id,
                 redact(str(exc)),
             )
-            return {}, None
+            return None, None, None
         if not keys:
             log.debug(
                 "the conversion host %s of provider %s: its console shows no host key to pin",
                 server,
                 provider.id,
             )
-            return {}, None
+            return None, None, None
+        where = f" in project {project}" if project is not None else ""
         event = new_event(
             "conversion_host.key_pinned",
-            f"the {side} conversion host {found_by} of provider {provider.id} (server {server}) "
-            "pinned from its console",
+            f"the {side} conversion host {found_by} of provider {provider.id}{where} (server "
+            f"{server}) pinned from its console",
             actor=actor,
             data={
                 "provider_id": provider.id,
@@ -1321,7 +1371,7 @@ class Orchestrator:
             },
         )
         pin = HostKeyPin(server_id=server, keys=keys, source="console", pinned_at=self._now())
-        return {"conversion_host_pin": pin}, event
+        return pin, None, event
 
     def host_keys(self, plan_id: str, migration_id: str | None = None) -> _HostKeyBook:
         """The book of the conversion hosts' keys of a run of the plan - a migration's step, or
@@ -1334,23 +1384,19 @@ class Orchestrator:
         conversion_host.key_pinned in one transaction -, under the provider's lock as a check
         holds it; the provider as stored when it was pinned meanwhile or nothing was pinned. The
         host of the run of ``plan_id`` is looked up with the plan's credential, in its project
-        when it names one there (§7.2, §27.5)."""
-        plan: Plan | None = None
-        if plan_id is not None:
-            with contextlib.suppress(NotFound):
-                plan = await self._plan(plan_id)
+        when it names one there (§7.2, §27.5), and pinned as that credential's pin (§26.4)."""
+        plan = await self._plan_of_run(plan_id)
         async with self._lock(f"provider:{provider_id}"):
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
-            if provider.conversion_host_pin is not None:
+            project = credential_project(Step.PRESTAGE, provider.role, plan)
+            if host_pin(provider, project) is not None:
                 return provider
-            pinning, pinned = await self._pin_conversion_host(
-                provider, for_step(self.providers, Step.PRESTAGE, provider, plan), "system"
+            pin, _, pinned = await self._pin_conversion_host(
+                provider, implementation(self.providers, provider, project), "system", project
             )
-            if pinned is None:
+            updated = with_host_pin(provider, project, pin) if pin is not None else None
+            if updated is None or pinned is None:
                 return provider
-            updated = provider.model_copy(
-                update={"conversion_host_pin": pinning["conversion_host_pin"]}
-            )
             await put_and_emit(self.store, self.bus, "provider", updated, version, pinned)
             return updated
 
@@ -1363,18 +1409,34 @@ class Orchestrator:
         plan_id: str | None,
     ) -> None:
         """The pin of a server a pre-staging's role created with the key the run injected (SDD
-        §7.2, §26.3, §26.4): its keys, source injected, with conversion_host.key_pinned in one
-        transaction - over any earlier pin, another server's -, under the provider's lock as a
-        check holds it."""
+        §7.2, §26.3, §26.4): its keys, source injected, as the pin of the credential the plan's
+        pre-staging reaches the side's host with (§27.5), with conversion_host.key_pinned in one
+        transaction - over any earlier pin of that credential, another server's -, under the
+        provider's lock as a check holds it. A project whose credential went meanwhile takes no
+        pin: its pin went with it (§12)."""
+        plan = await self._plan_of_run(plan_id)
+        project = credential_project(Step.PRESTAGE, side, plan)
         async with self._lock(f"provider:{provider_id}"):
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
             pin = HostKeyPin(
                 server_id=server_id, keys=list(keys), source="injected", pinned_at=self._now()
             )
+            updated = with_host_pin(provider, project, pin)
+            if updated is None:
+                log.warning(
+                    "the %s conversion host of provider %s (server %s) was not pinned: the "
+                    "credential of project %s went meanwhile",
+                    side,
+                    provider_id,
+                    server_id,
+                    project,
+                )
+                return
+            where = f" in project {project}" if project is not None else ""
             event = new_event(
                 "conversion_host.key_pinned",
-                f"the {side} conversion host of provider {provider_id} (server {server_id}) "
-                "pinned with the host key its pre-staging injected",
+                f"the {side} conversion host of provider {provider_id}{where} (server "
+                f"{server_id}) pinned with the host key its pre-staging injected",
                 plan_id=plan_id,
                 data={
                     "provider_id": provider_id,
@@ -1384,8 +1446,17 @@ class Orchestrator:
                     "source": "injected",
                 },
             )
-            updated = provider.model_copy(update={"conversion_host_pin": pin})
             await put_and_emit(self.store, self.bus, "provider", updated, version, event)
+
+    async def _plan_of_run(self, plan_id: str | None) -> Plan | None:
+        """The plan of a run's book (SDD §7.2): the projects it names choose the credentials, and
+        so the pins, of its conversion hosts (§26.4, §27.5); None without one, or for a plan
+        that is gone."""
+        if plan_id is None:
+            return None
+        with contextlib.suppress(NotFound):
+            return await self._plan(plan_id)
+        return None
 
     async def _caps(
         self, provider: Provider, actor: str, project: str | None = None

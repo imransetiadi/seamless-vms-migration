@@ -2843,6 +2843,74 @@ def test_finding_conv_host_key_unknown_for_a_pin_of_another_server():
     )
 
 
+def test_finding_conv_host_key_unknown_for_a_projects_replaced_host():
+    """SDD §9.3, §10, §26.5 (§26.10 decision 11): on a side where the plan names a project, the
+    finding judges that project's host - its project credential's pin and the check's report of
+    the host in the project's entry -, never the provider's own: the project's host found
+    replaced blocks the plan, and the provider's own host found replaced blocks a plan without a
+    project alone. A project's host without a pin is one Seamless creates, or a run pins."""
+    from tests.credential_support import project_credentials, tenant_project
+
+    a = tenant_project()
+    replaced = (
+        "conversion host replaced: conv-src is now server srv-a-2; its pin belongs to server "
+        "srv-a-1"
+    )
+    entry = {
+        "status": "ok",
+        "message": None,
+        "project_name": "tenant-a",
+        "domain": "Default",
+        "user_id": "user-tenant-a",
+        "roles": ["member"],
+        "restricted": True,
+        "expires_at": None,
+        "checked_at": "2026-10-29T08:00:00Z",
+    }
+    held = project_credentials(SRC.id, a)
+    pin = HostKeyPin(
+        server_id="srv-a-1", keys=[bare(public_key(3))], source="injected", pinned_at=utcnow()
+    )
+    held[a] = held[a].model_copy(update={"conversion_host_pin": pin})
+    source = SRC.model_copy(
+        update={
+            "project_credentials": held,
+            "capabilities": {"projects": {a: {**entry, "message": replaced}}},
+        }
+    )
+    tenant_plan = make_plan(source_project=a)
+    f = only(
+        check(plan=tenant_plan, source=source, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN"
+    )
+    assert f.severity == Severity.blocker
+    assert f"source RHOSP 17.1 (conv-src in project {a}): conv-src is now server srv-a-2" in (
+        f.message
+    )
+    assert "its pin belongs to server srv-a-1" in f.message
+    # the provider's own host, managed and without a pin, is not judged for a plan without one
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(plan=make_plan(), source=source, host_key_checking=True)
+    )
+    # the provider's own host found replaced blocks a plan without a project, not the project's
+    own_replaced = _pinned(SRC).model_copy(
+        update={
+            "status_message": "conversion host replaced: conv-src is now server srv-2; its pin "
+            "belongs to server srv-conv-1",
+            "project_credentials": held,
+            "capabilities": {"projects": {a: entry}},
+        }
+    )
+    assert only(
+        check(plan=make_plan(), source=own_replaced, host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(plan=tenant_plan, source=own_replaced, host_key_checking=True)
+    )
+
+
 def test_finding_conv_host_key_unknown_not_for_a_host_seamless_will_create():
     """SDD §9.3, §26.3: a host Seamless manages gets its key injected when its pre-staging creates
     it, or its console read and pinned when it exists: no finding without a pin. Nor for a
