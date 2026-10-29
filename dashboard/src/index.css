@@ -79,7 +79,7 @@
 }
 
 @utility card {
-  @apply rounded-lg border border-border bg-card text-card-foreground;
+  @apply min-w-0 wrap-anywhere rounded-lg border border-border bg-card text-card-foreground;
 }
 
 @utility num {
@@ -99,7 +99,7 @@
 }
 
 @utility input {
-  @apply block min-h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-base text-foreground placeholder:text-muted-foreground transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-status-danger sm:text-sm;
+  @apply block min-h-11 w-full rounded-md border border-input bg-background px-3 py-2 text-base text-foreground placeholder:text-muted-foreground transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-status-danger sm:text-sm;
 }
 
 @utility skip-link {
@@ -198,13 +198,13 @@
 
   :root.light {
     color-scheme: light;
-    --background: 248 250 252; /* #F8FAFC */
+    --background: 232 237 243; /* #E8EDF3 */
     --foreground: 30 41 59; /* #1E293B */
-    --card: 255 255 255; /* #FFFFFF */
+    --card: 241 244 248; /* #F1F4F8 */
     --card-foreground: 30 41 59; /* #1E293B */
-    --muted: 233 239 248; /* #E9EFF8 */
+    --muted: 220 227 237; /* #DCE3ED */
     --muted-foreground: 71 85 105; /* #475569 */
-    --border: 226 232 240; /* #E2E8F0 */
+    --border: 197 207 220; /* #C5CFDC */
     --input: 100 116 139; /* #64748B */
     --primary: 37 99 235; /* #2563EB */
     --primary-foreground: 255 255 255; /* #FFFFFF */
@@ -222,7 +222,7 @@
     --chart-1: 37 99 235; /* #2563EB */
     --chart-2: 180 83 9; /* #B45309 */
     --chart-reference: 71 85 105; /* #475569 */
-    --chart-grid: 226 232 240; /* #E2E8F0 */
+    --chart-grid: 197 207 220; /* #C5CFDC */
   }
 
   html {
@@ -235,6 +235,17 @@
   @media (min-width: 1024px) {
     html {
       scroll-padding-top: 1rem;
+    }
+  }
+
+  /* Keep keyboard focus below both the mobile header and the section navigation. */
+  html:has(.section-nav) {
+    scroll-padding-top: 8rem;
+  }
+
+  @media (min-width: 768px) {
+    html:has(.section-nav) {
+      scroll-padding-top: 5rem;
     }
   }
 

@@ -1,3 +1,4 @@
+import { useListState } from '../lib/useListState';
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -37,15 +38,24 @@ function download(name: string, body: string, type: string) {
 export default function AdvisorAudit() {
   usePageTitle('Advisor audit');
   const searchId = useId();
+  const listState = useListState('advisor-audit');
   const audit = useEventTail({ audit: true }, AUDIT_KEEP);
-  const [action, setAction] = useState('all');
-  const [actor, setActor] = useState('all');
-  const [query, setQuery] = useState('');
+  const [action, setAction] = listState.field('action', 'all');
+  const [actor, setActor] = listState.field('actor', 'all');
+  const [query, setQuery] = listState.field('query', '');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filtersActive = query !== '' || action !== 'all' || actor !== 'all';
+  const clearFilters = () => {
+    setQuery('');
+    setAction('all');
+    setActor('all');
+    searchRef.current?.focus();
+  };
 
   // Load older audit events (SDD §12, §16): the page before the oldest loaded; the window it was read below stays
   // loaded, so reading the newest audit events again leaves no gap; a full page may have more before it
   const api = useApi();
-  const [older, setOlder] = useState<{ events: Event[]; more: boolean } | null>(null);
+  const [older, setOlder] = listState.field<{ events: Event[]; more: boolean } | null>('older', null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<unknown>(null);
   const [announcement, setAnnouncement] = useState('');
@@ -64,11 +74,12 @@ export default function AdvisorAudit() {
     setOlderError(null);
     try {
       const page = await fetchEventTail(api, { audit: true, before: oldest }, AUDIT_KEEP);
+      const restoreFocus = document.activeElement === moreRef.current;
       setOlder((prev) => ({ events: [...page, ...(prev?.events ?? []), ...(audit.data ?? [])], more: page.length >= AUDIT_KEEP }));
       setAnnouncement(page.length ? `Loaded ${page.length} older audit events.` : 'This is the start of the audit trail.');
       // the start of the trail removes the button: the table takes the focus, never the page (SDD §16)
       requestAnimationFrame(() => {
-        if (!moreRef.current) tableRef.current?.focus();
+        if (restoreFocus && !moreRef.current && document.activeElement === document.body) (tableRef.current ?? searchRef.current)?.focus();
       });
     } catch (error) {
       setOlderError(error);
@@ -145,7 +156,7 @@ export default function AdvisorAudit() {
           <label htmlFor={searchId} className="field-label">
             Search
           </label>
-          <input id={searchId} type="search" className="input" placeholder="VM, recommendation id, actor or text" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input ref={searchRef} id={searchId} type="search" className="input" placeholder="VM, recommendation id, actor or text" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
         <SelectField
           label="Action"
@@ -155,6 +166,7 @@ export default function AdvisorAudit() {
           options={[{ value: 'all', label: 'All actions' }, ...AUDIT_EVENT_KINDS.map((kind) => ({ value: kind, label: auditActionLabel(kind) }))]}
         />
         <SelectField label="Actor" className="md:w-60" value={actor} onChange={(e) => setActor(e.target.value)} options={[{ value: 'all', label: 'All actors' }, ...actors.map((a) => ({ value: a, label: a }))]} />
+        {filtersActive && <Button size="lg" onClick={clearFilters}>Clear filters</Button>}
       </div>
 
       <Panel title="Audit events" description={`Newest first, ${AUDIT_KEEP} at a time; Load older audit events reads further back`}>
@@ -172,7 +184,7 @@ export default function AdvisorAudit() {
         ) : events.length === 0 ? (
           <EmptyState icon={ScrollText} title="No audit events yet" description="Validating a plan records each recommendation and its decision here." />
         ) : shown.length === 0 ? (
-          <EmptyState icon={SearchX} title="No audit events match" description="Change the search or the filters." />
+          <EmptyState icon={SearchX} title="No audit events match" description="Clear filters to see all loaded audit events." />
         ) : (
           <div ref={tableRef} tabIndex={-1} className="table-wrap rounded-md border border-border outline-hidden">
             <table className="data-table">

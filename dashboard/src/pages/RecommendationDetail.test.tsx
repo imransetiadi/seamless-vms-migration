@@ -12,6 +12,65 @@ function renderRec(id: string, server?: MockServer) {
 }
 
 describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
+  it('offers recovery without Retry for a missing recommendation', async () => {
+    renderRec('not-found');
+    expect(await screen.findByText('This recommendation does not exist')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to recommendations' })).toHaveAttribute('href', '/advisor');
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
+  it('loads recommendation audit events beyond the newest scope window', async () => {
+    const server = createTestServer();
+    for (let i = 0; i < 1001; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: 'mig-d4e6f8a090', actor: 'test', message: 'newer scope event', data: {} });
+    renderRec('rec-d4e6f8a09001', server);
+    await screen.findByText(/^Recommended: Warm migration/);
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole('tab', { name: 'Audit' }));
+    expect(await screen.findByText('No audit events for this recommendation in the loaded window.')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    expect(await screen.findByRole('table')).toHaveTextContent('Recommendation created');
+    expect(screen.getAllByText('Recommendation created')).toHaveLength(1);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Loaded recommendation audit history' })).toHaveFocus());
+  });
+  it('keeps the audit window when loading older events fails and retries', async () => {
+    const server = createTestServer();
+    for (let i = 0; i < 1001; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: 'mig-d4e6f8a090', actor: 'test', message: 'newer', data: {} });
+    const handle = server.handle.bind(server);
+    let fail = true;
+    const cursors: string[] = [];
+    server.handle = (method, path, query, body, token) => {
+      if (path === '/events' && query.has('before')) {
+        cursors.push(query.get('before')!);
+        if (fail) return { status: 503, body: { error: { code: 'unavailable', message: 'Try later' } } };
+      }
+      return handle(method, path, query, body, token);
+    };
+    renderRec('rec-d4e6f8a09001', server);
+    await screen.findByText(/^Recommended: Warm migration/);
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole('tab', { name: 'Audit' }));
+    await user.click(await screen.findByRole('button', { name: 'Load older audit events' }));
+    expect(await screen.findByText('Older audit events could not be loaded')).toBeInTheDocument();
+    expect(screen.getByText('No audit events for this recommendation in the loaded window.')).toBeInTheDocument();
+    fail = false;
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByRole('table')).toHaveTextContent('Recommendation created');
+    expect(cursors).toHaveLength(2);
+    expect(cursors[0]).toBe(cursors[1]);
+    expect(Number(cursors[0])).toBeGreaterThan(0);
+  });
+  it('keeps Retry for a temporary recommendation failure', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    let fail = true;
+    server.handle = (method, path, query, body, token) => fail && path === '/advisor/recommendations/rec-d4e6f8a09001'
+      ? { status: 503, body: { error: { code: 'unavailable', message: 'Try later' } } }
+      : handle(method, path, query, body, token);
+    renderRec('rec-d4e6f8a09001', server);
+    expect(await screen.findByText('This recommendation could not be loaded')).toBeInTheDocument();
+    fail = false;
+    await userEvent.setup({ delay: null }).click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText(/^Recommended: Warm migration/)).toBeInTheDocument();
+  });
   it('shows the recommendation, its decision and its audit trail', async () => {
     renderRec('rec-d4e6f8a09001');
     const user = userEvent.setup({ delay: null });
@@ -139,7 +198,7 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
 
   it('says when the recommendation does not exist', async () => {
     renderRec('rec-000000000000');
-    expect(await screen.findByText(/recommendation could not be loaded/i)).toBeInTheDocument();
+    expect(await screen.findByText(/recommendation does not exist/i)).toBeInTheDocument();
   });
 
   it('offers Approve and Override while the recommendation can still change its migration, to advisor.approve (SDD §14.6, ADV-04)', async () => {

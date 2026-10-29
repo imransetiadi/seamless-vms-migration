@@ -1,5 +1,6 @@
+import { useListState, validListSort } from '../lib/useListState';
 import { Hourglass, SearchX, TriangleAlert } from 'lucide-react';
-import { memo, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useId, useMemo, useRef, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Phase, type Plan, type Strategy, type MigrationLike } from '../api/types';
 import { formatDuration, formatNumber, formatPct } from '../lib/format';
@@ -106,11 +107,12 @@ const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }
 /** Plan migrations with strategy, estimate and findings; text/phase/strategy/wave filters; sortable. */
 export function MigrationsTable({ migrations, plan, caption = 'Migrations', emptyDescription, emptyAction }: MigrationsTableProps) {
   const searchId = useId();
-  const [query, setQuery] = useState('');
-  const [phase, setPhase] = useState<Phase | 'all'>('all');
-  const [strategy, setStrategy] = useState<Strategy | 'all'>('all');
-  const [wave, setWave] = useState('all');
-  const [sort, setSort] = useState<SortState<SortKey> | null>(null);
+  const listState = useListState('migrations');
+  const [query, setQuery] = listState.field('query', '');
+  const [phase, setPhase] = listState.field<Phase | 'all'>('phase', 'all');
+  const [strategy, setStrategy] = listState.field<Strategy | 'all'>('strategy', 'all');
+  const [wave, setWave] = listState.field('wave', 'all');
+  const [sort, setSort] = listState.field<SortState<SortKey> | null>('sort', null, validListSort(['vm', 'phase', 'strategy', 'wave', 'progress', 'estimate', 'findings', 'downtime']));
 
   const waves = useMemo(() => [...(plan?.waves ?? [])].sort((a, b) => a.order - b.order), [plan]);
   const waveName = useMemo(() => new Map(waves.map((w) => [w.id, w.name])), [waves]);

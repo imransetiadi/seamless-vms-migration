@@ -328,6 +328,23 @@ describe('Plans page', () => {
     expect(within(dialog).getByLabelText(/^name/i)).toHaveAttribute('aria-invalid', 'true');
   });
 
+  it('resets VM filters when changing the source to an already cached inventory', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = within(screen.getByRole('dialog', { name: /new migration plan/i }));
+    const source = dialog.getByLabelText(/source provider/i);
+    await user.selectOptions(source, 'vcenter-hq');
+    await dialog.findByLabelText('Search VMs');
+    await user.selectOptions(source, 'rhosp17-dc1');
+    await dialog.findByRole('checkbox', { name: 'Select web-01' });
+    await user.type(dialog.getByLabelText('Search VMs'), 'web-01');
+    await user.selectOptions(source, 'vcenter-hq');
+    expect(dialog.getByLabelText('Search VMs')).toHaveValue('');
+    expect(dialog.getByRole('table', { name: /^VMs on vCenter HQ/ })).toBeInTheDocument();
+    expect(source).toHaveFocus();
+  });
+
   it('creates a draft plan with the selected VMs', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

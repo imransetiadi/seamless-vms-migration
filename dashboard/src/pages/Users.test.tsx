@@ -1,11 +1,12 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AppRoutes } from '../App';
+import App, { AppRoutes } from '../App';
 import { queryKeys } from '../api/hooks';
 import { Layout } from '../components/Layout';
 import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import Users from './Users';
+import { createQueryClient } from '../api/queryClient';
 
 function renderUsers(token = 'admin') {
   const server = createTestServer();
@@ -33,6 +34,7 @@ describe('dashboard user access', () => {
     expect(JSON.stringify(view.queryClient.getQueryData(queryKeys.users))).not.toContain(token);
     await user.click(screen.getByRole('button', { name: 'Copy token' }));
     expect(await screen.findByText('Token copied.')).toBeInTheDocument();
+    await user.click(screen.getByLabelText('I have saved this token securely'));
     await user.click(screen.getByRole('button', { name: 'Done' }));
     expect(screen.queryByLabelText('New user API token')).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByLabelText(/user name/i)).toHaveFocus());
@@ -67,6 +69,8 @@ describe('dashboard user access', () => {
     await user.click(screen.getByRole('button', { name: 'Add user' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('a user with this name already exists');
     expect(screen.getByLabelText(/user name/i)).toHaveValue('RINA');
+    expect(screen.getByLabelText(/user name/i)).toHaveAttribute('aria-invalid', 'true');
+    await waitFor(() => expect(screen.getByLabelText(/user name/i)).toHaveFocus());
     expect(screen.queryByLabelText('New user API token')).not.toBeInTheDocument();
   });
 
@@ -102,4 +106,36 @@ describe('dashboard user access', () => {
     await user.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('rina')).toBeInTheDocument();
   });
+});
+
+it('warns before leaving an unacknowledged token and clears its mutation after confirmed navigation', async () => {
+  const user = userEvent.setup();
+  const server = createTestServer();
+  server.health.auth_disabled = false;
+  window.history.replaceState(null, '', '/users');
+  const queryClient = createQueryClient({ queries: { retry: false }, mutations: { retry: false } });
+  render(<App client={createTestClient(server)} queryClient={queryClient} />);
+  await user.type(await screen.findByLabelText(/user name/i), 'guarded-user');
+  await user.click(screen.getByRole('button', { name: 'Add user' }));
+  await screen.findByLabelText('New user API token');
+  expect(screen.getByRole('button', { name: 'Done' })).toHaveAttribute('aria-disabled', 'true');
+  await user.click(within(screen.getByRole('navigation', { name: 'Primary' })).getByRole('link', { name: 'Overview' }));
+  expect(await screen.findByRole('alertdialog')).toHaveTextContent('Leave without saving this token?');
+  await user.click(screen.getByRole('button', { name: 'Keep editing' }));
+  expect(screen.getByLabelText('New user API token')).toBeInTheDocument();
+  await user.click(within(screen.getByRole('navigation', { name: 'Primary' })).getByRole('link', { name: 'Overview' }));
+  await user.click(screen.getByRole('button', { name: 'Leave and lose token' }));
+  await screen.findByRole('heading', { name: 'Overview' });
+  await waitFor(() => expect(queryClient.getMutationCache().getAll()).toHaveLength(0));
+  expect(screen.queryByLabelText('New user API token')).not.toBeInTheDocument();
+});
+
+it('rejects an empty required user name before calling the API', async () => {
+  const user = userEvent.setup();
+  const view = renderUsers();
+  await screen.findByText('rina');
+  const requests = vi.spyOn(view.server, 'handle');
+  await user.click(screen.getByRole('button', { name: 'Add user' }));
+  expect((screen.getByLabelText(/user name/i) as HTMLInputElement).validity.valueMissing).toBe(true);
+  expect(requests.mock.calls.some(([method, path]) => method === 'POST' && path === '/users')).toBe(false);
 });

@@ -8,7 +8,16 @@ import { cn } from '../lib/cn';
  */
 export function ScrollRegion({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
   return (
-    <div role="region" aria-label={label} tabIndex={0} className={cn('table-wrap', className)}>
+    // A focusable region intentionally handles its own scrolling keys.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
+    <div role="region" aria-label={label} tabIndex={0} className={cn('table-wrap', className)}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey) return;
+        const delta = { ArrowLeft: [-40, 0], ArrowRight: [40, 0], ArrowUp: [0, -40], ArrowDown: [0, 40] }[event.key];
+        if (!delta) return;
+        event.preventDefault();
+        event.currentTarget.scrollBy({ left: delta[0], top: delta[1] });
+      }}>
       {children}
     </div>
   );

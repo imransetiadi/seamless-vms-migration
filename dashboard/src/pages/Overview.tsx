@@ -402,7 +402,7 @@ export default function Overview() {
 
       {/* DOM order is the phone order: live clocks, then the human actions, then the history.
           On wide screens the actions take the right column beside both downtime panels. */}
-      <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] xl:grid-rows-[auto_1fr]">
+      <div className="mt-2 grid items-start gap-4 sm:mt-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] xl:grid-rows-[auto_1fr]">
         {migrationsQuery.isPending ? (
           <LoadingBlock label="Loading the downtime clocks…" />
         ) : migrationsUnknown ? (

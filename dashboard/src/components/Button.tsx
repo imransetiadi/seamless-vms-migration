@@ -44,6 +44,11 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   // the note about an unavailable action, under the button for a few seconds (lib/useAnchoredNote)
   const note = useAnchoredNote(4000);
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
+    // Safari does not focus pointer-activated buttons; dialogs need their trigger for focus restoration.
+    // Only a pointer click (detail = its click count, at least 1): a keyboard activation already has the
+    // focus, and the click a form's implicit submission dispatches (Enter in a field, detail 0) must leave
+    // it in the field.
+    if (event.detail > 0) event.currentTarget.focus({ preventScroll: true });
     if (softDisabled || loading) {
       event.preventDefault();
       if (softDisabled) note.show(event.currentTarget);

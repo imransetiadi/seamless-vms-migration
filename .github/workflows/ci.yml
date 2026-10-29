@@ -178,7 +178,8 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci --no-audit --no-fund
-      - run: npx playwright install --with-deps chromium
+      # the dashboard's Playwright config runs Chromium and WebKit (SDD §16, the 2026-10-29 UI audit's WebKit findings)
+      - run: npx playwright install --with-deps chromium webkit
       - name: Playwright smoke against the mock-mode build (real CSS pipeline)
         run: npm run test:e2e
       - name: Build the dashboard a demo server serves

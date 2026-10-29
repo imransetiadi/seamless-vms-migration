@@ -1,4 +1,4 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Route, Routes } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
@@ -17,6 +17,39 @@ function renderLogin(options: RenderOptions = {}) {
 }
 
 describe('Login', () => {
+  it('keeps the submitted token stable and ignores Enter while sign-in is pending', async () => {
+    const user = userEvent.setup({ delay: null });
+    let attempts = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    renderLogin({ wrapFetch: (mock) => async (input, init) => {
+      if (new URL(String(input), 'http://localhost').pathname.endsWith('/me')) {
+        attempts += 1;
+        await pending;
+      }
+      return mock(input, init);
+    } });
+    const input = await screen.findByLabelText('API token');
+    await user.type(input, 'not-a-valid-token');
+    await user.keyboard('{Enter}');
+    await waitFor(() => expect(attempts).toBe(1));
+    await user.type(input, 'edited{Enter}{Enter}');
+    try {
+      expect(input).toHaveValue('not-a-valid-token');
+      expect(input).toHaveAttribute('readonly');
+      expect(input).toHaveFocus();
+      expect(attempts).toBe(1);
+    } finally {
+      release();
+    }
+    await screen.findByRole('alert');
+    expect(input).not.toHaveAttribute('readonly');
+    await user.clear(input);
+    await user.type(input, 'viewer{Enter}');
+    await screen.findByText('Home page');
+    expect(attempts).toBe(2);
+  });
+
   it('says the session ended when a signed-in request was refused, once, and not after signing out (SDD §16)', async () => {
     storeToken('smg_test-token-not-real');
     endSession(); // what the client does on a 401 for a stored token
