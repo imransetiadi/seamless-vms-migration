@@ -513,7 +513,7 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const vmware = m.strategy === 'vmware_cold' || m.strategy === 'vmware_warm';
   return (
     <div className="flex min-w-0 flex-col wrap-anywhere gap-3 text-sm">
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
         <dt className="text-muted-foreground">Source id</dt>
         <dd className="min-w-0">
           <code className="text-xs">{vm.source_id}</code>

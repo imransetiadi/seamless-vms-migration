@@ -65,7 +65,7 @@ function ServiceCard({
           <StatusBadge tone={badge.tone} icon={badge.icon} label={badge.label} size="md" />
         </div>
       </div>
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
         {lines.map(([k, v]) => (
           <div key={k} className="contents">
             <dt className="text-muted-foreground">{k}</dt>
