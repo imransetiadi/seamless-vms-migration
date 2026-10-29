@@ -262,6 +262,92 @@ describe('MigrationDetail', () => {
     expect(screen.queryByRole('note', { name: 'Cutover will refuse' })).toBeNull();
   });
 
+  it('names the credential that holds a cutover at the gate', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const source = server.providers.find((p) => p.id === plan.source_provider_id)!;
+    const destination = server.providers.find((p) => p.id === plan.destination_provider_id)!;
+    // made-up Keystone projects and the API's records of their application credentials (SDD §4.2, §10, §27.4)
+    const a = '6c1f0e2a9b8d47c3a5e4f1d2c3b4a596';
+    const c = 'd4e5f6a7b8c94d0e8f1a2b3c4d5e6f70';
+    const hour = 3_600_000;
+    const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+    const check = (name: string, expires: string | null, checked: string) => ({
+      status: 'ok',
+      message: null,
+      project_name: name,
+      domain: 'Default',
+      user_id: `user-${name}`,
+      roles: ['member'],
+      restricted: true,
+      expires_at: expires,
+      checked_at: checked,
+    });
+    const secrets = { a: `provider-${source.id}.project-0123456789abcdef`, c: `provider-${destination.id}.project-fedcba9876543210` };
+    plan.source_project = a;
+    plan.destination_project = c;
+    source.project_credentials = { [a]: { secret: secrets.a, updated_at: at(-48 * hour) } };
+    source.capabilities = { ...source.capabilities, projects: { [a]: check('tenant-a', null, at(-24 * hour)) } };
+    destination.project_credentials = { [c]: { secret: secrets.c, updated_at: at(-48 * hour) } };
+    destination.capabilities = { ...destination.capabilities, projects: { [c]: check('tenant-c', at(3 * hour), at(-24 * hour)) } };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server, live: true });
+    const held = () => screen.findByRole('note', { name: 'Cutover held by a credential' });
+    // what a write or a check of a provider announces: the page reads the providers again (SDD §4.3, §16)
+    const checked = (provider: typeof source) =>
+      server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'admin', message: `provider ${provider.id}: ok`, data: { provider_id: provider.id, status: 'ok' } });
+
+    // the destination's credential expires in 3 hours: it holds the cutover, named with its provider and side
+    let note = await held();
+    expect(note).toHaveTextContent('A credential holds the cutover.');
+    expect(note).toHaveTextContent('The source VM keeps running meanwhile.');
+    let items = within(note).getAllByRole('listitem');
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveTextContent(`Project tenant-c (${c}) at ${destination.name}, the plan's destination project: expires at`);
+    expect(items[0]).toHaveTextContent(/, within 24 hours\. An admin writes a new credential for the project, then checks the provider\.$/);
+    for (const secret of Object.values(secrets)) expect(note).not.toHaveTextContent(secret);
+    await waitFor(() => expect(server.subscriberCount).toBeGreaterThan(0));
+
+    // the source's credential written since its last check is named too, the source's first, until a check reads it
+    source.project_credentials = { [a]: { secret: secrets.a, updated_at: at(-hour) } };
+    checked(source);
+    await waitFor(async () => expect(within(await held()).getAllByRole('listitem')).toHaveLength(2));
+    items = within(await held()).getAllByRole('listitem');
+    expect(items.map((li) => li.textContent?.split(':')[0])).toEqual([
+      `Project tenant-a (${a}) at ${source.name}, the plan's source project`,
+      `Project tenant-c (${c}) at ${destination.name}, the plan's destination project`,
+    ]);
+    expect(items[0]).toHaveTextContent(/written at .+, after its last check\. Check the provider: the cutover starts once a check reads it\.$/);
+
+    // a check that cannot read it holds it still - an expiry not read never stands for none -, and the destination's
+    // new expiry, 25 hours on, holds it no more
+    source.capabilities = {
+      ...source.capabilities,
+      projects: { [a]: { ...check('tenant-a', null, at(0)), status: 'error', message: 'the sign-in failed: HTTP 401', project_name: null } },
+    };
+    destination.capabilities = { ...destination.capabilities, projects: { [c]: check('tenant-c', at(25 * hour), at(0)) } };
+    checked(source);
+    await waitFor(async () => expect(within(await held()).getAllByRole('listitem')).toHaveLength(1));
+    note = await held();
+    expect(within(note).getByRole('listitem')).toHaveTextContent(
+      `Project ${a} at ${source.name}, the plan's source project: its last check failed: the sign-in failed: HTTP 401. Check the provider: the cutover starts once a check reads it.`,
+    );
+
+    // the check that reads it: nothing holds the cutover any more
+    source.capabilities = { ...source.capabilities, projects: { [a]: check('tenant-a', null, at(0)) } };
+    checked(source);
+    await waitFor(() => expect(screen.queryByRole('note', { name: 'Cutover held by a credential' })).toBeNull());
+
+    // a migration that cut over is past its gate: a credential that expires soon holds nothing there
+    source.capabilities = { ...source.capabilities, projects: { [a]: check('tenant-a', at(hour), at(0)) } };
+    checked(source);
+    expect(await held()).toHaveTextContent(`Project tenant-a (${a}) at ${source.name}`);
+    m.phase = 'completed';
+    server.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: completed`, data: { from: 'verifying', to: 'completed' } });
+    await waitFor(() => expect(screen.queryByRole('note', { name: 'Cutover held by a credential' })).toBeNull());
+  });
+
   it('names the strategy of each earlier attempt beside the attempts count (SDD §4.2, §14.4)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;

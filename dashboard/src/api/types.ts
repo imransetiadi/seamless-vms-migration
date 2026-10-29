@@ -191,6 +191,36 @@ export interface Provider {
   conversion_host_pin?: HostKeyPin | null;
   /** The source cluster's Ceph access (SDD §4.2, §28.4): an OpenStack or RHOSO source alone. Older fixtures omit it (null). */
   ceph?: CephAccess | null;
+  /** Server-owned: its application credential per Keystone project, by project id (SDD §4.2, §27.4) - the secret's name
+   * and when an admin wrote it, never a value; its check report's `projects` holds what each one's last check read
+   * (SDD §10). Older fixtures omit it ({}). */
+  project_credentials?: Record<string, ProjectCredential>;
+}
+
+/** A provider's application credential for one Keystone project (SDD §4.2, §27.4). */
+export interface ProjectCredential {
+  /** Its secret's name (`provider-{id}.project-<h>`), never a value. */
+  secret: string;
+  /** When an admin wrote it. */
+  updated_at: Timestamp;
+  /** The pin of the project's conversion host (SDD §26.4). */
+  conversion_host_pin?: HostKeyPin | null;
+}
+
+/** A project credential's entry of its provider's check report, `capabilities.projects` (SDD §10). */
+export interface ProjectCheck {
+  status: 'ok' | 'error';
+  /** Why an error is one, in Seamless's words; never a credential's value. */
+  message: string | null;
+  project_name: string | null;
+  domain: string | null;
+  user_id: string | null;
+  roles: string[] | null;
+  restricted: boolean | null;
+  /** Its expiry; null when it never expires. */
+  expires_at: Timestamp | null;
+  /** The time of the check that read it. */
+  checked_at: Timestamp;
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
@@ -604,6 +634,10 @@ export interface Plan {
   description: string | null;
   source_provider_id: string;
   destination_provider_id: string;
+  /** The Keystone projects whose credentials its steps act with at its source and its destination; null: the provider's
+   * own credential (SDD §4.2, §27.4). Refused for a VMware source; older fixtures omit them (null). */
+  source_project?: string | null;
+  destination_project?: string | null;
   vm_ids: string[];
   mappings: Mappings;
   default_strategy: Strategy | 'auto';

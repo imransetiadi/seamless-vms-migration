@@ -1,11 +1,11 @@
-import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, Power, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, KeyRound, Power, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { useDemoSpeed, useEventTail, useMigration, usePlan, useProviders, useRecommendations, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
-import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Role, type Strategy, type VerificationConfig } from '../api/types';
+import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Provider, type Role, type Strategy, type VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -41,10 +41,12 @@ import { gpuWaitBegins, gpuWaitEnds, hasGpuPanel } from '../lib/gpu';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange, countedApprovals, uncountedReason } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
+import { cutoverHolds } from '../lib/projectCredentials';
 import { destinationName } from '../lib/providerUse';
 import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { useHashLanding } from '../lib/useHashLanding';
+import { useNow } from '../lib/useNow';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** Announces phase changes and every 10 % of progress — never every tick (aria-live polite). */
@@ -116,7 +118,49 @@ function splitIssue(issue: string): { code: string | null; text: string } {
 /** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
 const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 
-function Alerts({ m, destination }: { m: Migration; destination: string }) {
+/**
+ * Rule 6 of the cutover gate (SDD §5.4, §16, plan task TC7): each credential its cutover and a rollback would act with
+ * that may not last the cutover - it expires within 24 hours, was written since its last check, or that check failed -,
+ * judged at the browser's clock from the plan and its providers as the API serves them; the source runs meanwhile.
+ */
+function CredentialHoldNote({ m, plan, source, destination }: { m: Migration; plan: Plan | undefined; source: Provider | undefined; destination: Provider | undefined }) {
+  // a plan that names no project is never held by a credential: no clock runs for it
+  const now = useNow(60_000, Boolean(plan?.source_project || plan?.destination_project));
+  const holds = cutoverHolds(m, plan, source, destination, now);
+  if (holds.length === 0) return null;
+  return (
+    <div role="note" aria-label="Cutover held by a credential" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+      <KeyRound aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+      <div className="min-w-0 text-foreground">
+        <p>
+          <strong className="font-semibold">A credential holds the cutover.</strong> It starts only while each credential it and a rollback would
+          use lasts at least 24 hours more, as the last check read it. The source VM keeps running meanwhile.
+        </p>
+        <ul className="mt-1 list-disc pl-5">
+          {holds.map((h) => (
+            <li key={`${h.side}:${h.projectId}`} className="wrap-break-word">
+              Project {h.project} at {h.provider}, the plan&apos;s {h.side} project: {h.why}. {h.remedy}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function Alerts({
+  m,
+  destination,
+  plan,
+  sourceProvider,
+  destinationProvider,
+}: {
+  m: Migration;
+  destination: string;
+  plan: Plan | undefined;
+  sourceProvider: Provider | undefined;
+  destinationProvider: Provider | undefined;
+}) {
   const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
   const sourceStopped = m.phase === 'failed' && clockOpen;
   // the recommendation the migration waits on, while it can still take it (SDD §14.6)
@@ -180,6 +224,7 @@ function Alerts({ m, destination }: { m: Migration; destination: string }) {
           </div>
         </div>
       )}
+      <CredentialHoldNote m={m} plan={plan} source={sourceProvider} destination={destinationProvider} />
       {waiting && (
         <div role="status" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
           <Hourglass aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
@@ -821,7 +866,7 @@ export default function MigrationDetail() {
         {planUnavailable && (
           <ErrorBanner error={plan.error} title="The plan of this migration is unavailable" onRetry={() => void plan.refetch()} />
         )}
-        <Alerts m={m} destination={destinationName(providers.data, p)} />
+        <Alerts m={m} destination={destinationName(providers.data, p)} plan={p} sourceProvider={source} destinationProvider={destinationProvider} />
 
         <Panel id="next-step" title="Next step">
           <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} planLoading={planLoading} />
