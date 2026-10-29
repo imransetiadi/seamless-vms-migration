@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import secrets
@@ -32,8 +33,10 @@ from ..ai.redaction import redact
 from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
+from ..executors.base import ProcessGroups
 from ..executors.router import ExecutorRouter
-from ..lease import Lease, new_holder, replica_address, take
+from ..leader import Leadership
+from ..lease import new_holder, replica_address
 from ..notify.notifier import Notifier, senders_for
 from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
@@ -340,14 +343,18 @@ def build_services(
         registry = ProviderRegistry(settings)
         jev = JevClient(settings) if settings.jev_mode != "off" else None
         memory = MemoryClient.from_settings(settings)
+        # one book of the playbooks' process groups for the executors and the hook runner: a
+        # deposition kills them (SDD §7.1)
+        groups = ProcessGroups()
         orchestrator = Orchestrator(
             store,
             bus,
             registry,
-            ExecutorRouter(settings, providers=registry),
+            ExecutorRouter(settings, providers=registry, groups=groups),
             Advisor(jev, settings),
             KnowledgeService(memory, store, bus),
             settings,
+            process_groups=groups,
         )
     store.create_schema()
     if settings.tokens_file is not None:
@@ -368,23 +375,19 @@ def build_services(
     )
 
 
-async def _take_the_lease(svc: Services, holder: str) -> Lease:
-    """The orchestrator's lease, before the server writes anything: tried every retry period while
-    another server holds it (SDD §11, §15). Its epoch becomes the store's own."""
+async def _leadership(svc: Services, holder: str, hooks: list[Hook]) -> Leadership:
+    """The replica's leadership of its orchestrator (SDD §8, §15): the lease's holder and address,
+    and the takeover's start hooks - the demo seed. Its address is resolved off the event loop."""
     address = await asyncio.to_thread(replica_address, svc.settings.port)
-    lease = Lease(svc.store.engine, holder, address, svc.settings.leader_lease_s)
-    svc.store.epoch = await take(lease)
-    return lease
-
-
-async def _release_the_lease(lease: Lease, store: Store) -> None:
-    """Expire the lease now, so another server takes it at its next try (SDD §11, §15); one that
-    cannot be released lapses on its own."""
-    try:
-        if not await asyncio.to_thread(lease.release, store.epoch):
-            log.warning("the orchestrator lease was no longer this server's at its stop")
-    except Exception:  # noqa: BLE001 - the stop goes on; the lease lapses by itself
-        log.warning("could not release the orchestrator lease; it lapses by itself", exc_info=True)
+    return Leadership(
+        svc.store,
+        svc.orchestrator,
+        holder=holder,
+        address=address,
+        lease_s=svc.settings.leader_lease_s,
+        start_hooks=[functools.partial(hook, svc) for hook in hooks],
+        notifier=svc.notifier,
+    )
 
 
 def create_app(
@@ -395,9 +398,10 @@ def create_app(
     sse_heartbeat_s: float = 15.0,
     on_startup: list[Hook] | None = None,
 ) -> FastAPI:
-    """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks); with a
-    fenced store - the server's own - it first takes the lease, and releases it once the
-    orchestrator stopped (SDD §11, §15)."""
+    """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks). With a
+    fenced store - the server's own - the replica's leadership does (SDD §8, §15): its elector's
+    first try comes before the server serves, the hooks and the orchestrator run at each takeover
+    and stop at each deposition, and the stop releases the lease."""
     svc = build_services(settings, store, orchestrator, sse_heartbeat_s)
     # SDD §8.7: the notifier runs beside the orchestrator, in the server's process alone
     svc.notifier = Notifier(svc.store, svc.bus, settings, senders_for(settings))
@@ -406,8 +410,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        lease = await _take_the_lease(svc, holder) if svc.store.fenced else None
-        try:
+        if not svc.store.fenced:  # a store given by a test or the CLI: no lease
             for hook in hooks:
                 await hook(svc)
             await svc.orchestrator.start()
@@ -417,9 +420,13 @@ def create_app(
             finally:
                 await svc.notifier.stop()
                 await svc.orchestrator.stop()
+            return
+        svc.leadership = await _leadership(svc, holder, hooks)
+        await svc.leadership.start()
+        try:
+            yield
         finally:
-            if lease is not None:
-                await _release_the_lease(lease, svc.store)
+            await svc.leadership.stop()
 
     app = FastAPI(
         title="Seamless Migrate",

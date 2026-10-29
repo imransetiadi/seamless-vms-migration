@@ -196,6 +196,9 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
 
 
 def build_app(settings: Settings) -> Any:
+    """The server's app (SDD §15): in demo mode its seed runs at each takeover of the
+    orchestrator's lease, before the orchestrator starts, with its restore of the fake clouds (§8,
+    §10)."""
     from .api.app import create_app
     from .demo import demo_server_settings, seed_demo
 

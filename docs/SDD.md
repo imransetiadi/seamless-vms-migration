@@ -643,7 +643,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `conversion_host.key_pinned` (§7.2, §10, §26.5), `conversion_host.key_refused` (§7.2, §26.5), `hook.created`,
 `hook.updated`, `hook.deleted` (§23.3), `channel.created`, `channel.updated`, `channel.deleted`, `subscription.created`,
-`subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), `leader.acquired`, `leader.released` (§8, §11, §25.3), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value; a project credential's write (§12, §27.4, plan task TC2) carries its `project_id` and the secret's
@@ -673,6 +673,12 @@ into a host its role created (§7.2); it never carries a key's comment or a line
 link the source host refused), its server, the SHA256 fingerprints the run pinned for it, the one the host offered
 when ssh printed it, the run's plan and its migration (null for a pre-staging) -, each null when the run cannot know
 it (§7.2); it never carries a line of the output, of a console or an ssh command line.
+`leader.acquired` is written in the takeover's transaction (§11, plan task HA3) and carries `{"holder", "epoch",
+"previous_holder", "previous_epoch", "cause", "resumes"}` - the replica that took the orchestrator's lease and the
+epoch it took, the holder and the epoch before it (null for the first), `cause` `first` (nobody held the lease),
+`released` (its holder released it) or `expired` (it lapsed: a leader that died, or one deposed, writes nothing), and
+`resumes`, how many migrations in a resumable phase the takeover drives again (§8). `leader.released` is written in
+the release's transaction and carries `{"holder", "epoch"}`, the lease it ends. Neither has a plan or a migration.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -1863,6 +1869,14 @@ class Executor(Protocol):
 Executors must be **idempotent per step**: re-running a step after a crash converges to the same
 state (the orchestrator resumes from `Migration.checkpoint`).
 
+**Process groups** (§25.4 layer 3, plan task HA3). Each playbook the control plane runs - a step's and a playbook
+hook's (§7.2 Hooks) - starts in a session of its own, so its process group holds what it starts. Its runner registers
+that group with the orchestrator's `ProcessGroups` (`executors.base`; the router hands the one book to its executors,
+and the orchestrator to its hook runner) from the playbook's start until it ended. `ProcessGroups.kill()` sends
+SIGKILL to every group registered, from whatever thread calls it - a deposition's, never waiting for the event loop
+(§8) -, and closes the book: a group registered after it is killed at once, until `open()`. A server's book is closed
+while its replica does not lead and opened by its takeover (§8); the CLI's is never closed.
+
 ### 7.2 AnsibleExecutor (`executors/ansible.py`)
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
@@ -2809,10 +2823,50 @@ Placement allocation:
 * `Orchestrator(store, bus, providers, executors, advisor, knowledge, settings)` with
   `async start()`/`async stop()` (FastAPI lifespan) and a tick loop (`settings.tick_s`, default 1.0).
   On SIGTERM `seamless serve` waits at most 5 s for open requests — an event stream never ends by
-  itself — then cancels them, and the lifespan runs `stop()`: running steps are cancelled (a playbook
-  gets SIGTERM, then SIGKILL after 10 s) and their run files (`secrets.yml`, `clouds.yaml`) removed. The
-  container's stop grace leaves room for it: 30 s on Compose (`stop_grace_period`), 60 s on OpenShift
+  itself — then cancels them, and the lifespan runs `stop()`, then releases the lease (below): running steps are
+  cancelled (a playbook gets SIGTERM, then SIGKILL after 10 s) and their run files (`secrets.yml`, `clouds.yaml`)
+  removed. The container's stop grace leaves room for it: 30 s on Compose (`stop_grace_period`), 60 s on OpenShift
   (`terminationGracePeriodSeconds`).
+* **The leadership** (§25.3–§25.5, plan task HA3). A server's orchestrator runs only while its replica leads.
+  `seamless_migrate.leader`'s elector tries the lease (§11) every retry period (2 s) while its replica follows, and
+  renews it every retry period while it leads, in a thread of its own on a connection of its own: an engine outside
+  the store's pool with one connection, whose connects (PostgreSQL's `connect_timeout`, whole seconds, at least 2)
+  and each transaction's statements and lock waits (`statement_timeout` and `lock_timeout`; SQLite's busy timeout)
+  are bounded by the retry period, so neither a busy event loop nor a busy pool delays it. It notes its monotonic
+  clock before it sends a campaign or a renewal: one that takes or renews the lease sets the leader's deadline to that
+  time plus the renew deadline, two thirds of `SEAMLESS_LEADER_LEASE_S` (20 s of 30) - at least a third of the lease
+  before the expiry the database then set. It renews only while the tick loop is healthy by §12's rule (a tick within
+  max(5 × `tick_s`, 30 s), fewer than three failed ticks in a row), or while its replica stops: a leader whose loop
+  hangs lets its lease lapse. A renewal that fails is logged and tried at the next period; one that renews nothing -
+  the lease was taken - deposes the leader at once.
+  * *The deposition.* The watchdog, a thread of its own that calls no database, deposes the leader when its deadline
+    passes; so do a renewal that renewed nothing, a write the fence refused (`Fenced`, §11: the store tells the
+    elector, whatever the code around the write catches), the check below when it reads another epoch, and a takeover
+    whose start failed. A deposition sets the store's epoch to `None`, so the replica writes nothing more; sends
+    SIGKILL to the process group of every playbook the replica runs, from the deposing thread (§7.1); logs its reason;
+    and schedules on the event loop the stop of the notifier and the orchestrator (`stop()`: the tasks are cancelled,
+    nothing new starts). The replica then follows, and campaigns again once that stop ended: it may lead again. It
+    releases nothing: its lease lapses.
+  * *The takeover*, on the event loop and in order with the stops: the start hooks - in demo mode the seed, with its
+    restore of the fake clouds (§10) -, then `start()`, then the notifier (§8.7). `start()` begins as a new process
+    would: it forgets what its process knew of an earlier term - the assessments pre-stagings covered, the GPU reads'
+    outcomes and the cutovers begun, the drivers' crash counts, the wave events seen, the tick's health - and drives
+    again the migrations in a resumable phase from their checkpoints, as a restart does (below). It reads them after
+    the takeover committed, so it sees every write of the old epoch (§25.5). A start that fails is logged and deposes
+    the replica.
+  * *The life cycle of a server.* Its lifespan starts the elector and waits for its first try: a replica that takes
+    the lease runs its takeover before it serves, and one that finds it held serves at once as a follower (§15). Its
+    stop stops the notifier and the orchestrator - renewing the lease meanwhile, whatever the tick loop's health -,
+    then ends the elector's threads, then releases the lease with `leader.released` in one transaction (§11), unless
+    it no longer leads.
+  * *The check before an action on a cloud* (§25.4 layer 2). Before each step attempt - each of the retries below, a
+    pre-staging, a cancel's cleanup and a finalize included -, each hook (§8.2), each floating IP's move and return
+    (§8.3), each DNS swap and revert (§8.4) and each Octavia member's drain, join and restore (§8.5), a server's
+    orchestrator checks its deadline and reads the epoch in the lease row (`Store.lease_epoch()`, §11). Past its
+    deadline, or with a store whose epoch is not the row's - which deposes it -, it starts nothing: the action ends as
+    a stop cancels one (`NotLeading`, an `asyncio.CancelledError`), nothing is recorded for it, and the next leader
+    runs it from its checkpoint; a finalize answers 409. A replica past its deadline runs no tick. The CLI's
+    orchestrator, whose store holds no lease, checks nothing.
 * Public async API used by routes: `validate_plan(plan_id, actor)`, `start_plan`, `pause_plan`,
   `approve(migration_id, actor, comment)`, `request_cutover(migration_id, actor, force_window)`,
   `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `cancel_plan(plan_id, actor, reason)`, `finalize(…,
@@ -3199,7 +3253,8 @@ The orchestrator gives the messages their two facts (§4.3): `migration.downtime
 ### 8.7 The notifier (plan task NT5, §24.6, §24.7)
 
 `seamless_migrate.notify.notifier.Notifier` runs in the server's process beside the orchestrator and starts and stops
-with it in the API's lifespan; the CLI runs none. It is never in a migration's path: no step, gate, transition or
+with it in the API's lifespan - on the replica that leads, at its takeover and at its deposition or stop (§8) -; the
+CLI runs none. It is never in a migration's path: no step, gate, transition or
 route waits for it.
 
 * **One task per channel, in `seq` order.** Each tick (`tick_s`, 1 s) the notifier lists the channels and keeps one
@@ -3891,11 +3946,14 @@ simulated cutover created), and `server_allocations` the GPU units the server ho
 one that holds none, the fake's Placement holding GPUs alone. `gpu_capacity()` - the cutover gate's read
 (§22.7) - finds the A100-3-20C GPU's units held by another tenant on its first two reads that ask for the trait
 `CUSTOM_NVIDIA_A100_3_20C`, and released from the third, while `inventory()` - the validation's read - and `check()`
-always find them free. A restart builds new fakes: the seed hands them the servers the migrations recorded
-(`destination_server_id`) with their flavors, as it stops their sources again (§8.1). A fake rebuilt while the
-control plane runs - its provider's document changed: a rename, its declared profiles, a written credential - takes
-over the simulated cloud of the one it replaces, as a real cloud keeps its servers: the servers and their GPU units,
-the gate's reads of the other tenant's GPU and, for a source, its VMs' power states (plan task G9 review).
+always find them free. A restart builds new fakes, and so does every replica: the seed - idempotent, it runs at each
+takeover, before the orchestrator starts, rather than at the process's start (§8, §25.5; plan task HA3) - hands them
+the servers the migrations recorded (`destination_server_id`) with their flavors, as it stops their sources again
+(§8.1); a server handed again to a replica's own fakes holds anew what it held (`create_server`). A fake rebuilt
+while the control plane runs - its provider's document changed: a rename, its declared profiles, a written
+credential - takes over the simulated cloud of the one it replaces, as a real cloud keeps its servers: the servers and
+their GPU units, the gate's reads of the other tenant's GPU and, for a source, its VMs' power states (plan task G9
+review).
 
 **Heat stacks and Octavia members** (plan task N2; the findings of §9.3, §23.8). An OpenStack source's inventory reads
 them, keeping only what a finding names:
@@ -4222,11 +4280,19 @@ expired once `now()` reaches `expires_at`.
   transaction, takes it where it is still expired: `epoch + 1`, its `holder` and `address`, `acquired_at` and
   `renewed_at` `now()`, `expires_at` `now()` plus the lease (`SEAMLESS_LEADER_LEASE_S`, §15.1). A `lock_timeout` of
   the retry period (2 s; on SQLite the wait for its write lock) keeps a candidate from queueing behind the row - a try
-  that times out takes nothing -, and a valid lease is never locked.
+  that times out takes nothing -, and a valid lease is never locked. A server's elector (§8, plan task HA3) writes
+  `leader.acquired` (§4.3) in the transaction that takes the lease: its `cause` is `first` for the insert, `released`
+  when the newest `leader.released` names the holder and the epoch it took over from, else `expired`, and `resumes`
+  counts the migrations in a resumable phase as that transaction reads them.
 * *Renewal.* `renewed_at = now()` and `expires_at = now()` plus the lease, where `holder` and `epoch` are the
-  replica's own; a renewal that updates no row - the lease was taken - renews nothing.
+  replica's own; a renewal that updates no row - the lease was taken - renews nothing. One whose wait for the row's
+  lock outlasts the retry period fails, as a database error does: the lease may still be the replica's, and the
+  elector tries again at its next period (§8).
 * *Release.* `expires_at = now()` where `holder` and `epoch` are the replica's own: another replica takes the lease at
-  its next try.
+  its next try. A server's release writes `leader.released` (§4.3) in the same transaction, where it ended the lease.
+
+The lease's statements run on the elector's own connection (§8). The orchestrator reads the epoch the row holds,
+`Store.lease_epoch()` (`None` while nobody took the lease), before each action on a cloud (§8).
 
 **The fence** (§25.4 layer 1, plan task HA2). A server process's store - the one the API builds for itself when it is
 given none, `Store(url, fenced=True)` (§15) - begins each write transaction (`put`, `put_with_event`,
@@ -4234,7 +4300,9 @@ given none, `Store(url, fenced=True)` (§15) - begins each write transaction (`p
 `create_user`) by reading the lease's `epoch` under a key-share lock: `SELECT … FOR KEY SHARE` on PostgreSQL, and on
 SQLite after `BEGIN IMMEDIATE`, which takes the database's write lock. When that epoch is not the one the process took
 (`Store.epoch`, `None` until it took one), the write raises `Fenced` - a `StoreError` that carries both epochs -,
-nothing of it is written, and the store logs the refusal with both epochs. A takeover locks the row `FOR UPDATE`,
+nothing of it is written, and the store logs the refusal with both epochs and hands it to its elector
+(`Store.on_fenced`), which deposes the leader whatever the code around the write catches (§8, plan task HA3); a
+deposition sets `Store.epoch` back to `None`. A takeover locks the row `FOR UPDATE`,
 which waits for every key-share lock, so a write of the old epoch commits before the takeover or not at all; a
 renewal changes no key column, so renewals and writes never wait for each other. `auth.denied` is written without the
 check: the replica that refuses a request records it (§13.1). The CLI's store holds no lease and checks none (§15).
@@ -5047,14 +5115,15 @@ The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `
 `EstimatorParams.link_bps`, the plan default of 131,072,000 B/s (125 MiB/s, about 1,048.6 Mbit/s); `--link-mbps 1000` is
 125,000,000 B/s.
 
-`serve` takes the orchestrator's lease (§11) before it runs the demo seed and starts its orchestrator, trying again
-every 2 s while another server holds a valid one, and releases it once its orchestrator stopped; its store checks
-the lease's epoch in every write (§11). The elector that renews the lease is §25.3's (plan task HA3): until it lands,
-a server's lease lapses `SEAMLESS_LEADER_LEASE_S` after it took it, and a second server against the same PostgreSQL
-database then takes it over and fences the first one's writes (`Fenced`). On SQLite, `serve` first takes an exclusive
-`flock` on `{database}.server.lock` and exits 1 (`error: another server runs against this database`) while another
-server holds it: SQLite in WAL mode serves one host's processes, so it never has a second replica (§25.3). The other
-commands open the store without a lease and check none: their writes are a person's (`actor: cli`).
+`serve` runs the orchestrator's elector (§8, §11; plan task HA3): it tries the lease once before it serves, and a
+server that takes it runs the demo seed and starts its orchestrator and its notifier first; one that finds the lease
+held serves at once as a follower - no seed, no orchestrator, every write but `auth.denied` refused - and tries again
+every 2 s. The leader renews its lease every 2 s and is deposed by its renew deadline; its stop releases the lease
+once its orchestrator stopped. Its store checks the lease's epoch in every write (§11). On SQLite, `serve` first
+takes an exclusive `flock` on `{database}.server.lock` and exits 1 (`error: another server runs against this
+database`) while another server holds it: SQLite in WAL mode serves one host's processes, so it never has a second
+replica (§25.3). The other commands open the store without a lease and check none: their writes are a person's
+(`actor: cli`).
 
 `plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
@@ -7841,8 +7910,9 @@ that answer reads themselves (decision 4); the run directories' state in the dat
 
 The row, the database's clock, the campaign's, the renewal's and the release's statements, `SEAMLESS_LEADER_LEASE_S`
 and SQLite's server lock are binding in §11, §15.1 and §15 since plan task HA2, where `serve` takes the lease once at
-its start and releases it after its orchestrator stopped. The thread, the renewals' schedule, the deadline, the
-watchdog and the renewals only while the tick loop is healthy stay proposed (HA3).
+its start and releases it after its orchestrator stopped. The thread and its connection, the renewals' schedule, the
+deadline, the watchdog, the renewals only while the tick loop is healthy and the release with `leader.released` are
+binding in §8, §11 and §15 since plan task HA3, which replaced HA2's single take at `serve`'s start by the elector.
 
 ### 25.4 Fencing
 
@@ -7864,8 +7934,8 @@ acting.
 
    Layer 1 is binding in §11 since plan task HA2 - the epoch read under a key-share lock at the start of each write,
    the takeover's `FOR UPDATE`, the renewal that changes no key column, `Fenced`, `auth.denied` aside, the refusals
-   logged with both epochs, the CLI's store unfenced -, but for the deposition on a `Fenced` write (HA3) and the
-   application role's `idle_in_transaction_session_timeout` (HA6).
+   logged with both epochs, the CLI's store unfenced -, and the deposition on a `Fenced` write in §8 and §11 since plan
+   task HA3, but for the application role's `idle_in_transaction_session_timeout` (HA6).
 2. **Actions on the clouds start only while the lease holds.** Before a step's attempt, a hook, a floating IP move, a
    DNS swap or an Octavia member change (§8, §8.2–§8.5), the orchestrator checks its deadline and reads the epoch in
    the lease row. A pause between this check and the action defeats it (Kleppmann); layer 3 and the margin cover that.
@@ -7878,6 +7948,10 @@ acting.
      and another pod cannot attach to them. The new leader runs the step again from its checkpoint (FR-16, NFR-04).
    * A call a playbook already sent to a cloud (a server's stop, a volume's attach) completes there. The step run again
      reads the cloud's state, as after a restart.
+
+   Layers 2 and 3 are binding in §7.1 and §8 since plan task HA3: the check of the deadline and the epoch before each
+   action on a cloud, and the process groups' book, its kill from the deposing thread and its refusal of a group
+   registered after the kill.
 
 **The hazard.** Two orchestrators on one migration would run its step twice at once: two stops of the source VM, two
 final passes onto the same destination volumes, two server creates - and, had their phases diverged, a stop and a
@@ -7911,6 +7985,9 @@ than the margin: the database host's clock must slew, never step.
   renew deadline deposes the leader: its steps are cancelled, and they resume once the database is back and a leader
   is elected. Today nothing cancels a step for a database outage (QASuite R-05). The timing lets a database restart
   or failover shorter than 20 s depose nobody (`TODO(LAB): confirm` the database's restart and failover times).
+
+The takeover through `start()`, the old leader's cutovers counted by the gate, the open clock kept and the demo seed
+at each takeover are binding in §8 and §10 since plan task HA3.
 
 ### 25.6 The followers and the API
 
@@ -7988,6 +8065,9 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
 * `/health`'s `leader` (§25.6) and the leader line of `seamless status`;
 * logs: each takeover, each failed renewal and each deposition with its reason, and each write the fence refused with
   both epochs.
+
+The events, with their data's names (`previous_holder`, `previous_epoch`, `resumes`), are binding in §4.3 and §11
+since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8).
 
 ### 25.9 Security
 
@@ -8067,7 +8147,7 @@ The owner took each default as written on 2026-10-23 (D2):
 |---|---|---|
 | PRD: FR-27's priority and acceptance criteria, the 0.2.0 row as delivered, a 0.5.0 row; D2 decided | PRD, §20 | HA1 |
 | the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
-| the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 | HA3 |
+| the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |

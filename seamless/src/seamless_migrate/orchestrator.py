@@ -11,6 +11,9 @@
   driver then continues from the new phase, so transitions are never lost or duplicated.
 * On start, migrations in ``precopy|syncing|cutover|verifying|rolling_back`` are resumed;
   executors are idempotent per step and ``mark_downtime_start`` is idempotent.
+* A server's orchestrator runs while its replica leads (``seamless_migrate.leader``, SDD §8): it
+  checks its renew deadline and the lease's epoch before each action on a cloud, and a takeover's
+  ``start()`` begins as a new process would.
 """
 
 from __future__ import annotations
@@ -124,6 +127,7 @@ from .events import EventBus, emit, new_event, put_all_and_emit, put_and_emit
 from .executors.ansible import recorded_copied_data, recorded_destination_volumes, run_dir
 from .executors.base import (
     PermanentStepError,
+    ProcessGroups,
     StepContext,
     StepName,
     StepResult,
@@ -427,6 +431,13 @@ class BadRequest(OrchestratorError, ValueError):
 
 class Unprocessable(OrchestratorError, ValueError):
     """The request is well formed but cannot be applied as given (HTTP 422)."""
+
+
+class NotLeading(asyncio.CancelledError):
+    """An action on a cloud this replica may not start: its renew deadline passed, or the lease is
+    at another epoch than its store's (SDD §8, §25.4 layer 2). A cancellation, so it ends the
+    action as a stop does: nothing is recorded for it, and the next leader runs it from its
+    checkpoint."""
 
 
 class VerificationFailed(PermanentStepError):
@@ -867,6 +878,8 @@ class Orchestrator:
         verify_poll_s: float = 10.0,
         verifier_factory: Callable[[Any], Any] | None = None,
         hook_runner: Any = None,
+        process_groups: ProcessGroups | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store = store
         self.db = AsyncStore(store)
@@ -884,8 +897,16 @@ class Orchestrator:
         self._verifier_factory = verifier_factory or (
             lambda dst: Verifier(dst, settings, poll_s=verify_poll_s)
         )
+        #: the book of the process groups of this replica's playbooks, a hook's included: a
+        #: deposition kills them (SDD §7.1, §25.4 layer 3)
+        self.process_groups = process_groups if process_groups is not None else ProcessGroups()
         #: runs a plan's hooks at their points (SDD §7.2, §8.2)
-        self.hook_runner = hook_runner or HookRunner(settings)
+        self.hook_runner = hook_runner or HookRunner(settings, groups=self.process_groups)
+        #: a server's leadership (SDD §8): whether its replica leads, and its deposition; None for
+        #: the CLI's orchestrator and a test's, which act without a lease
+        self.leadership: Any = None
+        #: the clock of the tick's heartbeat and health (SDD §12)
+        self._monotonic = monotonic
         #: Octavia's pace for the member helper (SDD §8.5)
         self.lb_pace = Pace()
         # SDD §8: a lock lives while a coroutine holds it or waits for it
@@ -982,6 +1003,30 @@ class Orchestrator:
     def wake(self) -> None:
         if self._wake is not None:
             self._wake.set()
+
+    def _leads(self) -> bool:
+        """Whether this orchestrator may act (SDD §8): always without a leadership - the CLI's, a
+        test's -, else while its replica leads and its renew deadline has not passed."""
+        return self.leadership is None or bool(self.leadership.leads())
+
+    async def _hold_the_lease(self, what: str) -> None:
+        """Before an action on a cloud - a step's attempt, a hook, a floating IP's move or return,
+        a DNS swap or revert, an Octavia member's change - a server's orchestrator checks its renew
+        deadline and reads the epoch in the lease row (SDD §8, §25.4 layer 2): past its deadline,
+        or with a store whose epoch is not the row's - which deposes it -, it starts nothing
+        (:class:`NotLeading`). The CLI's, whose store holds no lease, checks nothing."""
+        if not self.store.fenced:
+            return
+        if not self._leads():
+            raise NotLeading(f"{what}: this replica does not lead")
+        own = self.store.epoch
+        held = await self.db.lease_epoch()
+        if own is not None and held == own:
+            return
+        reason = f"the lease is at epoch {held}, this replica's is {own}"
+        if self.leadership is not None:
+            self.leadership.depose(reason)
+        raise NotLeading(f"{what}: {reason}")
 
     async def _load(self, mid: str) -> tuple[Migration, int]:
         return await self.db.get_versioned("migration", mid, Migration)
@@ -2696,6 +2741,8 @@ class Orchestrator:
                     options={"delete_dest_volumes": True},
                     locked=True,
                 )
+                # SDD §8, §25.4 layer 2: a deposed leader leaves the cleanup to the next one
+                await self._hold_the_lease(f"the cleanup of {m.vm.name}")
                 result = await self.executors.for_strategy(strategy).run(StepName.ROLLBACK, ctx)
             except asyncio.CancelledError:
                 raise
@@ -2784,6 +2831,13 @@ class Orchestrator:
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""
     ) -> Migration:
+        try:
+            return await self._finalize(mid, actor, delete_source, confirm)
+        except NotLeading as exc:
+            # a person's action answers as one: the replica no longer leads (SDD §8, §12)
+            raise NotAllowed(f"finalize refused: {exc}") from None
+
+    async def _finalize(self, mid: str, actor: str, delete_source: bool, confirm: str) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.phase != P.completed:
@@ -2798,6 +2852,8 @@ class Orchestrator:
                 raise NotAllowed(SOURCE_RUNS_AGAIN)
             if confirm != m.vm.name:
                 raise BadRequest("confirm must equal the VM name")
+            # SDD §8, §25.4 layer 2: the finalize's step starts only while the lease holds
+            await self._hold_the_lease(f"the finalize of {m.vm.name}")
             plan = await self._plan(m.plan_id)
             source = await self.db.get("provider", plan.source_provider_id, Provider)
             destination = await self.db.get("provider", plan.destination_provider_id, Provider)
@@ -3611,6 +3667,8 @@ class Orchestrator:
     async def start(self) -> None:
         if self._tick_task is not None and not self._tick_task.done():
             return
+        # SDD §8: a takeover's start begins as a new process would
+        self._forget()
         self._stopping = False
         self._wake = asyncio.Event()
         migrations = await self.db.list("migration", Migration)
@@ -3626,6 +3684,21 @@ class Orchestrator:
         # ready migration starts (SDD §8, review RV52-O2)
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
+
+    def _forget(self) -> None:
+        """What a new process would not know (SDD §8): a replica that leads again starts as a
+        restart does - nothing pre-staged, no GPU read or cutover begun, no driver crash, no wave
+        event seen, a tick health of its own."""
+        self._prestage_done.clear()
+        self._prestage_retry_at.clear()
+        self._gpu_outcomes.clear()
+        self._cutovers_begun.clear()
+        self._driver_crashes.clear()
+        self._wave_events_seen.clear()
+        self._progress_at.clear()
+        self._source_watch_due = None
+        self._last_tick_at = None
+        self._tick_errors = 0
 
     def pending_cleanups(self) -> int:
         """How many cancels' cleanups this process runs now (SDD §5.1)."""
@@ -3670,7 +3743,7 @@ class Orchestrator:
     async def _loop(self) -> None:
         assert self._wake is not None
         while not self._stopping:
-            started = time.monotonic()
+            started = self._monotonic()
             self._last_tick_at = started  # heartbeat: the loop is alive even during a long tick
             try:
                 await self.tick()
@@ -3682,7 +3755,7 @@ class Orchestrator:
             except Exception:
                 self._tick_errors += 1
                 log.exception("orchestrator tick failed")
-            self._record_tick(time.monotonic() - started)
+            self._record_tick(self._monotonic() - started)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self.settings.tick_s)
             self._wake.clear()
@@ -3696,7 +3769,7 @@ class Orchestrator:
         """
         task = self._tick_task
         running = task is not None and not task.done()
-        age = None if self._last_tick_at is None else time.monotonic() - self._last_tick_at
+        age = None if self._last_tick_at is None else self._monotonic() - self._last_tick_at
         # a tick heartbeats when it starts and when it ends: a long tick is not a dead loop
         stale = age is not None and age > max(5 * self.settings.tick_s, 30.0)
         failing = self._tick_errors >= 3  # the loop runs but every tick raises
@@ -3711,7 +3784,7 @@ class Orchestrator:
     def _record_tick(self, seconds: float) -> None:
         """Tick timing for ``GET /metrics`` (QASuite PERF-CP-02: p95 below half of tick_s)."""
         stats = self.tick_stats
-        self._last_tick_at = time.monotonic()
+        self._last_tick_at = self._monotonic()
         stats["count"] += 1
         stats["sum"] += seconds
         stats["last"] = seconds
@@ -3722,6 +3795,8 @@ class Orchestrator:
             log.warning("orchestrator tick took %.3f s (budget %.3f s)", seconds, budget)
 
     async def tick(self) -> None:
+        if not self._leads():
+            return  # SDD §8: a replica past its renew deadline runs no tick; its stop follows
         await self._resume_orphans()
         self._start_source_watch()
         all_plans = await self.db.list("plan", Plan)
@@ -4023,6 +4098,8 @@ class Orchestrator:
 
     async def _prestage(self, plan: Plan, migs: list[Migration]) -> None:
         try:
+            # SDD §8, §25.4 layer 2: a pre-staging is a step's attempt
+            await self._hold_the_lease(f"the pre-staging of {plan.name}")
             source = await self.db.get("provider", plan.source_provider_id, Provider)
             destination = await self.db.get("provider", plan.destination_provider_id, Provider)
             executor = self.executors.prestage_executor(source.kind)
@@ -4364,6 +4441,8 @@ class Orchestrator:
                 current, _ = await self._load(m.id)
                 if current.phase != m.phase:
                     return None
+                # SDD §8, §25.4 layer 2: no attempt starts unless the lease holds
+                await self._hold_the_lease(f"{step} of {current.vm.name}")
                 # each attempt reads the providers anew: a retry after a credential rotation
                 # signs in with the new credentials (SDD §8, §13.3, review RV26-07)
                 source = await self.db.get("provider", plan.source_provider_id, Provider)
@@ -4942,6 +5021,8 @@ class Orchestrator:
                     detail="no such hook in the catalog",
                 )
             else:
+                # SDD §8, §25.4 layer 2: no hook runs unless the lease holds
+                await self._hold_the_lease(f"hook {name} at {point} of {m.vm.name}")
                 run = await self.hook_runner.run(
                     hook, context, run_dir(self.settings, plan.id, m.id), log_line
                 )
@@ -5052,6 +5133,8 @@ class Orchestrator:
         entry = _journal_entry(await self.db.get("migration", m.id, Migration), address)
         if entry is not None and entry.state in ("moved", "finalized"):
             return False
+        # SDD §8, §25.4 layer 2: no floating IP moves unless the lease holds
+        await self._hold_the_lease(f"the move of floating IP {address} of {m.vm.name}")
         if entry is None or entry.state == "returned":
             targets = plan.nic_target(m.vm.source_id, nic)[1]
             port = await src.floating_ip_port(address)
@@ -5092,6 +5175,8 @@ class Orchestrator:
             return exc  # the rollback fails before the source starts, as a call's failure does
         for entry in pending:
             try:
+                # SDD §8, §25.4 layer 2: no floating IP goes back unless the lease holds
+                await self._hold_the_lease(f"the return of floating IP {entry.address}")
                 await dst.disassociate_floating_ip(entry.address)
                 await dst.release_floating_ip(entry.address)
                 if entry.source_port:
@@ -5183,6 +5268,8 @@ class Orchestrator:
                 if state == "unchanged":
                     await self._dns_action(m, name, "swap", "unchanged", f"the address stays {old}")
                     return None
+            # SDD §8, §25.4 layer 2: no DNS swap unless the lease holds
+            await self._hold_the_lease(f"the DNS swap of {swap.name}")
             backend = backend_for(target, dst, self.settings)
             outcome, held = await backend.replace(swap.name, swap.rdtype, swap.old, swap.new)
         except Exception as exc:
@@ -5223,6 +5310,8 @@ class Orchestrator:
             return None
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         try:
+            # SDD §8, §25.4 layer 2: no DNS revert unless the lease holds
+            await self._hold_the_lease(f"the DNS revert of {swap.name}")
             dst = for_step(self.providers, Step.DNS, destination, plan)
             backend = backend_for(target, dst, self.settings)
             outcome, held = await backend.replace(swap.name, swap.rdtype, swap.new, swap.old)
@@ -5340,6 +5429,8 @@ class Orchestrator:
                     pool=pool,
                 )
                 try:
+                    # SDD §8, §25.4 layer 2: no member changes unless the lease holds
+                    await self._hold_the_lease(f"the drain of member {address} of {source_pool}")
                     await self._lb_journal(m.id, entry)
                     await self.lb_pace.change(
                         functools.partial(src.set_pool_member, source_pool, key[1], False)
@@ -5373,6 +5464,8 @@ class Orchestrator:
             return exc
         for entry in pending:
             try:
+                # SDD §8, §25.4 layer 2: no member changes unless the lease holds
+                await self._hold_the_lease(f"the join of member {entry.address} to {entry.pool}")
                 address = join_address(cur, plan, entry.address)
                 entry = await self._lb_journal(m.id, entry.model_copy(update={"state": "joining"}))
                 held = [
@@ -5416,6 +5509,8 @@ class Orchestrator:
             return
         for entry in pending:
             try:
+                # SDD §8, §25.4 layer 2: no member changes unless the lease holds
+                await self._hold_the_lease(f"the restore of member {entry.address}")
                 gone = {entry.member} if entry.member else set()
                 if entry.state == "joining":
                     address = join_address(cur, plan, entry.address)

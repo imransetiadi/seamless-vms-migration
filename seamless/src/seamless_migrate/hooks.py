@@ -21,6 +21,7 @@ from .config import Settings
 from .domain.models import Event, Hook, HookPoint, Migration, Plan, Provider
 from .events import new_event
 from .executors.ansible import ansible_env, ansible_yaml, stop_process_group
+from .executors.base import ProcessGroups
 from .security.secrets import SecretNotFound, read_secret
 
 #: how many of a playbook's last lines a failure's detail is looked for in
@@ -107,10 +108,16 @@ class HookRunner:
     tests."""
 
     def __init__(
-        self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        groups: ProcessGroups | None = None,
     ) -> None:
         self.settings = settings
         self.transport = transport
+        #: the book a playbook hook's process group is registered with while it runs (SDD §7.1)
+        self.groups = groups if groups is not None else ProcessGroups()
 
     async def run(
         self, hook: Hook, context: dict[str, Any], run_dir: Path, log: Log | None = None
@@ -168,13 +175,18 @@ class HookRunner:
             except OSError as exc:
                 raise _Failed(f"cannot run ansible-playbook: {type(exc).__name__}") from None
             lines: deque[str] = deque(maxlen=_TAIL_LINES)
+            # its session's process group, until it ended: a deposition kills it (SDD §7.1)
+            self.groups.add(proc.pid)
             try:
                 await _read_output(proc, lines, log)
                 returncode = await proc.wait()
             finally:
-                if proc.returncode is None:
-                    # a timeout or a cancel: the playbook does not outlive its run (SDD §7.2)
-                    await asyncio.shield(stop_process_group(proc))
+                try:
+                    if proc.returncode is None:
+                        # a timeout or a cancel: the playbook does not outlive its run (SDD §7.2)
+                        await asyncio.shield(stop_process_group(proc))
+                finally:
+                    self.groups.discard(proc.pid)
         finally:
             await asyncio.to_thread(shutil.rmtree, workdir, True)
         if returncode != 0:

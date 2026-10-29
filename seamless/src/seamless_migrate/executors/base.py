@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import contextlib
+import logging
+import os
+import signal
+import threading
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar, runtime_checkable
@@ -13,6 +18,8 @@ from ..domain.enums import Strategy
 from ..domain.models import Migration, Plan, Provider, SyncPass
 
 T = TypeVar("T")
+
+log = logging.getLogger(__name__)
 
 
 class StepName(StrEnum):
@@ -128,6 +135,71 @@ async def outlive_cancel(work: Awaitable[T]) -> T:
             task.exception()  # retrieved: the cancelled step reports nothing of it
         raise cancelled
     return task.result()
+
+
+def _sigkill(pgid: int) -> None:
+    """SIGKILL to the process group ``pgid``; one already gone is no error."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+class ProcessGroups:
+    """The book of the process groups of the playbooks a replica runs (SDD §7.1, §25.4 layer 3).
+
+    Each playbook - a step's and a playbook hook's - starts in a session of its own, so its pid
+    is its process group's id; its runner registers the group from the playbook's start until it
+    ended. :meth:`kill` sends SIGKILL to every registered group from whatever thread calls it - a
+    deposition's, never waiting for the event loop - and closes the book: a group registered
+    after it is killed at once, until :meth:`open`. Thread-safe."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._groups: set[int] = set()
+        self._closed = False
+
+    def add(self, pgid: int) -> None:
+        """Register the group of a playbook that started; killed at once while the book is closed:
+        a replica that does not lead runs no playbook (SDD §7.1)."""
+        with self._lock:
+            if not self._closed:
+                self._groups.add(pgid)
+                return
+        log.warning("killed the process group %d of a playbook: this replica does not lead", pgid)
+        _sigkill(pgid)
+
+    def discard(self, pgid: int) -> None:
+        """Forget the group of a playbook that ended."""
+        with self._lock:
+            self._groups.discard(pgid)
+
+    @contextlib.contextmanager
+    def running(self, pgid: int) -> Iterator[None]:
+        """The group registered while the block runs - the playbook's life."""
+        self.add(pgid)
+        try:
+            yield
+        finally:
+            self.discard(pgid)
+
+    def kill(self) -> list[int]:
+        """Close the book and send SIGKILL to every group registered (SDD §25.4 layer 3); the
+        groups signalled. Their runners discard them once they ended."""
+        with self._lock:
+            self._closed = True
+            groups = sorted(self._groups)
+        for pgid in groups:
+            _sigkill(pgid)
+        return groups
+
+    def open(self) -> None:
+        """Accept groups again: the replica leads (SDD §8)."""
+        with self._lock:
+            self._closed = False
+
+    def groups(self) -> frozenset[int]:
+        """The groups registered now."""
+        with self._lock:
+            return frozenset(self._groups)
 
 
 @runtime_checkable

@@ -32,6 +32,14 @@ describe('the Events page categories (SDD §4.3, §14.5, §16)', () => {
     expect(categoriesOf('conversion_host.key_refused')).toEqual(['providers', 'security']);
   });
 
+  it.each(['leader.acquired', 'leader.released'])(
+    'files %s under Security: the replica that leads is the audit trail\'s only writer (SDD §4.3, §25.9, plan task HA3)',
+    (kind) => {
+      expect(PERSISTED_EVENT_KINDS).toContain(kind);
+      expect(categoriesOf(kind)).toEqual(['security']);
+    },
+  );
+
   it.each(['hook.created', 'hook.updated', 'hook.deleted'])(
     'files %s under Security: a hook runs code with the control plane\'s reach (SDD §23.3, plan task N3)',
     (kind) => {

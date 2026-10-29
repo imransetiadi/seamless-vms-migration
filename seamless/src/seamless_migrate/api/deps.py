@@ -60,6 +60,8 @@ class Services:
     memory: Any = None
     #: the notifier (SDD §8.7), started and stopped with the orchestrator
     notifier: Any = None
+    #: the replica's leadership of its orchestrator (SDD §8), a server's alone
+    leadership: Any = None
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
