@@ -31,7 +31,7 @@ SCRIPT = textwrap.dedent(
     Loader.add_constructor("!unsafe", lambda loader, node: loader.construct_scalar(node))
 
     argv = sys.argv[1:]
-    record = {{"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
+    record = {{"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(), "pgid": os.getpgrp(),
               "env_keys": sorted(os.environ)}}
     inventory = argv[argv.index("-i") + 1]
     playbook = argv[argv.index("-i") + 2]

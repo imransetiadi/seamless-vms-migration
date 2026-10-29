@@ -40,7 +40,7 @@ mode = os.stat(context).st_mode & 0o777 if os.path.exists(context) else None
 with open(os.environ["ANSIBLE_HOOK_FAKE_RECORD"], "w") as fh:
     json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "env": dict(os.environ),
                "context": open(context).read() if mode is not None else None,
-               "mode": mode, "pid": os.getpid()}}, fh)
+               "mode": mode, "pid": os.getpid(), "pgid": os.getpgrp()}}, fh)
 for line in os.environ.get("ANSIBLE_HOOK_FAKE_LINES", "").split("|"):
     if line:
         print(line, flush=True)
@@ -249,6 +249,46 @@ async def test_a_hook_that_exceeds_its_timeout_fails(env, tmp_path, monkeypatch)
     )
     assert time.monotonic() - started < 15
     assert (result.outcome, result.detail) == ("failed", "timed out after 1 s")
+
+
+async def test_a_playbook_hook_registers_its_process_group_while_it_runs(
+    env, tmp_path, monkeypatch
+):
+    """SDD §7.1, §7.2 Hooks, §25.4 layer 3: a playbook hook runs in a session of its own - its
+    process group its pid - and the runner registers that group with its book while it runs: the
+    book's kill, from another thread as a deposition sends it, ends the hook, which then failed; a
+    hook that ended, either way, leaves none registered."""
+    import asyncio
+
+    from seamless_migrate.executors.base import ProcessGroups
+
+    settings, record = env
+    groups = ProcessGroups()
+    runner = HookRunner(settings, groups=groups)
+    monkeypatch.setenv("ANSIBLE_HOOK_FAKE_SLEEP", "30")
+    task = asyncio.ensure_future(runner.run(PLAYBOOK, document(), tmp_path / "run"))
+    seen = None
+    for _ in range(200):  # until the playbook wrote what it was given
+        await asyncio.sleep(0.05)
+        try:
+            seen = json.loads(record.read_text())
+            break
+        except (OSError, ValueError):
+            continue
+    assert seen is not None, "the hook's playbook never started"
+    assert seen["pgid"] == seen["pid"], "in a session of its own"
+    assert groups.groups() == frozenset({seen["pid"]})
+    assert await asyncio.to_thread(groups.kill) == [seen["pid"]]
+    result = await asyncio.wait_for(task, 15)
+    assert result.outcome == "failed" and result.detail.startswith("exit -9")
+    assert groups.groups() == frozenset()
+    with pytest.raises(ProcessLookupError):
+        os.kill(seen["pid"], 0)
+
+    groups.open()
+    monkeypatch.setenv("ANSIBLE_HOOK_FAKE_SLEEP", "0")
+    done = await runner.run(PLAYBOOK, document(), tmp_path / "run")
+    assert done.outcome == "succeeded" and groups.groups() == frozenset()
 
 
 async def test_a_hooks_output_is_redacted(env, tmp_path, monkeypatch):

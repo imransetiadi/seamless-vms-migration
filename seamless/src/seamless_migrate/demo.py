@@ -274,7 +274,9 @@ async def _plans(settings: Settings) -> list[Plan]:
 async def seed_demo(
     store: Store, settings: Settings, orchestrator: Orchestrator | None = None
 ) -> None:
-    """Create the demo providers and plans (idempotent) and start the plans."""
+    """Create the demo providers and plans (idempotent) and start the plans; then hand this
+    process's new fakes what the migrations recorded - their sources stopped, their servers
+    created (SDD §8.1, §10). A server runs it at each takeover of the orchestrator's lease (§8)."""
     if orchestrator is None:
         from .api.app import build_services
 

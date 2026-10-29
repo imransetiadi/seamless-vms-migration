@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -321,3 +322,90 @@ def build_harness(
     store.put("provider", SRC_PROVIDER)
     store.put("provider", DST_PROVIDER)
     return Harness(store, bus, orch, executor, source, destination, settings, clock)
+
+
+#: two replicas of the control plane (SDD §25): their host names and addresses (RFC 5737)
+REPLICAS = {
+    "seamless-a": "192.0.2.10:8080",
+    "seamless-b": "192.0.2.11:8080",
+    "seamless-c": "192.0.2.12:8080",
+    "seamless-d": "192.0.2.13:8080",
+}
+#: a lease of two seconds: its renew deadline 1.33 s, the last third its margin (SDD §8, §25.3)
+SHORT_LEASE_S = 2.0
+#: a try or a renewal every tenth of a second
+SHORT_RETRY_S = 0.1
+
+
+class Monotonic:
+    """A monotonic clock a test moves forward: what the orchestrator's tick health reads
+    (SDD §12)."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def __call__(self) -> float:
+        return time.monotonic() + self.offset
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+
+
+def build_replica(
+    tmp_path,
+    url: str,
+    vms: list[VMRef],
+    *,
+    executor: Any = None,
+    settings: Settings | None = None,
+    source: StaticSource | None = None,
+    destination: StaticDestination | None = None,
+    clock: Clock | None = None,
+    hook_runner: Any = None,
+    monotonic: Callable[[], float] | None = None,
+) -> Harness:
+    """A replica of the control plane on the database at ``url`` (SDD §25): a fenced store, a bus
+    and an orchestrator of its own, over cloud doubles that two replicas may share, as they share
+    one cloud. It writes nothing until its leadership takes the lease (SDD §11)."""
+    settings = settings or make_settings(tmp_path)
+    store = Store(url, fenced=True)
+    bus = EventBus(store)
+    source = source or StaticSource(vms)
+    destination = destination or StaticDestination()
+    executor = executor or ScriptedExecutor(settings)
+    clock = clock or Clock()
+    orch = Orchestrator(
+        store,
+        bus,
+        StaticRegistry(source, destination),
+        SingleRouter(executor),
+        None,
+        None,
+        settings,
+        sleep=fast_sleep,
+        clock=clock,
+        verify_poll_s=0.01,
+        hook_runner=hook_runner,
+        **({} if monotonic is None else {"monotonic": monotonic}),
+    )
+    return Harness(store, bus, orch, executor, source, destination, settings, clock)
+
+
+def lead(h: Harness, holder: str, **kw: Any) -> Any:
+    """``h``'s leadership as the replica ``holder`` (SDD §8): a lease of two seconds, a try every
+    tenth of a second, unless ``kw`` says otherwise."""
+    from seamless_migrate.leader import Leadership
+
+    kw.setdefault("lease_s", SHORT_LEASE_S)
+    kw.setdefault("retry_s", SHORT_RETRY_S)
+    return Leadership(h.store, h.orch, holder=holder, address=REPLICAS[holder], **kw)
+
+
+async def until(predicate: Callable[[], object], timeout: float = 10.0, what: str = "it") -> None:
+    """Until ``predicate()`` holds, looked at every 10 ms; ``what`` names it when it never does."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError(f"{what} did not come within {timeout:g} s")
+        await asyncio.sleep(0.01)

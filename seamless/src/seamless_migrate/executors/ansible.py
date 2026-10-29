@@ -82,6 +82,7 @@ from .base import (
     HostKeys,
     NoHostKeys,
     PermanentStepError,
+    ProcessGroups,
     StepContext,
     StepName,
     StepResult,
@@ -1496,10 +1497,19 @@ class _Trust:
 class AnsibleExecutor:
     name = "ansible"
 
-    def __init__(self, settings: Settings, *, providers: Any = None, poll_s: float = 1.0) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        providers: Any = None,
+        poll_s: float = 1.0,
+        groups: ProcessGroups | None = None,
+    ) -> None:
         self.settings = settings
         self._providers = providers
         self.poll_s = poll_s
+        #: the book each playbook's process group is registered with while it runs (SDD §7.1)
+        self.groups = groups if groups is not None else ProcessGroups()
 
     @property
     def providers(self) -> Any:
@@ -2981,6 +2991,8 @@ class AnsibleExecutor:
             )
         except OSError as exc:
             raise PermanentStepError(f"cannot run {self.settings.ansible_playbook}: {exc}") from exc
+        # its session's process group, until it ended: a deposition kills it (SDD §7.1, §25.4)
+        self.groups.add(proc.pid)
         tail = asyncio.create_task(self._tail(ctx, osm)) if ctx is not None else None
         lines: deque[str] = deque(maxlen=400)
         try:
@@ -3032,12 +3044,15 @@ class AnsibleExecutor:
                 await outlive_cancel(ctx.mark_downtime_start(at=stop_seen_at))
             raise
         finally:
-            if tail is not None:
-                tail.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await tail
-            if proc.returncode is None:
-                await self._stop_process(proc)
+            try:
+                if tail is not None:
+                    tail.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await tail
+                if proc.returncode is None:
+                    await self._stop_process(proc)
+            finally:
+                self.groups.discard(proc.pid)
         if returncode != 0:
             output = "\n".join(lines)
             detail = next(

@@ -807,6 +807,94 @@ async def test_a_restart_hands_the_new_fakes_the_servers_the_demo_created(tmp_pa
     assert await fresh.server_allocations(gpu.destination_server_id) == {"VGPU": 1}
 
 
+async def test_a_demo_takeover_hands_the_new_fakes_their_servers(tmp_path, monkeypatch):
+    """SDD §8, §10, §25.5 (plan task HA3): two demo servers on one database, each with fakes of its
+    own. The follower serves before it leads, its fakes holding no server: the seed's restore runs
+    at a takeover, not at the process's start. Once the leader stopped, the follower's takeover runs
+    the seed before its orchestrator starts, so its new fakes hold the servers the migrations
+    recorded - a cut-over GPU VM's server with its unit and its GPU flavor."""
+    from seamless_migrate import lease as lease_module
+    from seamless_migrate.cli import build_app
+
+    monkeypatch.setattr(lease_module, "RETRY_S", 0.05)
+    url = f"sqlite:///{tmp_path / 'seamless.db'}"
+
+    def server(name: str):
+        settings = Settings(
+            data_dir=tmp_path / name,
+            db_url=url,
+            secrets_dir=tmp_path / "secrets",
+            demo=True,
+            demo_speed=1e6,
+            demo_failure_rate=0.0,
+            tick_s=0.01,
+            auth_disabled=True,
+            dashboard_dir=None,
+        )
+        return build_app(settings)
+
+    apps = [server("a"), server("b")]
+    services = [app.state.services for app in apps]
+    served = [asyncio.Event(), asyncio.Event()]
+    stops = [asyncio.Event(), asyncio.Event()]
+
+    async def serve(i: int) -> None:
+        async with apps[i].router.lifespan_context(apps[i]):
+            served[i].set()
+            await stops[i].wait()
+
+    follower = services[1].orchestrator
+    rhoso = None
+    at_start: dict = {}
+    start = follower.start
+
+    async def starting() -> None:
+        # what the follower's new fakes hold when its orchestrator starts: after the seed ran
+        fake = follower.providers.get(rhoso)
+        at_start["pools"] = _pools((await fake.inventory()).gpu_capacity)
+        at_start["server"] = await fake.get_server(gpu.destination_server_id)
+        at_start["units"] = await fake.server_allocations(gpu.destination_server_id)
+        await start()
+
+    follower.start = starting
+    servers = [asyncio.create_task(serve(0))]
+    try:
+        await asyncio.wait_for(served[0].wait(), 60)
+        servers.append(asyncio.create_task(serve(1)))
+        await asyncio.wait_for(served[1].wait(), 60)
+        store = services[0].store
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+        while loop.time() < deadline:
+            [gpu] = [m for m in store.list("migration", Migration) if m.vm.name == "gpu-ml-01"]
+            if gpu.phase == Phase.completed:
+                break
+            await asyncio.sleep(0.05)
+        assert gpu.phase == Phase.completed and gpu.destination_server_id, (gpu.phase, gpu.error)
+        rhoso = store.get("provider", "rhoso18", Provider)
+        fake = follower.providers.get(rhoso)
+        assert _pools((await fake.inventory()).gpu_capacity) == DEMO_POOLS, "it holds none yet"
+        assert await fake.server_allocations(gpu.destination_server_id) is None
+        assert not follower.health()["running"]
+
+        stops[0].set()
+        await asyncio.wait_for(servers[0], 60)
+        deadline = loop.time() + 30
+        while not follower.health()["running"] and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        assert follower.health()["running"], "the follower's takeover"
+    finally:
+        for stop in stops:
+            stop.set()
+        await asyncio.gather(*servers, return_exceptions=True)
+        for s in services:
+            s.store.dispose()
+    assert at_start["server"]["flavor"]["name"] == "g1.a100-4c"
+    assert at_start["units"] == {"VGPU": 1}
+    [a100_4c, *_] = at_start["pools"]
+    assert a100_4c[0] == "VGPU CUSTOM_NVIDIA_A100_4C" and a100_4c[1] < 4
+
+
 async def test_the_demo_seed_cancels_a_vm_its_preflight_blocks(tmp_path, store, monkeypatch):
     """SDD §10: since gpu-ml-01's flavor is mapped no demo VM is blocked (plan task G9); the seed
     still cancels one its pre-flight blocks, naming the blocker - a VM in error, here."""

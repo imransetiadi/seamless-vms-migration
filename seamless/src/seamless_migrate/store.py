@@ -14,7 +14,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -352,6 +352,15 @@ def _event_row(event: Event) -> dict[str, Any]:
     }
 
 
+def write_event(conn: sa.Connection, event: Event) -> Event:
+    """Append ``event`` in the caller's transaction on ``conn``; the event as written, its seq set
+    (SDD §11). The lease's takeover and release write theirs so, in the transaction that changes
+    the row (§8, plan task HA3); the seq comes back as every insert's of the store does."""
+    row = _event_row(event)
+    seq = int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
+    return Event(seq=seq, **row)
+
+
 def _index_names(conn: sa.Connection) -> set[str]:
     """The index names the store's tables have: on PostgreSQL those of the tables their names
     resolve to through search_path, as every statement of the store does - not the current
@@ -379,8 +388,12 @@ class Store:
         self.url = url
         self.engine = build_engine(url)
         self.fenced = fenced
-        #: the lease epoch this process took; None until it takes one (SDD §11)
+        #: the lease epoch this process took; None until it takes one, and again once deposed
+        #: (SDD §8, §11)
         self.epoch: int | None = None
+        #: the elector that a refused write deposes, handed each refusal before it is raised -
+        #: whatever the code around the write catches (SDD §8, §11; plan task HA3)
+        self.on_fenced: Callable[[Fenced], None] | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
     def create_schema(self) -> None:
@@ -444,7 +457,21 @@ class Store:
         if self.epoch is None or lease != self.epoch:
             refused = Fenced(what, self.epoch, lease)
             log.warning("%s", refused)
+            if self.on_fenced is not None:
+                try:
+                    self.on_fenced(refused)
+                except Exception:  # noqa: BLE001 - the refusal stands whatever its elector does
+                    log.exception("the elector could not take the fence's refusal")
             raise refused
+
+    def lease_epoch(self) -> int | None:
+        """The epoch the orchestrator's lease row holds now, None while nobody took the lease: what
+        a server's orchestrator reads before each action on a cloud (SDD §8, §11)."""
+        with self.engine.connect() as conn:
+            epoch = conn.execute(
+                sa.select(leases.c.epoch).where(leases.c.name == ORCHESTRATOR_LEASE)
+            ).scalar_one_or_none()
+        return None if epoch is None else int(epoch)
 
     def truncate_for_tests(self) -> None:
         """Delete every row (test helper; never used by the application)."""
@@ -1052,6 +1079,9 @@ class AsyncStore:
     async def append_event(self, event: Event) -> Event:
         return await asyncio.to_thread(self.sync.append_event, event)
 
+    async def lease_epoch(self) -> int | None:
+        return await asyncio.to_thread(self.sync.lease_epoch)
+
     async def events(self, **kwargs: Any) -> list[Event]:
         return await asyncio.to_thread(lambda: self.sync.events(**kwargs))
 
@@ -1092,6 +1122,7 @@ __all__ = [
     "StoreError",
     "UnstorableValue",
     "build_engine",
+    "write_event",
 ]
 
 

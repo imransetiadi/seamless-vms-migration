@@ -94,6 +94,10 @@ PERSISTED_KINDS = frozenset(
         "auth.denied",
         "user.created",
         "events.pruned",
+        # the orchestrator's lease taken and released, each in its own transaction (SDD §4.3, §8,
+        # §11, §25.3)
+        "leader.acquired",
+        "leader.released",
         *AUDIT_KINDS,
     }
 )
