@@ -32,6 +32,7 @@ from seamless_migrate.domain.models import (
     AdvisorSnapshot,
     AppProbe,
     Approval,
+    ConversionHostConfig,
     CutoverWindow,
     Event,
     Finding,
@@ -1191,6 +1192,33 @@ async def test_validation_judges_a_network_with_the_roles_its_check_just_read(tm
     assert [f.code for f in web.findings] == ["NET_PORT_NOT_PERMITTED"]
     assert "'app-net' (project project-admin)" in web.findings[0].message
     assert web.phase == P.blocked
+
+
+@pytest.mark.parametrize(
+    ("checking", "code"),
+    [(True, "CONV_HOST_KEY_UNKNOWN"), (False, "CONV_HOST_KEYS_UNCHECKED")],
+    ids=["keys checked", "keys unchecked"],
+)
+async def test_validation_judges_the_conversion_hosts_keys_by_the_setting(
+    tmp_path, store, checking, code
+):
+    """SDD §9.3, §15.1, §26.5 (plan task ST7): validation judges the conversion hosts' keys with
+    SEAMLESS_ANSIBLE_HOST_KEY_CHECKING and the providers as its checks just left them - a host
+    the operator brings without a key blocks the data path's strategies while keys are checked,
+    and with the setting off the plan is warned that no hop checks a key."""
+    settings = make_settings(tmp_path, ansible_host_key_checking=checking)
+    h, plan = await setup(tmp_path, store, [vm(1)], settings=settings)
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(
+            update={"conversion_host": ConversionHostConfig(name="conv-dst", manage=False)}
+        ),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    web = await h.by_vm(plan.id, "vm-1")
+    assert [f.code for f in web.findings] == [code]
+    data_path = [e for e in web.estimates if e.strategy in (Strategy.cold, Strategy.warm)]
+    assert data_path and all(e.eligible is (not checking) for e in data_path)
 
 
 async def test_validation_records_resolved_flavor_mapping(tmp_path, store):
@@ -5751,6 +5779,8 @@ async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_
         collection_root=find_repo_root(),
         step_timeout_s=1.0,
         max_step_retries=0,
+        # the clock alone: the host key checks have their own tests (SDD §7.2, plan task ST7)
+        ansible_host_key_checking=False,
     )
     executor = AnsibleExecutor(settings, providers=FakeRegistry(), poll_s=0.02)
     source = make_vm(source_id="srv-1", name="web-01")
@@ -8522,8 +8552,11 @@ def recent_base():
     return utcnow() - timedelta(seconds=600)
 
 
-def scripted_pass(base, started_offset_s, duration_s, changed, kind, scanned=20 * 2**30):
-    """A warm pass with scripted byte counts, timestamped relative to ``base``."""
+def scripted_pass(
+    base, started_offset_s, duration_s, changed, kind, scanned=20 * 2**30, extents=None
+):
+    """A warm pass with scripted byte counts, timestamped relative to ``base``; ``extents`` how it
+    used each disk's extents (SDD §28.5)."""
     from seamless_migrate.domain.models import SyncPass
 
     async def hook(ctx):
@@ -8538,6 +8571,7 @@ def scripted_pass(base, started_offset_s, duration_s, changed, kind, scanned=20 
                 bytes_changed=changed,
                 bytes_transferred=changed,
                 duration_s=duration_s,
+                extents=extents or {},
             )
         )
 
@@ -12574,3 +12608,141 @@ async def test_a_restart_in_a_rollback_runs_the_reverts_still_owed(tmp_path, sto
     await restarted.orch.stop()
     assert [r[0] for r in again.runs] == ["dns-back", "undrain-lb"]
     assert back.hook_reverts == []
+
+
+# -- extent tracking (SDD §9.1, §28.6; plan task CE8) ----------------------------------------
+CEPH_FSID = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+
+
+async def tracked_setup(tmp_path, store, executor, settings):
+    """A warm plan that tracks extents, its source with Ceph access, its key and an rbd pool of
+    its fsid in its check report, and a 200 GiB VM with 120 GiB used on that pool (SDD §28.6)."""
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.models import CephAccess
+
+    disk = make_disk(
+        id="vol-1", size_gb=200, used_gb=120.0, pool="hostgroup@ceph#ceph", device="/dev/vda"
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=200, used_gb=120.0, disks=[disk])],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 290, "require_approval": True,
+         "extent_tracking": True},
+        executor=executor,
+        settings=settings,
+    )  # fmt: skip
+    store.put(
+        "provider",
+        SRC_PROVIDER.model_copy(update={"ceph": CephAccess(
+            fsid=CEPH_FSID, monitors=["mon1.ceph.example"],
+            key_updated_at=datetime(2026, 10, 29, tzinfo=UTC),
+        )}),
+    )  # fmt: skip
+    report = {"admin": True, "compute_microversion": "2.88", "ovn": True, "storage_backends": [
+        {"pool": "hostgroup@ceph#ceph", "vendor": "Open Source", "protocol": "ceph",
+         "family": "rbd", "ceph_fsid": CEPH_FSID, "ceph_pool": "volumes"}]}  # fmt: skip
+
+    async def check():
+        return report
+
+    h.source.check = check
+    return h, plan
+
+
+async def test_a_tracked_migration_converges_by_its_slo_after_its_first_checked_pass(
+    tmp_path, store
+):
+    """SDD §28.6: after pass 1 (1,013 s) and one checked pass (450 s) of the worked example - its
+    2 GiB of changes above the threshold, so the SLO rule alone decides -, the final downtime the
+    rule reckons - snapshot + q + the delta's read and transfer, no scan - is about 282 s, within
+    a 290 s SLO: the migration waits for its cutover after two passes, where a scan of the
+    200 GiB disk alone would cost 410 s."""
+    settings = make_settings(tmp_path)
+    base = recent_base()
+    checked = {
+        "/dev/vda": {
+            "mode": "checked",
+            "reason": None,
+            "query_s": 4.5,
+            "missed": 0,
+            "assumed_zero": False,
+        }
+    }
+    executor = ScriptedExecutor(
+        settings,
+        hooks={
+            StepName.PRECOPY: scripted_pass(
+                base, 0, 983.0, 120 * 2**30, "full", scanned=200 * 2**30
+            ),
+            StepName.SYNC: scripted_pass(
+                base, 1013, 420.0, 2 * 2**30, "delta", scanned=200 * 2**30, extents=checked
+            ),
+        },
+    )  # fmt: skip
+    h, plan = await tracked_setup(tmp_path, store, executor, settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    await h.orch.stop()
+    assert m.tracked_disks == ["vol-1"]
+    assert [p.number for p in m.sync_passes] == [1, 2]
+    assert m.observed_extent_query_s == 4.5
+    # the convergence rule's figure: a pass as long as the last one's whole time (420 + 30 s)
+    from dataclasses import replace
+
+    from seamless_migrate.planning.estimator import estimate_final_downtime, params_for_plan
+
+    params = replace(params_for_plan(plan), scan_bps=m.observed_scan_bps, extent_query_s=4.5)
+    final = estimate_final_downtime(m.vm, Strategy.warm, 450.0, params, tracked=["vol-1"])
+    assert final <= 290 < estimate_final_downtime(m.vm, Strategy.warm, 450.0, params)
+    # pass 1's own figure - 1,013 s of writes at the plan's default rate, q = 10 s - was over it
+    assert (
+        estimate_final_downtime(
+            m.vm.model_copy(update={"change_rate_bps": 2 * 2**20}),
+            Strategy.warm,
+            1013.0,
+            params_for_plan(plan),
+            tracked=["vol-1"],
+        )
+        > 290
+    )
+    assert m.estimate.downtime_s == pytest.approx(final, rel=0.05)
+
+
+async def test_a_miss_puts_the_disks_scan_back_into_the_estimate(tmp_path, store):
+    """SDD §28.5, §28.6: a check that found changes outside the disk's extents turns tracking
+    off for it: the disk leaves tracked_disks, the estimate counts its scan again, and the SLO
+    rule no longer ends the passes."""
+    settings = make_settings(tmp_path)
+    base = recent_base()
+    missed = {
+        "/dev/vda": {
+            "mode": "checked",
+            "reason": None,
+            "query_s": 4.5,
+            "missed": 2,
+            "assumed_zero": False,
+        }
+    }
+    executor = ScriptedExecutor(
+        settings,
+        hooks={
+            StepName.PRECOPY: scripted_pass(
+                base, 0, 983.0, 120 * 2**30, "full", scanned=200 * 2**30
+            ),
+            StepName.SYNC: scripted_pass(
+                base, 1013, 420.0, 2 * 2**30, "delta", scanned=200 * 2**30, extents=missed
+            ),
+        },
+    )  # fmt: skip
+    h, plan = await tracked_setup(tmp_path, store, executor, settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    await h.orch.stop()
+    assert m.tracked_disks == []
+    assert len(m.sync_passes) == plan.max_sync_passes  # not the SLO: the scan is back
+    assert m.estimate.downtime_s > 290
+    assert m.estimate.downtime_parts["copy_s"] == pytest.approx(
+        30 + 200 * 2**30 / m.observed_scan_bps, rel=0.05
+    )

@@ -57,14 +57,24 @@ class _Spec:
 # Cinder pools of the demo clouds: Ceph RBD and NetApp ONTAP over NFS (SDD §7.3.1, §10).
 _CEPH = {"vendor": "Open Source", "protocol": "ceph", "family": "rbd"}
 _ONTAP_NFS = {"vendor": "NetApp", "protocol": "nfs", "family": "netapp_nfs"}
+#: the demo clusters' fsids (SDD §10, §28.4, plan task CE11): an rbd pool reports its cluster's
+#: and its Ceph pool, as the real check reads them from location_info
+DEMO_CEPH_FSID = "6f8c2d4e-1b3a-4c5d-9e7f-0a1b2c3d4e5f"
+DEMO_DST_CEPH_FSID = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+
+
+def _rbd(fsid: str, pool: str) -> dict[str, Any]:
+    return {**_CEPH, "ceph_fsid": fsid, "ceph_pool": pool}
+
+
 _SOURCE_POOLS = {
-    "ceph-ssd": ("overcloud@tripleo_ceph#ceph-ssd", _CEPH),
-    "ceph-hdd": ("overcloud@tripleo_ceph#hdd", _CEPH),
+    "ceph-ssd": ("overcloud@tripleo_ceph#ceph-ssd", _rbd(DEMO_CEPH_FSID, "volumes-ssd")),
+    "ceph-hdd": ("overcloud@tripleo_ceph#hdd", _rbd(DEMO_CEPH_FSID, "volumes")),
     "netapp-nfs": ("overcloud@tripleo_netapp#192.0.2.50:/cinder_finance", _ONTAP_NFS),
 }
 _DESTINATION_POOLS = (
-    ("hostgroup@ceph-ssd#ssd", _CEPH),
-    ("hostgroup@ceph-hdd#hdd", _CEPH),
+    ("hostgroup@ceph-ssd#ssd", _rbd(DEMO_DST_CEPH_FSID, "ssd")),
+    ("hostgroup@ceph-hdd#hdd", _rbd(DEMO_DST_CEPH_FSID, "hdd")),
     # same SVM export, mounted through the RHOSO storage network's LIF
     ("hostgroup@ontap-nfs#198.51.100.50:/cinder_finance", _ONTAP_NFS),
 )

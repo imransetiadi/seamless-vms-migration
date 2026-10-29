@@ -10,8 +10,20 @@ from datetime import datetime
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
-from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef, Wave
+from ..domain.models import (
+    Disk,
+    Finding,
+    GpuDevice,
+    Mappings,
+    NicOverride,
+    Plan,
+    Provider,
+    SyncPass,
+    VMRef,
+    Wave,
+)
 from ..guest_os import identify
+from ..security.host_keys import SIDE_ALIASES
 from .gpu import (
     PoolKey,
     ProfileSize,
@@ -220,6 +232,28 @@ class CatalogEntry:
 
 
 CATALOG: dict[str, CatalogEntry] = {
+    # extent tracking (SDD §9.3, §28.9; plan task CE9)
+    "CEPH_ACCESS_MISSING": CatalogEntry(
+        Severity.warning,
+        (S.warm,),
+        "Give the source provider its Ceph access (ceph: fsid, monitors, client) and its key "
+        "(PUT /providers/{id}/ceph-key), and run its check so that an rbd pool of that fsid is "
+        "known; or turn extent_tracking off. Every pass scans in full until then.",
+    ),
+    "EXTENT_TRACKING_PARTIAL": CatalogEntry(
+        Severity.info,
+        (S.warm,),
+        "Nothing stops the migration: the named disks scan in full on every pass, the others use "
+        "their extents. A tracked disk is an unencrypted Cinder RBD volume of the source's "
+        "cluster whose host the source credential can read.",
+    ),
+    "EXTENT_TRACKING_MISSED": CatalogEntry(
+        Severity.warning,
+        (S.warm,),
+        "Check the Ceph releases of the source's compute nodes and cluster for the fast-diff "
+        "fixes (Ceph #61616: Pacific 16.2.14, Quincy 17.2.7, Reef 18.1.2); the disk scans in "
+        "full for the rest of the migration.",
+    ),
     "SRC_VM_ERROR_STATE": CatalogEntry(
         Severity.blocker,
         (),
@@ -582,6 +616,20 @@ CATALOG: dict[str, CatalogEntry] = {
         (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
         "Configure a conversion host on the provider.",
     ),
+    "CONV_HOST_KEY_UNKNOWN": CatalogEntry(
+        Severity.blocker,
+        (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
+        "Declare the conversion host's public keys on its provider (conversion_host."
+        "ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and "
+        "pre-stage again, which creates it with an injected key.",
+    ),
+    "CONV_HOST_KEYS_UNCHECKED": CatalogEntry(
+        Severity.warning,
+        (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
+        "Set SEAMLESS_ANSIBLE_HOST_KEY_CHECKING to true: each conversion host then needs declared "
+        "keys or a pin, which a host Seamless creates gets injected and the provider check reads "
+        "from the console of one it finds.",
+    ),
     "HANDOVER_BACKEND_UNMAPPED": CatalogEntry(
         Severity.info,
         (S.storage_handover,),
@@ -660,6 +708,115 @@ KIT_TWIN_REMEDIATION = (
     "after its name as it writes it, so the two would share them - in separate plans too, when "
     "they go to one destination project."
 )
+
+
+def ceph_pools(source: Provider) -> dict[str, str]:
+    """Cinder pool to Ceph pool, from the source check's ``rbd`` entries whose ``ceph_fsid`` is
+    the provider's (SDD §10, §28.4); {} without a Ceph access or a pool of its cluster."""
+    if source.ceph is None:
+        return {}
+    backends = (source.capabilities or {}).get("storage_backends") or []
+    return {
+        str(b["pool"]): str(b["ceph_pool"])
+        for b in backends
+        if isinstance(b, Mapping)
+        and b.get("family") == "rbd"
+        and b.get("ceph_fsid") == source.ceph.fsid
+        and b.get("pool")
+        and b.get("ceph_pool")
+    }
+
+
+def tracking_ready(plan: Plan, source: Provider | None) -> bool:
+    """A warm plan that tracks extents with a source that can be read: a Ceph access with its
+    key and an rbd pool of its fsid, never a VMware source (SDD §28.4, §28.9)."""
+    if not plan.extent_tracking or source is None or source.kind == ProviderKind.vmware:
+        return False
+    return (
+        source.ceph is not None
+        and source.ceph.key_updated_at is not None
+        and bool(ceph_pools(source))
+    )
+
+
+def disk_tracking_problem(disk: Disk, pools: Mapping[str, str]) -> str | None:
+    """Why ``disk`` does not qualify for extent tracking (SDD §28.3, §28.4), None when it does."""
+    label = disk.name or disk.id
+    if disk.kind != "volume":
+        return f"{label} is no Cinder volume ({disk.kind})"
+    if disk.encrypted:
+        return f"{label} is encrypted"
+    if not disk.pool:
+        return f"{label} has a host the source credential cannot read"
+    if disk.pool not in pools:
+        return f"{label} is on {disk.pool}, no rbd pool of the cluster"
+    return None
+
+
+def qualifying_disks(vm: VMRef, source: Provider) -> list[str]:
+    """The ids of the VM's disks that qualify for extent tracking with ``source`` (SDD §28.3,
+    §28.4, §28.6): validation's ``Migration.tracked_disks`` of a tracked plan."""
+    pools = ceph_pools(source)
+    return [d.id for d in vm.disks if disk_tracking_problem(d, pools) is None]
+
+
+def _extent_findings(
+    vm: VMRef, plan: Plan, source: Provider | None, sync_passes: Sequence[SyncPass] | None
+) -> list[Finding]:
+    """CEPH_ACCESS_MISSING, EXTENT_TRACKING_PARTIAL and EXTENT_TRACKING_MISSED (SDD §9.3, §28.9)
+    for a warm plan that tracks extents: the source's access, key and pool; the VM's disks that
+    do not qualify, each with why; the misses a check of the migration found."""
+    if not plan.extent_tracking or source is None or source.kind == ProviderKind.vmware:
+        return []
+    out: list[Finding] = []
+    pools = ceph_pools(source)
+    if source.ceph is None:
+        why = "no Ceph access"
+    elif source.ceph.key_updated_at is None:
+        why = "no Ceph key"
+    elif not pools:
+        why = f"no rbd pool of its cluster {source.ceph.fsid} in its check report"
+    else:
+        why = None
+    if why is not None:
+        out.append(
+            finding(
+                "CEPH_ACCESS_MISSING",
+                f"The plan tracks extents, but {source.label} has {why}: every pass of {vm.name} "
+                "scans its disks in full.",
+            )
+        )
+    else:
+        problems = [
+            problem
+            for problem in (disk_tracking_problem(disk, pools) for disk in vm.disks)
+            if problem is not None
+        ]
+        if problems:
+            out.append(
+                finding(
+                    "EXTENT_TRACKING_PARTIAL",
+                    f"{len(problems)} disk(s) of {vm.name} do not qualify for extent tracking and "
+                    "scan in full on every pass: " + "; ".join(problems) + ".",
+                )
+            )
+    missed = sorted(
+        {
+            dev
+            for sync_pass in sync_passes or []
+            for dev, use in sync_pass.extents.items()
+            if use.missed > 0
+        }
+    )
+    if missed:
+        out.append(
+            finding(
+                "EXTENT_TRACKING_MISSED",
+                f"A check of {vm.name} found changes outside the extents of {', '.join(missed)}: "
+                "the disk scans in full for the rest of the migration.",
+            )
+        )
+    return out
 
 
 def finding(
@@ -1641,6 +1798,9 @@ def run_preflight(
     shares: Mapping[str, QuotaShare] | None = None,
     dns_ttl: int | None = None,
     lb_pools: Mapping[str, PoolPair] | None = None,
+    sync_passes: Sequence[SyncPass] | None = None,
+    host_key_checking: bool | None = None,
+    checked: Mapping[str, Provider] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1650,7 +1810,12 @@ def run_preflight(
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles);
     ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4);
-    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5).
+    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5);
+    ``sync_passes`` the migration's passes so far: the misses are read from their extent use
+    (§28.9).
+    ``host_key_checking`` the setting SEAMLESS_ANSIBLE_HOST_KEY_CHECKING, None unjudged (§26.5);
+    ``checked`` the providers as validation's checks just left them, by id - their pins, and a host
+    found replaced -, else ``source`` and ``destination`` as given (§10 "Host key pins").
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -2168,6 +2333,14 @@ def run_preflight(
                     f"No conversion host configured on: {', '.join(lacking)}.",
                 )
             )
+        if host_key_checking is not None:
+            out.extend(
+                _host_key_findings(
+                    (checked or {}).get(source.id, source),
+                    (checked or {}).get(destination.id, destination),
+                    host_key_checking,
+                )
+            )
 
     if destination is not None and dst_caps:
         out.extend(_destination_capabilities(destination, dst_caps))
@@ -2202,6 +2375,8 @@ def run_preflight(
                 f"reach the old address for up to {dns_ttl} s.",
             )
         )
+    # a warm plan that tracks extents (SDD §9.3, §28.9; plan task CE9)
+    out.extend(_extent_findings(vm, plan, source, sync_passes))
     return out
 
 
@@ -2261,6 +2436,64 @@ def _stack_findings(
         else:
             out.append(finding("SRC_VM_AUTOSCALED", text))
     return out
+
+
+#: how the provider check reports a pin of another server (SDD §10 "Host key pins", §26.5)
+_REPLACED = "conversion host replaced: "
+
+
+def _host_key_findings(source: Provider, destination: Provider, checking: bool) -> list[Finding]:
+    """CONV_HOST_KEY_UNKNOWN and CONV_HOST_KEYS_UNCHECKED (SDD §9.3, §26.5): the conversion hosts
+    the plan needs - both for an OpenStack source, a VMware source's destination host alone -
+    while their keys are checked, each with declared keys or a pin of its server, or one
+    Seamless will create; else the warning that no hop checks a key."""
+    vmware = source.kind == ProviderKind.vmware
+    needed = (
+        [("destination", destination)]
+        if vmware
+        else [
+            ("source", source),
+            ("destination", destination),
+        ]
+    )
+    needed = [(side, p) for side, p in needed if p.conversion_host is not None]
+    if not needed:
+        return []
+    if not checking:
+        return [
+            finding(
+                "CONV_HOST_KEYS_UNCHECKED",
+                "SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false: no hop of the data path checks a "
+                "conversion host's key, so a host at a conversion host's address that is not it "
+                "would be trusted with the disks.",
+            )
+        ]
+    problems: list[str] = []
+    for side, provider in needed:
+        host = provider.conversion_host
+        assert host is not None
+        if host.ssh_host_keys:
+            continue
+        name = f"{side} {provider.label} ({host.name or SIDE_ALIASES[side]})"
+        message = provider.status_message or ""
+        if message.startswith(_REPLACED):
+            problems.append(f"{name}: {message[len(_REPLACED) :]}")
+        elif provider.conversion_host_pin is not None:
+            continue
+        elif not host.manage or (vmware and side == "destination"):
+            problems.append(
+                f"{name} has neither declared keys nor a pin, and Seamless will not create it"
+            )
+    if not problems:
+        return []
+    return [
+        finding(
+            "CONV_HOST_KEY_UNKNOWN",
+            "No key is known for a conversion host the plan needs while keys are checked: "
+            + "; ".join(problems)
+            + ". Its runs would be refused before their first playbook.",
+        )
+    ]
 
 
 def _memberships(vm: VMRef, members: Sequence[PoolMember]) -> list[PoolMember]:

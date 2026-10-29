@@ -324,6 +324,14 @@ version, then resume the plans.
 The first pre-staging after an upgrade from a version before issue #112's fix adopts the conversion key: see
 section 7.1.
 
+**To 0.5.0**, which checks the conversion hosts' SSH host keys on every hop (`SEAMLESS_ANSIBLE_HOST_KEY_CHECKING`,
+on by default; SDD §26.8): drain first (section 5). A cutover the upgrade cuts off resumes only once its hosts are
+pinned - it checks them before the stop, and one whose source VM was already stopped is rolled back. After the
+upgrade, run the check on each provider, or let the first pre-staging do it: a host 0.4.0 made is pinned once from
+its console. A host whose console no longer prints the block blocks its plans with `CONV_HOST_KEY_UNKNOWN` until you
+declare its keys (section 7.2). 0.4.0's link keys go with the first 0.5.0 run on each host pair; a link you made by
+hand stays yours to remove.
+
 ---
 
 ## 7. Troubleshooting
@@ -428,6 +436,165 @@ Other cases:
   The next pre-staging on that pair also replaces its keypair.
 - **Re-keyed hosts** keep the earlier key authorized. Once no plan of that key is in flight, remove its line by hand
   (Security.md §6.4).
+
+### 7.2 The conversion hosts' SSH host keys (0.5.0)
+
+Every hop of the data path checks a conversion host against a key known before the first connection (SDD §26): the
+key Seamless injected when it created the host, the key its console printed at first boot, or the keys you declare.
+The provider page shows each host's **Host keys** - the fingerprints, where they came from (`Declared`, the pin's
+`injected` or `console`), the server and the time - and warns while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`
+(then no hop checks a key, and validation adds the warning `CONV_HOST_KEYS_UNCHECKED` to every plan).
+
+**Declaring a host's keys.** For a host you bring (`conversion_host.manage: false`, a VMware destination's
+conversion host), or one whose console does not print the `SSH HOST KEY KEYS` block, read the keys on the host
+itself - on its console, or over a connection you trust for another reason:
+
+```bash
+cat /etc/ssh/ssh_host_ed25519_key.pub   # and ecdsa or rsa, if sshd offers those
+```
+
+Paste them, one per line, into **Host keys** of the provider form (`PATCH /api/v1/providers/{id}` →
+`conversion_host.ssh_host_keys`). A line that is no public key is refused by name, never quoted back. Declared keys
+win over the pin; clear them to go back to it.
+
+**A plan blocked by `CONV_HOST_KEY_UNKNOWN`.** The plan needs a host that has neither declared keys nor a pin and
+that Seamless will not create, or whose pin belongs to another server than the one the provider's host resolves to.
+Declare the keys as above; or, for a host Seamless manages, delete it and start the plan again: the pre-staging
+creates it with an injected key and pins it.
+
+**A refused key.** A run that meets another key fails at once and for good: the migration's reason starts with
+`host key refused:` and names the side, the server, the address, the pinned and the offered fingerprints, and the
+event `conversion_host.key_refused` (Events, under Providers and Security) carries the same - alert on it, since a
+refused key may be an attack. A cutover checks both hosts and its link before the source VM stops, so the source keeps
+running; one whose source was already stopped rolls back. Find out why the key changed before anything else:
+
+- **The host was rebuilt or replaced** (the reason `conversion host replaced:`, or the provider's check reporting
+  it): a conversion host deleted and created again under its name and address is a new server, and the old pin does
+  not apply. Declare the new host's keys, or delete it and let a pre-staging create and pin it again.
+- **The image regenerated its keys** (a host Seamless created that "does not present" its injected key): check the
+  image's cloud-init (`ssh_deletekeys`, `ssh_keys` honoured; SDD §26.3), then delete the host and pre-stage again.
+- **Neither**: treat the host's network as compromised (Security.md §13), and do not declare the offered key.
+
+Seamless never accepts a refused key on its own: no prompt, no `accept-new`, no new pin for the same server. The way
+out is always a declared key or a host pre-staged again.
+
+**The link between the hosts.** Each run makes its own link key on the destination host and writes one restricted
+line into the source host's `~/.ssh/authorized_keys` (comment `seamless-link workload=<server id> run=<run>`); the run
+removes both when it ends. A run also removes its migration's earlier lines and every expired one, and the first
+0.5.0 run on a host pair removes 0.4.0's `CONVERSION LINK KEY` block and the destination's `~/.ssh/id_rsa` when it
+holds the plan's old link key. A link you made by hand - another comment, another key - is yours to remove.
+### 7.3 Changed-extent tracking: the Ceph user, its key and the route (0.5.0, Technology Preview)
+
+Changed-extent tracking (SDD §28, FR-26) lets a warm migration's final pass read only the chunks Ceph's `rbd diff`
+lists between Cinder's pass snapshots, instead of scanning every disk on both sides: the downtime loses its scan term
+(Performance.md §4.6). It is a **Technology Preview** until LAB-CE01–CE07 and PERF-E2E-SM1b pass (QASuite §7, §9),
+and off by default twice: a source provider must hold Ceph access, and a plan must turn `extent_tracking` on. A disk
+that cannot use extents scans in full, as today, with its reason recorded; tracking never fails a pass.
+
+**What qualifies.** A Cinder volume, not encrypted, whose pool is of the `rbd` family on the provider's cluster: the
+source check reports each `rbd` entry of `storage_backends` with its `ceph_fsid` and `ceph_pool`, read from Cinder's
+`location_info`, and a disk qualifies when that fsid is the provider's. Image-booted disks, encrypted volumes, volumes
+of another backend and volumes whose `host` or `name_id` the credential cannot read (admin reads under the default
+policies) stay untracked: the validation says so (`EXTENT_TRACKING_PARTIAL`, each disk and why).
+
+**1. The Ceph user** (owner decision 3, SDD §28.11). A metadata-only user: it computes fast diffs from the images'
+object maps and cannot read a volume's data. Run on a monitor, once per tracked pool (`volumes` below), with the
+address of the *source* conversion host:
+
+```bash
+POOL=volumes
+HOST=<the source conversion host's address on the Ceph public network>
+ceph auth get-or-create client.seamless \
+  mon "profile rbd network $HOST/32" \
+  osd "allow r class-read pool=$POOL object_prefix rbd_header. network $HOST/32, \
+       allow r class-read pool=$POOL object_prefix rbd_object_map. network $HOST/32, \
+       allow r class-read pool=$POOL object_prefix rbd_id. network $HOST/32, \
+       allow r class-read pool=$POOL object_prefix rbd_directory network $HOST/32, \
+       allow r class-read pool=$POOL object_prefix rbd_info network $HOST/32"
+```
+
+The object set is what SDD §28.4 proposes; the lab confirms it (LAB-CE04, `TODO(LAB)`). If the lab shows the
+metadata-only user cannot diff, the fallback is `osd "profile rbd-read-only pool=$POOL network $HOST/32"`, which
+reads every tenant's volumes of the pool - keep the `network` limit. Nothing writes: Cinder makes and deletes every
+snapshot. A `network` cap refuses the key from any other address (LAB-CE04), so a re-created managed conversion host
+with a new address needs `ceph auth caps` again. `client.seamless` is the default `client` of the provider's `ceph`;
+another name goes into `ceph.client`.
+
+**2. The route.** The source conversion host reaches the monitors (TCP 3300, and 6789 for messenger v1) and the OSDs
+(TCP 6800–7300) of the Ceph public network; open them to that host's address alone (Security.md §6.4, §8). A managed
+conversion host sits on its own tenant network behind a router, and a director-deployed RHOSP 17.1 keeps Ceph on its
+isolated Storage network: either route the conversion network there, or use an existing conversion host
+(`conversion_host.manage: false`) that already reaches Ceph. The control plane never talks to Ceph. The pre-staging
+of a plan that tracks extents installs `ceph-common` on the source host (`os_migrate_conversion_host_ceph_client`,
+`conversion_host_content`); the image's repository must carry it.
+
+**3. Ceph access on the provider, and the key.** An admin sets the source provider's `ceph` - the cluster's `fsid`
+(`ceph fsid`), its monitors as the conversion host reaches them, the `client` - with `PATCH /api/v1/providers/{id}`
+or the dashboard's provider page, then writes the key, write-only. The key never goes on a command line: pipe it from
+`ceph auth get-key` into a request body, with the token in a header file as section 5 does.
+
+```bash
+PROVIDER=<the source provider id>
+ceph auth get-key client.seamless \
+  | python3 -c 'import json, sys; print(json.dumps({"key": sys.stdin.read().strip()}))' \
+  | curl -sS -X PUT "$URL/api/v1/providers/$PROVIDER/ceph-key" -H @"$HEADER_FILE" \
+         -H 'Content-Type: application/json' --data-binary @-
+```
+
+`GET /api/v1/providers/{id}` then shows `ceph.key_updated_at` and nothing of the key: it lives in the secret store
+as `provider-{id}.ceph`, reaches each run as 0600 files beside `secrets.yml`, deleted with it, and the conversion host
+as a 0700 directory for one query, removed after it (SDD §13.3, §28.8; Security.md C4-08). The event
+`provider.credentials_updated` names the secret, never a value. `ceph: null` on the provider, and the provider's
+deletion, delete the secret: delete the Ceph user at the cluster then.
+
+**4. The snapshot quota.** A tracked volume keeps the Cinder snapshot of its last completed pass as the diff base
+until the next pass completes: one more snapshot per volume than today, two during a pass. Raise the source project's
+quota before the first tracked plan: `openstack quota set --snapshots <n> --project <source project>` (and
+`--gigabytes` where snapshots count against it). The cutover deletes the bases with the final snapshot's cleanup; a
+rollback, a cancel and a change of strategy delete them too.
+
+**5. The plan.** `extent_tracking: true` on the plan (`PATCH /api/v1/plans/{id}`, `seamless plan apply`, or the plan's
+page); refused with 422 on a VMware source. It may change at any time: off, the next pass scans; on, the next pass
+checks. The validation warns with `CEPH_ACCESS_MISSING` when the source has no Ceph access, no key or no `rbd` pool of
+its fsid: every pass scans in full then.
+
+**6. Reading each pass's extent use.** `GET /api/v1/migrations/{id}` carries `sync_passes[].extents`, one entry per
+device, and the migration page shows them; `migration.sync_pass` events carry the same (SDD §28.5):
+
+| `mode` | Meaning | What to do |
+|---|---|---|
+| `checked` | a full scan that compared the extents with what changed; `missed: 0` proves the tracker on this disk for that interval; `query_s` is the query's time | nothing: the pre-copy and keep-warm passes check (owner decision 5) |
+| `checked`, `missed > 0` | the extents missed a write: the disk scans in full from then on, and `EXTENT_TRACKING_MISSED` is raised | read the compute nodes' librbd and the cluster's release (item 7); the migration completes, with the scan in its downtime |
+| `read` | the final pass read only the listed chunks: the downtime lost the scan | nothing |
+| `scanned`, `first_pass` / `unchecked` / `no_base` | the first pass, or no check of the disk passed yet, or no base is recorded (the first pass after a rollback that created a server, LAB-CE06) | nothing: the next pass checks |
+| `scanned`, `not_tracked` / `encrypted` | the disk does not qualify (item "What qualifies") | expected; `EXTENT_TRACKING_PARTIAL` named it at validation |
+| `scanned`, `base_gone` / `resized` | Cinder no longer has the base snapshot `available`, or the volume's size or `name_id` changed (a retype, an extend) | expected after such an operation; the next pass checks again |
+| `scanned`, `assumed_zero` | the base pass ran with `os_migrate_warm_assume_zero` and did not read the destination in full | the next `checked` pass proves the destination; keep `assume_zero` off for tracked plans |
+| `scanned`, `query_failed` | `rbd diff` failed, took longer than its timeout (300 s) or listed an extent beyond the volume | the monitors unreachable, the key or the caps wrong, fast-diff off or the object map invalid (`rbd info` shows `object map invalid`/`fast diff invalid` flags; `rbd object-map rebuild <pool>/volume-<id>` as admin): fix, the next pass checks again |
+| `{}` | the plan does not track extents | - |
+
+A final pass that scanned keeps today's downtime for that disk; the estimate says so beforehand
+(`Migration.tracked_disks`, Performance.md §4.6), and the calibration of the query time
+(`observed_extent_query_s`) comes from the checked passes.
+
+**7. The Ceph releases.** Ceph #61616 ("volume data corruption when using rbd-mirror w/failover"): an object map
+forked for a snapshot taken under I/O could miss writes, so an `rbd diff` of those snapshots "may be incomplete". The
+librbd fix is in Pacific 16.2.14, Quincy 17.2.7 and Reef 18.1.2 and every later release (Squid 19). The map is kept by
+the image's writer - QEMU's librbd on the **source compute nodes** -, whose version no OpenStack API shows, and RHCS
+6.1, which RHOSP 17.1 supports, is built from Quincy 17.2.6 (`TODO(LAB): confirm` which builds carry the fix). Read
+both before the first tracked plan and record them (LAB-CE02):
+
+```bash
+ceph versions                                   # the cluster: mon, osd, mds by release
+# each source compute node's librbd (RHOSP 17.1 runs libvirt in a container):
+sudo podman exec nova_libvirt rpm -q librbd1    # director-deployed
+rpm -q librbd1  ||  dpkg -l librbd1             # a plain host, a community cloud
+```
+
+The checks guard at run time: every pre-copy pass of a tracked disk is a `checked` pass, which counts the chunks that
+changed outside the extents; a miss turns tracking off for that disk and raises `EXTENT_TRACKING_MISSED`. An image
+whose fast-diff feature is off or whose map is invalid still diffs, one request per object - slower, correct: `rbd
+feature enable <pool>/volume-<id> object-map fast-diff` and `rbd object-map rebuild` make it fast again.
 
 ---
 

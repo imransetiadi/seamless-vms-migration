@@ -228,6 +228,9 @@ describe('MigrationActions', () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('db-mysql-02', 'approver');
     expect(migration).toMatchObject({ phase: 'syncing', strategy: 'warm' });
+    // untracked here: the demo's plan tracks this VM's extents, which takes its forced downtime under the SLO (SDD §28.6, plan task CE10)
+    migration.tracked_disks = [];
+    migration.observed_extent_query_s = null;
     const plan = server.plans.find((p) => p.id === migration.plan_id)!;
 
     await user.click(button(/^force cutover$/i));

@@ -2227,3 +2227,62 @@ async def test_a_provider_edit_and_a_plan_start_never_interleave(tmp_path):
     assert edited.status_code == 200, edited.text  # the edit came first...
     assert store.get("plan", plan.id, Plan).status == PlanStatus.running  # ...then the start
     store.dispose()
+
+
+def test_a_plan_turns_extent_tracking_on_and_off(api):
+    """SDD §4.2, §28.9 (plan task CE7): extent_tracking is false unless chosen, round-trips on
+    create and edit, and may change at any time a plan can be edited."""
+    body = {
+        "name": "tracked",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["extent_tracking"] is False
+    plan_id = created.json()["id"]
+    on = api.client.patch(
+        f"/api/v1/plans/{plan_id}", headers=api.h(Role.operator), json={"extent_tracking": True}
+    )
+    assert on.status_code == 200 and on.json()["extent_tracking"] is True, on.text
+    assert api.get(f"/api/v1/plans/{plan_id}").json()["extent_tracking"] is True
+    off = api.client.patch(
+        f"/api/v1/plans/{plan_id}", headers=api.h(Role.operator), json={"extent_tracking": False}
+    )
+    assert off.status_code == 200 and off.json()["extent_tracking"] is False
+    tracked = api.post("/api/v1/plans", Role.operator, json={**body, "extent_tracking": True})
+    assert tracked.status_code == 201 and tracked.json()["extent_tracking"] is True
+    bad = api.post("/api/v1/plans", Role.operator, json={**body, "extent_tracking": "maybe"})
+    assert bad.status_code == 422 and "extent_tracking" in bad.json()["error"]["message"]
+
+
+def test_extent_tracking_is_refused_for_a_vmware_source(api):
+    """SDD §28.9: the extents are a Ceph cluster's; a vCenter source has none - 422 on create and
+    on edit, naming the field."""
+    vcenter = {
+        "id": "vc-dc2",
+        "name": "vCenter DC2",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.dc2.example/sdk",
+    }
+    assert api.post("/api/v1/providers", Role.admin, json=vcenter).status_code == 201
+    body = {
+        "name": "vmware",
+        "source_provider_id": "vc-dc2",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    bad = api.post("/api/v1/plans", Role.operator, json={**body, "extent_tracking": True})
+    assert bad.status_code == 422, bad.text
+    assert "extent_tracking" in bad.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"extent_tracking": True},
+    )
+    assert patched.status_code == 422 and "extent_tracking" in patched.json()["error"]["message"]
+    assert api.get(f"/api/v1/plans/{created.json()['id']}").json()["extent_tracking"] is False

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import random
 import re
@@ -30,6 +31,7 @@ from ..orchestrator import RELEASES_VM, cleanup_pending
 from ..security.auth import Principal
 from ..security.secret_store import (
     SecretStoreError,
+    ceph_key_secret_name,
     conversion_key_secret_name,
     credentials_secret_name,
     secret_store,
@@ -43,7 +45,12 @@ from .deps import (
     services,
     validation_message,
 )
-from .schemas import ConversionKeyRequest, EmptyRequest, ProviderCredentialsRequest
+from .schemas import (
+    CephKeyRequest,
+    ConversionKeyRequest,
+    EmptyRequest,
+    ProviderCredentialsRequest,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["providers"])
@@ -58,6 +65,7 @@ PROVIDER_EDITABLE_FIELDS = frozenset(
         "name",
         "endpoint",
         "cloud",
+        "ceph",
         "credentials_secret",
         "region",
         "verify_tls",
@@ -194,14 +202,17 @@ async def create_provider(
             "conversion_host_pin": None,
         }
     )
-    # the store names a provider's secrets provider-{id} and provider-{id}-ssh: an id that makes
-    # them another provider's would overwrite (and on deletion remove) its key (SDD §13.3)
+    provider = _with_ceph_key_time(provider, None)
+    # the store names a provider's secrets provider-{id}, provider-{id}-ssh and provider-{id}.ceph:
+    # an id that makes them another provider's would overwrite (and on deletion remove) its key
+    # (SDD §13.3; the SEAMLESS_SECRET_ variables read `.` and `-` alike, audit AP-04)
     async with svc.orchestrator.provider_lock():
         clash = next(
             (
                 other.id
                 for other in await svc.db.list("provider", Provider)
-                if provider.id == f"{other.id}-ssh" or other.id == f"{provider.id}-ssh"
+                if provider.id in (f"{other.id}-ssh", f"{other.id}-ceph")
+                or other.id in (f"{provider.id}-ssh", f"{provider.id}-ceph")
             ),
             None,
         )
@@ -210,7 +221,8 @@ async def create_provider(
                 409,
                 "conflict",
                 f"provider id {provider.id!r} would share a secret with provider {clash!r}: "
-                "Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh",
+                "Seamless stores a provider's secrets as provider-<id>, provider-<id>-ssh and "
+                "provider-<id>.ceph",
             )
         try:
             await svc.db.put("provider", provider, expected_version=0)
@@ -274,7 +286,14 @@ async def update_provider(
                 422, "validation_error", validation_message(exc.errors(), "invalid provider")
             ) from None
         _check_secret_names(updated, set(body))
+        # key_updated_at is the key's write alone (SDD §4.2): a client's value is ignored
+        updated = _with_ceph_key_time(
+            updated, provider.ceph.key_updated_at if provider.ceph is not None else None
+        )
         await svc.db.put("provider", updated, expected_version=version)
+    if provider.ceph is not None and updated.ceph is None:
+        # a key without an access to use it would stay in the store for good (SDD §13.3)
+        await _delete_secret_quietly(svc, ceph_key_secret_name(provider_id))
     await emit(
         svc.store,
         svc.bus,
@@ -284,6 +303,27 @@ async def update_provider(
         data={"provider_id": provider_id, "fields": sorted(body), **_secret_names(updated)},
     )
     return updated
+
+
+def _with_ceph_key_time(provider: Provider, when: Any) -> Provider:
+    """The provider with ``ceph.key_updated_at`` set to ``when`` - the server's own value, never a
+    client's (SDD §4.2) - or unchanged without a Ceph access."""
+    if provider.ceph is None or provider.ceph.key_updated_at == when:
+        return provider
+    return provider.model_copy(
+        update={"ceph": provider.ceph.model_copy(update={"key_updated_at": when})}
+    )
+
+
+async def _delete_secret_quietly(svc: Any, name: str) -> None:
+    """A provider's Ceph key removed as best effort: a store that refuses is logged, never a
+    failure of the request that no longer needs the secret (SDD §13.3). The line names neither
+    the secret nor the provider, which the request's own event records (CodeQL py/log-injection,
+    py/clear-text-logging-sensitive-data on a line built from the path's provider id)."""
+    try:
+        await asyncio.to_thread(secret_store(svc.settings).delete, name)
+    except SecretStoreError as exc:
+        log.warning("could not delete a provider's ceph key secret: %s", exc)
 
 
 async def _store_secret(
@@ -318,8 +358,12 @@ async def _record_secret(
             try:
                 store = secret_store(svc.settings)
                 await asyncio.to_thread(store.delete, name)
-            except SecretStoreError:
-                log.warning("secret %s of a deleted provider could not be removed", name)
+            except SecretStoreError as exc:
+                # neither the secret's name nor the provider's id: both come from the request's
+                # path (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
+                log.warning(
+                    "the secret of a provider deleted meanwhile could not be removed: %s", exc
+                )
             raise
         updated = provider.model_copy(update={**update(provider), **_SERVER_OWNED})
         try:
@@ -403,6 +447,60 @@ async def set_conversion_key(
     return updated
 
 
+@router.put("/providers/{provider_id}/ceph-key", response_model=Provider)
+async def set_ceph_key(
+    provider_id: str,
+    body: CephKeyRequest,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.admin)),
+) -> Provider:
+    """Write-only Ceph key of the source cluster the provider declares (SDD §12, §13.3, §28.4):
+    the secret ``provider-{id}.ceph``, key ``key``; the provider records the time alone."""
+    svc = services(request)
+    provider = await svc.db.get("provider", provider_id, Provider)  # 404 before any write
+    if provider.ceph is None:
+        raise ApiError(
+            422, "validation_error", "provider has no ceph access: set `ceph` before its key"
+        )
+    key = body.key.strip()
+    try:
+        if any(c.isspace() for c in key) or len(base64.b64decode(key, validate=True)) < 16:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ApiError(
+            422, "validation_error", "key must be the base64 key `ceph auth get-key` prints"
+        ) from None
+    name = ceph_key_secret_name(provider_id)
+    await _store_secret(request, name, {"key": key}, provider_id)
+
+    def record(fresh: Provider) -> dict[str, Any]:
+        if fresh.ceph is None:
+            # the access went while the key was being recorded: the key goes with it
+            raise _CephAccessGone
+        return {"ceph": fresh.ceph.model_copy(update={"key_updated_at": utcnow()})}
+
+    try:
+        updated = await _record_secret(request, provider_id, name, record)
+    except _CephAccessGone:
+        await _delete_secret_quietly(svc, name)
+        raise ApiError(
+            409, "conflict", "the provider's ceph access was removed meanwhile; set it again"
+        ) from None
+    await emit(
+        svc.store,
+        svc.bus,
+        "provider.credentials_updated",
+        f"ceph key of provider {provider_id} updated",
+        actor=principal.name,
+        data={"provider_id": provider_id, "secret": name, "keys": ["key"]},
+    )
+    return updated
+
+
+class _CephAccessGone(Exception):
+    """The Ceph access was removed between the key's write and its record."""
+
+
 async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
     """The plans that still need the provider (SDD §12), each with why: one that has not completed
     (a failed one can start again), or a completed one with a migration that holds its VM - it can
@@ -471,12 +569,18 @@ async def delete_provider(
     # and the deletion is audited whatever the store answers, naming what it left (audit AA-03) -
     # a store that cannot be built leaves both (review RV52-X2)
     left: list[str] = []
-    for name in (credentials_secret_name(provider_id), conversion_key_secret_name(provider_id)):
+    for name in (
+        credentials_secret_name(provider_id),
+        conversion_key_secret_name(provider_id),
+        ceph_key_secret_name(provider_id),
+    ):
         try:
             await asyncio.to_thread(secret_store(svc.settings).delete, name)
         except SecretStoreError as exc:
             left.append(name)
-            log.warning("could not delete secret %s of provider %s: %s", name, provider_id, exc)
+            # provider.deleted names the secret left (secret_left); the line names nothing the
+            # request's path gave (CodeQL py/log-injection, py/clear-text-logging-sensitive-data)
+            log.warning("a secret of a deleted provider could not be removed: %s", exc)
     await emit(
         svc.store,
         svc.bus,

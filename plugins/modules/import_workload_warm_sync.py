@@ -117,6 +117,50 @@ options:
     default: auto
     choices: [auto, full, delta, final]
     type: str
+  extents:
+    description:
+      - Extent tracking of the pass (Seamless Migrate SDD 28.4, 28.5). C(off) scans every disk
+        in full. C(check) runs a full pass that also counts the changed chunks the extents of a
+        disk with a base miss; a miss turns tracking off for that disk. C(read), on a final pass,
+        sends the listed chunks alone for a disk whose base pass read the destination in full,
+        that a check passed and that no check missed; on any other pass it checks. Each disk's
+        mode and reason are recorded in the pass. Tracking never fails a pass.
+      - Quote the value in YAML - C("off") - since YAML reads a bare C(off) as false.
+    required: false
+    default: "off"
+    choices: ["off", check, read]
+    type: str
+  ceph_conf:
+    description:
+      - The run's minimal C(ceph.conf) (fsid, monitors), copied to the source conversion host for
+        each extent query and removed after it.
+    required: false
+    type: path
+  ceph_keyring:
+    description:
+      - The run's Ceph keyring (0600), copied to the source conversion host for each extent query
+        and removed after it; never logged.
+    required: false
+    type: path
+  ceph_client:
+    description:
+      - The Ceph user the query runs as, without C(client.).
+    required: false
+    default: seamless
+    type: str
+  ceph_pools:
+    description:
+      - The tracked pools, a Cinder pool (the volume's host, C(host@backend#pool)) to its Ceph
+        pool. A volume on another pool is not tracked.
+    required: false
+    type: dict
+  extent_query_timeout:
+    description:
+      - Seconds C(rbd diff) may run on the source conversion host; a query that outlives it
+        scans the disk in full.
+    required: false
+    default: 300
+    type: int
   chunk_size:
     description:
       - blocksync chunk size in bytes.
@@ -281,6 +325,12 @@ def run_module():
         log_file=dict(type="str", default=None),
         state_file=dict(type="str", default=None),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
+        extents=dict(type="str", default="off", choices=["off", "check", "read"]),
+        ceph_conf=dict(type="path", default=None),
+        ceph_keyring=dict(type="path", default=None, no_log=True),
+        ceph_client=dict(type="str", default="seamless"),
+        ceph_pools=dict(type="dict", default=None),
+        extent_query_timeout=dict(type="int", default=300),
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
@@ -333,6 +383,12 @@ def run_module():
             src_ssh_user=params["src_ssh_user"],
             ssh_known_hosts=params["ssh_known_hosts"],
             link=params["link"],
+            extents=params["extents"],
+            ceph_conf=params["ceph_conf"],
+            ceph_keyring=params["ceph_keyring"],
+            ceph_client=params["ceph_client"],
+            ceph_pools=params["ceph_pools"],
+            extent_query_timeout=params["extent_query_timeout"],
         )
         sync_pass = warm_sync.sync(params["pass_kind"])
         block_device_mapping = warm_sync.block_device_mapping()

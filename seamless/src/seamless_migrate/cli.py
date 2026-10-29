@@ -289,6 +289,11 @@ def _resolve_providers(store: Any, spec: PlanCreate) -> None:
             raise CliError(f"{role} provider {provider_id!r} does not exist") from None
         if str(provider.role) != role:
             raise CliError(f"provider {provider_id!r} is not a {role} provider")
+        if role == "source" and spec.extent_tracking and provider.kind == ProviderKind.vmware:
+            # as POST and PATCH /plans refuse it (SDD §28.9, plan task CE7)
+            raise CliError(
+                "extent_tracking: a VMware source has no Ceph cluster to read extents from"
+            )
     # SDD §15: the hooks it names, as POST and PATCH /plans check them (§12, plan task N3)
     from .domain.models import Hook
     from .plan_checks import unknown_hook

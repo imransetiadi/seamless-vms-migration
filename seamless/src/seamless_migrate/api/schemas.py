@@ -62,6 +62,12 @@ class ConversionKeyRequest(_Body):
     private_key: str = Field(min_length=64, max_length=16384, repr=False)
 
 
+class CephKeyRequest(_Body):
+    """The Ceph user's key as ``ceph auth get-key`` prints it (SDD §12, §28.4): write-only."""
+
+    key: str = Field(min_length=16, max_length=512, repr=False)
+
+
 class WavesAutoRequest(_Body):
     max_wave_size: int = Field(default=10, ge=1, le=1000)
 
@@ -187,6 +193,14 @@ class Health(BaseModel):
 class Me(BaseModel):
     name: str
     role: Role
+
+
+class CurrentUser(Me):
+    """GET /me: the signed-in user, and what the dashboard needs to know of the installation."""
+
+    #: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING, for the provider page's warning while it is off - for a
+    #: signed-in viewer alone, never on the public /health (SDD §12, §16, plan task ST7)
+    host_key_checking: bool
 
 
 class JevStatus(BaseModel):

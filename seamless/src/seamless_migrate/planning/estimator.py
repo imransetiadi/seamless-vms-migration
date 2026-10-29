@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
@@ -13,6 +13,7 @@ from ..domain.models import (
     MAX_DURATION_S,
     MAX_SYNC_PASSES,
     MIN_RATE_BPS,
+    Disk,
     Estimate,
     Plan,
     SyncPass,
@@ -29,6 +30,8 @@ class EstimatorParams:
     boot_s: float = 120.0
     create_s: float = 60.0
     snapshot_s: float = 30.0
+    #: q: one extent query on the source conversion host (SDD §28.6, plan task CE8)
+    extent_query_s: float = 10.0
     handover_per_volume_s: float = 20.0
     v2v_s: float = 300.0
     v2v_inplace_s: float = 120.0
@@ -60,7 +63,7 @@ def unknown_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
 _RATE_FIELDS = frozenset({"link_bps", "scan_bps", "max_aggregate_scan_bps"})
 _DURATION_FIELDS = frozenset(
     {"shutdown_s", "boot_s", "create_s", "snapshot_s", "handover_per_volume_s", "v2v_s",
-     "v2v_inplace_s"}
+     "v2v_inplace_s", "extent_query_s"}
 )  # fmt: skip
 
 #: Override keys that belong to plan fields (rejected: set the plan field instead).
@@ -121,15 +124,52 @@ def params_for_plan(plan: Plan, base: EstimatorParams | None = None) -> Estimato
     return replace(params, **updates)
 
 
-def scan_seconds(vm: VMRef, params: EstimatorParams) -> float:
-    """Time to read and hash every disk once: ``max(Dmax/S, D/min(S·P, A))``."""
-    if not vm.disks:
+def scan_seconds(
+    vm: VMRef, params: EstimatorParams, disks: Collection[Disk] | None = None
+) -> float:
+    """Time to read and hash every disk once: ``max(Dmax/S, D/min(S·P, A))`` - over ``disks``
+    alone when given (the untracked ones of §28.6), 0 for none."""
+    chosen = list(vm.disks) if disks is None else list(disks)
+    if not chosen:
         return 0.0
-    largest = max(d.size_gb for d in vm.disks) * GIB
+    largest = max(d.size_gb for d in chosen) * GIB
+    total = sum(d.size_gb for d in chosen) * GIB
     aggregate = params.scan_bps * max(1, int(params.parallel_disks))
     if params.max_aggregate_scan_bps is not None and params.max_aggregate_scan_bps > 0:
         aggregate = min(aggregate, float(params.max_aggregate_scan_bps))
-    return max(largest / params.scan_bps, vm.disk_bytes / aggregate)
+    return max(largest / params.scan_bps, total / aggregate)
+
+
+#: the reasons a disk scanned for that hold for the rest of the migration (SDD §28.5, §28.6)
+LASTING_SCAN_REASONS = frozenset({"not_tracked", "encrypted", "missed"})
+
+
+def tracked_disks(
+    vm: VMRef, qualifying: Collection[str], sync_passes: Sequence[SyncPass]
+) -> list[str]:
+    """The disks (ids) the final pass is expected to read from extents (SDD §28.6): the
+    ``qualifying`` ones less each whose last recorded pass scanned it for a lasting reason."""
+    by_device = {d.device: d.id for d in vm.disks if d.device}
+    out = {d.id for d in vm.disks if d.id in set(qualifying)}
+    if sync_passes:
+        for dev, use in sync_passes[-1].extents.items():
+            # a miss turns tracking off for the disk at once (SDD §28.5)
+            if use.missed > 0 or (use.mode == "scanned" and use.reason in LASTING_SCAN_REASONS):
+                out.discard(by_device.get(dev, dev))
+    return sorted(out)
+
+
+def final_copy_seconds(
+    vm: VMRef, params: EstimatorParams, final_delta: float, tracked: Collection[str] | None = None
+) -> float:
+    """The final pass's copy term (SDD §9.1): ``snapshot + max(scan, Δf/L)``, or with disks read
+    from extents ``snapshot + max(scan_U, q + max(Δf/S, Δf/L))`` over the others' scan (§28.6)."""
+    p = params
+    if not tracked:
+        return p.snapshot_s + max(scan_seconds(vm, p), final_delta / p.link_bps)
+    untracked = [d for d in vm.disks if d.id not in set(tracked)]
+    read = p.extent_query_s + max(final_delta / p.scan_bps, final_delta / p.link_bps)
+    return p.snapshot_s + max(scan_seconds(vm, p, untracked), read)
 
 
 def _precopy_passes(
@@ -177,12 +217,14 @@ def estimate(
     *,
     hooks_s: float = 0.0,
     dns_tail_s: float | None = None,
+    tracked: Collection[str] | None = None,
 ) -> Estimate:
     """Estimate pre-copy time, passes and downtime for ``vm`` under ``strategy``.
 
     ``hooks_s`` is the plan's post_create hooks' time, a part of the downtime; ``dns_tail_s`` the
-    VM's DNS record's TTL, apart from it (SDD §9.1, plan task N10). The result is always
-    ``eligible=True``; eligibility is decided by the selector.
+    VM's DNS record's TTL, apart from it (SDD §9.1, plan task N10); ``tracked`` the disks the
+    final pass reads from extents, whose checked passes cost their query (§28.6). The result is
+    always ``eligible=True``; eligibility is decided by the selector.
     """
     strategy = Strategy(strategy)
     p = params
@@ -198,16 +240,18 @@ def estimate(
         copy_s, conversion_s = p.snapshot_s + used / link, 0.0
     elif strategy == Strategy.warm:
         scan = scan_seconds(vm, p)
+        # a tracked migration's checked passes query the extents too (SDD §28.6)
+        query = p.extent_query_s if tracked else 0.0
         durations, final_delta = _precopy_passes(
             first_pass_seconds(vm, strategy, p),
             used,
-            lambda d: p.snapshot_s + max(scan, d / link),
+            lambda d: p.snapshot_s + query + max(scan, d / link),
             disk,
             rate,
             p,
         )
         precopy_s, passes = sum(durations), len(durations)
-        copy_s, conversion_s = p.snapshot_s + max(scan, final_delta / link), 0.0
+        copy_s, conversion_s = final_copy_seconds(vm, p, final_delta, tracked), 0.0
     elif strategy == Strategy.storage_handover:
         copy_s, conversion_s = len(vm.disks) * p.handover_per_volume_s, 0.0
     elif strategy == Strategy.vmware_cold:
@@ -272,15 +316,17 @@ def final_downtime_parts(
     last_pass_s: float,
     params: EstimatorParams,
     hooks_s: float = 0.0,
+    tracked: Collection[str] | None = None,
 ) -> dict[str, float]:
     """The parts of the downtime if cut over now, after a pass of ``last_pass_s``, the post_create
-    hooks' ``hooks_s`` among them (SDD §5.3, §9.1)."""
+    hooks' ``hooks_s`` among them (SDD §5.3, §9.1); ``tracked`` the disks read from extents
+    (§28.6)."""
     rate = vm.change_rate_bps if vm.change_rate_bps is not None else params.change_rate_bps
     delta = min(float(vm.disk_bytes), rate * max(0.0, last_pass_s))
     p = params
     if Strategy(strategy) == Strategy.vmware_warm:
         return _parts(p, delta / p.link_bps, p.v2v_inplace_s, hooks_s)
-    return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0, hooks_s)
+    return _parts(p, final_copy_seconds(vm, p, delta, tracked), 0.0, hooks_s)
 
 
 def whole_pass_seconds(sync_pass: SyncPass, strategy: Strategy, params: EstimatorParams) -> float:
@@ -299,10 +345,11 @@ def estimate_final_downtime(
     last_pass_s: float,
     params: EstimatorParams,
     hooks_s: float = 0.0,
+    tracked: Collection[str] | None = None,
 ) -> float:
     """Downtime if cut over now, given the duration of the last completed pass, the post_create
-    hooks' ``hooks_s`` included (SDD §5.3, §9.1)."""
-    return sum(final_downtime_parts(vm, strategy, last_pass_s, params, hooks_s).values())
+    hooks' ``hooks_s`` included (SDD §5.3, §9.1), ``tracked`` the disks read from extents."""
+    return sum(final_downtime_parts(vm, strategy, last_pass_s, params, hooks_s, tracked).values())
 
 
 def estimate_forced_downtime(
@@ -311,13 +358,14 @@ def estimate_forced_downtime(
     last_pass_s: float | None,
     params: EstimatorParams,
     hooks_s: float = 0.0,
+    tracked: Collection[str] | None = None,
 ) -> float:
     """The downtime a Force cutover expects (SDD §5.4): after a pass as long as the last one that
     ended, or - before any pass ended (``None``) - after the running first pass; the post_create
-    hooks' ``hooks_s`` included (§9.1)."""
+    hooks' ``hooks_s`` included (§9.1), ``tracked`` the disks read from extents (§28.6)."""
     if last_pass_s is None:
         last_pass_s = first_pass_seconds(vm, strategy, params)
-    return estimate_final_downtime(vm, strategy, last_pass_s, params, hooks_s)
+    return estimate_final_downtime(vm, strategy, last_pass_s, params, hooks_s, tracked)
 
 
 # -- calibration (SDD §9.1 "Configuration and calibration") ----------------------------------
@@ -352,6 +400,8 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
     """
     if sync_pass.kind == SyncPassKind.full:
         return None
+    if any(use.mode == "read" for use in sync_pass.extents.values()):
+        return None  # it read the listed chunks alone: no scan to read S from (SDD §28.6)
     duration, scanned = sync_pass.duration_s, sync_pass.bytes_scanned
     if not duration or duration <= 0 or scanned <= 0:
         return None
@@ -365,3 +415,14 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
     if link and link > 0 and duration <= LINK_BOUND_MARGIN * (sync_pass.bytes_transferred / link):
         return rate if rate > params.scan_bps else None
     return rate
+
+
+def observed_extent_query_s(sync_pass: SyncPass) -> float | None:
+    """The ``q`` a checked pass measured: its longest extent query (SDD §9.1, §28.6); None for a
+    pass that checked no disk, or whose checks record no query time."""
+    queries = [
+        use.query_s
+        for use in sync_pass.extents.values()
+        if use.mode == "checked" and use.query_s is not None
+    ]
+    return max(queries) if queries else None

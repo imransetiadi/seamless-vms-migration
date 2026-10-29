@@ -57,6 +57,7 @@ from ..planning.networks import (
     port_refusal_at_run,
     resolve_network,
 )
+from ..planning.preflight import ceph_pools
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.host_keys import (
@@ -67,9 +68,11 @@ from ..security.host_keys import (
     trusted_keys,
     write_known_hosts,
 )
+from ..security.secret_store import ceph_key_secret_name
 from ..security.secrets import (
     SecretNotFound,
     openstack_cloud_entry,
+    read_secret,
     remove_quietly,
     resolve,
     resolve_private_key,
@@ -701,6 +704,68 @@ def _common_openstack_vars(
     return out
 
 
+#: the run's Ceph files beside secrets.yml (SDD §7.2, §28.4): the minimal ceph.conf and the keyring
+CEPH_CONF_FILE = "ceph.conf"
+CEPH_KEYRING_FILE = "ceph.keyring"
+#: seconds rbd may run on the source conversion host for one query (SDD §28.5)
+EXTENT_QUERY_TIMEOUT_S = 300
+
+
+def ceph_tracking(plan: Plan, source: Provider, settings: Settings) -> dict[str, Any] | None:
+    """What a warm plan that tracks extents gets of its source's Ceph access (SDD §7.2, §28.4):
+    the access, its key and the tracked pools - None when the plan does not track, or the source
+    has no access, no key or no pool of its fsid (every pass scans; the findings of §28.9 say so).
+    The key is read for the run's keyring alone: it reaches no variable and no log line."""
+    if not plan.extent_tracking or source.ceph is None:
+        return None
+    pools = ceph_pools(source)
+    if not pools:
+        return None
+    try:
+        key = read_secret(ceph_key_secret_name(source.id), settings).get("key")
+    except SecretNotFound:
+        key = None
+    if not key:
+        return None
+    return {"access": source.ceph, "key": key, "pools": pools}
+
+
+def ceph_run_files(ctx: StepContext) -> list[tuple[Path, str]]:
+    """The run's ceph.conf and keyring, 0600 beside secrets.yml and deleted with it (SDD §7.2),
+    for a warm step of a plan whose tracking is on; [] otherwise."""
+    tracking = ceph_tracking(ctx.plan, ctx.source, ctx.settings)
+    if tracking is None or ctx.migration.strategy != Strategy.warm:
+        return []
+    access = tracking["access"]
+    rdir = run_dir(ctx.settings, ctx.plan.id, ctx.migration.id)
+    conf = f"[global]\nfsid = {access.fsid}\nmon_host = {','.join(access.monitors)}\n"
+    keyring = f"[client.{access.client}]\n\tkey = {tracking['key']}\n"
+    return [(rdir / CEPH_CONF_FILE, conf), (rdir / CEPH_KEYRING_FILE, keyring)]
+
+
+def _extent_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
+    """The roles' extent tracking variables of a warm pass (SDD §6.5, §7.2): check for a pre-copy
+    or sync run, read for the cutover, with the Ceph files, user, pools and timeout; {} when the
+    plan passes no Ceph file."""
+    files = ceph_run_files(ctx)
+    if not files or step not in (StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER):
+        return {}
+    tracking = ceph_tracking(ctx.plan, ctx.source, ctx.settings)
+    assert tracking is not None  # ceph_run_files found it
+    out: dict[str, Any] = {
+        "os_migrate_warm_ceph_conf": str(files[0][0]),
+        "os_migrate_warm_ceph_keyring": str(files[1][0]),
+        "os_migrate_warm_ceph_client": tracking["access"].client,
+        "os_migrate_warm_ceph_pools": dict(tracking["pools"]),
+        "os_migrate_warm_extent_query_timeout": EXTENT_QUERY_TIMEOUT_S,
+    }
+    if step == StepName.CUTOVER:
+        out["os_migrate_warm_extents_final"] = "read"
+    else:
+        out["os_migrate_warm_extents_precopy"] = "check"
+    return out
+
+
 def build_vars(
     step: StepName, ctx: StepContext, network_map: dict[str, str] | None = None
 ) -> dict[str, Any]:
@@ -758,6 +823,8 @@ def build_vars(
     )
     # SDD §6.4: keep mapped volume types (apply_mappings rewrote them to RHOSO types)
     out["os_migrate_workloads_preserve_volume_type"] = bool(ctx.plan.mappings.volume_types)
+    # a warm pass of a plan that tracks extents (SDD §7.2, §28.4, plan task CE7)
+    out.update(_extent_vars(step, ctx))
     # the cleanup after a cancel is the only step that asks for delete_dest_volumes (SDD §5.1)
     cancel_cleanup = step == StepName.ROLLBACK and bool(ctx.options.get("delete_dest_volumes"))
     if (
@@ -982,6 +1049,8 @@ def _warm_sync_pass(entry: dict[str, Any], m: Migration, started: Any) -> SyncPa
         bytes_changed=int(entry.get("bytes_changed") or 0),
         bytes_transferred=int(entry.get("bytes_transferred") or 0),
         duration_s=entry.get("duration_s"),
+        # how the pass used each disk's extents, as the sync recorded it (SDD §4.2, §28.5)
+        extents=entry.get("extents") or {},
     )
 
 
@@ -1495,6 +1564,10 @@ class AnsibleExecutor:
         # no static link: no plan's link key goes to the hosts - each run makes its own (SDD §7.2,
         # §26.6)
         variables["os_migrate_link_conversion_hosts"] = False
+        # the content install puts the Ceph client on the source host of a tracked plan (SDD §6.5)
+        variables["os_migrate_conversion_host_ceph_client"] = (
+            ceph_tracking(plan, source, self.settings) is not None
+        )
         if deploy_conversion_hosts:
             for side, old_key in sorted(rekey.items()):
                 variables[f"os_migrate_{side}_conversion_rekey_private_path"] = str(old_key)
@@ -2692,6 +2765,9 @@ class AnsibleExecutor:
         cleanup = (secrets_path, osm / "clouds.yaml", workdir / "clouds.yaml")
         if key_path is not None:
             cleanup += (key_path,)
+        # the Ceph files of a tracked warm plan go with the run, like secrets.yml (SDD §7.2)
+        ceph_files = ceph_run_files(ctx) if ctx is not None else []
+        cleanup += tuple(path for path, _ in ceph_files)
         control: Path | None = None
         if trust is not None:
             variables = {**variables, **trust.variables()}
@@ -2713,6 +2789,8 @@ class AnsibleExecutor:
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)
             write_secret_file(secrets_path, ansible_yaml(secret_vars))
+            for path, content in ceph_files:
+                write_secret_file(path, content)
             if key_path is not None:
                 secret = destination.conversion_host.ssh_key_secret  # type: ignore[union-attr]
                 try:

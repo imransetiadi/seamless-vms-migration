@@ -1,18 +1,19 @@
 import { CircleAlert, CircleCheck, FileKey2, KeyRound, LockKeyhole, PlugZap, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { useId, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode, type Ref } from 'react';
 import { ApiError } from '../api/client';
-import { useCheckProvider, useCreateProvider, useInventory, useSetConversionKey, useSetProviderCredentials, useUpdateProvider } from '../api/hooks';
-import type { ConversionHostConfig, Distribution, Provider, ProviderCredentials, ProviderPatch, ProviderRole } from '../api/types';
+import { useCheckProvider, useCreateProvider, useInventory, useSetCephKey, useSetConversionKey, useSetProviderCredentials, useUpdateProvider } from '../api/hooks';
+import type { CephAccess, ConversionHostConfig, Distribution, Provider, ProviderCredentials, ProviderPatch, ProviderRole } from '../api/types';
 import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
 import { formatRelative, namesText } from '../lib/format';
+import { declaredKeyProblems, declaredKeys } from '../lib/hostKeys';
 import { inventoryGpuFlavors, sameVgpuProfiles, vgpuProfileErrors, vgpuProfileMap, type VgpuProfileRow } from '../lib/gpu';
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
 import { isBlank, providerLabel } from '../lib/providerUse';
 import { providerStatusMeta } from '../lib/status';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
-import { SelectField, TextField } from './Field';
+import { SelectField, TextAreaField, TextField } from './Field';
 import { Modal } from './Modal';
 import { Segmented } from './Segmented';
 import { ProviderStatusBadge } from './StatusBadge';
@@ -50,6 +51,8 @@ interface FormState {
   hostNetwork: string;
   hostUser: string;
   hostCidr: string;
+  /** The conversion host's public keys its operator declares, one OpenSSH line each (SDD §4.2, §16, §26.3). */
+  hostKeys: string;
   privateKey: string;
   privateKeyLabel: string;
   /** A secret managed outside Seamless (SDD §13.3): its name, for the credentials and for the key. */
@@ -62,6 +65,12 @@ interface FormState {
   policyProfile: '' | 'secure_rbac' | 'legacy';
   /** The vGPU profile each GPU flavor of an OpenStack or RHOSO provider gives, as rows (SDD §4.2, §16, §22.3). */
   gpuProfiles: VgpuProfileRow[];
+  /** The source cluster's Ceph access (SDD §4.2, §28.4, plan task CE10): declared or not, its fsid, monitors (one per line), client, and a key to write once. */
+  cephEnabled: boolean;
+  cephFsid: string;
+  cephMonitors: string;
+  cephClient: string;
+  cephKey: string;
 }
 
 /** A field of the form; a vGPU profile row's by its row's key (SDD §16). */
@@ -77,9 +86,14 @@ type FieldKey =
   | 'appSecret'
   | 'hostName'
   | 'hostAddress'
+  | 'hostKeys'
   | 'privateKey'
   | 'secretName'
   | 'keySecretName'
+  | 'cephFsid'
+  | 'cephMonitors'
+  | 'cephClient'
+  | 'cephKey'
   | `gpuFlavor-${number}`
   | `gpuProfile-${number}`;
 
@@ -88,6 +102,32 @@ const SECRET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const SECRET_NAME_RULE = '1–128 letters, digits, ., _ or -, starting with a letter or digit.';
 /** On OpenShift a Secret read through the API (not mounted) must say it is meant for providers (SDD §13.3). */
 const OPENSHIFT_LABEL = 'On OpenShift, a Secret Seamless reads through the API needs the label seamless.io/provider-secret: "true".';
+
+/** A Ceph cluster's fsid (a UUID), a monitor address ("host" or "host:port") and a Ceph user without "client.", as the API reads them (SDD §4.2, §28.4). */
+const CEPH_FSID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CEPH_MONITOR = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]{0,252})(?::[0-9]{1,5})?$/;
+const CEPH_CLIENT = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** The monitors as typed: one per line, or comma-separated. */
+function cephMonitorList(text: string): string[] {
+  return text
+    .split(/[\n,]/)
+    .map((m) => m.trim())
+    .filter(Boolean);
+}
+
+/** The key as `ceph auth get-key` prints it: base64 of at least 16 bytes and no spaces, as the API checks it (SDD §12, §28.4). */
+function cephKeyLooksRight(key: string): boolean {
+  if (/\s/.test(key) || key.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(key)) return false;
+  const padding = key.endsWith('==') ? 2 : key.endsWith('=') ? 1 : 0;
+  return (key.length * 3) / 4 - padding >= 16;
+}
+
+/** Whether a declared access changed in what a PATCH may set: never its server-owned key time (SDD §4.2). */
+function sameCephAccess(a: Omit<CephAccess, 'key_updated_at'> | null, b: CephAccess | null): boolean {
+  if (!a || !b) return !a && !b;
+  return a.fsid === b.fsid && a.client === b.client && JSON.stringify(a.monitors) === JSON.stringify(b.monitors);
+}
 
 /** Why a named secret is refused, or null (SDD §13.3): the name rule, and no other provider's provider-* secret. */
 function secretNameError(name: string, own: string, what: string): string | null {
@@ -146,10 +186,16 @@ function initialState(provider: Provider | undefined): FormState {
     hostNetwork: host?.external_network ?? '',
     hostUser: host?.ssh_user ?? 'cloud-user',
     hostCidr: host?.ssh_allowed_cidr ?? '',
+    hostKeys: (host?.ssh_host_keys ?? []).join('\n'),
     privateKey: '',
     privateKeyLabel: '',
     secretName: secretName ?? '',
     keySource: keySecretName ? 'external' : 'upload',
+    cephEnabled: Boolean(provider?.ceph),
+    cephFsid: provider?.ceph?.fsid ?? '',
+    cephMonitors: provider?.ceph?.monitors.join('\n') ?? '',
+    cephClient: provider?.ceph?.client ?? 'seamless',
+    cephKey: '',
     keySecretName: keySecretName ?? '',
     release: provider?.release ?? '',
     policyProfile: provider?.policy_profile ?? '',
@@ -342,6 +388,13 @@ function judgedAgain(errors: Errors, rows: readonly VgpuProfileRow[] | null): Er
   return { ...kept, ...rowProblems(rows ?? []) };
 }
 
+/** Whether two conversion hosts are the same, whatever the order of their fields; no declared key is none (older fixtures omit it). */
+function sameConversionHost(a: ConversionHostConfig | null, b: ConversionHostConfig | null): boolean {
+  const canonical = (host: ConversionHostConfig | null) =>
+    host && JSON.stringify(Object.entries({ ...host, ssh_host_keys: host.ssh_host_keys ?? [] }).sort(([x], [y]) => (x < y ? -1 : 1)));
+  return canonical(a) === canonical(b);
+}
+
 /** The platform mark: two letters in a square, the one memorable element of the provider UI. */
 export function PlatformMark({ preset, size = 'md' }: { preset: DistributionPreset; size?: 'md' | 'lg' }) {
   return (
@@ -479,6 +532,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const update = useUpdateProvider();
   const setCredentials = useSetProviderCredentials();
   const setKey = useSetConversionKey();
+  const setCephKey = useSetCephKey();
   const check = useCheckProvider();
   // the provider's GPU flavors, which its vGPU profiles name: read with its inventory while the form shows and nothing
   // saves - each step of a save would read it again, for a source every VM, for a destination Placement too (SDD §16)
@@ -509,6 +563,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   // an OpenStack or RHOSO provider, source or destination, declares the vGPU profiles of its GPU flavors; vCenter reports
   // each VM's own (SDD §16, §22.3)
   const declaresGpuProfiles = preset.kind !== 'vmware';
+  // an OpenStack or RHOSO source declares its Ceph cluster's access for changed-extent tracking (SDD §16, §28.4)
+  const declaresCeph = form.role === 'source' && preset.kind !== 'vmware';
   const id = (key: string) => `provider-dialog-${key}`;
   // offered once its inventory is read, never for a provider not added yet; what is not known is said, never read as none
   const offered = current && inventory.data ? inventoryGpuFlavors(inventory.data, current.gpu_profiles ?? {}) : [];
@@ -585,9 +641,34 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     if (form.keySource === 'upload' && form.privateKey && !/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(form.privateKey.trim())) {
       e.privateKey = 'This is not an OpenSSH or PEM private key (it must start with -----BEGIN … PRIVATE KEY-----).';
     }
+    // what the API refuses of a declared Ceph access, and the key it needs once (SDD §4.2, §12, §28.4)
+    if (declaresCeph && form.cephEnabled) {
+      if (!CEPH_FSID.test(form.cephFsid.trim().toLowerCase())) e.cephFsid = "Enter the cluster's fsid: a UUID, as ceph fsid prints it.";
+      const monitors = cephMonitorList(form.cephMonitors);
+      if (monitors.length === 0 || monitors.length > 9) e.cephMonitors = 'Enter 1 to 9 monitor addresses, one per line.';
+      else if (monitors.some((monitor) => !CEPH_MONITOR.test(monitor))) e.cephMonitors = 'Each monitor is an address: host or host:port.';
+      const client = form.cephClient.trim();
+      if (client.toLowerCase().startsWith('client.')) e.cephClient = 'Enter the Ceph user without its "client." prefix.';
+      else if (!CEPH_CLIENT.test(client)) e.cephClient = 'Enter the Ceph user: 1–64 letters, digits, ., _ or -.';
+      const cephKeyStored = editing && Boolean(current?.ceph?.key_updated_at);
+      const key = form.cephKey.trim();
+      if (!key && !cephKeyStored) e.cephKey = "Add the Ceph user's key, as ceph auth get-key prints it.";
+      else if (key && !cephKeyLooksRight(key)) e.cephKey = 'This is not a Ceph key: base64 of at least 16 bytes, without spaces.';
+    }
+    // a line that is no ed25519, ECDSA or RSA public key, by its number - never quoted: it may be a private key (SDD §4.2, §16)
+    if (preset.kind !== 'vmware') {
+      const problems = declaredKeyProblems(form.hostKeys);
+      if (problems.length) e.hostKeys = problems.join('; ');
+    }
     // what the API refuses of a declared vGPU profile, and a flavor declared twice (SDD §4.2, §16, §22.3)
     return declaresGpuProfiles ? { ...e, ...rowProblems(form.gpuProfiles) } : e;
   };
+
+  /** The access to send: what the form declares, without the server-owned key time (SDD §4.2, §28.4). */
+  const cephAccess = (): Omit<CephAccess, 'key_updated_at'> | null =>
+    form.cephEnabled
+      ? { fsid: form.cephFsid.trim().toLowerCase(), monitors: cephMonitorList(form.cephMonitors), client: form.cephClient.trim() || 'seamless' }
+      : null;
 
   const conversionHost = (): ConversionHostConfig | null => {
     const blank = (v: string) => (v.trim() ? v.trim() : null);
@@ -602,8 +683,11 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       ssh_user: form.hostUser.trim() || 'cloud-user',
       ssh_allowed_cidr: blank(form.hostCidr),
       ssh_key_secret: !form.hostManaged && form.keySource === 'external' ? form.keySecretName.trim() : (existing?.ssh_key_secret ?? null),
+      // the list whole (SDD §12); a vCenter's form takes none and keeps what the provider has
+      ssh_host_keys: declaredKeys(form.hostKeys),
     };
-    const empty = host.manage && !host.name && !host.flavor && !host.image && !host.external_network && !host.ssh_allowed_cidr && !existing;
+    const empty =
+      host.manage && !host.name && !host.flavor && !host.image && !host.external_network && !host.ssh_allowed_cidr && !host.ssh_host_keys?.length && !existing;
     return empty ? null : host;
   };
 
@@ -629,7 +713,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setErrors(found);
     setFailure(null);
     if (Object.keys(found).length) {
-      if (['hostName', 'hostAddress', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
+      if (['hostName', 'hostAddress', 'hostKeys', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
       requestAnimationFrame(() => summaryRef.current?.focus());
       return;
     }
@@ -650,6 +734,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         ...(declaresProfile ? { policy_profile: form.policyProfile || null } : {}),
         // the map whole (SDD §12, §22.3)
         ...(declaresGpuProfiles ? { gpu_profiles: vgpuProfileMap(form.gpuProfiles) } : {}),
+        // a source's Ceph access, never its key time (SDD §28.4); off deletes a stored key
+        ...(declaresCeph ? { ceph: cephAccess() as CephAccess | null } : {}),
       };
       // every step that succeeded is kept: a later failure never makes Save add the provider again
       const keep = (step: Provider): Provider => {
@@ -660,11 +746,16 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (current) {
         const patch: ProviderPatch = {};
         for (const [key, value] of Object.entries(fields) as Array<[keyof ProviderPatch, unknown]>) {
-          // declared vGPU profiles are one map in any order of their pairs: a PATCH resets the check report (SDD §12, §16)
+          // declared vGPU profiles are one map in any order of their pairs, a conversion host one object in any order of
+          // its fields: a PATCH resets the check report (SDD §12, §16)
           const same =
             key === 'gpu_profiles'
               ? sameVgpuProfiles(value as Record<string, string>, current.gpu_profiles ?? {})
-              : JSON.stringify(value) === JSON.stringify(current[key]);
+              : key === 'ceph'
+                ? sameCephAccess(value as CephAccess | null, current.ceph ?? null)
+              : key === 'conversion_host'
+                ? sameConversionHost(value as ConversionHostConfig | null, current.conversion_host)
+                : JSON.stringify(value) === JSON.stringify(current[key]);
           if (!same) (patch as Record<string, unknown>)[key] = value;
         }
         if (form.mode === 'clouds_yaml' && current.credentials_secret) patch.credentials_secret = null;
@@ -675,6 +766,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       const creds = credentials();
       if (creds) saved = keep(await setCredentials.mutateAsync({ id: saved.id, credentials: creds }));
       if (form.keySource === 'upload' && form.privateKey) saved = keep(await setKey.mutateAsync({ id: saved.id, privateKey: form.privateKey }));
+      // the Ceph key, written once after the access is saved and never read back (SDD §28.4, plan task CE10)
+      if (declaresCeph && form.cephEnabled && form.cephKey.trim()) saved = keep(await setCephKey.mutateAsync({ id: saved.id, key: form.cephKey.trim() }));
       if (test) {
         saved = keep(await check.mutateAsync(saved.id));
         setOutcome({ provider: saved, checked: true });
@@ -1142,6 +1235,20 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                     inputClassName="font-mono"
                   />
                 </div>
+                {preset.kind !== 'vmware' && (
+                  <TextAreaField
+                    id={id('hostKeys')}
+                    label="Host keys"
+                    value={form.hostKeys}
+                    onChange={(e) => set('hostKeys', e.target.value)}
+                    placeholder="e.g. ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… conv-host"
+                    hint="The host's public keys, one per line: ed25519, ECDSA or RSA, read out of band (its /etc/ssh/ssh_host_*_key.pub). They win over the keys a check pins; leave it empty to pin them from the host's console."
+                    error={errors.hostKeys}
+                    spellCheck={false}
+                    autoComplete="off"
+                    wrap="off"
+                  />
+                )}
                 {!form.hostManaged && (
                   <Segmented
                     label="SSH key from"
@@ -1210,6 +1317,77 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               </div>
             )}
           </Section>
+
+          {declaresCeph && (
+            <Section
+              title="Ceph access"
+              aside={<TechPreviewBadge feature="extents" />}
+              description="Lets a plan track changed extents: the warm passes diff Cinder's pass snapshots on the source cluster, so the final pass copies only what changed."
+            >
+              <Toggle
+                checked={form.cephEnabled}
+                onChange={(v) => set('cephEnabled', v)}
+                label="Declare the source cluster's Ceph access"
+                hint="Off: no plan of this source tracks extents, and a stored key is deleted."
+              />
+              {form.cephEnabled && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <TextField
+                    id={id('cephFsid')}
+                    label="Cluster fsid"
+                    required
+                    value={form.cephFsid}
+                    onChange={(e) => set('cephFsid', e.target.value)}
+                    placeholder="e.g. 6f8c2d4e-1b3a-4c5d-9e7f-0a1b2c3d4e5f"
+                    hint="As ceph fsid prints it; a pool on another cluster stays untracked."
+                    error={errors.cephFsid}
+                    inputClassName="font-mono"
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                  <TextField
+                    id={id('cephClient')}
+                    label="Ceph user"
+                    required
+                    value={form.cephClient}
+                    onChange={(e) => set('cephClient', e.target.value)}
+                    hint='Without "client.": the metadata-only user of the operations guide.'
+                    error={errors.cephClient}
+                    inputClassName="font-mono"
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                  <TextAreaField
+                    id={id('cephMonitors')}
+                    label="Monitors"
+                    required
+                    value={form.cephMonitors}
+                    onChange={(e) => set('cephMonitors', e.target.value)}
+                    hint="One per line, host or host:port, as the source conversion host reaches them (1 to 9)."
+                    error={errors.cephMonitors}
+                    className="sm:col-span-2"
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                  <div className="flex flex-col gap-2 sm:col-span-2">
+                    <StoredNote at={current?.ceph?.key_updated_at} what="A Ceph key" />
+                    <TextField
+                      id={id('cephKey')}
+                      label="Ceph key"
+                      type="password"
+                      value={form.cephKey}
+                      onChange={(e) => set('cephKey', e.target.value)}
+                      hint="As ceph auth get-key prints it. Written once, never shown again."
+                      error={errors.cephKey}
+                      inputClassName="font-mono"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </div>
+                </div>
+              )}
+            </Section>
+          )}
 
           {declaresGpuProfiles && (
             <VgpuProfiles

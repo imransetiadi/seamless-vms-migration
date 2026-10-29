@@ -1,7 +1,7 @@
 import { CircleCheck } from 'lucide-react';
 import { memo } from 'react';
 import { Link } from 'react-router-dom';
-import { NETWORK_CODES } from '../api/findingCatalog';
+import { EXTENT_CODES, NETWORK_CODES } from '../api/findingCatalog';
 import { SEVERITIES, type Finding, type Severity } from '../api/types';
 import { cn } from '../lib/cn';
 import type { FindingGroup } from '../lib/findings';
@@ -57,6 +57,7 @@ export function FindingsList({ findings, emptyText = 'No findings — pre-flight
             <p className="flex flex-wrap items-center gap-x-2">
               <code className="text-xs font-semibold text-foreground">{f.code}</code>
               {NETWORK_CODES.has(f.code) && <TechPreviewBadge feature="network" />}
+              {EXTENT_CODES.has(f.code) && <TechPreviewBadge feature="extents" />}
               {f.vmName &&
                 (f.migrationId ? (
                   <Link to={`/migrations/${f.migrationId}`} className="font-mono text-xs underline underline-offset-4">
@@ -100,6 +101,7 @@ export const FindingGroupsList = memo(function FindingGroupsList({
             <p className="flex flex-wrap items-baseline gap-x-2">
               <code className="text-xs font-semibold text-foreground">{g.code}</code>
               {NETWORK_CODES.has(g.code) && <TechPreviewBadge feature="network" />}
+              {EXTENT_CODES.has(g.code) && <TechPreviewBadge feature="extents" />}
               <span className="text-xs text-muted-foreground">
                 {g.items.length} VM{g.items.length === 1 ? '' : 's'}
               </span>

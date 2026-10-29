@@ -19,6 +19,7 @@ import type {
   Estimate,
   Event,
   EvidenceItem,
+  ExtentUse,
   Finding,
   GpuCapacity,
   GpuDevice,
@@ -395,25 +396,31 @@ const MOCK_POOLS: Record<string, string> = {
   lvm: 'lab@lvm#lvm',
 };
 
-const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other') => ({
+/** The demo clusters' fsids (SDD §10, §28.4, plan task CE11): an rbd pool reports its cluster's and its Ceph pool. */
+export const DEMO_CEPH_FSID = '6f8c2d4e-1b3a-4c5d-9e7f-0a1b2c3d4e5f';
+export const DEMO_PROD_CEPH_FSID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+
+const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other', ceph?: { fsid: string; pool: string }) => ({
   pool,
   vendor: family === 'netapp_nfs' ? 'NetApp' : 'Open Source',
   protocol: family === 'netapp_nfs' ? 'nfs' : family === 'rbd' ? 'ceph' : 'iSCSI',
   family,
+  // an rbd entry alone carries them, as the API's check (SDD §10): null without location_info
+  ...(family === 'rbd' ? { ceph_fsid: ceph?.fsid ?? null, ceph_pool: ceph?.pool ?? null } : {}),
 });
 
 const DC1_STORAGE = [
-  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd'),
-  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd'),
-  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd'),
-  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'volumes' }),
+  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'volumes-ssd' }),
+  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'tripleo-ceph' }),
+  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd', { fsid: DEMO_CEPH_FSID, pool: 'tripleo-ceph-ssd' }),
   backend('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1', 'netapp_nfs'),
 ];
 
 const PROD_STORAGE = [
-  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd'),
-  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd'),
-  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd'),
+  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-hdd' }),
+  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-nvme' }),
+  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd', { fsid: DEMO_PROD_CEPH_FSID, pool: 'volumes-ssd' }),
   // the same ONTAP export, mounted through the RHOSO storage network's LIF
   backend('hostgroup@ontap-nfs#198.51.100.60:/cinder_dc1', 'netapp_nfs'),
 ];
@@ -1017,9 +1024,16 @@ const LAB_VMS: VmSpec[] = [
 // Providers
 // -------------------------------------------------------------------------------------------
 
-function conversionHost(name: string, address: string) {
-  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null };
+function conversionHost(name: string, address: string, sshHostKeys: string[] = []) {
+  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null, ssh_host_keys: sshHostKeys };
 }
+
+/** The demo destinations' conversion host keys as their operator declares them: the API demo's (SDD §10, §26.3; plan task ST7),
+ * synthetic - made up from each host's name, so no private half exists anywhere. */
+const DEMO_HOST_KEYS = {
+  dst: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPG3KNdzNY5BMzcxmBiodxJzFyuk3o+NUwZvY9B8BPyn os-migrate-conv-dst',
+  dc3: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONXdEMQsyylyTGj3eyOnSgAxp5zE4Y8rF+Fpabez7MG os-migrate-conv-dc3',
+};
 
 export function buildProviders(now: number): Provider[] {
   // what each seeded destination's check read of its cloud: its GPU capacity among it (SDD §10, §22.3)
@@ -1037,6 +1051,8 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
+      // the demo cluster's Ceph access, its key as written (SDD §10, §28.4, plan task CE11)
+      ceph: { fsid: DEMO_CEPH_FSID, monitors: ['ceph-mon-0.dc1.example.com', 'ceph-mon-1.dc1.example.com'], client: 'seamless', key_updated_at: iso(now - 30 * 24 * 60 * 60_000) },
       capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }, iso(now - 4 * 60_000)),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
@@ -1125,7 +1141,7 @@ export function buildProviders(now: number): Provider[] {
       region: 'regionOne',
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
-      conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
+      conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31', [DEMO_HOST_KEYS.dst]),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
       capabilities: checkOf(
         { id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
@@ -1180,7 +1196,7 @@ export function buildProviders(now: number): Provider[] {
       region: 'RegionOne',
       verify_tls: true,
       ca_cert_path: null,
-      conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
+      conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60', [DEMO_HOST_KEYS.dc3]),
       capabilities: checkOf(
         { id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
         iso(now - 6 * 60_000),
@@ -1284,8 +1300,8 @@ export function buildInventories(now: number = Date.now()): Record<string, VMRef
 // -------------------------------------------------------------------------------------------
 
 /** A strategy's estimate as the API's validation computes it (§9.1, §16), each part shown to 0.1 s. */
-export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[]): Estimate {
-  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s);
+export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[], tracked?: readonly string[] | null): Estimate {
+  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s, tracked);
   const round = (n: number) => Math.round(n * 10) / 10;
   // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
   const downtime_parts = Object.fromEntries(DOWNTIME_PARTS.map((part) => [part, round(e.downtime_parts[part] ?? 0)]));
@@ -2022,6 +2038,7 @@ export function defaultPlanFields(now: number) {
     description: null,
     mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
     default_strategy: 'auto' as const,
+    extent_tracking: false,
     strategy_overrides: {},
     selection_policy: 'min_downtime' as const,
     downtime_slo_s: 600,
@@ -2120,7 +2137,8 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'running',
     createdAgo: 3 * D,
-    overrides: {
+    // the demo's finance plan tracks its Ceph volumes' extents (SDD §28, plan task CE11)
+    overrides: { extent_tracking: true,
       mappings: { networks: { 'tenant-infra': 'tenant-infra' }, flavors: { 'g1.a10': 'm1.large' }, volume_types: { 'tripleo-ceph': 'ceph-hdd', 'tripleo-ceph-ssd': 'ceph-ssd' }, projects: {} },
       // PRD G1: warm cutovers within 15 minutes.
       downtime_slo_s: 900,
@@ -2609,9 +2627,33 @@ export function buildFixtures(now: number): Fixtures {
       );
       const bytesTotal = m.strategy === 'storage_handover' ? 0 : vm.used_bytes;
       const progress = m.progress ?? 0;
+      // a tracked plan's qualifying disks: the source cluster's Cinder RBD volumes, not encrypted (SDD §28.4, §28.6, plan task CE10)
+      const clusterOf = new Map(
+        ((source.capabilities.storage_backends as Array<{ pool?: unknown; family?: unknown; ceph_fsid?: unknown }> | undefined) ?? [])
+          .filter((b) => b.family === 'rbd' && typeof b.pool === 'string')
+          .map((b) => [b.pool as string, typeof b.ceph_fsid === 'string' ? b.ceph_fsid : null]),
+      );
+      const trackedDisks =
+        plan.extent_tracking && source.ceph && m.strategy === 'warm'
+          ? vm.disks.filter((d) => d.kind === 'volume' && !d.encrypted && d.pool && clusterOf.get(d.pool) === source.ceph!.fsid).map((d) => d.id)
+          : [];
+      // how a pass used each disk's extents, as the simulator records it (SDD §28.5): the first pass scans every disk, a
+      // later one checks the tracked disks (the final pass reads them) and scans the others
+      const extentUse = (kind: SyncPass['kind'], first: boolean): Record<string, ExtentUse> => {
+        const uses: Record<string, ExtentUse> = {};
+        if (!trackedDisks.length) return uses;
+        for (const d of vm.disks) {
+          const device = d.device ?? d.id;
+          if (first) uses[device] = { mode: 'scanned', reason: 'first_pass', query_s: null, missed: 0, assumed_zero: false };
+          else if (trackedDisks.includes(d.id)) uses[device] = { mode: kind === 'final' ? 'read' : 'checked', reason: null, query_s: kind === 'final' ? 8.4 : 9.6, missed: 0, assumed_zero: false };
+          else uses[device] = { mode: 'scanned', reason: d.encrypted ? 'encrypted' : 'not_tracked', query_s: null, missed: 0, assumed_zero: false };
+        }
+        return uses;
+      };
       const syncPasses: SyncPass[] = scheduled.map(({ spec: p, start, end }, i) => {
         const changed = Math.round(p.changedGiB * GiB);
         return {
+          ...(trackedDisks.length && end !== null ? { extents: extentUse(p.kind, i === 0) } : {}),
           number: i + 1,
           kind: p.kind,
           started_at: iso(start),
@@ -2642,6 +2684,9 @@ export function buildFixtures(now: number): Fixtures {
         estimates,
         // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not
         observed_scan_bps: syncPasses.filter((p) => p.kind !== 'full' && p.ended_at !== null).length > 0 ? 545 * MiB : null,
+        tracked_disks: trackedDisks,
+        // a checked pass calibrates the query time (SDD §28.6)
+        observed_extent_query_s: trackedDisks.length && syncPasses.some((p) => p.kind !== 'full' && p.kind !== 'final' && p.ended_at !== null) ? 9.6 : null,
         resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings,
         checkpoint: m.checkpoint ?? null,

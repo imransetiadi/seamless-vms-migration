@@ -36,6 +36,9 @@ export const NETWORK_CODES: ReadonlySet<string> = new Set([
   'MAP_LB_POOL_INCOMPATIBLE',
 ]);
 
+/** The findings of changed-extent tracking (SDD §28.9): each carries the Technology Preview badge (SDD §16, plan task CE10). */
+export const EXTENT_CODES: ReadonlySet<string> = new Set(['CEPH_ACCESS_MISSING', 'EXTENT_TRACKING_PARTIAL', 'EXTENT_TRACKING_MISSED']);
+
 export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['severity']; strategies: Strategy[]; remediation: string }>> = {
   SRC_VM_ERROR_STATE: {
     severity: 'blocker',
@@ -328,6 +331,16 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
     remediation: 'Configure a conversion host on the provider.',
   },
+  CONV_HOST_KEY_UNKNOWN: {
+    severity: 'blocker',
+    strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
+    remediation: "Declare the conversion host's public keys on its provider (conversion_host.ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and pre-stage again, which creates it with an injected key.",
+  },
+  CONV_HOST_KEYS_UNCHECKED: {
+    severity: 'warning',
+    strategies: ['cold', 'warm', 'vmware_cold', 'vmware_warm'],
+    remediation: 'Set SEAMLESS_ANSIBLE_HOST_KEY_CHECKING to true: each conversion host then needs declared keys or a pin, which a host Seamless creates gets injected and the provider check reads from the console of one it finds.',
+  },
   HANDOVER_BACKEND_UNMAPPED: {
     severity: 'info',
     strategies: ['storage_handover'],
@@ -337,5 +350,23 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     severity: 'warning',
     strategies: [],
     remediation: 'Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.',
+  },
+  CEPH_ACCESS_MISSING: {
+    severity: 'warning',
+    strategies: ['warm'],
+    remediation:
+      'Give the source provider its Ceph access (ceph: fsid, monitors, client) and its key (PUT /providers/{id}/ceph-key), and run its check so that an rbd pool of that fsid is known; or turn extent_tracking off. Every pass scans in full until then.',
+  },
+  EXTENT_TRACKING_PARTIAL: {
+    severity: 'info',
+    strategies: ['warm'],
+    remediation:
+      'Nothing stops the migration: the named disks scan in full on every pass, the others use their extents. A tracked disk is an unencrypted Cinder RBD volume of the source\'s cluster whose host the source credential can read.',
+  },
+  EXTENT_TRACKING_MISSED: {
+    severity: 'warning',
+    strategies: ['warm'],
+    remediation:
+      'Check the Ceph releases of the source\'s compute nodes and cluster for the fast-diff fixes (Ceph #61616: Pacific 16.2.14, Quincy 17.2.7, Reef 18.1.2); the disk scans in full for the rest of the migration.',
   },
 };

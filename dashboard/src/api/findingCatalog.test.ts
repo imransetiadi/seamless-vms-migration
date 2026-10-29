@@ -25,6 +25,26 @@ describe("the offline mock's finding catalog is the API's (SDD §9.3, §16)", ()
     expect([...new Set(off.map((f) => `${f.code}: ${f.remediation}`))]).toEqual([]);
   });
 
+  // a conversion host without a declared key or a pin, and a data path that checks none (SDD §9.3, §26.5; plan task ST7)
+  it('has the two host key findings', () => {
+    const strategies = ['cold', 'warm', 'vmware_cold', 'vmware_warm'];
+    expect(FINDING_CATALOG.CONV_HOST_KEY_UNKNOWN).toEqual({
+      severity: 'blocker',
+      strategies,
+      remediation:
+        "Declare the conversion host's public keys on its provider (conversion_host.ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and pre-stage again, which creates it with an injected key.",
+    });
+    expect(FINDING_CATALOG.CONV_HOST_KEYS_UNCHECKED).toEqual({
+      severity: 'warning',
+      strategies,
+      remediation:
+        'Set SEAMLESS_ANSIBLE_HOST_KEY_CHECKING to true: each conversion host then needs declared keys or a pin, which a host Seamless creates gets injected and the provider check reads from the console of one it finds.',
+    });
+    // right after CONV_HOST_MISSING, in the API's order
+    const codes = Object.keys(FINDING_CATALOG);
+    expect(codes.slice(codes.indexOf('CONV_HOST_MISSING'), codes.indexOf('CONV_HOST_MISSING') + 3)).toEqual(['CONV_HOST_MISSING', 'CONV_HOST_KEY_UNKNOWN', 'CONV_HOST_KEYS_UNCHECKED']);
+  });
+
   // seamless/tests/test_preflight.py holds them to §16's list, which a dashboard test cannot read (vite.config.ts fs.allow)
   it('holds the thirteen network findings, each a code of the catalog (SDD §16, §23.7, §23.9, plan task N12c)', () => {
     expect(NETWORK_CODES.size).toBe(13);

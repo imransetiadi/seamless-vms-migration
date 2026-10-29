@@ -210,6 +210,14 @@ function SettingsSummary({
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
       {plan.port_creation_mode === 'neutron' && <Setting label="Ports">MAC and fixed IPs kept</Setting>}
+      {plan.extent_tracking && (
+        <Setting label="Changed extents">
+          {/* an extent element: its Technology Preview badge (SDD §16, §28.11, plan task CE10) */}
+          <span className="inline-flex flex-wrap items-center gap-2">
+            Tracked on the source Ceph cluster <TechPreviewBadge feature="extents" />
+          </span>
+        </Setting>
+      )}
       {Object.keys(plan.nic_overrides ?? {}).length > 0 && (
         <Setting label="Network overrides">
           {Object.keys(plan.nic_overrides).length === 1 ? '1 VM' : `${Object.keys(plan.nic_overrides).length} VMs`}

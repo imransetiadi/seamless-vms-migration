@@ -11,14 +11,17 @@ from seamless_migrate.domain.models import (
     ACKNOWLEDGEABLE_FINDINGS,
     DEFAULT_PRESTAGE,
     AppProbe,
+    ConversionHostConfig,
     GpuDevice,
     HandoverConfig,
+    HostKeyPin,
     Mappings,
     Nic,
     VerificationConfig,
     VMRef,
     Wave,
     invalid_plan_settings,
+    utcnow,
 )
 from seamless_migrate.planning.gpu import gpu_requests
 from seamless_migrate.planning.platforms import destination_release
@@ -48,6 +51,7 @@ from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.providers.openstack import OpenStackProvider
 from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
+from tests.key_support import bare, public_key
 
 SRC = make_provider()
 # the destination provider a message about the destination cloud names (SDD §1 naming, plan T6)
@@ -97,6 +101,8 @@ def check(
     shares=None,
     dns_ttl=None,
     lb_pools=None,
+    sync_passes=None,
+    host_key_checking=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -111,6 +117,8 @@ def check(
         shares=shares,
         dns_ttl=dns_ttl,
         lb_pools=lb_pools,
+        sync_passes=sync_passes,
+        host_key_checking=host_key_checking,
     )
 
 
@@ -168,6 +176,9 @@ def test_catalog_is_complete():
         "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
+        # the conversion hosts' keys (SDD §9.3, §26.5, plan task ST7)
+        "CONV_HOST_KEY_UNKNOWN",
+        "CONV_HOST_KEYS_UNCHECKED",
         # the Heat and Octavia codes (SDD §9.3, plan task N2)
         "SRC_VM_HEAT_STACK",
         "SRC_VM_AUTOSCALED",
@@ -198,6 +209,10 @@ def test_catalog_is_complete():
         "NET_ADDRESS_REFUSED",
         "NET_PORT_NOT_PERMITTED",
         "MAP_NIC_OVERRIDE_INVALID",
+        # extent tracking (SDD §9.3, §28.9, plan task CE9)
+        "CEPH_ACCESS_MISSING",
+        "EXTENT_TRACKING_PARTIAL",
+        "EXTENT_TRACKING_MISSED",
         "MAP_NIC_OVERRIDE",
         "MAP_FIP_ADDRESS_CHANGE",
         "DST_FIP_ADDRESS_UNAVAILABLE",
@@ -2746,6 +2761,123 @@ def test_finding_conv_host_missing():
     )
 
 
+_DATA_PATH = {Strategy.cold, Strategy.warm, Strategy.vmware_cold, Strategy.vmware_warm}
+
+
+def _brought(provider, **host):
+    """``provider`` with a conversion host Seamless does not create (manage false)."""
+    return provider.model_copy(
+        update={"conversion_host": ConversionHostConfig(name="conv", manage=False, **host)}
+    )
+
+
+def _pinned(provider, server="srv-conv-1"):
+    pin = HostKeyPin(
+        server_id=server, keys=[bare(public_key(7))], source="console", pinned_at=utcnow()
+    )
+    return provider.model_copy(update={"conversion_host_pin": pin})
+
+
+def test_finding_conv_host_key_unknown_for_a_brought_host_without_keys():
+    """SDD §9.3, §26.5 (plan task ST7): while keys are checked, a conversion host the plan needs
+    that Seamless will not create - manage false, or a VMware destination's host, which the
+    operator brings - and that has neither declared keys nor a pin blocks the data path's
+    strategies: its run would be refused before its first playbook. Declared keys or a pin of
+    its server clear it; with checking off nothing is judged here."""
+    source, destination = _brought(SRC), _brought(DST)
+    f = only(
+        check(source=source, destination=destination, host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert f.severity == Severity.blocker and set(f.strategies) == _DATA_PATH
+    assert "source RHOSP 17.1 (conv)" in f.message and "destination RHOSO 18.0 (conv)" in f.message
+    assert "neither declared keys nor a pin" in f.message
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(source=source, destination=destination, host_key_checking=False)
+    )
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN"
+        for x in check(
+            source=_brought(SRC, ssh_host_keys=[public_key(1)]),
+            destination=_pinned(destination),
+            host_key_checking=True,
+        )
+    )
+    # a VMware source: the destination's host is the operator's, whatever manage says
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware, conversion_host=None)
+    f = only(
+        check(source=vcenter, destination=DST, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN"
+    )
+    assert "destination RHOSO 18.0" in f.message and "source" not in f.message.split(":")[1]
+    # the kit uses the destination's host alone: a VMware source's own is never judged
+    f = only(
+        check(source=_brought(vcenter), destination=DST, host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert "source" not in f.message.split(":")[1]
+
+
+def test_finding_conv_host_key_unknown_for_a_pin_of_another_server():
+    """SDD §9.3, §10, §26.4, §26.5: a pin belongs to one server. When the validation's provider
+    check found the host resolving to another server - its status message "conversion host
+    replaced: ..." -, the pin no longer applies, and the host blocks until the operator declares
+    its keys, or deletes it and a pre-staging creates and pins it again - also a host Seamless
+    manages."""
+    replaced = _pinned(SRC).model_copy(
+        update={
+            "status_message": "conversion host replaced: conv-src is now server srv-2; its pin "
+            "belongs to server srv-conv-1"
+        }
+    )
+    f = only(check(source=replaced, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN")
+    assert f.severity == Severity.blocker
+    assert "is now server srv-2; its pin belongs to server srv-conv-1" in f.message
+    declared = replaced.model_copy(
+        update={
+            "conversion_host": ConversionHostConfig(name="conv-src", ssh_host_keys=[public_key(2)])
+        }
+    )
+    assert all(
+        x.code != "CONV_HOST_KEY_UNKNOWN" for x in check(source=declared, host_key_checking=True)
+    )
+
+
+def test_finding_conv_host_key_unknown_not_for_a_host_seamless_will_create():
+    """SDD §9.3, §26.3: a host Seamless manages gets its key injected when its pre-staging creates
+    it, or its console read and pinned when it exists: no finding without a pin. Nor for a
+    strategy without a conversion host (no provider has one: CONV_HOST_MISSING says so)."""
+    managed_src = SRC.model_copy(update={"conversion_host": ConversionHostConfig(name="conv-src")})
+    managed_dst = DST.model_copy(update={"conversion_host": ConversionHostConfig(name="conv-dst")})
+    found = check(source=managed_src, destination=managed_dst, host_key_checking=True)
+    assert all(x.code != "CONV_HOST_KEY_UNKNOWN" for x in found)
+    missing = check(
+        source=SRC.model_copy(update={"conversion_host": None}),
+        destination=DST.model_copy(update={"conversion_host": None}),
+        host_key_checking=True,
+    )
+    assert all(x.code != "CONV_HOST_KEY_UNKNOWN" for x in missing)
+    assert any(x.code == "CONV_HOST_MISSING" for x in missing)
+
+
+def test_finding_conv_host_keys_unchecked_while_checking_is_off():
+    """SDD §9.3, §26.5, §26.8: with SEAMLESS_ANSIBLE_HOST_KEY_CHECKING false, the data path
+    authenticates no conversion host: a warning for the strategies that use one, never a
+    blocker; none while checking is on, and none for a plan whose providers have no conversion
+    host."""
+    f = only(check(host_key_checking=False), "CONV_HOST_KEYS_UNCHECKED")
+    assert f.severity == Severity.warning and set(f.strategies) == _DATA_PATH
+    assert "SEAMLESS_ANSIBLE_HOST_KEY_CHECKING" in f.message
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in check(host_key_checking=True))
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in check())
+    bare_providers = check(
+        source=SRC.model_copy(update={"conversion_host": None}),
+        destination=DST.model_copy(update={"conversion_host": None}),
+        host_key_checking=False,
+    )
+    assert all(x.code != "CONV_HOST_KEYS_UNCHECKED" for x in bare_providers)
+
+
 def test_finding_handover_backend_unmapped():
     plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"other": "h@b#p"}))
     f = only(check(plan=plan), "HANDOVER_BACKEND_UNMAPPED")
@@ -4317,3 +4449,191 @@ def _destination(case):
         ),
         "dst_caps": {k: dest[k] for k in ("roles", "policy_profile") if k in dest} or None,
     }
+
+
+# --------------------------------------------------------------------------------------------
+# extent tracking (SDD §9.3, §28.9; plan task CE9)
+
+CEPH_FSID = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+
+
+def ceph_source(key=True, pools=True, fsid=CEPH_FSID):
+    """An OpenStack source with Ceph access, its key written, and an rbd pool of its cluster in
+    its check report."""
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.models import CephAccess
+
+    backends = [
+        {
+            "pool": "hostgroup@ceph#ceph",
+            "vendor": "Open Source",
+            "protocol": "ceph",
+            "family": "rbd",
+            "ceph_fsid": fsid if pools else "99999999-2222-4333-8444-555555555555",
+            "ceph_pool": "volumes",
+        },
+        {
+            "pool": "hostgroup@ontap#flex",
+            "vendor": "NetApp",
+            "protocol": "iSCSI",
+            "family": "netapp_block",
+        },
+    ]
+    return make_provider(
+        ceph=CephAccess(
+            fsid=CEPH_FSID,
+            monitors=["mon1.ceph.example"],
+            key_updated_at=datetime(2026, 10, 29, tzinfo=UTC) if key else None,
+        ),
+        capabilities={"storage_backends": backends},
+    )
+
+
+def tracked_vm(**kw):
+    disks = kw.pop("disks", None) or [
+        make_disk(id="vol-boot", name="vm-boot", pool="hostgroup@ceph#ceph", bootable=True),
+        make_disk(id="vol-data", name="vm-data", pool="hostgroup@ceph#ceph"),
+    ]
+    return make_vm(disks=disks, **kw)
+
+
+def test_finding_ceph_access_missing():
+    """SDD §9.3, §28.9: a warm plan that tracks extents whose source has no Ceph access, or no
+    rbd pool of its fsid in its check report, warns that every pass scans in full; a plan that
+    does not track, or a VMware source, is not judged."""
+    plan = make_plan(extent_tracking=True)
+    f = only(check(vm=tracked_vm(), plan=plan, source=SRC), "CEPH_ACCESS_MISSING")
+    assert f.severity == Severity.warning and f.strategies == [Strategy.warm]
+    assert "no Ceph access" in f.message and "scans its disks in full" in f.message
+    assert "PUT /providers/{id}/ceph-key" in f.remediation
+    other = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(pools=False)), "CEPH_ACCESS_MISSING"
+    )
+    assert f"no rbd pool of its cluster {CEPH_FSID}" in other.message
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=make_plan(), source=SRC)
+        if x.code.startswith(("CEPH", "EXTENT"))
+    ]
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware, conversion_host=None)
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=vcenter)
+        if x.code == "CEPH_ACCESS_MISSING"
+    ]
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source())
+        if x.code == "CEPH_ACCESS_MISSING"
+    ]
+
+
+def test_finding_ceph_access_missing_without_a_key():
+    """SDD §9.3: an access without its key (key_updated_at null) is as good as none."""
+    plan = make_plan(extent_tracking=True)
+    f = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(key=False)), "CEPH_ACCESS_MISSING"
+    )
+    assert "no Ceph key" in f.message
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source(key=False))
+        if x.code == "EXTENT_TRACKING_PARTIAL"
+    ]
+
+
+def test_finding_extent_tracking_partial():
+    """SDD §9.3, §28.3: with access, a VM whose disks all qualify gets no finding; one with a disk
+    that does not gets the info, warm alone."""
+    plan = make_plan(extent_tracking=True)
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source())
+        if x.code.startswith(("CEPH", "EXTENT"))
+    ]
+    vm = tracked_vm(
+        disks=[
+            make_disk(id="vol-boot", name="vm-boot", pool="hostgroup@ceph#ceph", bootable=True),
+            make_disk(id="vol-data", name="vm-data", pool="hostgroup@ceph#ceph", encrypted=True),
+        ]
+    )
+    f = only(check(vm=vm, plan=plan, source=ceph_source()), "EXTENT_TRACKING_PARTIAL")
+    assert f.severity == Severity.info and f.strategies == [Strategy.warm]
+    assert "1 disk(s) of" in f.message and "vm-data is encrypted" in f.message
+    assert "scan in full on every pass" in f.message
+
+
+def test_finding_extent_tracking_partial_names_each_disk_and_why():
+    """SDD §9.3, §28.4: each disk that does not qualify is named with its reason - not a Cinder
+    volume, encrypted, a host the credential cannot read, a pool of another backend."""
+    plan = make_plan(extent_tracking=True)
+    vm = tracked_vm(
+        disks=[
+            make_disk(id="vol-1", name="d-image", kind="image_root", pool=None),
+            make_disk(id="vol-2", name="d-enc", pool="hostgroup@ceph#ceph", encrypted=True),
+            make_disk(id="vol-3", name="d-nohost", pool=None),
+            make_disk(id="vol-4", name="d-netapp", pool="hostgroup@ontap#flex"),
+            make_disk(id="vol-5", name="d-ok", pool="hostgroup@ceph#ceph"),
+        ]
+    )
+    f = only(check(vm=vm, plan=plan, source=ceph_source()), "EXTENT_TRACKING_PARTIAL")
+    assert f.message.startswith("4 disk(s) of")
+    for part in (
+        "d-image is no Cinder volume (image_root)",
+        "d-enc is encrypted",
+        "d-nohost has a host the source credential cannot read",
+        "d-netapp is on hostgroup@ontap#flex, no rbd pool of the cluster",
+    ):
+        assert part in f.message, part
+    assert "d-ok" not in f.message
+
+
+def test_finding_extent_tracking_missed():
+    """SDD §9.3, §28.5: a checked pass of the migration that found changes outside a disk's
+    extents warns, naming the devices; passes without a miss do not."""
+    from seamless_migrate.domain.enums import SyncPassKind
+    from seamless_migrate.domain.models import ExtentUse, SyncPass, utcnow
+
+    plan = make_plan(extent_tracking=True)
+    clean = [
+        SyncPass(
+            number=1,
+            kind=SyncPassKind.full,
+            started_at=utcnow(),
+            extents={"/dev/vda": ExtentUse(mode="scanned", reason="first_pass")},
+        ),
+        SyncPass(
+            number=2,
+            kind=SyncPassKind.delta,
+            started_at=utcnow(),
+            extents={"/dev/vda": ExtentUse(mode="checked")},
+        ),
+    ]
+    assert not [
+        x
+        for x in check(vm=tracked_vm(), plan=plan, source=ceph_source(), sync_passes=clean)
+        if x.code == "EXTENT_TRACKING_MISSED"
+    ]
+    missed = clean + [
+        SyncPass(
+            number=3,
+            kind=SyncPassKind.delta,
+            started_at=utcnow(),
+            extents={
+                "/dev/vda": ExtentUse(mode="checked", missed=3),
+                "/dev/vdb": ExtentUse(mode="checked", missed=1),
+            },
+        )
+    ]
+    f = only(
+        check(vm=tracked_vm(), plan=plan, source=ceph_source(), sync_passes=missed),
+        "EXTENT_TRACKING_MISSED",
+    )
+    assert f.severity == Severity.warning and f.strategies == [Strategy.warm]
+    assert "outside the extents of /dev/vda, /dev/vdb" in f.message
+    assert "Ceph #61616" in f.remediation
+    # the misses are judged even while the access is gone meanwhile
+    assert only(
+        check(vm=tracked_vm(), plan=plan, source=SRC, sync_passes=missed), "EXTENT_TRACKING_MISSED"
+    )

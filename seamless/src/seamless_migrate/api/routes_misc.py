@@ -21,12 +21,12 @@ from .schemas import (
     AdvisorNoteEntry,
     AdvisorNoteList,
     AdvisorStatus,
+    CurrentUser,
     DataSentList,
     DemoPowerRequest,
     Health,
     Hit,
     JevStatus,
-    Me,
     MemoryStatus,
     RecommendationPage,
     SimilarIncidentsRequest,
@@ -81,9 +81,15 @@ async def _health(request: Request) -> Health:
     )
 
 
-@router.get("/me", response_model=Me)
-async def me(principal: Principal = Depends(require_role(Role.viewer))) -> Me:
-    return Me(name=principal.name, role=principal.role)
+@router.get("/me", response_model=CurrentUser)
+async def me(
+    request: Request, principal: Principal = Depends(require_role(Role.viewer))
+) -> CurrentUser:
+    return CurrentUser(
+        name=principal.name,
+        role=principal.role,
+        host_key_checking=services(request).settings.ansible_host_key_checking,
+    )
 
 
 @router.get("/stats", response_model=Stats)

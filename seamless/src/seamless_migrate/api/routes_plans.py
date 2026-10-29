@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import TypeAdapter, ValidationError
 
-from ..domain.enums import Phase, PlanStatus, ProviderRole, Role
+from ..domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     PLAN_EDITABLE_FIELDS,
     REQUEST_BODY,
@@ -113,6 +113,17 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
             ) from None
         if provider.role != role:
             raise ApiError(400, "bad_request", f"provider {provider_id!r} is not a {role} provider")
+        if (
+            role == ProviderRole.source
+            and spec.extent_tracking
+            and provider.kind == ProviderKind.vmware
+        ):
+            # the extents are a Ceph cluster's; a vCenter has none (SDD §28.9)
+            raise ApiError(
+                422,
+                "validation_error",
+                "extent_tracking: a VMware source has no Ceph cluster to read extents from",
+            )
 
 
 async def _out(request: Request, plans: list[Plan]) -> list[PlanOut]:

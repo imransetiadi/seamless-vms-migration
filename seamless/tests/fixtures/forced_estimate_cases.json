@@ -944,7 +944,7 @@
     "expected_s": 340.96
   },
   {
-    "name": "warm, pre-copy, a plan with post_create hooks: their timeouts, 420 s, add to the figure (SDD §9.1, plan task N10)",
+    "name": "warm, pre-copy, a plan with post_create hooks: their timeouts, 420 s, add to the figure (SDD \u00a79.1, plan task N10)",
     "vm": {
       "source_id": "vm-1",
       "name": "db-01",
@@ -1010,5 +1010,79 @@
     "last_pass_s": null,
     "hooks_s": 420.0,
     "expected_s": 1294.2240000000002
+  },
+  {
+    "name": "warm, tracked: a Force cutover after a checked pass drops the scan (SDD 28.6)",
+    "strategy": "warm",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 1073741824,
+      "max_sync_passes": 5,
+      "estimator_overrides": {},
+      "downtime_slo_s": 300
+    },
+    "vm": {
+      "source_id": "vm-1",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 200,
+          "used_gb": 120.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": "hostgroup@ceph#ceph"
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500,
+          "network_key": null
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 2097152,
+      "key_name": null,
+      "disk_bytes": 214748364800,
+      "used_bytes": 128849018880,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "observed_scan_bps": null,
+    "observed_extent_query_s": 4.5,
+    "last_pass_s": 450.0,
+    "tracked": [
+      "d0"
+    ],
+    "expected_s": 281.7
   }
 ]
