@@ -1,6 +1,7 @@
 import hashlib
 import re
 import secrets
+import sqlite3
 import threading
 from datetime import UTC, datetime
 
@@ -32,6 +33,17 @@ from seamless_migrate.store import (
 )
 from tests.conftest import PG_URL
 from tests.factories import make_migration, make_plan, make_provider, make_vm
+
+
+def sqlite_reads_nan_json() -> bool:
+    """Whether this SQLite reads NaN and Infinity in a JSON document: 3.34.1, RHEL 9's, answers
+    "malformed JSON" where 3.45 and later read them as null and inf (CI's RHEL 9 job)."""
+    with sqlite3.connect(":memory:") as connection:
+        try:
+            connection.execute("select json_extract(?, '$.a')", ('{"a": NaN}',))
+        except sqlite3.OperationalError:
+            return False
+    return True
 
 
 def test_put_get_roundtrip(any_store: Store):
@@ -847,6 +859,10 @@ def test_a_document_an_earlier_version_stored_with_nan_or_an_infinity_is_written
     read as null, a probability as absent, and the document is written again."""
     if any_store.engine.dialect.name != "sqlite":
         pytest.skip("PostgreSQL's JSONB never kept the tokens")
+    if not sqlite_reads_nan_json():
+        pytest.skip(
+            "this SQLite refuses NaN and Infinity in JSON (RHEL 9's 3.34.1): no such document"
+        )
     m = make_migration()
     any_store.put("migration", m)
     nan, inf = float("nan"), float("inf")
