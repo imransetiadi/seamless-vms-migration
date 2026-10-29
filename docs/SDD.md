@@ -3608,6 +3608,14 @@ class DestinationProvider(Protocol):
         # list, as openstacksdk finds one), None when the user holds none; any other failure is a provider error, never
         # None. The demo's fakes hold no keypair
 
+# an OpenStack provider, source or destination, signs in with each of its project credentials for the provider check
+# (below, "The check of project credentials"; §27.7, plan task TC3):
+    async def check_project(self, project_id: str) -> dict[str, Any]
+        # one call: a sign-in with the provider's credential for the Keystone project (§13.3) on a connection of its
+        # own, which reads {project_id, project_name, domain, user_id, roles} from its token and - only when the
+        # token's project is project_id - {restricted, expires_at} from the application credential's record; a
+        # provider error when the sign-in or the record's read fails, naming an HTTP status or a failure's kind alone
+
 # an OpenStack provider, source or destination, reads and changes Octavia pools for the member helper (§8.5, plan
 # task N9) - raw requests, none logged (§13.4), each read under one read's bound; a failure, or a change Octavia
 # refuses (409 while the load balancer is PENDING_*), names its HTTP status or its kind alone:
@@ -3660,7 +3668,10 @@ Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking ca
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
 OpenStack destination (kind `openstack`, distribution `openstack_community` or `kolla`) takes the same code path as
 RHOSO 18.0, §21; `check()` reports `{"admin": bool,
-"roles": [the role names of the credential's token, sorted; left out when they cannot be read], "compute_microversion": str,
+"roles": [the role names of the credential's token, sorted; left out when they cannot be read],
+"project": {"id": str, "name": str|null, "domain": str|null} [the project the credential's token is scoped to - its id,
+its name and its domain's name, else that domain's id -; left out when the token names none: §27.7, plan task TC3],
+"compute_microversion": str,
 "block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
 "family": "rbd"|"netapp_nfs"|"netapp_block"|"other", "ceph_fsid"?: str|null, "ceph_pool"?: str|null}], "tls": bool,
@@ -3886,6 +3897,53 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
   `conversion_host` for a VMware destination's host): its declared keys (`ssh_host_keys`) when it has some, else its
   pin's keys when the pin's server is the one the host resolves to - never the pin of another server -, else nothing.
   Each run writes its own with it (§7.2 "Conversion host keys", §26.4; since plan task ST5).
+
+**The check of project credentials** (plan task TC3; §13.3, §27.4, §27.7). After its own `check()` - and whatever it
+answered - the provider check (`POST /providers/{id}/check`) signs in with each project credential the provider holds
+(`Provider.project_credentials`, §4.2), one provider call each (`check_project`, above), one after the other in the
+order of their project ids: the bound ends a call's wait, not its thread (below), so a Keystone that never answers
+pins one worker thread at a time. A validation's check (§8) signs in with the plan's project credentials alone - its
+`source_project` on its source provider, its `destination_project` on its destination (§4.2 with plan task TC4; until
+then a plan names none, and a validation's check signs in with no project credential); a project the provider holds
+no credential for has nothing to sign in with (validation's refusal of it comes with plan task TC5, §27.5).
+* **The sign-in.** `OpenStackProvider.check_project` opens a connection of its own with the project's entry (§13.3:
+  the provider credential's auth URL, else its endpoint) and closes it after the call, so each check signs in afresh:
+  one `POST /v3/auth/tokens`, a request keystoneauth never logs - the token's body it writes at DEBUG names the
+  application credential, so that line is dropped from every handler (§13.4). It reads its token's project, that
+  project's domain (its name, else its id), its user's id and its role names; and, only when the token's project is
+  the credential's key, the application credential's record, `GET /v3/users/{user_id}/application_credentials/{id}` -
+  a raw request, not logged, which Keystone's default policy lets the credential's own user send
+  (`TODO(LAB): confirm`, §27.7) -, its `unrestricted` flag and its `expires_at`, null when it never expires.
+* **The report** (check report key `projects`, by project id):
+  ```text
+  ProjectCheck { status: "ok"|"error",
+                 message: str|null,           # why an error is one, in Seamless's words with an HTTP status or a
+                                              # failure's kind - never a message Keystone wrote, never a
+                                              # credential's value
+                 project_name: str|null,      # its token's project
+                 domain: str|null,            # that project's domain: its name, else its id
+                 user_id: str|null,           # its token's user (the credential's)
+                 roles: list[str]|null,       # its token's role names, sorted
+                 restricted: bool|null,       # the application credential's: false when it is unrestricted
+                 expires_at: datetime|null,   # its expiry; null when it never expires
+                 checked_at: datetime }       # the last_checked_at of the check that read it
+  ```
+  An `error` entry carries `message` and `checked_at`, its other fields null: a sign-in that fails or runs past the
+  call's bound; a credential whose token's project is not its key, never used further - its record is not read, and
+  the message names the token's project; a record that cannot be read, since an expiry not read must never stand for
+  none; and a provider that cannot sign in with a project credential (the demo's fakes, until plan task TC9 gives them
+  tenant projects, §27.10). One project's failure fails neither the provider's check - its `status` and
+  `status_message` stay its own credential's - nor another project's entry.
+* **What a check keeps.** A check replaces the entries of the projects it signed in with and keeps the other entries of
+  the credentials the provider still holds as the last check read them, each with its `checked_at`: a full check
+  replaces them all, a validation's its plan's. A check whose own `check()` failed keeps its earlier report, as
+  before, with `projects` brought up to date. A provider without project credentials reports no `projects` (a write's
+  or a deletion's report may hold an empty one, §12).
+* **Secrets.** Nothing of a project credential - its secret, or its application credential's id - reaches the report,
+  an event or a log line; `provider.checked` keeps its data (§4.3).
+* **The demo.** The fakes' checks name their credentials' own projects: the OpenStack source's `finance`
+  (`project-finance`), its VMs' project, and each destination's `demo` (`project-demo`), which owns its own networks
+  (`network_details`), each in the domain `Default`.
 
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
@@ -6129,6 +6187,10 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 * The destination credential (project-scoped) needs: `member` for `cold` and `warm` in its own project; `admin` for
   pre-staging flavors, for `storage_handover` (volume manage) and for an external network that is not shared; `service`
   or `admin` for a port with a fixed IP or MAC on another project's network. `manager` is never required.
+* The check names the project the provider credential's token is scoped to (`project`) and reports, for each project
+  credential (§27.4), its token's role names, user and domain with the application credential's restricted flag and
+  expiry (`projects`; §10, §27.7, plan task TC3): the roles a plan's steps act with in its projects (§27.5), which the
+  findings of §27.7 judge with plan task TC6.
 * The check reports `policy_profile`: the one its provider declares (`Provider.policy_profile`, §4.2), else by kind
   and series (§10.1: `legacy` for RHOSO 18.0 until D14 is decided, `secure_rbac` from 2023.2, `unknown` when the
   series cannot tell). `NET_PORT_NOT_PERMITTED`, the executors' checks before the stop and the collection's
@@ -8198,9 +8260,10 @@ release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
 The proposed fields, routes, check keys, findings and gate rule stay out of the tables the SDD-reading tests parse
 (§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did; a proposed finding code is written here
 without code quotes. Plan task TC2's provider field, routes, secret name and deletion rules are binding in §4.2, §4.3,
-§12 and §13.3 since that task. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their
-documentation and, for Cinder's manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a
-behaviour only a lab can show, is marked `TODO(LAB): confirm`.
+§12 and §13.3 since that task; plan task TC3's check of each project credential, with the check report keys `projects`
+and `project`, in §10 and §21.5 since that task. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia
+come from their documentation and, for Cinder's manage, its source, all read 2026-10-23. A fact only an excerpt showed,
+and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
 
 ### 27.1 What 0.4.0 has
 
@@ -8360,8 +8423,9 @@ another only where a service lets an admin act by id or on the project's behalf.
 
 ### 27.7 Checks, findings and the cutover gate
 
-* **The provider check** (`POST /providers/{id}/check`) signs in with each project credential too, and a validation's
-  check (§8) with the plan's alone. It reports per project (check report key `projects`, by project id): `status`
+* **The provider check** (`POST /providers/{id}/check`; binding in §10 - "The check of project credentials" - and
+  §21.5 since plan task TC3) signs in with each project credential too, and a validation's check (§8) with the plan's
+  alone. It reports per project (check report key `projects`, by project id): `status`
   (`ok` or `error`) and its `message`, the token's `project_name`, `domain`, `user_id` and `roles`, the application
   credential's `restricted` flag and `expires_at`, and `checked_at`. Keystone caps a token issued with an application
   credential at its expiry since the fix of CVE-2022-2447, and the credential's own record holds the date
@@ -8488,7 +8552,7 @@ The owner took each default as written on 2026-10-23 (D20):
 |---|---|---|
 | PRD: a functional requirement for project credentials, the 0.2.0 row as delivered, a 0.5.0 row; D20 decided | PRD, §20 | TC1 |
 | `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 (binding) | TC2 |
-| the check of each project credential: the report keys `projects` and `project` | §10, §21.5 | TC3 |
+| the check of each project credential: the report keys `projects` and `project` | §10, §21.5 (binding) | TC3 |
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 | TC5 |
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
