@@ -70,7 +70,7 @@ if ((await unauthenticated('/health')) !== null) {
 }
 // none of the caller's settings reach the server: SQLite and the token in its own directory
 const data = mkdtempSync(join(tmpdir(), 'seamless-keyboard-browser.'));
-const env = { PATH: process.env.PATH, HOME: process.env.HOME };
+const env = { PATH: process.env.PATH, HOME: process.env.HOME, SEAMLESS_DATA_DIR: data };
 if (process.env.PYTHONPATH) env.PYTHONPATH = process.env.PYTHONPATH;
 
 /** A throwaway token: the first line `seamless token create` prints, its YAML entry the rest. */
