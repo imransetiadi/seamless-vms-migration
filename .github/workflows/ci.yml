@@ -378,16 +378,24 @@ jobs:
           retention-days: 30
 
   deploy-scripts:
-    name: deploy scripts on ${{ matrix.image }} (compose-init.sh, the Make targets on Linux)
+    name: deploy scripts on ${{ matrix.name }} (compose-init.sh, the Make targets on Linux)
     # SDD §17.1: a Linux host runs the stack on its own Docker Engine with no Colima. These distributions' tools
     # (bash, coreutils, make, openssl) run the init script and the targets' dry runs; Debian and Ubuntu leave
-    # openssl out, so the init script's /dev/urandom fallback runs too
+    # openssl out, so the init script's /dev/urandom fallback runs too. RHEL 9 and 10 run as Red Hat's UBI images,
+    # RHEL's freely redistributable base with the same tools (QASuite §14.1)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        image: ["rockylinux:9", "almalinux:9", "fedora:42", "debian:12", "ubuntu:24.04"]
+        include:
+          - { name: "RHEL 9 (UBI)", image: "registry.access.redhat.com/ubi9/ubi" }
+          - { name: "RHEL 10 (UBI)", image: "registry.access.redhat.com/ubi10/ubi" }
+          - { name: "rockylinux:9", image: "rockylinux:9" }
+          - { name: "almalinux:9", image: "almalinux:9" }
+          - { name: "fedora:42", image: "fedora:42" }
+          - { name: "debian:12", image: "debian:12" }
+          - { name: "ubuntu:24.04", image: "ubuntu:24.04" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Init and dry runs as the README's Linux quick start runs them
@@ -409,6 +417,41 @@ jobs:
             grep -q "compose.linux-host.yaml" /tmp/up.txt
             make --no-print-directory seamless-colima-up | grep -q "Colima is not needed on Linux"
             echo "ok on $(. /etc/os-release && echo "$PRETTY_NAME")"
+          '
+
+  rhel-control-plane:
+    name: control plane on RHEL ${{ matrix.rhel }} (UBI, AppStream Python ${{ matrix.python }})
+    # The owner's ask of 2026-10-29: the tools run on RHEL 9 and later. Red Hat's UBI images are RHEL's freely
+    # redistributable base with RHEL's AppStream Pythons; the control plane installs from the checkout into a venv of
+    # that Python, its CLI answers, and its configuration, store, model and API core tests pass there (QASuite §14.1).
+    # RHEL 9 offers Python 3.11 and 3.12 as AppStream packages beside its 3.9; RHEL 10's python3 is 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rhel: "9", image: "registry.access.redhat.com/ubi9/ubi", python: "3.12", packages: "python3.12 python3.12-pip" }
+          - { rhel: "10", image: "registry.access.redhat.com/ubi10/ubi", python: "3.12", packages: "python3 python3-pip" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the control plane into the AppStream Python's venv, run its CLI and its tests
+        env:
+          IMAGE: ${{ matrix.image }}
+          PY: ${{ matrix.python }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -e PY -e PACKAGES "$IMAGE" bash -euo pipefail -c '
+            # shellcheck disable=SC2086  # PACKAGES is a space-separated list
+            dnf -y -q install $PACKAGES >/dev/null
+            cp -r /src /work && cd /work/seamless
+            "python$PY" -m venv .venv
+            .venv/bin/pip install -q --upgrade pip
+            .venv/bin/pip install -q -e ".[dev,openstack,vmware,dns]"
+            .venv/bin/seamless version
+            .venv/bin/python -m pytest -q -p no:cacheprovider \
+              tests/test_config.py tests/test_models.py tests/test_store.py tests/test_api_core.py
+            echo "ok on $(. /etc/os-release && echo "$PRETTY_NAME") with $(.venv/bin/python --version)"
           '
 
   compose-linux:
