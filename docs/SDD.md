@@ -3113,7 +3113,9 @@ route waits for it.
 * **Senders.** A sender per channel kind (`Sender`: `send(channel, message, key, secret) -> SendResult`) answers
   `sent`, `failed` (final) or `retry` (a timeout, a connection or TLS error, HTTP 408, 429 or 5xx, a temporary SMTP
   4yz reply), with a reason, an optional `Retry-After` and an email's refused count. The notifier reads the channel's
-  secret (`notify-{name}`, §13.3) each time it sends, so a rotation needs no restart. Plan tasks NT6–NT8 bring the
+  secret (`notify-{name}`) each time it sends, as §13.3 resolves a secret - files under `SEAMLESS_SECRETS_DIR`,
+  the Kubernetes store, then `SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY}` variables -, so a rotation needs no restart; an
+  email channel has no secret of its own. Plan tasks NT6–NT8 bring the
   email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`. In
   demo mode `senders_for` gives every kind a recording sender instead, which renders the message and answers `sent`;
   a sender that needs no secret, as a recording one, is handed none, and the notifier reads none for it (§7.4, plan
@@ -3123,7 +3125,9 @@ route waits for it.
   extension (a relay without it fails the message with `no_starttls`, and nothing but EHLO went in clear text) and
   upgrades before anything else; `tls` connects with implicit TLS. The relay's certificate is verified against the
   system's CAs or `SEAMLESS_SMTP_CA_FILE`; a failed verification is a TLS error, retried, and sends nothing. AUTH
-  (`SEAMLESS_SMTP_SECRET`'s `username` and `password`) only after TLS. A 4yz reply is `retry` and a 5yz reply `failed`,
+  only after TLS, with the `username` and `password` of `SEAMLESS_SMTP_SECRET`, which the sender reads as §13.3
+  resolves a secret each time it sends (a rotation needs no restart); a named secret that cannot be read, or holds no
+  `username`, fails the message with `no_secret`, final, and nothing is sent. A 4yz reply is `retry` and a 5yz reply `failed`,
   each with its code as the reason; recipients the relay refused while it accepted others count as `refused`, and the
   message is sent; all refused is `failed` (or `retry` when every reply was 4yz). The message is §24.5's email: the
   sender's domain in the `Message-ID`, the key before it. A session has 30 s. No relay configured is `no_relay`.
@@ -7326,7 +7330,7 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
 * **A channel may send ids instead of names** (`redact_names`, owner decision 8): a channel outside the organization
   whose VM and plan names are confidential.
 * **Recipients are personal data.** The API shows them to an admin alone (§24.3), no event names one, and an erasure
-  request reaches them (MEMORY.md §5, plan task NT11).
+  request reaches them (MEMORY.md §3.5, plan task NT11).
 * Nothing of a notification reaches Jev or agentmemory (§13.4).
 * `redact()` learns Slack incoming webhook URLs (`hooks.slack.com/services/…`), so one in an error or a log line is
   removed; binding in §13.4, with the Slack sender in §8.7, since plan task NT7.

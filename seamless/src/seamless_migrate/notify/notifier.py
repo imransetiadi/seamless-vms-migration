@@ -26,7 +26,7 @@ from ..domain.models import (
     utcnow,
 )
 from ..events import EventBus, emit
-from ..security.secret_store import SecretStoreError, secret_store
+from ..security.secrets import SecretNotFound, read_secret
 from ..store import ConflictError, NotFound, Store
 from .messages import Message, build_message, triggers_for
 
@@ -321,15 +321,21 @@ class Notifier:
     async def _secret(
         self, channel: NotificationChannel, sender: Sender
     ) -> Mapping[str, str] | None:
-        """The channel's secret, read each time a message is sent (§24.3); none for an email
-        channel, and none for a sender that needs none - the demo's recording senders (§7.4)."""
+        """The channel's secret, read each time a message is sent as §13.3 resolves a secret -
+        files under SEAMLESS_SECRETS_DIR, the Kubernetes store, then the
+        SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY} variables (§8.7, §24.3); none for an email channel,
+        and none for a sender that needs none - the demo's recording senders (§7.4)."""
         if channel.kind == "email" or not getattr(sender, "reads_secret", True):
             return None
         try:
-            return await asyncio.to_thread(secret_store(self.settings).read, channel.secret_name)
-        except SecretStoreError as exc:
-            log.warning("channel %s: its secret could not be read: %s", channel.name, exc)
+            values = await asyncio.to_thread(read_secret, channel.secret_name, self.settings)
+        except (SecretNotFound, OSError) as exc:
+            # the error's class alone: its text may name a path or a store's answer
+            log.warning(
+                "channel %s: its secret could not be read (%s)", channel.name, type(exc).__name__
+            )
             return None
+        return values or None
 
     async def _deliver(
         self, channel: NotificationChannel, message: Message, key: str

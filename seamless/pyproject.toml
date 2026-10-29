@@ -64,7 +64,7 @@ testpaths = ["tests"]
 # job once hung at 55 % of the suite until its 30-minute timeout, with no test named)
 faulthandler_timeout = 300
 markers = [
-  "live: talks to real external services (Jev, agentmemory); skipped unless enabled",
+  "live: talks to real external services (Jev, agentmemory, Slack, an SMTP relay, a webhook receiver); skipped unless enabled",
   "lab: runs against the reference lab clouds (QASuite §7); skipped unless SEAMLESS_LAB_* is set",
 ]
 

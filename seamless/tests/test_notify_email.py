@@ -56,6 +56,14 @@ def settings_for(tmp_path, relay, certificate, *, security="starttls", secret=No
     return Settings(**kw)
 
 
+def write_relay_secret(tmp_path, username, password):
+    """SEAMLESS_SMTP_SECRET's secret, smtp-relay, as files under SEAMLESS_SECRETS_DIR (§13.3)."""
+    directory = tmp_path / "secrets" / "smtp-relay"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "username").write_text(username)
+    (directory / "password").write_text(password)
+
+
 async def send(sender, secret=None, channel=CHANNEL):
     return await sender.send(channel, MESSAGE, "app-owners_7", secret)
 
@@ -64,9 +72,10 @@ async def test_email_goes_over_starttls_and_authenticates_after_it(tmp_path, cer
     """SDD §24.3: the session opens in plain text, upgrades with STARTTLS before anything else,
     and authenticates with the secret's username and password only then; the relay receives one
     message for the channel's recipients, all in To."""
+    write_relay_secret(tmp_path, "seamless", "relay-pw")
     with Relay(certificate, mode="starttls", auth=("seamless", "relay-pw")) as relay:
         sender = EmailSender(settings_for(tmp_path, relay, certificate, secret="smtp-relay"))
-        result = await send(sender, {"username": "seamless", "password": "relay-pw"})
+        result = await send(sender)  # an email channel has no secret of its own (§24.3)
         assert result.outcome == "sent" and result.refused == 0, result
         assert relay.logins == ["seamless"]  # the relay admits AUTH after TLS alone
         assert relay.handler.sessions_tls == [True]
@@ -76,7 +85,8 @@ async def test_email_goes_over_starttls_and_authenticates_after_it(tmp_path, cer
         assert mail["Subject"] == "[Seamless] web-01 is down for its cutover"
         assert relay.handler.recipients == [["owners@example.com", "ops@example.org"]]
         # a wrong password is a 535: final
-        wrong = await send(sender, {"username": "seamless", "password": "nope"})
+        write_relay_secret(tmp_path, "seamless", "nope")
+        wrong = await send(sender)
         assert wrong.outcome == "failed" and wrong.reason == "535"
         assert len(relay.handler.messages) == 1
 
@@ -192,3 +202,24 @@ async def test_an_email_channel_without_a_relay_fails_with_no_relay(tmp_path):
         )
         assert api.get("/api/v1/notifications/channels").json()[0]["name"] == "ops"
     store.dispose()
+
+
+async def test_the_relay_secret_is_read_each_time_a_message_is_sent(tmp_path, certificate):
+    """SDD §8.7, §13.3, §24.3: the sender reads SEAMLESS_SMTP_SECRET's username and password as
+    §13.3 resolves a secret, each time it sends - the notifier hands an email channel no secret
+    of its own -, and authenticates with them after TLS; a rotation needs no restart; a named
+    secret that cannot be read fails the message with no_secret, final, and sends nothing."""
+    with Relay(certificate, mode="starttls", auth=("seamless", "relay-pw")) as relay:
+        sender = EmailSender(settings_for(tmp_path, relay, certificate, secret="smtp-relay"))
+        missing = await send(sender)
+        assert (missing.outcome, missing.reason) == ("failed", "no_secret")
+        assert relay.logins == [] and relay.handler.messages == []
+        write_relay_secret(tmp_path, "seamless", "old-pw")
+        wrong = await send(sender)
+        assert (wrong.outcome, wrong.reason) == ("failed", "535")
+        write_relay_secret(tmp_path, "seamless", "relay-pw")  # rotated: no restart
+        sent = await send(sender)
+        assert sent.outcome == "sent", sent
+        # smtplib tries each AUTH mechanism the relay offers after a 535, so the count varies:
+        # what matters is that the secret's username alone was used, and the rotation took
+        assert set(relay.logins) == {"seamless"} and len(relay.handler.messages) == 1

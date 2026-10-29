@@ -588,3 +588,27 @@ async def test_an_outcome_event_is_timed_in_seq_order_with_the_others(lab, hours
         ]
 
     await run(lab, body)
+
+
+async def test_a_channels_secret_given_as_variables_reaches_its_sender(lab, monkeypatch):
+    """SDD §13.3, §24.3: an admin may create a channel's secret outside the control plane - files
+    under SEAMLESS_SECRETS_DIR, a Kubernetes Secret, or SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY}
+    variables -, and the notifier reads it as §13.3 resolves a secret, each time it sends: the
+    variables reach the sender, and a file written later wins over them without a restart."""
+    url = "https://hooks.slack.com/services/T000/B000/notasecret"
+    monkeypatch.setenv("SEAMLESS_SECRET_NOTIFY_OPS_SLACK_URL", url)
+    lab.channel()
+    lab.subscribe("ops-slack")
+    lab.downtime(1)
+
+    async def body():
+        await lab.wait_outcomes(1)
+        assert lab.sender.secrets == [{"url": url}]
+        mounted = lab.settings.secrets_dir / "notify-ops-slack"
+        mounted.mkdir(parents=True)
+        (mounted / "url").write_text(url + "-mounted")
+        lab.downtime(1)
+        await lab.wait_outcomes(2)
+        assert lab.sender.secrets[-1] == {"url": url + "-mounted"}
+
+    await run(lab, body)

@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+import seamless_migrate.notify.email as email_module
 import seamless_migrate.notify.notifier as notifier_module
 from seamless_migrate.api.app import build_services
 from seamless_migrate.config import Settings
@@ -1056,7 +1057,10 @@ def nothing_leaves(monkeypatch) -> list[str]:
         (smtplib.SMTP, "connect"),
     ):
         monkeypatch.setattr(owner, name, refused(f"{owner.__name__}.{name}"))
-    monkeypatch.setattr(notifier_module, "secret_store", refused("a channel secret's read"))
+    # the notifier reads a channel's secret, and the email sender the relay's, as §13.3 resolves a
+    # secret (read_secret, since NT12): in demo mode neither may read one
+    monkeypatch.setattr(notifier_module, "read_secret", refused("a channel secret's read"))
+    monkeypatch.setattr(email_module, "read_secret", refused("the relay secret's read"))
     return tried
 
 

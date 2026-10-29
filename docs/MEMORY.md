@@ -228,10 +228,15 @@ words that appear in an error message — treat the memory server as an internal
   role and the token digest, SDD §13.1), and every L2 document that records who acted: a migration's
   `approvals[].actor`, `phase_history[].actor` and the reasons that name who acted (a retry, a requested delta pass,
   a Force cutover: "Force cutover by …: …"), `cutover_requested_by` and `force_cutover.actor`, a recommendation's
-  `requested_by` (the user whose validation recorded it) and its decision (`actor`, kind `user`), and an advisor
-  policy's `updated_by` (reviews RV37B-12, RV38B-12) -, in the bootstrap tokens file's names (`GET /users` lists both
-  kinds), and in git history;
-  agentmemory holds none by design. No route
+  `requested_by` (the user whose validation recorded it) and its decision (`actor`, kind `user`), an advisor
+  policy's `updated_by`, and a notification subscription's `created_by` (reviews RV37B-12, RV38B-12; plan task
+  NT11) -, in the bootstrap tokens file's names (`GET /users` lists both kinds), and in git history;
+  agentmemory holds none by design. An email notification channel's `recipients` are personal data too - the
+  addresses of people or of their lists, which the API shows to an admin alone and which no event, log line or
+  message body names (SDD §24.3, §24.7, §24.8): an admin removes an address with the channel's Edit on the
+  Notifications page (`PATCH /notifications/channels/{name}`), or deletes the channel once no subscription names it,
+  and L2 no longer holds it but in its backups; the relay's and the recipients' mail systems keep what they
+  delivered. No route
   deletes a user: erasing one is a database change (delete its `user` row, Security.md §5.1), and a file token's
   name goes by editing the file (§5.1). Handle requests against L2 under change control.
 * **Access control:** bind the memory server to loopback; when it must be reachable (team server, cluster),
