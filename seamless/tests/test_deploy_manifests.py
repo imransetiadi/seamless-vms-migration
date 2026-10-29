@@ -96,6 +96,37 @@ def test_postgres_gets_a_writable_home_under_its_read_only_root():
         assert mounts.get(scratch) in empty
 
 
+def test_the_bundled_postgresql_drops_a_vanished_client_within_a_minute():
+    """SDD §17, §25.4, §25.7 (plan task HA6): a control plane cut off from the database loses its
+    session locks - a leader's VM-claim lock (§5.4) - within about a minute, not after the
+    operating system's two hours: the StatefulSet's server starts with keepalives of 10 s idle,
+    then 6 probes 5 s apart (40 s), and ends a transaction the application role left idle after
+    10 s. They are the arguments of the image's own start script, which hands them to postgres as
+    -c options, so they hold for whichever role the control plane connects as."""
+    docs = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "postgres-statefulset.yaml").read_text()
+    )
+    (sts,) = [d for d in docs if d and d.get("kind") == "StatefulSet"]
+    (container,) = [
+        c for c in sts["spec"]["template"]["spec"]["containers"] if c["name"] == "postgres"
+    ]
+    assert "command" not in container  # the image's entrypoint runs its start script
+    args = container.get("args", [])
+    assert args[:1] == ["run-postgresql"], args
+    assert len(args) % 2 == 1 and args[1::2] == ["-c"] * (len(args) // 2), args
+    settings = dict(arg.split("=", 1) for arg in args[2::2])
+    assert settings == {
+        "tcp_keepalives_idle": "10",
+        "tcp_keepalives_interval": "5",
+        "tcp_keepalives_count": "6",
+        "idle_in_transaction_session_timeout": "10s",
+    }
+    idle, interval, count = (
+        int(settings[f"tcp_keepalives_{k}"]) for k in ("idle", "interval", "count")
+    )
+    assert idle + interval * count <= 60
+
+
 def test_security_md_describes_the_api_token_the_deployment_mounts():
     """Security.md's secrets rules and hardening table say what deployment.yaml does with the
     control plane's Kubernetes API token: mounted for the dashboard's Secret store (R-15)."""
