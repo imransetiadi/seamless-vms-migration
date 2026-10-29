@@ -221,7 +221,8 @@ class KnownHost:
     server_id: str | None
     #: its declared keys, ``conversion_host.ssh_host_keys``
     declared: Sequence[str] = ()
-    #: its provider's ``conversion_host_pin``
+    #: the pin of the credential the run reaches it with: its provider's ``conversion_host_pin``,
+    #: or a project credential's (``credentials.host_pin``, SDD §26.4)
     pin: Pin | None = None
 
 

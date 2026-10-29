@@ -219,7 +219,9 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
                                                        # set by the provider check (§10, §26.4); returned by the
-                                                       # API and never written through it (§12)
+                                                       # API and never written through it (§12). The host its own
+                                                       # credential reaches: a project's host has its own pin, on
+                                                       # that project's credential (ProjectCredential, §26.4)
            project_credentials: dict[str, ProjectCredential] = {},
                                                        # server-owned: an application credential per Keystone
                                                        # project, by project id (1-64 letters, digits, - or _),
@@ -246,7 +248,15 @@ CephAccess { fsid: str,                      # the cluster's fsid, a UUID; a poo
 
 ProjectCredential { secret: str,             # its secret's name, provider-{id}.project-<h> (§13.3), never
                                              # a value
-                    updated_at: datetime }   # when an admin wrote it
+                    updated_at: datetime,    # when an admin wrote it
+                    conversion_host_pin: HostKeyPin|null = null }
+                                             # server-owned with its entry: the pinned host keys of the
+                                             # project's conversion host, which a plan with the project
+                                             # deploys and reaches with this credential (§7.2, §26.4,
+                                             # §27.5; the owner's decision of 2026-10-29, after plan task
+                                             # TC5); returned by the API and never written through it,
+                                             # kept when an admin writes the credential again, gone with
+                                             # it (§12)
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -2354,18 +2364,21 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     `conversion_host`. A host without declared keys is looked up as the provider check finds it (§10): by its name
     (`conversion_host.name`, else its side's alias), else by its address. A lookup that fails fails the run as
     transient, a rollback's excepted, which logs it. A plan with a project on a side looks its host up there with the
-    plan's credential, where the deploy created it (above, §27.5); a provider holds one pin (§4.2), so the hosts of
-    two projects of one provider replace each other's pin as each project's pre-staging creates its own, and a run
-    that meets the other's pin is refused ("conversion host replaced", below) - pins per project wait for an owner
-    decision (`TODO(OWNER)`, plan task TC5).
+    plan's credential, where the deploy created it (above, §27.5), and that host - another server than the provider's
+    own - has its own pin, on the project's credential (`ProjectCredential.conversion_host_pin`, §4.2; the owner's
+    decision of 2026-10-29, after plan task TC5). A run reads and writes the pin of the credential it reaches the host
+    with (`credentials.host_pin`, §26.4): the provider's own pin for its own credential, a project's for that
+    project's credential, never another's - so two projects of one provider each keep their own host's pin, and
+    neither run meets the other's.
   * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
     `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
     resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
     `ANSIBLE_HOST_KEY_CHECKING=True`, and gives the VMware inventory's `conversion_host` entry what
     `conv_host_inventory.yml` gives an OpenStack host (§6.5): `ansible_ssh_common_args` with §26.4's options,
     `HostKeyAlias=conversion_host` and the pinned keys' `HostKeyAlgorithms`, and `ansible_ssh_host_key_checking: true`.
-  * **A host without a pin** - no declared keys, no pin - has its console read once and pinned by the provider check's
-    path (§10, §26.8: `conversion_host.key_pinned`, source `console`). A pre-staging, pre-copy, sync or cutover then
+  * **A host without a pin** - no declared keys, no pin of the credential the run reaches it with - has its console
+    read once with that credential and pinned as that credential's pin by the provider check's path (§10, §26.8:
+    `conversion_host.key_pinned`, source `console`). A pre-staging, pre-copy, sync or cutover then
     refuses before any playbook, as a permanent failure, a host it has no key for: "host key unknown: no key is pinned
     or declared for the {side} conversion host {name}", and one whose pin belongs to another server than the one it
     resolves to: "conversion host replaced: {name} is now server {new id}; its pin belongs to server {old id}" ({name}
@@ -2377,9 +2390,10 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     `dst`), 0600 with its final newline, passed as `os_migrate_{side}_conversion_host_key_private_path` and removed
     after the run whatever its outcome, never logged; its public half under the side's alias in the run's
     `known_hosts`. The role's report (`osm/conversion/hosts.json`, §6.5) is removed before the run and read after it,
-    also after a failure: a server under `created` of a side that got a key is pinned with it (source `injected`,
-    `conversion_host.key_pinned`); one under `found` does not hold it and is not pinned - a run that succeeded is
-    refused for it "host key unknown: ...", unless the provider's pin is that server's. A run whose output refuses the
+    also after a failure: a server under `created` of a side that got a key is pinned with it as the pin of the side's
+    credential (source `injected`, `conversion_host.key_pinned`) - not pinned when that credential went meanwhile, its
+    pin going with it (§12); one under `found` does not hold it and is not pinned - a run that succeeded is refused
+    for it "host key unknown: ...", unless the side's pin is that server's. A run whose output refuses the
     key of a server it created fails "the conversion host {name}, created with an injected host key, does not present
     it: check its image's cloud-init".
   * **A refusal in the output** - the collection's "host key refused: " and "link refused by the source conversion
@@ -4054,13 +4068,17 @@ series}`; `pool_name(resource_class, traits, forbidden_traits) -> str` names a p
 (plan task G4).
 
 **Host key pins** (`seamless_migrate.security.host_keys`, plan task ST2; §26.3, §26.4). A provider's conversion
-host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone writes:
+host's pin is `Provider.conversion_host_pin` (§4.2), and the host each of its project credentials reaches - a plan
+with that project's (§7.2, §27.5) - has its own, `ProjectCredential.conversion_host_pin` (the owner's decision of
+2026-10-29, after plan task TC5). The server alone writes them, and each reader takes the pin of the credential that
+reaches the host, never another's (`credentials.host_pin(provider, project_id)`: the provider's own for its own
+credential, None, else that project credential's - none for a project it holds no credential for):
 * **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
   of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
-  looks the host's server up: by its name, `conversion_host.name`, else its side's name as the executor names the host
-  (`os_migrate_conv_src` for a source, `os_migrate_conv_dst` for a destination, §7.2), with `find_server`; else by
-  `conversion_host.address`, with `server_of_address`. No server, or a lookup that fails (logged by its provider
-  error), pins nothing. Then:
+  looks the host's server up with its own credential: by its name, `conversion_host.name`, else its side's name as the
+  executor names the host (`os_migrate_conv_src` for a source, `os_migrate_conv_dst` for a destination, §7.2), with
+  `find_server`; else by `conversion_host.address`, with `server_of_address`. No server, or a lookup that fails
+  (logged by its provider error), pins nothing. Then, its own pin (`conversion_host_pin`):
   * **no pin:** the check reads the server's whole console (`console_log(server_id, None)`) and pins what the parser
     keeps of it - `{server_id, keys, source: "console", pinned_at}` -, written with the check's own write and
     `conversion_host.key_pinned` (§4.3) in one transaction. A console that gives no key pins nothing, and the next
@@ -4075,6 +4093,16 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
   Its destinations declare their conversion hosts' keys instead (`ssh_host_keys`, plan task ST7): one synthetic
   ed25519 key each, made up from the host's name - no private half exists -, as an operator reads a brought host's
   key out of band, so no demo plan meets `CONV_HOST_KEY_UNKNOWN` while keys are checked (§9.3).
+* **A project's host** (the owner's decision of 2026-10-29, after plan task TC5). After each project credential's
+  sign-in that answered `ok` ("The check of project credentials", below), a credential that holds a pin has its
+  project's host looked up with it, as a run of a plan with the project finds the host (§7.2): by its name, else its
+  address, as above. A host that resolves to another server than the pin's is reported in that project's entry of
+  the report (`projects`): its `message` the words above, its `status` staying `ok`. The check reads no console of a
+  project's host and pins nothing for a project: a project's host is pinned by the pre-staging that creates it, with
+  the key it injects, or by a run that meets it without a pin (§7.2, §26.8). A credential without a pin, or whose
+  sign-in failed, is not looked up; a lookup that fails is logged by its provider error and reports nothing.
+  Validation's `CONV_HOST_KEY_UNKNOWN` (§9.3) judges a side where the plan names a project by that project's pin and
+  this report, in place of the provider's own pin and `status_message` (§26.5).
 * **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
   `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
   that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
@@ -4113,7 +4141,9 @@ credential has expired.
   ProjectCheck { status: "ok"|"error",
                  message: str|null,           # why an error is one, in Seamless's words with an HTTP status or a
                                               # failure's kind - never a message Keystone wrote, never a
-                                              # credential's value
+                                              # credential's value; on an ok entry null, or the report of
+                                              # its project's conversion host found replaced ("Host key
+                                              # pins", above)
                  project_name: str|null,      # its token's project
                  domain: str|null,            # that project's domain: its name, else its id
                  user_id: str|null,           # its token's user (the credential's)
@@ -4425,16 +4455,16 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` - its projects' pins with it - ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pins - its own and its project credentials' -, each of which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
-| PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`; that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
-| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
+| PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`, its `conversion_host_pin` kept: a credential written again reaches the same project's host, whose pin belongs to its server (§26.4); that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
+| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry - its project's conversion host pin with it, so a later credential for the project starts without one (§26.4) - and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
-| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
+| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin of another server reported in that project's entry of `projects`, no console of a project's host read, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
 | POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
 | GET | `/hooks/{name}` | viewer | — | `Hook` |
@@ -8279,7 +8309,9 @@ host's entry, the gate, the probe before the stop, the forward to `127.0.0.1`, t
 removed), the content install's sshd settings and R-02 (the helper script's private directory and its SHA-256 check) -
 in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task; plan task ST7's - the two findings, the setting's default `true`,
 `GET /me`'s `host_key_checking` and the dashboard's host keys, its warning and the form's declared keys - in §9.3, §12,
-§15.1 and §16 since that task. The facts
+§15.1 and §16 since that task; the owner's decision of 2026-10-29, after plan task TC5 (§26.10, decision 11) - a pin
+per project credential, the one rule that selects a step's pin, the check's report of a project's replaced host and
+the project credential routes' rules for its pin - in §4.2, §7.2, §10 and §12 since it. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -8393,8 +8425,25 @@ decision 10).
   until the operator declares its keys, or deletes it and a pre-staging creates and pins it again (LAB-SSH08). The
   provider check does not pin the new server from its console; it reports the replacement (§10), since a host
   replaced behind Seamless's back is a change an operator should see, not one to take in silence.
-* **Why per host.** A conversion host serves every plan of its provider, so a plan's pre-staging data would hold one
-  pin per plan for one host. The database also keeps the pin when the data volume is lost or moved.
+* **A pin per project** (owner decision 11; binding in §4.2, §7.2, §10 and §12 since it). A plan with a project on a
+  side deploys and reaches its conversion host in that project, with the project's credential (§27.5): another
+  server than the provider's own host, one per project that plans name. Each project credential so holds its
+  project's host's pin (`ProjectCredential.conversion_host_pin`), beside the provider's own pin for its own
+  credential. Whatever reads or writes a pin - a run, a pre-staging and its book of keys, the provider check,
+  validation's finding - takes the pin of the credential that reaches the host there, the one §27.5's selection names
+  (`credentials.credential_project`, then `credentials.host_pin`): a plan without a project on that side keeps the
+  provider's own pin, as before, and a plan with one reads and writes its project's alone. Two tenants' hosts never
+  replace each other's pin, and a run never meets another project's. A project's pin is server-owned with its entry
+  (`PATCH /providers/{id}` refuses `project_credentials`, `POST /providers` ignores it), returned with it, kept when
+  an admin writes the credential again - the same project's host, whose pin is its server's - and gone with the
+  credential's deletion: a later credential for the project starts without one, and its host is pinned again from
+  its console by a run, or created and pinned with an injected key by a pre-staging; no pin outlives the credential
+  that reached its host (§12). The provider check reports a project's host found replaced in that project's entry of
+  its report and reads no project host's console (§10). Declared keys (`conversion_host.ssh_host_keys`) stay the
+  provider's and win over every pin, a project's too (§26.3).
+* **Why per host.** A conversion host serves every plan of the project its credential reaches - its provider's own,
+  or a project credential's -, so a plan's pre-staging data would hold one pin per plan for one host. The database
+  also keeps the pin when the data volume is lost or moved.
 * **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
   else the pins, of the hosts it uses: one hashed entry per key under the host's alias - its inventory name,
   `os_migrate_conv_src` or `os_migrate_conv_dst`, or the group's name, `conversion_host`, for a VMware destination's
@@ -8450,7 +8499,8 @@ decision 10).
 * **Findings** (proposed for §9.3, for `cold`, `warm`, `vmware_cold` and `vmware_warm`):
   * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
     keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
-    to another server than the one the provider's host resolves to;
+    to another server than the one the provider's host resolves to - for a plan with a project on that side, the
+    project's pin and the check's report of the project's host (§10, owner decision 11);
   * CONV_HOST_KEYS_UNCHECKED, a warning while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`: the plan's data path
     authenticates no conversion host.
 
@@ -8583,6 +8633,25 @@ The owner took each default as written on 2026-10-23 (D8):
 9. **The two events and the two findings** of §26.5: a refused key is a security event an operator should see.
 10. **R-02 joined to the gate's task:** the gate runs the helper script by its path, so the private 0700 directory and
     the SHA-256 check before `sudo python3` (C3-07) belong with it.
+11. **Pins per (provider, project)**, decided by the owner on 2026-10-29, after plan task TC5 and before TC6 and TC7.
+    TC5 deploys a plan's conversion hosts in its projects (§27.5), so a provider's hosts are as many servers as the
+    projects its plans name; with one pin per provider, two tenants' pre-stagings replaced each other's pin and each
+    refused the other's runs ("conversion host replaced") - safe, but it serialized the tenants. Each project
+    credential now holds its project's host's pin, and every step reads and writes the pin of the credential it acts
+    with (§26.4); a plan without a project keeps the provider's own pin, unchanged.
+    * **On the credential's entry** (`ProjectCredential.conversion_host_pin`), not in a map of pins by project beside
+      it: server-owned and returned with the entry, so no route takes a new field; read where the step's credential is
+      selected; a write changes the registry's fingerprint of that project's connection and of the provider's own
+      alone, where a map on the provider is in every project's (§10); and no pin outlives its credential, where a map
+      would keep pins of projects no credential reaches.
+    * **Rotation keeps it, deletion takes it:** a credential an admin writes again reaches the same project's host,
+      whose pin is its server's, as the provider's own pin outlives a rewrite of its credential (§12); a deleted
+      credential takes its pin along, so a later credential for the project trusts no pin that no credential held
+      meanwhile - its host is pinned again from its console by a run, or, where the console lost its block, deleted
+      and created again by a pre-staging (§26.8).
+    * **The check reports, never pins:** a project's host is one Seamless creates (§27.5), pinned with the key its
+      pre-staging injects; the check reports a project's host found replaced in that project's entry, as it reports
+      its own in `status_message`, and reads no project host's console (§10).
 
 ### 26.11 Contract changes (each binding from its plan task)
 
@@ -8597,6 +8666,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, its warning while keys are not checked (`GET /me` `host_key_checking`), the form's declared keys, the findings' catalog | §9.3, §12, §15.1, §16 (binding) | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
+| a pin per project credential (`ProjectCredential.conversion_host_pin`); the one rule that selects a step's pin (`credentials.host_pin`); the check's report of a project's replaced host; the project credential routes' rules for its pin (owner decision 11) | §4.2, §7.2, §10, §12 (binding) | after TC5 |
 
 ## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
@@ -8758,7 +8828,10 @@ another only where a service lets an admin act by id or on the project's behalf.
   confirm`).
 * **Conversion hosts** of a plan with a project are deployed in that project with its credential (`manage` true): the
   import finds each by name in its credential's project (`roles/import_workloads`). An existing host (`manage` false)
-  serves its provider's own project alone: validation refuses (400) a plan that names a project on such a side.
+  serves its provider's own project alone: validation refuses (400) a plan that names a project on such a side. Each
+  project's host keeps its own pin, on its project credential, which the plan's steps read and write as they act with
+  that credential (§26.4, §26.10 decision 11; binding in §4.2, §7.2, §10 and §12 since the owner's decision of
+  2026-10-29).
 * **A rotated credential** is used from the next step on: the registry's connection fingerprint holds each project
   credential's `updated_at`, as it holds the provider's (§10, §13.3). **Hooks** still get no credential (§23.3).
 

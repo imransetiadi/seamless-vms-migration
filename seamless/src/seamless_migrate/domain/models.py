@@ -246,6 +246,11 @@ class ProjectCredential(_Model):
     secret: str
     #: when an admin wrote it
     updated_at: UTCDateTime
+    #: server-owned with its entry: the pin of the project's conversion host, which a plan with
+    #: the project deploys and reaches with this credential (SDD §4.2, §26.4, §27.5; the owner's
+    #: decision of 2026-10-29, after plan task TC5) - kept when an admin writes the credential
+    #: again, gone with it (§12)
+    conversion_host_pin: HostKeyPin | None = None
 
 
 class Provider(_Model):
@@ -282,7 +287,8 @@ class Provider(_Model):
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
     #: server-owned: its conversion host's pinned host keys, which the provider check writes
-    #: (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it (§12)
+    #: (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it (§12); the host its own
+    #: credential reaches: a project's host has its own pin, on its ProjectCredential
     conversion_host_pin: HostKeyPin | None = None
     #: server-owned: an application credential per Keystone project, by project id, which PUT and
     #: DELETE …/projects/{project_id}/credentials write (SDD §4.2, §12, §27.4) - POST ignores it,

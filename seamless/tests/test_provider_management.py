@@ -668,6 +668,116 @@ def test_the_pin_is_returned_and_cannot_be_written(api):
     assert api.get("/api/v1/providers/src-two").json()["conversion_host_pin"] is None
 
 
+def _host_pin(server_id: str, seed: int) -> dict:
+    """A conversion host's pin as the API returns it (SDD §4.2): synthetic, made up for the test."""
+    return {
+        "server_id": server_id,
+        "keys": [bare(public_key(seed, "root@conv-src"))],
+        "source": "injected",
+        "pinned_at": "2026-10-29T08:00:00Z",
+    }
+
+
+def _pin_projects(api, provider_id: str, pins: dict, own: dict | None = None) -> None:
+    """The provider's project credentials given the pins of ``pins`` by project id, and its own
+    pin ``own``, as the server writes them (SDD §4.2, §26.4)."""
+    stored = api.store.get("provider", provider_id, Provider)
+    entries = {
+        project: entry.model_copy(update={"conversion_host_pin": HostKeyPin(**pins[project])})
+        if project in pins
+        else entry
+        for project, entry in stored.project_credentials.items()
+    }
+    update = {"project_credentials": entries}
+    if own is not None:
+        update["conversion_host_pin"] = HostKeyPin(**own)
+    api.store.put("provider", stored.model_copy(update=update))
+
+
+def _pins_of(api, provider_id: str) -> tuple:
+    """The provider's own pin and its project credentials' pins, as GET returns them."""
+    got = api.get(f"/api/v1/providers/{provider_id}").json()
+    projects = {p: e["conversion_host_pin"] for p, e in got["project_credentials"].items()}
+    return got["conversion_host_pin"], projects
+
+
+def test_a_projects_pin_is_returned_and_cannot_be_written(api):
+    """SDD §4.2, §12, §26.4 (§26.10 decision 11): a project's conversion host pin is the server's,
+    on its project credential's entry beside the provider's own pin - GET returns it there, PATCH
+    refuses project_credentials as it refuses every server-owned field, POST ignores it -, and an
+    edit of what the operator owns, the provider's own credentials and a check keep it."""
+    tenant_a, tenant_b = _project_id(), _project_id()
+    assert _write(api, "src-osp", tenant_a) == 200 and _write(api, "src-osp", tenant_b) == 200
+    pin = _host_pin("srv-conv-a", 4)
+    _pin_projects(api, "src-osp", {tenant_a: pin})
+    assert _pins_of(api, "src-osp") == (None, {tenant_a: pin, tenant_b: None})
+    listed = {p["id"]: p["project_credentials"] for p in api.get("/api/v1/providers").json()}
+    assert listed["src-osp"][tenant_a]["conversion_host_pin"] == pin
+    entries = api.get("/api/v1/providers/src-osp").json()["project_credentials"]
+    forged = {
+        **entries,
+        tenant_b: {**entries[tenant_b], "conversion_host_pin": {**pin, "server_id": "srv-other"}},
+    }
+    for value in (forged, {}):
+        refused = patch(api, "/api/v1/providers/src-osp", {"project_credentials": value})
+        assert refused.status_code == 422, refused.text
+        assert "fields cannot be changed: project_credentials" in refused.text
+    declared = {"name": "conv-src", "ssh_host_keys": [public_key(3, "root@conv-src")]}
+    edited = patch(api, "/api/v1/providers/src-osp", {"name": "x", "conversion_host": declared})
+    assert edited.status_code == 200, edited.text
+    own = {
+        "username": "svc-migrate",
+        "password": secrets.token_urlsafe(16),
+        "project_name": "admin",
+    }
+    assert put(api, "/api/v1/providers/src-osp/credentials", own).status_code == 200
+    assert api.post("/api/v1/providers/src-osp/check", Role.operator).status_code == 200
+    assert _pins_of(api, "src-osp") == (None, {tenant_a: pin, tenant_b: None})
+    created = api.post(
+        "/api/v1/providers",
+        json={
+            **SOURCE,
+            "id": "src-two",
+            "project_credentials": {
+                tenant_a: {
+                    "secret": _project_secret("src-two", tenant_a),
+                    "updated_at": "2026-10-29T08:00:00Z",
+                    "conversion_host_pin": pin,
+                }
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["project_credentials"] == {}
+
+
+def test_a_projects_pin_is_kept_by_a_new_credential_and_goes_with_its_deletion(api):
+    """SDD §12, §26.4 (§26.10 decision 11): an admin who writes a project's credential again keeps
+    its pin - the same project's host, whose pin is its server's -; deleting the credential takes
+    the pin along, so a credential written later for the project starts without one and trusts no
+    pin that no credential held meanwhile. Another project's pin and the provider's own stay as
+    they were throughout."""
+    tenant_a, tenant_b = _project_id(), _project_id()
+    assert _write(api, "src-osp", tenant_a) == 200 and _write(api, "src-osp", tenant_b) == 200
+    pin_a, pin_b, own = (
+        _host_pin("srv-conv-a", 1),
+        _host_pin("srv-conv-b", 2),
+        _host_pin("srv-conv-src", 3),
+    )
+    _pin_projects(api, "src-osp", {tenant_a: pin_a, tenant_b: pin_b}, own)
+    rotated = put(api, _project_path("src-osp", tenant_a), _app_credential())
+    assert rotated.status_code == 200, rotated.text
+    entry = rotated.json()["project_credentials"][tenant_a]
+    assert entry["secret"] == _project_secret("src-osp", tenant_a)
+    assert entry["conversion_host_pin"] == pin_a
+    assert _pins_of(api, "src-osp") == (own, {tenant_a: pin_a, tenant_b: pin_b})
+
+    assert _delete(api, _project_path("src-osp", tenant_a)).status_code == 204
+    assert _pins_of(api, "src-osp") == (own, {tenant_b: pin_b})
+    assert _write(api, "src-osp", tenant_a) == 200
+    assert _pins_of(api, "src-osp") == (own, {tenant_a: None, tenant_b: pin_b})
+
+
 def test_deleting_a_provider_deletes_its_managed_secrets(api):
     assert api.post("/api/v1/providers", json=VCENTER).status_code == 201
     put(api, "/api/v1/providers/vc-dc2/credentials", {"username": "u", "password": "p"})
