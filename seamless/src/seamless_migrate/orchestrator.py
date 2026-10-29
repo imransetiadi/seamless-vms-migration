@@ -32,6 +32,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Coroutine,
     Iterable,
     Mapping,
@@ -110,6 +111,7 @@ from .domain.models import (
     new_recommendation_id,
     next_pass_number,
     repeated_vm_ids,
+    utc_text,
     utcnow,
 )
 from .events import EventBus, emit, new_event, put_all_and_emit, put_and_emit
@@ -774,6 +776,38 @@ def _update_backoff(attempt: int) -> float:
     return min(PLAN_UPDATE_BACKOFF_S, 0.005 * 2**attempt) * random.uniform(0.5, 1.0)
 
 
+#: what a project's entry of the check report holds beside its status, message and time (SDD §10
+#: "The check of project credentials")
+PROJECT_CHECK_FACTS = ("project_name", "domain", "user_id", "roles", "restricted", "expires_at")
+
+
+def _project_check(
+    status: str, message: str | None, read: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """A project's entry of the check report, without its time (SDD §10): an error's facts are
+    null, whatever its sign-in read."""
+    facts = read if read is not None else {}
+    return {"status": status, "message": message, **{k: facts.get(k) for k in PROJECT_CHECK_FACTS}}
+
+
+def _projects_report(
+    provider: Provider, signed_in: Mapping[str, dict[str, Any]], now: datetime
+) -> dict[str, Any]:
+    """The check report's ``projects`` (SDD §10, §27.7): the entries of the projects the check
+    signed in with, at its time, and the other entries of the credentials the provider holds as
+    the last check read them, by project id."""
+    earlier = provider.capabilities.get("projects")
+    kept = earlier if isinstance(earlier, dict) else {}
+    checked_at = utc_text(now)
+    report: dict[str, Any] = {}
+    for project_id in sorted(provider.project_credentials):
+        if project_id in signed_in:
+            report[project_id] = {**signed_in[project_id], "checked_at": checked_at}
+        elif project_id in kept:
+            report[project_id] = kept[project_id]
+    return report
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -1090,7 +1124,13 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # providers
-    async def check_provider(self, provider_id: str, actor: str = "system") -> Provider:
+    async def check_provider(
+        self, provider_id: str, actor: str = "system", *, projects: Collection[str] | None = None
+    ) -> Provider:
+        """The provider check (SDD §8, §10): its own check() and its conversion host's pin, then a
+        sign-in with each of its project credentials - with those of ``projects`` alone for a
+        validation's check, the plan's (§10 "The check of project credentials", §27.7) -, one
+        provider call each, whatever its own check answered."""
         # one check per provider at a time (SDD §8): a validation's check and a manual Check would
         # otherwise collide on the versioned write below; the innermost lock, it takes no other
         async with self._lock(f"provider:{provider_id}"):
@@ -1098,6 +1138,7 @@ class Orchestrator:
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
             impl = self.providers.get(provider)
             pinned: Event | None = None
+            update: dict[str, Any]
             try:
                 caps = await impl.check()
                 update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
@@ -1106,7 +1147,15 @@ class Orchestrator:
             if update["status"] == "ok":
                 pinning, pinned = await self._pin_conversion_host(provider, impl, actor)
                 update.update(pinning)
-            update["last_checked_at"] = self._now()
+            signed_in = await self._check_projects(provider, impl, projects)
+            update["last_checked_at"] = now = self._now()
+            if provider.project_credentials:
+                # a check that failed keeps its earlier report, its projects brought up to date
+                report = update.get("capabilities", provider.capabilities)
+                update["capabilities"] = {
+                    **report,
+                    "projects": _projects_report(provider, signed_in, now),
+                }
             updated = provider.model_copy(update=update)
             if pinned is None:
                 await self.db.put("provider", updated, expected_version=version)
@@ -1123,6 +1172,38 @@ class Orchestrator:
             },
         )
         return updated
+
+    async def _check_projects(
+        self, provider: Provider, impl: Any, projects: Collection[str] | None
+    ) -> dict[str, dict[str, Any]]:
+        """Each project credential's entry of the check report, without its time (SDD §10 "The
+        check of project credentials", §27.7): the provider's every credential, or those of
+        ``projects`` it holds, signed in with one provider call each, one after the other in the
+        order of their project ids - the bound ends a call's wait, not its thread (§10), so a
+        Keystone that never answers pins one worker thread at a time."""
+        held = provider.project_credentials
+        chosen = held.keys() if projects is None else held.keys() & set(projects)
+        return {pid: await self._check_project(provider, impl, pid) for pid in sorted(chosen)}
+
+    async def _check_project(
+        self, provider: Provider, impl: Any, project_id: str
+    ) -> dict[str, Any]:
+        """One project credential's entry (SDD §10, §27.7): ok with what its token and its record
+        say, else error with why - a failure, an implementation that cannot sign in with a project
+        credential, or a token scoped to another project, which is never used."""
+        sign_in = getattr(impl, "check_project", None)
+        try:
+            if sign_in is None:
+                raise ProviderError(f"{provider.id}: it cannot sign in with a project credential")
+            read = await sign_in(project_id)
+        except ProviderError as exc:
+            return _project_check("error", redact(str(exc))[:500])
+        scoped = read.get("project_id")
+        if scoped != project_id:
+            return _project_check(
+                "error", f"{provider.id}: its token is scoped to project {scoped}, not {project_id}"
+            )
+        return _project_check("ok", None, read)
 
     async def _pin_conversion_host(
         self, provider: Provider, impl: Any, actor: str
@@ -1245,8 +1326,14 @@ class Orchestrator:
             updated = provider.model_copy(update={"conversion_host_pin": pin})
             await put_and_emit(self.store, self.bus, "provider", updated, version, event)
 
-    async def _caps(self, provider: Provider, actor: str) -> dict[str, Any]:
-        checked = await self.check_provider(provider.id, actor)
+    async def _caps(
+        self, provider: Provider, actor: str, project: str | None = None
+    ) -> dict[str, Any]:
+        # a validation's check signs in with the plan's project credential on the provider's side
+        # alone, none for a plan that names none (SDD §8, §10, §27.7)
+        checked = await self.check_provider(
+            provider.id, actor, projects=[project] if project else []
+        )
         if checked.status != "ok":
             raise BadRequest(f"provider {provider.id} check failed: {checked.status_message}")
         return {**checked.capabilities, "conversion_host": checked.conversion_host is not None}
@@ -1335,8 +1422,9 @@ class Orchestrator:
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
         src_impl = self.providers.get(source)
         dst_impl = self.providers.get(destination)
-        src_caps = await self._caps(source, actor)
-        dst_caps = await self._caps(destination, actor)
+        # the plan's projects, by id (SDD §4.2 with plan task TC4; until then a plan names none)
+        src_caps = await self._caps(source, actor, getattr(plan, "source_project", None))
+        dst_caps = await self._caps(destination, actor, getattr(plan, "destination_project", None))
         # as the checks left them: their pins, and a host they found replaced (SDD §9.3, §10)
         as_checked = {
             p.id: p

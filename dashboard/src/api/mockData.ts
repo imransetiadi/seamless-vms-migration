@@ -436,6 +436,12 @@ const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: [
 /** The demo's admin token's role names: its check report and its destinations' inventories name them (SDD §10). */
 export const DEMO_TOKEN_ROLES: readonly string[] = ['admin', 'member', 'reader'];
 
+/** The projects the demo's provider credentials are scoped to, as the API's fakes name them in their check (SDD §10, §27.7). */
+const DEMO_OWN_PROJECTS = {
+  source: { id: 'project-finance', name: 'finance', domain: 'Default' },
+  destination: { id: 'project-demo', name: 'demo', domain: 'Default' },
+} as const;
+
 /** The vGPU profiles the demo's GPU destinations declare for their two vGPU flavors (`gpu_profiles`, SDD §22.3, §22.10). */
 const DEMO_GPU_PROFILES: Readonly<Record<string, string>> = { 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' };
 
@@ -505,7 +511,7 @@ export function readDestinationGpus(
 
 /**
  * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
- * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
+ * its token's roles and project, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
  * policy profile, by its maxima and what it declares (§10.1), and its GPU capacity, read at `checkedAt` for the GPU
  * flavors of its `inventory` with the profiles it declares (§22.3).
  */
@@ -521,6 +527,8 @@ function openstackCheck(
     admin: true,
     // an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
     roles: [...DEMO_TOKEN_ROLES],
+    // the project its token is scoped to (SDD §10, §27.7)
+    project: { ...DEMO_OWN_PROJECTS[provider.role] },
     compute_microversion: compute,
     block_storage_microversion: blockStorage,
     ovn: true,

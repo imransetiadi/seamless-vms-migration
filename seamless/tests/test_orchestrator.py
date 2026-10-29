@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import secrets
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ from seamless_migrate.domain.models import (
     PhaseChange,
     Plan,
     PolicyScope,
+    ProjectCredential,
     Provider,
     SyncPass,
     VerificationConfig,
@@ -75,6 +77,7 @@ from seamless_migrate.planning.estimator import (
     params_for_plan,
 )
 from seamless_migrate.providers.base import ProviderError
+from seamless_migrate.security.secret_store import project_secret_name
 from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
@@ -4313,6 +4316,132 @@ async def test_a_validation_and_a_manual_check_of_its_provider_both_succeed(tmp_
         return_exceptions=True,
     )
     assert [type(r).__name__ for r in results] == ["ValidationReport", "Provider"], results
+
+
+class _PlanNamingProjects(Plan):
+    """A plan as plan task TC4 stores one, naming its projects by id (SDD §4.2 with TC4, §27.4):
+    until TC4 adds the fields to Plan, a validation reads plans stored with them through this."""
+
+    source_project: str | None = None
+    destination_project: str | None = None
+
+
+def _project_credentials(provider_id: str, *project_ids: str) -> dict[str, ProjectCredential]:
+    """A provider's project credentials for the projects (SDD §4.2, §27.4)."""
+    return {
+        project_id: ProjectCredential(
+            secret=project_secret_name(provider_id, project_id), updated_at=utcnow()
+        )
+        for project_id in project_ids
+    }
+
+
+def _signs_in(impl, calls: list[str], names: dict[str, str]) -> None:
+    """``impl`` signs in with a project credential as a project of ``names`` (SDD §10 "The check
+    of project credentials"), recording the project each sign-in came with in ``calls``."""
+
+    async def check_project(project_id: str) -> dict:
+        calls.append(project_id)
+        return {
+            "project_id": project_id,
+            "project_name": names[project_id],
+            "domain": "Default",
+            "user_id": f"user-{names[project_id]}",
+            "roles": ["member", "reader"],
+            "restricted": True,
+            "expires_at": None,
+        }
+
+    impl.check_project = check_project
+
+
+async def test_a_validation_checks_the_plans_project_credentials_alone(
+    tmp_path, store, monkeypatch
+):
+    """SDD §8, §10 "The check of project credentials", §27.7 (plan task TC3): a validation's check
+    of each provider signs in with the plan's project credential on that side alone - its
+    source_project on its source provider, its destination_project on its destination, never the
+    providers' other project credentials -, replaces those projects' entries and keeps the others
+    as the last check read them. A plan that names no project signs in with none; a manual check
+    signs in with each."""
+    from seamless_migrate import orchestrator as orchestrator_module
+
+    monkeypatch.setattr(orchestrator_module, "Plan", _PlanNamingProjects)
+    tenant_a, tenant_b, tenant_c, tenant_d = (secrets.token_hex(16) for _ in range(4))
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    earlier = {
+        "status": "ok",
+        "message": None,
+        "project_name": "tenant-b",
+        "domain": "Default",
+        "user_id": "user-tenant-b",
+        "roles": ["member"],
+        "restricted": True,
+        "expires_at": None,
+        "checked_at": "2026-10-28T08:00:00Z",
+    }
+    store.put(
+        "provider",
+        SRC_PROVIDER.model_copy(
+            update={
+                "project_credentials": _project_credentials(SRC_PROVIDER.id, tenant_a, tenant_b),
+                "capabilities": {"projects": {tenant_b: earlier}},
+            }
+        ),
+    )
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(
+            update={
+                "project_credentials": _project_credentials(DST_PROVIDER.id, tenant_c, tenant_d)
+            }
+        ),
+    )
+    source_calls: list[str] = []
+    destination_calls: list[str] = []
+    _signs_in(h.source, source_calls, {tenant_a: "tenant-a", tenant_b: "tenant-b"})
+    _signs_in(h.destination, destination_calls, {tenant_c: "tenant-c", tenant_d: "tenant-d"})
+    named = {"source_project": tenant_a, "destination_project": tenant_c}
+    store.put("plan", _PlanNamingProjects.model_validate({**plan.model_dump(), **named}))
+
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (source_calls, destination_calls) == ([tenant_a], [tenant_c])
+    source = store.get("provider", SRC_PROVIDER.id, Provider)
+    checked_at = source.model_dump(mode="json")["last_checked_at"]
+    assert source.capabilities["projects"] == {
+        tenant_a: {
+            "status": "ok",
+            "message": None,
+            "project_name": "tenant-a",
+            "domain": "Default",
+            "user_id": "user-tenant-a",
+            "roles": ["member", "reader"],
+            "restricted": True,
+            "expires_at": None,
+            "checked_at": checked_at,
+        },
+        tenant_b: earlier,
+    }
+    destination = store.get("provider", DST_PROVIDER.id, Provider)
+    assert list(destination.capabilities["projects"]) == [tenant_c]
+    assert destination.capabilities["projects"][tenant_c]["project_name"] == "tenant-c"
+
+    # a plan that names no project: no project credential signs in, the entries stay; nor does
+    # a project its provider holds no credential for (validation refuses it with plan task TC5)
+    unheld = {"destination_project": secrets.token_hex(16)}
+    for projects in ({}, unheld):
+        store.put("plan", _PlanNamingProjects.model_validate({**plan.model_dump(), **projects}))
+        await h.orch.validate_plan(plan.id, "alice")
+        assert (source_calls, destination_calls) == ([tenant_a], [tenant_c])
+    kept = store.get("provider", SRC_PROVIDER.id, Provider).capabilities["projects"]
+    assert kept == source.capabilities["projects"]
+    assert (
+        store.get("provider", DST_PROVIDER.id, Provider).capabilities["projects"]
+        == (destination.capabilities["projects"])
+    )
+    # a manual check signs in with each of the provider's project credentials
+    await h.orch.check_provider(SRC_PROVIDER.id, "bob")
+    assert source_calls == [tenant_a, *sorted((tenant_a, tenant_b))]
 
 
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):

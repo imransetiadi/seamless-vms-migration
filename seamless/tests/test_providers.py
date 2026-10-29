@@ -1,7 +1,9 @@
 import builtins
 import json
 import logging
+import secrets
 import sys
+import threading
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -10,7 +12,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
-from seamless_migrate.domain.models import GpuDevice
+from seamless_migrate.domain.models import GpuDevice, ProjectCredential, Provider, utcnow
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
@@ -23,6 +25,7 @@ from seamless_migrate.providers.base import (
 from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
 from seamless_migrate.providers.openstack import OpenStackProvider
 from seamless_migrate.providers.vmware import VMwareProvider
+from seamless_migrate.security.secret_store import FileSecretStore, project_secret_name
 from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_provider
 from tests.key_support import public_key
@@ -4818,6 +4821,447 @@ async def test_a_destination_reads_its_projects_attached_floating_ips_and_their_
         floating_ips={"limit": -1, "used": 3, "reserved": 0}
     )
     assert (await dst.inventory()).floating_ip_quota is None
+
+
+# --------------------------------------------------------------------------------------------
+# the check of project credentials (SDD §10 "The check of project credentials", §27.7; plan task
+# TC3)
+
+
+def _made_up_id() -> str:
+    """A Keystone id as Keystone writes one: 32 hex digits, made up for the test."""
+    return secrets.token_hex(16)
+
+
+def _tenant(
+    cloud,
+    name,
+    *,
+    roles=("member", "reader"),
+    expires_at=None,
+    unrestricted=False,
+    domain="Default",
+):
+    """A made-up tenant project ``name`` and src-osp's project credential for it (plan task TC3):
+    an application credential of the project as the in-process cloud's Keystone holds it - its
+    id, its secret and its user generated -, and its secret in the secret store as PUT …/projects/
+    {project_id}/credentials writes it (SDD §13.3)."""
+    tenant = NS(
+        name=name,
+        project_id=_made_up_id(),
+        credential_id=_made_up_id(),
+        secret=secrets.token_urlsafe(32),
+        user_id=_made_up_id(),
+    )
+    cloud.app_credentials[tenant.credential_id] = {
+        "secret": tenant.secret,
+        "user_id": tenant.user_id,
+        "project": {
+            "id": tenant.project_id,
+            "name": name,
+            "domain": {"id": domain.lower(), "name": domain},
+        },
+        "roles": list(roles),
+        "unrestricted": unrestricted,
+        "expires_at": expires_at,
+    }
+    FileSecretStore(cloud.settings.secrets_dir).write(
+        project_secret_name("src-osp", tenant.project_id),
+        {
+            "application_credential_id": tenant.credential_id,
+            "application_credential_secret": tenant.secret,
+        },
+        {},
+    )
+    return tenant
+
+
+def _holding(*tenants):
+    """src-osp, reached through the in-process cloud's clouds.yaml entry, holding a project
+    credential for each tenant (SDD §4.2, §27.4)."""
+    from tests.orch_support import SRC_PROVIDER
+
+    held = {
+        t.project_id: ProjectCredential(
+            secret=project_secret_name("src-osp", t.project_id), updated_at=utcnow()
+        )
+        for t in tenants
+    }
+    return SRC_PROVIDER.model_copy(
+        update={
+            "cloud": "dst",
+            "endpoint": AUTH_URL,
+            "conversion_host": None,
+            "project_credentials": held,
+        }
+    )
+
+
+class _CloudRegistry:
+    """The provider registry over an in-process cloud: one OpenStackProvider per connection
+    fingerprint, as providers.registry caches one (SDD §10) - its own connection kept from one
+    check to the next."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+        self.built = {}
+
+    def get(self, provider):
+        key = registry.connection_fingerprint(provider, self.cloud.settings)
+        if key not in self.built:
+            self.built[key] = OpenStackProvider(
+                provider, self.cloud.settings, connect_fn=self.cloud.connect
+            )
+        return self.built[key]
+
+
+def _checking(tmp_path, store, **cloud):
+    """The orchestrator's provider check (POST /providers/{id}/check, SDD §12) of src-osp over an
+    in-process cloud: OpenStackProvider's own code through keystoneauth (plan task TC3)."""
+    from tests.orch_support import build_harness
+
+    in_process = InProcessCloud(tmp_path / "cloud", **cloud)
+    h = build_harness(tmp_path, store, [])
+    h.orch.providers = _CloudRegistry(in_process)
+    return h, in_process
+
+
+def _stamp(provider) -> str:
+    """The provider's last_checked_at as its JSON writes it."""
+    return provider.model_dump(mode="json")["last_checked_at"]
+
+
+def _leaks(tenants, **texts) -> list[str]:
+    """The names of the texts that hold a tenant's secret or its application credential's id -
+    what a failing assertion prints, never a value (SDD §10, §27.8)."""
+    values = [value for t in tenants for value in (t.secret, t.credential_id)]
+    return sorted(name for name, text in texts.items() if any(v in text for v in values))
+
+
+def _texts(store, provider, caplog) -> dict[str, str]:
+    """The report as the API answers it, every event and every log line."""
+    events = [e.model_dump(mode="json") for e in store.events(since_seq=0, limit=100000)]
+    return {
+        "report": provider.model_dump_json(),
+        "events": json.dumps(events),
+        "logs": caplog.text,
+    }
+
+
+async def test_the_check_signs_in_with_each_project_credential(tmp_path, store, caplog):
+    """SDD §10 "The check of project credentials", §27.7 (plan task TC3): POST /providers/{id}/check
+    signs in with the provider's own credential, then with each of its project credentials -
+    one provider call each, one after the other in the order of their project ids, at the provider
+    credential's auth URL -, and records an entry per project. Each check signs in afresh, and
+    whatever the provider's own check answered. Nothing of a credential reaches the report, an
+    event or a log line."""
+    caplog.set_level(logging.DEBUG)
+    h, cloud = _checking(tmp_path, store)
+    tenants = sorted(
+        [_tenant(cloud, "tenant-a"), _tenant(cloud, "tenant-b")], key=lambda t: t.project_id
+    )
+    # held in the other order: the check signs in in the order of the project ids
+    store.put("provider", _holding(*reversed(tenants)))
+    names = {t.credential_id: t.name for t in tenants}
+    in_order = [t.name for t in tenants]
+    closed: list[str] = []
+    connect = cloud.connect
+
+    def connecting(provider, settings, project_id=None):
+        conn = connect(provider, settings, project_id)
+        if project_id is not None:
+            conn.close = lambda: closed.append(project_id)
+        return conn
+
+    cloud.connect = connecting
+
+    checked = await h.orch.check_provider("src-osp", "alice")
+    assert checked.status == "ok" and checked.status_message is None
+    assert [names.get(who, who) for who in cloud.sign_ins] == ["svc", *in_order]
+    posts = [url for method, url in cloud.seen if method == "POST"]
+    assert posts == [AUTH_URL + "/auth/tokens"] * 3
+    # each project's connection is its own, closed after its call
+    assert closed == [t.project_id for t in tenants]
+    report = checked.capabilities["projects"]
+    assert {p: entry["status"] for p, entry in report.items()} == {
+        t.project_id: "ok" for t in tenants
+    }
+    assert list(report) == [t.project_id for t in tenants]
+    # the report the provider's own check read, beside its projects
+    assert checked.capabilities["project"]["name"] == "finance"
+    stored = await h.orch.db.get("provider", "src-osp", Provider)
+    assert stored.capabilities == checked.capabilities
+    # the provider's connection is kept, a project credential's never: it signs in again
+    await h.orch.check_provider("src-osp", "bob")
+    assert [names.get(who, who) for who in cloud.sign_ins] == ["svc", *in_order, *in_order]
+    assert _leaks(tenants, **_texts(store, checked, caplog)) == []
+
+    # a provider whose own check fails still signs in with each of its project credentials; its
+    # earlier report is kept, its projects brought up to date
+    calls = []
+
+    class Failing:
+        async def check(self):
+            raise ProviderError("src-osp: the compute API did not answer")
+
+        async def check_project(self, project_id):
+            calls.append(project_id)
+            return {"project_id": project_id, "project_name": "x", "roles": ["member"]}
+
+    h.orch.providers = NS(get=lambda p: Failing())
+    failed = await h.orch.check_provider("src-osp", "alice")
+    assert failed.status == "error"
+    assert calls == sorted(t.project_id for t in tenants)
+    assert {k: v for k, v in failed.capabilities.items() if k != "projects"} == {
+        k: v for k, v in checked.capabilities.items() if k != "projects"
+    }
+    assert {e["checked_at"] for e in failed.capabilities["projects"].values()} == {_stamp(failed)}
+
+
+async def test_the_check_reports_each_projects_name_domain_user_roles_and_expiry(
+    tmp_path, store, caplog
+):
+    """SDD §10 "The check of project credentials", §21.5, §27.7 (plan task TC3): each project's
+    entry holds its token's project name, that project's domain, its user and its role names
+    (sorted), the application credential's restricted flag and its expiry from its record - null
+    when it never expires, a time Keystone writes without a zone read as UTC - and the time of the
+    check that read it. Nothing of a credential reaches the report, an event or a log line."""
+    caplog.set_level(logging.DEBUG)
+    h, cloud = _checking(tmp_path, store)
+    tenant_a = _tenant(
+        cloud, "tenant-a", roles=("reader", "member"), expires_at="2026-12-31T23:59:59.000000"
+    )
+    tenant_b = _tenant(
+        cloud,
+        "tenant-b",
+        roles=("member", "load-balancer_member", "reader", "member"),
+        domain="Tenants",
+    )
+    store.put("provider", _holding(tenant_a, tenant_b))
+
+    checked = await h.orch.check_provider("src-osp", "alice")
+    stamp = _stamp(checked)
+    assert checked.capabilities["projects"] == {
+        tenant_a.project_id: {
+            "status": "ok",
+            "message": None,
+            "project_name": "tenant-a",
+            "domain": "Default",
+            "user_id": tenant_a.user_id,
+            "roles": ["member", "reader"],
+            "restricted": True,
+            "expires_at": "2026-12-31T23:59:59Z",
+            "checked_at": stamp,
+        },
+        tenant_b.project_id: {
+            "status": "ok",
+            "message": None,
+            "project_name": "tenant-b",
+            "domain": "Tenants",
+            "user_id": tenant_b.user_id,
+            "roles": ["load-balancer_member", "member", "reader"],
+            "restricted": True,
+            "expires_at": None,
+            "checked_at": stamp,
+        },
+    }
+    # each record read once, by its own user (Keystone answers another user's GET with 404)
+    names = {tenant_a.credential_id: "tenant-a", tenant_b.credential_id: "tenant-b"}
+    assert sorted(names.get(read, read) for read in cloud.records_read) == ["tenant-a", "tenant-b"]
+    # an expiry written with its zone, and a domain Keystone names by its id alone
+    cloud.app_credentials[tenant_b.credential_id]["expires_at"] = "2027-03-01T08:30:00Z"
+    cloud.app_credentials[tenant_b.credential_id]["project"]["domain"] = {"id": "tenants"}
+    again = (await h.orch.check_provider("src-osp", "alice")).capabilities["projects"]
+    assert again[tenant_b.project_id]["expires_at"] == "2027-03-01T08:30:00Z"
+    assert again[tenant_b.project_id]["domain"] == "tenants"
+    assert _leaks([tenant_a, tenant_b], **_texts(store, checked, caplog)) == []
+
+
+async def test_a_project_credential_scoped_to_another_project_fails_its_check(
+    tmp_path, store, caplog
+):
+    """SDD §10 "The check of project credentials", §27.7 (plan task TC3): a credential whose
+    token's project is not its key - written for tenant-a, an application credential of tenant-b -
+    is error, its message naming the token's project, and it is never used further: its record is
+    not read, and its entry reports nothing its token said. The provider and the other project
+    stay ok."""
+    caplog.set_level(logging.DEBUG)
+    h, cloud = _checking(tmp_path, store)
+    tenant_a, tenant_b = _tenant(cloud, "tenant-a"), _tenant(cloud, "tenant-b")
+    elsewhere = cloud.app_credentials[tenant_a.credential_id]
+    elsewhere["project"] = cloud.app_credentials[tenant_b.credential_id]["project"]
+    store.put("provider", _holding(tenant_a, tenant_b))
+
+    checked = await h.orch.check_provider("src-osp", "alice")
+    assert (checked.status, checked.status_message) == ("ok", None)
+    report = checked.capabilities["projects"]
+    assert report[tenant_a.project_id] == {
+        "status": "error",
+        "message": (
+            f"src-osp: its token is scoped to project {tenant_b.project_id}, not "
+            f"{tenant_a.project_id}"
+        ),
+        "project_name": None,
+        "domain": None,
+        "user_id": None,
+        "roles": None,
+        "restricted": None,
+        "expires_at": None,
+        "checked_at": _stamp(checked),
+    }
+    assert report[tenant_b.project_id]["status"] == "ok"
+    assert report[tenant_b.project_id]["project_name"] == "tenant-b"
+    read_a = tenant_a.credential_id in cloud.records_read
+    read_b = tenant_b.credential_id in cloud.records_read
+    assert (read_a, read_b) == (False, True)
+    assert _leaks([tenant_a, tenant_b], **_texts(store, checked, caplog)) == []
+
+
+async def test_a_failing_project_credential_fails_neither_its_provider_nor_another_project(
+    tmp_path, store, caplog, monkeypatch
+):
+    """SDD §10 "The check of project credentials", §27.7 (plan task TC3): a sign-in Keystone
+    refuses, one that runs past the call's bound, a record Keystone will not show, an expiry that
+    is no time and a secret the store does not hold each make their own project's entry error -
+    its message Seamless's words with an HTTP status or a failure's kind, never Keystone's text or
+    a credential's value, and redacted - while the provider's check and the other project stay
+    ok. A provider that cannot sign in with a project credential reports each entry error alike."""
+    from seamless_migrate.providers import openstack as openstack_provider
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 1.0)
+    h, cloud = _checking(tmp_path, store)
+    refused, held, hidden, unstored, fine = (
+        _tenant(cloud, name)
+        for name in ("tenant-a", "tenant-b", "tenant-c", "tenant-d", "tenant-e")
+    )
+    garbled = _tenant(cloud, "tenant-f", expires_at="next tuesday")
+    # Keystone holds another secret now (re-created): the stored one is refused
+    cloud.app_credentials[refused.credential_id]["secret"] = secrets.token_urlsafe(32)
+    release = threading.Event()
+    cloud.app_credentials[held.credential_id]["hold"] = release
+    cloud.app_credentials[hidden.credential_id]["record"] = 403
+    FileSecretStore(cloud.settings.secrets_dir).delete(
+        project_secret_name("src-osp", unstored.project_id)
+    )
+    tenants = [refused, held, hidden, unstored, fine, garbled]
+    store.put("provider", _holding(*tenants))
+    try:
+        checked = await h.orch.check_provider("src-osp", "alice")
+    finally:
+        release.set()
+    assert (checked.status, checked.status_message) == ("ok", None)
+    report = checked.capabilities["projects"]
+    unstored_name = project_secret_name("src-osp", unstored.project_id)
+    assert {t.name: report[t.project_id]["message"] for t in tenants} == {
+        "tenant-a": "src-osp: the sign-in failed: HTTP 401",
+        "tenant-b": "src-osp: call timed out after 1 s",
+        "tenant-c": "src-osp: the application credential's record was not read: HTTP 403",
+        "tenant-d": (
+            f"src-osp: secret '{unstored_name}' is missing application_credential_id, "
+            "application_credential_secret"
+        ),
+        "tenant-e": None,
+        "tenant-f": "src-osp: the application credential's record holds an expiry that is no time",
+    }
+    failed = [t for t in tenants if t is not fine]
+    facts = ("project_name", "domain", "user_id", "roles", "restricted", "expires_at")
+    assert [t.name for t in failed if any(report[t.project_id][k] for k in facts)] == []
+    assert {t.name: report[t.project_id]["status"] for t in tenants} == {
+        "tenant-a": "error",
+        "tenant-b": "error",
+        "tenant-c": "error",
+        "tenant-d": "error",
+        "tenant-e": "ok",
+        "tenant-f": "error",
+    }
+    assert report[fine.project_id]["project_name"] == "tenant-e"
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "provider.checked"]
+    assert event.data == {"provider_id": "src-osp", "status": "ok", "message": None}
+    assert _leaks(tenants, **_texts(store, checked, caplog)) == []
+
+    # an implementation without a project credential's sign-in (the demo's fakes until plan task
+    # TC9): each entry error, the provider's check its own
+    h.orch.providers = NS(get=lambda p: _NoProjectSignIn())
+    plain = await h.orch.check_provider("src-osp", "alice")
+    assert plain.status == "ok"
+    assert {e["message"] for e in plain.capabilities["projects"].values()} == {
+        "src-osp: it cannot sign in with a project credential"
+    }
+    # a failure's message is redacted before the report holds it (SDD §13.4)
+    leaked = secrets.token_urlsafe(16)
+    refusing = _NoProjectSignIn(f"src-osp: refused with password={leaked}")
+    h.orch.providers = NS(get=lambda p: refusing)
+    redacted = (await h.orch.check_provider("src-osp", "alice")).capabilities["projects"]
+    held_back = [
+        p for p, e in redacted.items() if e["status"] != "error" or leaked in (e["message"] or "")
+    ]
+    assert held_back == []
+
+
+class _NoProjectSignIn:
+    """A provider whose check answers and that cannot sign in with a project credential - or whose
+    sign-in fails with ``refusal``."""
+
+    def __init__(self, refusal=None):
+        if refusal is not None:
+
+            async def check_project(project_id):
+                raise ProviderError(refusal)
+
+            self.check_project = check_project
+
+    async def check(self):
+        return {"admin": True, "compute_microversion": "2.88", "ovn": True}
+
+
+async def test_the_check_names_the_providers_own_project(tmp_path, store, stub_openstack):
+    """SDD §10, §21.5, §27.7 (plan task TC3): the check report's `project` names the project the
+    provider credential's token is scoped to - its id, its name and its domain's name, else that
+    domain's id -, left out when the token names none; the demo's fakes name their credentials' own
+    projects. check_report_keys.json lists the key, which the shared keys' test holds the real
+    check, the fakes and the dashboard's mock to."""
+    own = _made_up_id()
+    h, cloud = _checking(
+        tmp_path,
+        store,
+        project={"id": own, "name": "migration", "domain": {"id": "default", "name": "Default"}},
+    )
+    store.put("provider", _holding())
+    checked = await h.orch.check_provider("src-osp", "alice")
+    assert checked.capabilities["project"] == {"id": own, "name": "migration", "domain": "Default"}
+    # a provider without project credentials reports no projects (SDD §10)
+    assert "projects" not in checked.capabilities
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    cloud.project = {"id": own, "name": "migration", "domain": {"id": "d-0001"}}
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+    assert caps["project"] == {"id": own, "name": "migration", "domain": "d-0001"}
+    # a token that names no project: no key
+    stub_openstack(fake_conn())
+    assert "project" not in await OpenStackProvider(make_provider(), settings()).check()
+    # the demo's fakes: the source's VMs' project, the destinations' own networks' project
+    source = await FakeSourceProvider(ProviderKind.openstack).check()
+    assert source["project"] == {"id": "project-finance", "name": "finance", "domain": "Default"}
+    destination = await FakeDestinationProvider().check()
+    assert destination["project"] == {"id": "project-demo", "name": "demo", "domain": "Default"}
+    owner = {n["project_id"] for n in (await FakeDestinationProvider().inventory()).network_details}
+    assert destination["project"]["id"] in owner
+    assert "project" not in await FakeSourceProvider(ProviderKind.vmware).check()
+
+
+async def test_the_check_reports_an_unrestricted_application_credential(tmp_path, store):
+    """SDD §10 "The check of project credentials", §27.7, §27.8 (plan task TC3): the entry's
+    `restricted` is the application credential's own - false for one created unrestricted, which
+    may create other application credentials and trusts, true for one created as Keystone does by
+    default."""
+    h, cloud = _checking(tmp_path, store)
+    tenant_a = _tenant(cloud, "tenant-a", unrestricted=True)
+    tenant_b = _tenant(cloud, "tenant-b")
+    store.put("provider", _holding(tenant_a, tenant_b))
+    report = (await h.orch.check_provider("src-osp", "alice")).capabilities["projects"]
+    assert report[tenant_a.project_id]["restricted"] is False
+    assert report[tenant_b.project_id]["restricted"] is True
+    assert {e["status"] for e in report.values()} == {"ok"}
 
 
 # --------------------------------------------------------------------------------------------

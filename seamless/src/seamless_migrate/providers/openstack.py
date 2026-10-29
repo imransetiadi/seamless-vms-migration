@@ -11,12 +11,13 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime
 from typing import Any, Literal, TypeVar
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderRole
-from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utc_text, utcnow
 from ..guest_os import identify
 from ..planning.gpu import PoolRequest, gpu_pools, gpu_requests
 from ..planning.platforms import destination_release
@@ -32,7 +33,11 @@ from ..planning.preflight import (
     StackPlace,
     StackRead,
 )
-from ..security.secrets import SecretNotFound, openstack_cloud_entry
+from ..security.secrets import (
+    SecretNotFound,
+    openstack_cloud_entry,
+    openstack_project_cloud_entry,
+)
 from ..storage import ceph_location, storage_family
 from .base import (
     ProviderConflict,
@@ -108,13 +113,25 @@ def _import_openstack() -> Any:
     return openstack
 
 
-def connect(provider: Provider, settings: Settings) -> Any:
-    """Open an openstacksdk connection for ``provider`` (credentials from ``clouds.yaml``)."""
+def connect(provider: Provider, settings: Settings, project_id: str | None = None) -> Any:
+    """Open an openstacksdk connection for ``provider`` (credentials from ``clouds.yaml`` or its
+    secret) - with its credential for the Keystone project ``project_id`` when one is given, the
+    provider's reach kept (SDD §13.3, §27.4)."""
     openstack = _import_openstack()
+    # a token's body names the application credential it signed in with (SDD §10, §13.4)
+    logging.getLogger(_TOKEN_LOGGER).addFilter(_NO_APPLICATION_CREDENTIAL_TOKEN)  # kept once
     kwargs: dict[str, Any] = {"app_name": "seamless-migrate"}
-    if provider.credentials_secret or (settings.clouds_yaml is not None and provider.cloud):
+    if (
+        project_id is not None
+        or provider.credentials_secret
+        or (settings.clouds_yaml is not None and provider.cloud)
+    ):
         try:
-            entry = openstack_cloud_entry(provider, settings)
+            entry = (
+                openstack_cloud_entry(provider, settings)
+                if project_id is None
+                else openstack_project_cloud_entry(provider, project_id, settings)
+            )
         except SecretNotFound as exc:
             raise ProviderError(f"{provider.id}: {exc}") from None
         kwargs.update(entry)
@@ -152,6 +169,59 @@ def _attr(obj: Any, *names: str, default: Any = None) -> Any:
         if value is not None:
             return value
     return default
+
+
+def _token_value(access: Any, *names: str) -> Any:
+    """The first of a token's properties that is set (SDD §10): keystoneauth's AccessInfo raises
+    KeyError for a part its token lacks - a project's domain without its name -, read as unset."""
+    for name in names:
+        try:
+            value = getattr(access, name, None)
+        except KeyError:
+            value = None
+        if value is not None:
+            return value
+    return None
+
+
+def _token_project(access: Any) -> dict[str, Any] | None:
+    """The project a token is scoped to - its id, its name and its domain's name, else that
+    domain's id (SDD §10, §27.7) -; None when the token names none."""
+    project_id = _token_value(access, "project_id")
+    if not project_id:
+        return None
+    return {
+        "id": str(project_id),
+        "name": _token_value(access, "project_name"),
+        "domain": _token_value(access, "project_domain_name", "project_domain_id"),
+    }
+
+
+#: keystoneauth's logger of a sign-in's answer, whose whole token body it writes at DEBUG
+_TOKEN_LOGGER = "keystoneauth.identity.v3.base"
+
+
+class _NoApplicationCredentialToken(logging.Filter):
+    """keystoneauth logs each sign-in's token body at DEBUG: a token an application credential
+    signed in with names that credential's id, so the record is dropped (SDD §10 "The check of
+    project credentials", §13.4). This keeps the line out of any handler, a test's capture
+    included."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return '"application_credential"' not in record.getMessage()
+        except Exception:  # a record whose args do not format: nothing to read, let it be
+            return True
+
+
+_NO_APPLICATION_CREDENTIAL_TOKEN = _NoApplicationCredentialToken()
+
+
+def _close_quietly(conn: Any) -> None:
+    """Close a connection, best effort."""
+    if callable(getattr(conn, "close", None)):
+        with contextlib.suppress(Exception):
+            conn.close()
 
 
 def _holders(volume: Any) -> list[str]:
@@ -489,10 +559,16 @@ class _BudgetedGet:
 
 
 def _read_failure(exc: Exception) -> tuple[Literal["forbidden", "error"], str]:
-    """Why a read of a source's Heat or Octavia failed (SDD §10): `forbidden` when the service
-    refused the credential (403), else `error` - its detail the HTTP status, or the failure's kind
-    when nothing answered; never a message's text, which may name a stack or a load balancer."""
-    status = exc.status if isinstance(exc, _ServiceAnswer) else getattr(exc, "status_code", None)
+    """Why a read of a source's Heat or Octavia failed, or a sign-in to Keystone (SDD §10, §27.7):
+    `forbidden` when the service refused the credential (403), else `error` - its detail the HTTP
+    status (openstacksdk's status_code, keystoneauth's http_status), or the failure's kind when
+    nothing answered; never a message's text, which may name a stack, a load balancer or a
+    credential."""
+    status = (
+        exc.status
+        if isinstance(exc, _ServiceAnswer)
+        else getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    )
     if isinstance(status, int) and not isinstance(status, bool):
         return ("forbidden" if status == 403 else "error"), f"HTTP {status}"
     return "error", type(exc).__name__
@@ -643,6 +719,10 @@ class OpenStackProvider:
     async def check(self) -> dict[str, Any]:
         return await self._run(self._check)
 
+    # the provider check's sign-in with a project credential (SDD §10, §27.7, plan task TC3)
+    async def check_project(self, project_id: str) -> dict[str, Any]:
+        return await self._run(self._check_project, project_id)
+
     async def list_vms(self) -> list[VMRef]:
         return await self._run(self._list_vms)
 
@@ -787,13 +867,17 @@ class OpenStackProvider:
             storage.sort(key=lambda b: b["pool"])
         # the role names of its token: what Neutron's port policy names (SDD §10, §6.6); left out
         # when the token cannot tell, so that half of NET_PORT_NOT_PERMITTED is not judged
-        roles = _try(
-            lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
+        access = _try(lambda: conn.session.auth.get_access(conn.session), None)
+        roles = (
+            _try(lambda: sorted(set(access.role_names or [])), None) if access is not None else None
         )
+        # the project its token is scoped to, left out when the token names none (SDD §10, §27.7)
+        project = _token_project(access)
         plain_http = _plain_http(self.provider.endpoint, conn)
         report = {
             "admin": admin,
             **({"roles": roles} if roles is not None else {}),
+            **({"project": project} if project is not None else {}),
             "compute_microversion": microversion,
             "block_storage_microversion": block_storage_microversion,
             "ovn": ovn,
@@ -873,6 +957,71 @@ class OpenStackProvider:
         if reason == "error" and not _answered(exc):
             self._placement_silent = (_monotonic() + PLACEMENT_SILENCE_S, detail)
         return reason, detail
+
+    def _check_project(self, project_id: str) -> dict[str, Any]:
+        """One sign-in with the provider's credential for the Keystone project ``project_id``, on
+        a connection of its own that is closed after it (SDD §10 "The check of project
+        credentials", §27.7): what its token says - its project, that project's domain, its user
+        and its role names -, and, only when the token's project is ``project_id``, the
+        application credential's restricted flag and expiry from its record. A failure names an
+        HTTP status or its kind, never a message Keystone wrote."""
+        conn = self._connect_fn(self.provider, self.settings, project_id=project_id)
+        try:
+            try:
+                access = conn.session.auth.get_access(conn.session)
+            except Exception as exc:
+                raise ProviderError(
+                    f"{self.provider.id}: the sign-in failed: {_read_failure(exc)[1]}"
+                ) from None
+            project = _token_project(access) or {}
+            read: dict[str, Any] = {
+                "project_id": project.get("id"),
+                "project_name": project.get("name"),
+                "domain": project.get("domain"),
+                "user_id": _token_value(access, "user_id"),
+                "roles": sorted(set(_token_value(access, "role_names") or [])),
+            }
+            if read["project_id"] != project_id:
+                return read  # another project's credential: never used further (SDD §27.7)
+            read.update(self._credential_record(conn, access))
+            return read
+        finally:
+            _close_quietly(conn)
+
+    def _credential_record(self, conn: Any, access: Any) -> dict[str, Any]:
+        """The application credential's restricted flag and expiry, read from its record by its
+        own user: a raw GET, not logged - keystoneauth would write its URL, which names the
+        credential (SDD §10, §27.7). A record that cannot be read, or whose expiry does not read as
+        a time, is a provider error: an expiry not read must never stand for none."""
+        user_id = _token_value(access, "user_id")
+        credential_id = _token_value(access, "application_credential_id")
+        if not user_id or not credential_id:
+            raise ProviderError(f"{self.provider.id}: its token names no application credential")
+        record_of = f"{self.provider.id}: the application credential's record"
+        path = "/users/{}/application_credentials/{}".format(
+            urllib.parse.quote(str(user_id), safe=""),
+            urllib.parse.quote(str(credential_id), safe=""),
+        )
+        try:
+            response = conn.identity.get(path, raise_exc=False, log=False)
+            status = int(response.status_code)
+            record = response.json().get("application_credential") if status == 200 else None
+        except Exception as exc:
+            raise ProviderError(f"{record_of} was not read: {_read_failure(exc)[1]}") from None
+        if status != 200:
+            raise ProviderError(f"{record_of} was not read: HTTP {status}")
+        if not isinstance(record, Mapping):
+            raise ProviderError(f"{record_of} was not read: Keystone answered none")
+        expires_at = record.get("expires_at")
+        try:
+            expiry = (
+                None
+                if expires_at is None
+                else utc_text(datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")))
+            )
+        except ValueError:
+            raise ProviderError(f"{record_of} holds an expiry that is no time") from None
+        return {"restricted": not _truthy(record.get("unrestricted")), "expires_at": expiry}
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
