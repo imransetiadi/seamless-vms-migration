@@ -7205,6 +7205,9 @@ and §13.3 since plan task NT8.
   last `seq`.
 * **New and disabled channels.** A new channel starts at its own `channel.created` event, so it never receives the
   history. A disabled channel's cursor follows the events, and nothing is queued for it.
+  A pass judges only the events written before it read the channel: an event written after - while an admin
+  enables the channel - waits for the next pass, which reads the channel enabled and sends it (§8.7, plan task NT7's
+  review: the race lost such an event).
 * **Timeouts.** An HTTP request has 15 s (Standard Webhooks recommends 15 to 30 s), and an SMTP session 30 s.
 * **A partly refused email.** When the relay accepts some recipients and refuses others, the message counts as sent.
   Its event gives the number refused, never their addresses.
