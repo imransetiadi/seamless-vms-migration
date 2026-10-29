@@ -1,7 +1,8 @@
 # Seamless Migrate control plane + dashboard (SDD 17).
 #
-# * One replica, strategy Recreate: the orchestrator is a singleton (SDD 17, open decision D2); a rolling
-#   update would briefly run two orchestrators against one database and one PVC.
+# * One replica, two on two nodes with the HA component (ha/, SDD 17, 25.7). Whichever runs, the replica that holds
+#   the lease in PostgreSQL runs the orchestrator, and the other relays the API to it (SDD 25.6). Strategy Recreate:
+#   a rollout ends the old pods before it starts new ones, so one version runs at a time (SDD 25.7).
 # * Security context follows SDD 17: non-root (UID assigned by the restricted SCC), readOnlyRootFilesystem,
 #   all capabilities dropped, seccomp RuntimeDefault, shareProcessNamespace (the pause process reaps what
 #   Ansible leaves); the service-account token only for the dashboard's Secret store (secret-store-rbac.yaml).
@@ -63,6 +64,8 @@ spec:
             # Trusted proxies for X-Forwarded-For (uvicorn FORWARDED_ALLOW_IPS): the router/ingress pod
             # addresses, so the auth lockout and the audit log see the real client address
             # (Security.md §12). Never "*" on a network where pods can reach the Service directly.
+            # The HA component sets it to the pod network, where the replicas are - a follower relays with the
+            # caller's address in X-Forwarded-For (SDD 25.9) -, and its value replaces this one: set it there.
             # - name: FORWARDED_ALLOW_IPS
             #   value: "10.128.0.0/14"
             # paths of the credential files mounted below (values, not secrets)
