@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import ValidationError
 
-from ..credentials import inventory_project
+from ..credentials import host_pin, inventory_project
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     BLANK_NAME,
@@ -629,7 +629,13 @@ async def set_project_credentials(
             lambda fresh: {
                 "project_credentials": {
                     **fresh.project_credentials,
-                    project_id: ProjectCredential(secret=name, updated_at=utcnow()),
+                    # a credential written again reaches the same project's host, whose pin
+                    # belongs to its server: kept; a deleted one's went with it (SDD §12, §26.4)
+                    project_id: ProjectCredential(
+                        secret=name,
+                        updated_at=utcnow(),
+                        conversion_host_pin=host_pin(fresh, project_id),
+                    ),
                 },
                 "capabilities": _without_project_check(fresh.capabilities, project_id),
             },

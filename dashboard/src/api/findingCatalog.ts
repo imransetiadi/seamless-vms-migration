@@ -39,6 +39,10 @@ export const NETWORK_CODES: ReadonlySet<string> = new Set([
 /** The findings of changed-extent tracking (SDD §28.9): each carries the Technology Preview badge (SDD §16, plan task CE10). */
 export const EXTENT_CODES: ReadonlySet<string> = new Set(['CEPH_ACCESS_MISSING', 'EXTENT_TRACKING_PARTIAL', 'EXTENT_TRACKING_MISSED']);
 
+/** The credential findings (SDD §9.3, §27.7): each is about one project credential the plan uses, which its message names with
+ * its provider - so a plan's findings list groups them by message, one entry per project (SDD §16, plan task TC6). */
+export const CREDENTIAL_CODES: ReadonlySet<string> = new Set(['PROJECT_CREDENTIAL_EXPIRING', 'PROJECT_CREDENTIAL_UNRESTRICTED', 'PROJECT_CREDENTIAL_ROLE_MISSING']);
+
 export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['severity']; strategies: Strategy[]; remediation: string }>> = {
   SRC_VM_ERROR_STATE: {
     severity: 'blocker',
@@ -136,6 +140,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: "Nothing to do: pre-staging imports the keypair (name and public key) for the destination's migration user.",
   },
+  DST_KEYPAIR_KEY_MISMATCH: {
+    severity: 'blocker',
+    strategies: [],
+    remediation: "Give the destination's migration user the source's key under that name: delete its keypair of that name and pre-stage keypairs, or create it again with the source's public key. A user of its own for each project credential keeps two tenants' keypairs of one name apart (Operations.md).",
+  },
   MAP_FLAVOR_MISSING: {
     severity: 'blocker',
     strategies: [],
@@ -159,7 +168,22 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
   DST_PROJECT_MISSING: {
     severity: 'blocker',
     strategies: [],
-    remediation: "Map the VM's project to an existing destination project (plan.mappings.projects).",
+    remediation: "Map the VM's project to a project the destination lists (plan.mappings.projects): for a plan with a destination project, to the project its destination_project names, where its VMs land - or name in destination_project the project the VMs go to.",
+  },
+  PROJECT_CREDENTIAL_EXPIRING: {
+    severity: 'warning',
+    strategies: [],
+    remediation: "Have an admin write a new application credential for the project before this one expires - one that outlives the plan's cutover window, or never expires - (PUT /providers/{id}/projects/{project_id}/credentials), then check the provider: a step that runs after the expiry fails, a rollback included.",
+  },
+  PROJECT_CREDENTIAL_UNRESTRICTED: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Have an admin write a restricted application credential for the project in its place - Keystone creates one restricted unless asked otherwise - and delete the unrestricted one in Keystone: a restricted credential creates no application credential and no trust, so a stolen run directory gives no lasting access.',
+  },
+  PROJECT_CREDENTIAL_ROLE_MISSING: {
+    severity: 'blocker',
+    strategies: [],
+    remediation: "Give the credential's user the role on the project in Keystone - member for the plan's steps, load-balancer_member for a plan that maps Octavia pools -, create a new application credential, which holds the roles its user has when it is created, and write it for the project; then check the provider and validate the plan again.",
   },
   NET_MTU_SHRINK: {
     severity: 'warning',
