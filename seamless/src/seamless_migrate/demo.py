@@ -1,10 +1,12 @@
-"""Demo seeding (``seamless serve --demo``): providers and two running plans.
+"""Demo seeding (``seamless serve --demo``): providers, two running plans and the notification
+channels.
 
-Idempotent: providers and plans that already exist (by id / name) are left untouched. Plans are
-auto-waved, validated and started so the dashboard shows every phase within minutes: the finance
-plan cuts over automatically (simulated failures exercise rollback), the VMware plan waits for
-approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrates (SDD §10,
-§22.10). VMs blocked by pre-flight are cancelled with an explanatory reason.
+Idempotent: providers, plans and channels that already exist (by id / name) are left untouched.
+Plans are auto-waved, validated and started so the dashboard shows every phase within minutes: the
+finance plan cuts over automatically (simulated failures exercise rollback), the VMware plan waits
+for approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrates (SDD §10,
+§22.10). VMs blocked by pre-flight are cancelled with an explanatory reason. One channel of each
+kind is subscribed to both plans, and records every message instead of sending it (§7.4, §24.9).
 """
 
 from __future__ import annotations
@@ -25,12 +27,16 @@ from .domain.models import (
     Migration,
     NetworkCutover,
     NicOverride,
+    NotificationChannel,
+    NotificationSubscription,
     Plan,
     PolicyScope,
     Provider,
     VerificationConfig,
 )
+from .events import put_and_emit
 from .executors.simulated import server_flavor
+from .notify.catalog import channel_event, subscription_event
 from .orchestrator import Orchestrator
 from .planning.probes import is_database, suggest_probes
 from .providers.base import ProviderError
@@ -72,6 +78,44 @@ DEMO_APPROVAL_COMMENTS = (
     "Change CHG-2041 approved by the DC2 service owner; backups checked this morning.",
     "Agreed with the application team for tonight's window; rollback steps reviewed.",
 )
+#: the demo server's relay and sender while SEAMLESS_SMTP_HOST and SEAMLESS_SMTP_FROM are unset
+#: (SDD §7.4, §15.1): a relay of the demo's fakes, as its clouds are, which nothing reaches
+DEMO_SMTP_HOST = "relay.example.com"
+DEMO_SMTP_FROM = "seamless@example.com"
+#: one channel of each kind, each subscribed to the seeded plans (SDD §10, §24.9): in demo mode
+#: every sender records instead of sending (§7.4), so the Slack channel needs no URL - a Slack
+#: channel's URL lives only in its secret (§24.3), and the demo holds none
+DEMO_CHANNELS = (
+    NotificationChannel(
+        name="app-owners",
+        kind="email",
+        description="Finance and DC2 application owners (the demo records, sends none)",
+        recipients=["finance-app-owners@example.com", "dc2-service-owners@example.org"],
+    ),
+    NotificationChannel(
+        name="migration-team",
+        kind="slack",
+        description="The migration team's Slack channel (the demo records, sends none)",
+    ),
+    NotificationChannel(
+        name="change-hub",
+        kind="webhook",
+        description="The change-management hub's receiver (the demo records, sends none)",
+        url="https://change-hub.example.com/hooks/seamless",
+    ),
+)
+
+
+def demo_server_settings(settings: Settings) -> Settings:
+    """The demo server's settings (SDD §7.4, §15.1): the demo's relay and sender where the
+    environment names none, so an email channel registers and is edited as with a real relay -
+    and its messages are recorded, never sent."""
+    missing = {
+        name: value
+        for name, value in (("smtp_host", DEMO_SMTP_HOST), ("smtp_from", DEMO_SMTP_FROM))
+        if not getattr(settings, name)
+    }
+    return settings.model_copy(update=missing) if missing else settings
 
 
 def _demo_host_key(host: str) -> str:
@@ -282,8 +326,46 @@ async def seed_demo(
         if plan.name == VMWARE_PLAN:
             await _seed_cutover_approvals(orchestrator, plan.id)
         log.info("demo plan %r seeded and started", plan.name)
+    await _seed_notifications(orchestrator)
     await _restore_source_power(orchestrator)
     await _restore_destination_servers(orchestrator)
+
+
+async def _seed_notifications(orchestrator: Orchestrator) -> None:
+    """One channel of each kind, each subscribed to the seeded plans with the default topics (SDD
+    §10, §24.9), added as an admin adds one - each write with its event, so each channel starts at
+    its own creation, after the seed's other events (§24.6). A channel the store holds is left as
+    it is, its subscriptions with it: a restart adds nothing, and keeps what an admin changed."""
+    store, bus = orchestrator.store, orchestrator.bus
+    held = {c.name for c in await orchestrator.db.list("notification_channel", NotificationChannel)}
+    plans = {p.name: p.id for p in await orchestrator.db.list("plan", Plan)}
+    plan_ids = [plans[name] for name in DEMO_PLAN_NAMES if name in plans]
+    for channel in DEMO_CHANNELS:
+        if channel.name in held:
+            continue
+        now = orchestrator.now()
+        channel = channel.model_copy(update={"created_at": now, "updated_at": now})
+        await put_and_emit(
+            store,
+            bus,
+            "notification_channel",
+            channel,
+            0,
+            channel_event("channel.created", channel, DEMO_ACTOR),
+        )
+        for plan_id in plan_ids:
+            sub = NotificationSubscription(
+                channel=channel.name, plan_id=plan_id, created_by=DEMO_ACTOR, created_at=now
+            )
+            await put_and_emit(
+                store,
+                bus,
+                "notification_subscription",
+                sub,
+                0,
+                subscription_event("subscription.created", sub, DEMO_ACTOR),
+            )
+        log.info("demo notification channel %r seeded", channel.name)
 
 
 #: a migration in these stopped its source: the simulated cutover did, before a restart

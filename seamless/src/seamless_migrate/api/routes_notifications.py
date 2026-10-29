@@ -18,6 +18,7 @@ from ..domain.models import (
     DEFAULT_NOTIFY_TOPICS,
     HOOK_NAME,
     REQUEST_BODY,
+    Event,
     NotificationChannel,
     NotificationChannelView,
     NotificationCursor,
@@ -27,6 +28,7 @@ from ..domain.models import (
     channel_view,
 )
 from ..events import emit
+from ..notify.catalog import channel_event, subscription_event
 from ..notify.email import relay_configured
 from ..security.auth import Principal
 from ..security.secret_store import SecretStoreError, secret_store
@@ -89,21 +91,25 @@ async def _view(request: Request, channel: NotificationChannel, principal: Princ
     return channel_view(channel, cursor, principal.role.at_least(Role.admin))
 
 
+async def _emit(request: Request, event: Event) -> None:
+    svc = services(request)
+    await emit(
+        svc.store,
+        svc.bus,
+        event.kind,
+        event.message,
+        plan_id=event.plan_id,
+        actor=event.actor,
+        data=event.data,
+    )
+
+
 async def _emit_channel(
     request: Request, kind: str, channel: NotificationChannel, actor: str, **data: Any
 ) -> None:
     """A channel.* event (SDD §4.3, §24.7): the channel's name and kind - never a URL, a recipient
     or a secret's value."""
-    svc = services(request)
-    verb = kind.split(".", 1)[1]
-    await emit(
-        svc.store,
-        svc.bus,
-        kind,
-        f"notification channel {channel.name} {verb}",
-        actor=actor,
-        data={"name": channel.name, "kind": channel.kind, **data},
-    )
+    await _emit(request, channel_event(kind, channel, actor, **data))
 
 
 async def _emit_subscription(
@@ -111,23 +117,7 @@ async def _emit_subscription(
 ) -> None:
     """A subscription.* event (SDD §4.3, §24.7): the subscription, its channel, its plan and its
     topics."""
-    svc = services(request)
-    verb = kind.split(".", 1)[1]
-    where = "every plan" if sub.plan_id is None else f"plan {sub.plan_id}"
-    await emit(
-        svc.store,
-        svc.bus,
-        kind,
-        f"subscription {sub.id} of channel {sub.channel} to {where} {verb}",
-        plan_id=sub.plan_id,
-        actor=actor,
-        data={
-            "id": sub.id,
-            "channel": sub.channel,
-            "plan_id": sub.plan_id,
-            "topics": [str(topic) for topic in sub.topics],
-        },
-    )
+    await _emit(request, subscription_event(kind, sub, actor))
 
 
 async def _subscriptions_of(request: Request, channel: str) -> list[NotificationSubscription]:

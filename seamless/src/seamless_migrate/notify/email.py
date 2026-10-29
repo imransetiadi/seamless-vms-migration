@@ -10,6 +10,7 @@ import smtplib
 import ssl
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from email.message import EmailMessage
 
 from ..config import Settings
 from ..domain.models import NotificationChannel
@@ -26,6 +27,19 @@ SMTP_TIMEOUT_S = 30.0
 def relay_configured(settings: Settings) -> bool:
     """Whether the installation has a relay: SEAMLESS_SMTP_HOST and SEAMLESS_SMTP_FROM (§24.3)."""
     return bool(settings.smtp_host and settings.smtp_from)
+
+
+def render_email(
+    settings: Settings, channel: NotificationChannel, message: Message, key: str
+) -> EmailMessage:
+    """The email the sender submits (SDD §24.5): From SEAMLESS_SMTP_FROM, To the channel's
+    recipients, the key in the Message-ID at the sender's domain - what the demo's recording
+    sender renders too (§7.4)."""
+    sender = settings.smtp_from or ""
+    domain = sender.rpartition("@")[2] or "seamless"
+    return email_message(
+        message, sender=sender, recipients=channel.recipients, key=key, domain=domain
+    )
 
 
 class EmailSender:
@@ -73,11 +87,7 @@ class EmailSender:
                 credentials = None
             if not credentials or not credentials.get("username"):
                 return SendResult("failed", "no_secret")
-        sender = settings.smtp_from or ""
-        domain = sender.rpartition("@")[2] or "seamless"
-        mail = email_message(
-            message, sender=sender, recipients=channel.recipients, key=key, domain=domain
-        )
+        mail = render_email(settings, channel, message, key)
         host, port = settings.smtp_host or "", settings.smtp_port
         try:
             if settings.smtp_security == "tls":

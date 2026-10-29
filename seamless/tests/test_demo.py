@@ -1,12 +1,32 @@
 import asyncio
+import json
+import smtplib
+import socket
+from collections import defaultdict
+from email import message_from_bytes, policy
+from urllib.parse import urlsplit
 
+import httpx
 import pytest
 
+import seamless_migrate.notify.email as email_module
+import seamless_migrate.notify.notifier as notifier_module
 from seamless_migrate.api.app import build_services
 from seamless_migrate.config import Settings
-from seamless_migrate.demo import DEMO_PLAN_NAMES, seed_demo
+from seamless_migrate.demo import DEMO_PLAN_NAMES, FINANCE_PLAN, seed_demo
 from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole
-from seamless_migrate.domain.models import AdvisorPolicy, Mappings, Migration, Plan, Provider
+from seamless_migrate.domain.models import (
+    AdvisorPolicy,
+    Mappings,
+    Migration,
+    NotificationChannel,
+    NotificationCursor,
+    NotificationSubscription,
+    Plan,
+    Provider,
+)
+from seamless_migrate.events import emit
+from seamless_migrate.notify.notifier import Notifier, Timing, senders_for
 from seamless_migrate.orchestrator import NotAllowed
 from seamless_migrate.providers.fake import FakeSourceProvider
 
@@ -995,3 +1015,327 @@ def test_the_demo_destinations_declare_their_conversion_hosts_keys():
         if p.role == ProviderRole.destination
     ]
     assert len(set(declared)) == len(declared)  # each host its own key
+
+
+# -- the demo's notifications (SDD §7.4, §10, §24.9, plan task NT10) ---------------------------
+
+#: the seeded channels and their kinds (SDD §10)
+DEMO_CHANNEL_KINDS = {"app-owners": "email", "migration-team": "slack", "change-hub": "webhook"}
+#: the notifier's clocks shortened, as tests/test_notify.py's are (SDD §24.6)
+FAST_NOTIFIER = Timing(
+    tick_s=0.02,
+    backoff_s=(0.03, 0.05, 0.08, 0.1),
+    jitter=0.0,
+    retry_after_max_s=0.2,
+    pace_s=0.01,
+    expiry_s=3600.0,
+    cursor_write_s=0.05,
+    restart_s=0.05,
+)
+
+
+@pytest.fixture
+def nothing_leaves(monkeypatch) -> list[str]:
+    """Every way a notification could leave the process, refused and recorded (SDD §24.9): a
+    socket's connection, httpx's network transports, an SMTP session, and the notifier's read of
+    a channel's secret."""
+    tried: list[str] = []
+
+    def refused(what: str):
+        def refuse(*args, **kwargs):
+            tried.append(what)
+            raise ConnectionRefusedError(f"{what}: nothing leaves the demo's process")
+
+        return refuse
+
+    for owner, name in (
+        (socket.socket, "connect"),
+        (socket.socket, "connect_ex"),
+        (socket, "create_connection"),
+        (httpx.HTTPTransport, "handle_request"),
+        (httpx.AsyncHTTPTransport, "handle_async_request"),
+        (smtplib.SMTP, "connect"),
+    ):
+        monkeypatch.setattr(owner, name, refused(f"{owner.__name__}.{name}"))
+    # the notifier reads a channel's secret, and the email sender the relay's, as §13.3 resolves a
+    # secret (read_secret, since NT12): in demo mode neither may read one
+    monkeypatch.setattr(notifier_module, "read_secret", refused("a channel secret's read"))
+    monkeypatch.setattr(email_module, "read_secret", refused("the relay secret's read"))
+    return tried
+
+
+def _seeded_channels(store) -> dict[str, NotificationChannel]:
+    return {c.name: c for c in store.list("notification_channel", NotificationChannel)}
+
+
+def _sent(store, **data) -> list:
+    """The notification.sent events whose data holds ``data``."""
+    return [
+        e
+        for e in store.events(since_seq=0, limit=100000, kinds=["notification.sent"])
+        if all(e.data.get(key) == value for key, value in data.items())
+    ]
+
+
+async def _until(found, timeout=60.0):
+    """``found()`` once it holds something, else what it holds at the timeout."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if result := found():
+            return result
+        await asyncio.sleep(0.02)
+    return found()
+
+
+async def test_the_demo_records_notifications_and_sends_none(
+    tmp_path, store, nothing_leaves, monkeypatch
+):
+    """SDD §7.4, §10, §24.9 (plan task NT10, §24.11 decision 11): in demo mode every sender
+    records instead of sending. The seed holds one channel of each kind - lists under example.com
+    and example.org, an https example.com receiver, no Slack URL anywhere -, each created with its
+    event and subscribed to both seeded plans with the default topics. A message to each - a
+    cutover's downtime, and the channel's test - is rendered in its kind's format as the real
+    sender renders it and recorded as notification.sent, and nothing leaves the process: no
+    connection, no SMTP session, no secret read, whatever a channel names."""
+    import inspect
+
+    import seamless_migrate.demo as demo
+
+    # the guard holds: a request or an SMTP session would be refused, and recorded
+    with pytest.raises(ConnectionRefusedError):
+        async with httpx.AsyncClient() as client:
+            await client.post("https://change-hub.example.com/hooks/seamless")
+    with pytest.raises(ConnectionRefusedError):
+        smtplib.SMTP("relay.example.com", 587)
+    assert len(nothing_leaves) == 2
+    nothing_leaves.clear()
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    senders = senders_for(settings)
+    assert {kind: type(sender).__name__ for kind, sender in senders.items()} == dict.fromkeys(
+        ("email", "slack", "webhook"), "RecordingSender"
+    )
+    # outside demo mode the server runs the real senders (SDD §8.7)
+    real = senders_for(Settings(data_dir=tmp_path / "real"))
+    assert [type(sender).__name__ for sender in real.values()] == [
+        "EmailSender",
+        "SlackSender",
+        "WebhookSender",
+    ]
+    rendered: dict[str, tuple[str, bytes]] = {}
+    for sender in senders.values():
+
+        def spy(channel, message, key, render=sender.render):
+            body = render(channel, message, key)
+            rendered[key] = (channel.kind, body)
+            return body
+
+        monkeypatch.setattr(sender, "render", spy)
+
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    channels = _seeded_channels(store)
+    assert {name: c.kind for name, c in channels.items()} == DEMO_CHANNEL_KINDS
+    email, slack, webhook = (channels[name] for name in DEMO_CHANNEL_KINDS)
+    assert email.recipients
+    assert all(r.endswith(("@example.com", "@example.org")) for r in email.recipients)
+    assert urlsplit(webhook.url).scheme == "https"
+    assert urlsplit(webhook.url).hostname.endswith(".example.com")
+    assert slack.url is None
+    assert "hooks.slack.com" not in inspect.getsource(demo)
+    plans = {p.id for p in store.list("plan", Plan)}
+    subs = store.list("notification_subscription", NotificationSubscription)
+    assert sorted((s.channel, s.plan_id) for s in subs) == sorted(
+        (name, plan_id) for name in channels for plan_id in plans
+    )
+    assert all(s.topics == ["approval", "downtime", "problem"] for s in subs)
+    catalog = [
+        e
+        for e in store.events(since_seq=0, limit=100000)
+        if e.kind in ("channel.created", "subscription.created")
+    ]
+    created = sorted(e.data["name"] for e in catalog if e.kind == "channel.created")
+    assert created == sorted(channels)
+    subscribed = sorted(e.data["id"] for e in catalog if e.kind == "subscription.created")
+    assert subscribed == sorted(s.id for s in subs)
+    assert {e.actor for e in catalog} == {"demo"}
+
+    finance = next(p for p in store.list("plan", Plan) if p.name == FINANCE_PLAN)
+    m = next(x for x in store.list("migration", Migration) if x.plan_id == finance.id)
+    notifier = Notifier(store, services.bus, settings, senders, timing=FAST_NOTIFIER)
+    await notifier.start()
+    try:
+        down = await emit(
+            store,
+            services.bus,
+            "migration.downtime_started",
+            "the source VM stopped",
+            plan_id=finance.id,
+            migration_id=m.id,
+        )
+        await _until(lambda: len(_sent(store, event_seq=down.seq)) >= len(channels))
+        tested = [await notifier.send_test(channel) for channel in channels.values()]
+    finally:
+        await notifier.stop()
+    assert tested == [{"outcome": "sent", "reason": None}] * len(channels)
+    sent = _sent(store, event_seq=down.seq)
+    title = f"{m.vm.name} is down for its cutover"
+    assert sorted(
+        (e.data["channel"], e.data["kind"], e.data["trigger"], e.data["tries"], e.data["reason"])
+        for e in sent
+    ) == sorted(
+        (name, kind, "downtime.started", 1, None) for name, kind in DEMO_CHANNEL_KINDS.items()
+    )
+    assert sorted(e.message for e in sent) == sorted(f"{title} -> {name}" for name in channels)
+    assert all(e.plan_id == finance.id and e.migration_id == m.id for e in sent)
+    assert sorted(e.data["channel"] for e in _sent(store, trigger="test")) == sorted(channels)
+    assert store.events(since_seq=0, limit=100000, kinds=["notification.failed"]) == []
+
+    # each message rendered in its kind's format, as the real sender renders it (SDD §24.5)
+    assert sorted(key.split("_test_")[0] for key in rendered if "_test_" in key) == sorted(channels)
+    kind, raw = rendered[f"app-owners_{down.seq}"]
+    mail = message_from_bytes(raw, policy=policy.default)
+    assert kind == "email" and mail["Subject"] == f"[Seamless] {title}"
+    assert [a.addr_spec for a in mail["To"].addresses] == email.recipients
+    assert mail["Message-ID"] == f"<app-owners_{down.seq}@seamless>"
+    assert mail["Auto-Submitted"] == "auto-generated"
+    assert "The source VM stopped at" in mail.get_content()
+    kind, raw = rendered[f"migration-team_{down.seq}"]
+    payload = json.loads(raw)
+    assert kind == "slack" and payload["text"] == title
+    assert [block["type"] for block in payload["blocks"]] == ["header", "section", "context"]
+    assert payload["unfurl_links"] is False and payload["unfurl_media"] is False
+    kind, raw = rendered[f"change-hub_{down.seq}"]
+    document = json.loads(raw)
+    assert kind == "webhook" and document["type"] == "downtime.started"
+    assert document["data"]["title"] == title and document["data"]["migration_id"] == m.id
+    assert document["data"]["event_seq"] == down.seq
+    assert nothing_leaves == []
+
+
+async def test_the_demos_cutovers_notify_their_downtime(tmp_path, store, nothing_leaves):
+    """SDD §7.4, §10, §24.9 (plan task NT10): the seeded demo run with its notifier beside its
+    orchestrator, a demo cutover notifies its downtime on each seeded channel: the source's stop
+    and the VM up on the destination are recorded as notification.sent, listed on the Events page
+    in seq order with every other event, and each channel's state on the Notifications page reads
+    sent; nothing leaves the process."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    channels = _seeded_channels(store)
+    assert {name: c.kind for name, c in channels.items()} == DEMO_CHANNEL_KINDS
+    downtime = {"downtime.started", "downtime.ended"}
+
+    def notified() -> list[Migration]:
+        """The completed migrations whose downtime every channel recorded as sent."""
+        seen: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for e in _sent(store):
+            if e.migration_id is not None:
+                seen[e.migration_id][e.data["channel"]].add(e.data["trigger"])
+        return [
+            m
+            for m in store.list("migration", Migration)
+            if m.phase == Phase.completed and all(downtime <= seen[m.id][c] for c in channels)
+        ]
+
+    orch = services.orchestrator
+    notifier = Notifier(store, services.bus, settings, senders_for(settings), timing=FAST_NOTIFIER)
+    await orch.start()
+    await notifier.start()
+    try:
+        done = await _until(notified)
+    finally:
+        await notifier.stop()
+        await orch.stop()
+    assert done, "no demo cutover notified its downtime on every channel"
+    m = done[0]
+    of_m = {e.seq: e for e in store.events(since_seq=0, migration_id=m.id, limit=100000)}
+    for name, kind in DEMO_CHANNEL_KINDS.items():
+        mine = {e.data["trigger"]: e for e in _sent(store, channel=name) if e.migration_id == m.id}
+        started, ended = mine["downtime.started"], mine["downtime.ended"]
+        assert started.data["kind"] == ended.data["kind"] == kind
+        assert started.message == f"{m.vm.name} is down for its cutover -> {name}"
+        assert ended.message.startswith(f"{m.vm.name} is up on the destination after ")
+        assert ended.message.endswith(f" -> {name}")
+        assert of_m[started.data["event_seq"]].kind == "migration.downtime_started"
+        assert of_m[ended.data["event_seq"]].kind == "migration.downtime_ended"
+        assert of_m[ended.data["event_seq"]].data["cause"] == "verified"
+        # the channel's state, as the Notifications page shows it (SDD §16, §24.3)
+        cursor = store.get("notification_cursor", name, NotificationCursor)
+        assert (cursor.last_outcome, cursor.failures_in_a_row, cursor.last_reason) == (
+            "sent",
+            0,
+            None,
+        )
+    assert store.events(since_seq=0, limit=100000, kinds=["notification.failed"]) == []
+    # the Events page lists events by time: their time order is their seq order (SDD §4.2)
+    events = store.events(since_seq=0, limit=100000)
+    inverted = [
+        (a.seq, a.kind, b.seq, b.kind)
+        for a, b in zip(events, events[1:], strict=False)
+        if b.ts < a.ts
+    ]
+    assert inverted == []
+    assert nothing_leaves == []
+
+
+def test_the_demo_server_edits_and_adds_email_channels_with_a_relay_of_fakes(
+    tmp_path, nothing_leaves
+):
+    """SDD §7.4, §15.1 (plan task NT10): the demo server - the app `seamless serve --demo` runs -
+    takes a relay of the demo's fakes while SEAMLESS_SMTP_HOST and SEAMLESS_SMTP_FROM are unset,
+    so from the Notifications page an admin disables and enables the seeded email channel and
+    adds one as with a real relay, and each channel's test answers sent; nothing reaches the
+    relay. A relay or a sender the environment names is kept, and outside demo mode the relay
+    stays unset."""
+    from fastapi.testclient import TestClient
+
+    from seamless_migrate.cli import build_app
+    from seamless_migrate.demo import demo_server_settings
+
+    named = Settings(data_dir=tmp_path / "named", demo=True, smtp_host="mail.example.org")
+    kept = demo_server_settings(named)
+    assert (kept.smtp_host, kept.smtp_from) == ("mail.example.org", "seamless@example.com")
+    plain = build_app(Settings(data_dir=tmp_path / "plain"))
+    assert plain.state.services.settings.smtp_host is None
+    plain.state.services.store.dispose()
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        secrets_dir=tmp_path / "secrets",
+        demo=True,
+        demo_speed=1.0,
+        demo_failure_rate=0.0,
+        auth_disabled=True,
+    )
+    assert (settings.smtp_host, settings.smtp_from) == (None, None)
+    app = build_app(settings)
+    served = app.state.services
+    assert (served.settings.smtp_host, served.settings.smtp_from) == (
+        "relay.example.com",
+        "seamless@example.com",
+    )
+    channels = "/api/v1/notifications/channels"
+    try:
+        # authentication off on loopback, as `seamless serve --demo` binds it (SDD §13.1)
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            listed = client.get(channels).json()
+            assert {c["name"]: c["kind"] for c in listed} == DEMO_CHANNEL_KINDS
+            for enabled in (False, True):
+                answer = client.patch(f"{channels}/app-owners", json={"enabled": enabled})
+                assert answer.status_code == 200, answer.text
+                assert answer.json()["enabled"] is enabled
+            added = client.post(
+                channels,
+                json={"name": "night-shift", "kind": "email", "recipients": ["oncall@example.org"]},
+            )
+            assert added.status_code == 201, added.text
+            for name in (*DEMO_CHANNEL_KINDS, "night-shift"):
+                tested = client.post(f"{channels}/{name}/test")
+                assert tested.json() == {"outcome": "sent", "reason": None}, (name, tested.text)
+    finally:
+        served.store.dispose()
+    assert nothing_leaves == []
