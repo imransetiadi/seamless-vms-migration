@@ -57,7 +57,7 @@ Principles:
    recorded against `jev-1.13.0`), no unit test touches the network.
 3. **Real engines for stateful dependencies.** The store runs against SQLite always and against PostgreSQL 16
    whenever `SEAMLESS_TEST_PG_URL` is set — no mocking of SQL.
-4. **Live tests are opt-in and bounded** (`SEAMLESS_LIVE_JEV=1`, `SEAMLESS_LIVE_MEMORY=1`, marker `live`).
+4. **Live tests are opt-in and bounded** (`SEAMLESS_LIVE_JEV=1`, `SEAMLESS_LIVE_MEMORY=1`, `SEAMLESS_LIVE_SLACK=1`, `SEAMLESS_LIVE_SMTP=1`, `SEAMLESS_LIVE_WEBHOOK=1`, marker `live`).
 5. **Synthetic data only.** VM names `qa-<profile>-<n>`, throw-away credentials, no customer data, no secrets
    in fixtures (`gitleaks` runs on every push).
 6. **Assert invariants, not just outputs:** one source stop per attempt, one destination server, monotonic
@@ -112,7 +112,7 @@ checks alone.
 | **S-CP-B3** planning | `test_estimator.py`, `test_selector.py`, `test_preflight.py`, `test_waves.py` | `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`, `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`, `test_ineligible_strategies_marked`, `test_multiattach_blocks_warm`, `test_handover_requires_backend_map_and_admin`, `test_vmware_warm_requires_cbt`, `test_override_ignored_when_ineligible`, `test_min_downtime_tie_prefers_simpler`, one `test_finding_<code_lower>` per SDD §9.3 code, `test_quota_aggregates_across_plan`, `test_duplicate_names_blocked`, `test_pilot_wave_first`, `test_app_tag_kept_together`, `test_manual_review_last_wave` |
 | **S-CP-B4** providers | `test_providers.py` | `test_fake_openstack_inventory_has_required_traits`, `test_fake_vmware_mixed_cbt`, `test_registry_returns_fake_in_demo`, `test_openstack_provider_maps_server_to_vmref`, `test_openstack_check_reports_admin_and_ovn`, `test_the_check_reports_a_real_clouds_compute_maximum_as_major_minor` (through Seamless's own connect() over an in-process keystoneauth session, `seamless/tests/cloud_support.py`: keystoneauth's tuple reported as "2.96", review RV18-01), `test_vmware_provider_maps_vm`, `test_missing_optional_dependency_raises_provider_error`, `test_openstack_find_server_finds_a_name_nova_reads_as_a_regular_expression` (a name filter Nova reads as a regular expression, on MySQL and PostgreSQL, SDD §10, review PV-01), `test_a_vcenter_that_accepts_and_never_answers_frees_the_worker_thread` (pyVmomi's real SmartConnect against a socket that never answers, SDD §10, review PV-02) |
 | **S-CP-B5** AI | `test_jev.py`, `test_advisor.py`, `test_memory.py`, `test_knowledge.py`, `test_redaction.py` | `test_decide_parses_fixture`, `test_circuit_breaker_opens_after_three_failures`, `test_stdio_env_whitelist`, `test_recommend_applies_only_within_tie_set_and_threshold`, `test_recommend_ignores_escape_hatch_and_escalate`, `test_recommend_never_returns_ineligible`, `test_classify_review_items_fall_back_to_heuristic`, `test_verification_blocked_console_sets_review_required`, `test_verification_contradiction_sets_review_never_flips_pass`, `test_the_review_says_boot_verified_once_and_names_other_verdicts_once`, `test_a_reason_from_the_rules_makes_the_review_required`, `test_redact_removes_secrets`, `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot`, `test_every_jev_call_leaves_redacted`, `test_every_agentmemory_request_leaves_redacted`, `test_only_the_two_clients_talk_to_the_ai_services`, `test_memory_remember_payload_and_auth_header`, `test_memory_search_tolerant_parsing`, `test_memory_failures_swallowed`, `test_knowledge_on_failure_attaches_hits` |
-| **S-CP-LIVE** | `test_live_integrations.py` | `test_live_jev_decide` (`SEAMLESS_LIVE_JEV=1`, `TYPESAFE_API_KEY`), `test_live_memory_roundtrip` (`SEAMLESS_LIVE_MEMORY=1`, `SEAMLESS_MEMORY_URL`) |
+| **S-CP-LIVE** | `test_live_integrations.py`, `test_notify_live.py` | `test_live_jev_decide` (`SEAMLESS_LIVE_JEV=1`, `TYPESAFE_API_KEY`), `test_live_memory_roundtrip` (`SEAMLESS_LIVE_MEMORY=1`, `SEAMLESS_MEMORY_URL`); the notification senders' live smoke (SDD §24.10, plan task NT12; records in §13.1d): `test_live_slack_accepts_a_message` (`SEAMLESS_LIVE_SLACK=1`, the webhook URL as `SEAMLESS_SECRET_NOTIFY_LIVE_SLACK_URL`), `test_live_smtp_delivers_over_starttls` and `test_live_smtp_delivers_over_implicit_tls` (`SEAMLESS_LIVE_SMTP=1`, the `SEAMLESS_SMTP_*` relay variables, a test mailbox in `SEAMLESS_LIVE_SMTP_TO`, optional `SEAMLESS_LIVE_SMTP_STARTTLS_PORT`, `SEAMLESS_LIVE_SMTP_TLS_PORT`, `SEAMLESS_LIVE_SMTP_TLS_HOST`), `test_live_webhook_receiver_verifies_the_signature` (`SEAMLESS_LIVE_WEBHOOK=1`, `SEAMLESS_LIVE_WEBHOOK_URL`, the signing key as `SEAMLESS_SECRET_NOTIFY_LIVE_WEBHOOK_SIGNING_KEY`) |
 | **S-CP-B6** executors | `test_executor_simulated.py`, `test_executor_ansible.py`, `test_executor_handover.py`, `test_secrets.py` | `test_simulated_warm_pass_deltas_shrink`, `test_simulated_cutover_marks_downtime`, `test_simulated_failure_rate_seeded`, `test_workload_filter_escapes_regex`, `test_apply_mappings_rewrites_refs`, `test_secrets_file_0600_and_deleted_after_run`, `test_warm_precopy_runs_export_once_then_precopy`, `test_cutover_cold_sets_stop_before_migration`, `test_vmware_warm_flags`, `test_progress_tail_reports_pct`, `test_transient_vs_permanent_failure`, `test_handover_journal_resume_skips_done_steps`, `test_handover_rollback_reverses_order`, `test_secret_resolution_file_then_env` |
 | **S-CP-B7** orchestrator | `test_orchestrator.py`, `test_verification.py` | `test_validate_creates_migrations_with_findings_and_estimates`, `test_a_plan_whose_finished_vm_left_the_source_validates_again`, `test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned_again`, `test_a_validation_reads_the_source_vm_of_a_migration_left_validating` (PL-09: a validation and the wave planner read from the source only the VMs a validation re-assesses, SDD §5.4), `test_start_rejects_blocked_plan`, `test_warm_flow_reaches_completed_with_downtime`, `test_cold_flow`, `test_requires_approval_waits`, `test_cutover_window_respected_and_force_window`, `test_keep_warm_pass_runs_after_interval`, `test_wave_dependencies_respected`, `test_max_concurrent_cutovers`, `test_failed_cutover_auto_rolls_back`, `test_rollback_request_during_step_is_serialized`, `test_retry_after_failure`, `test_finalize_requires_confirm_name`, `test_resume_mid_cutover_is_idempotent`, `test_advisor_tie_break_recorded`, `test_similar_incidents_attached_on_failure`, `test_verification_checks`, `test_verification_console_unavailable_skips_with_warning` |
 | **S-CP-B8** API | `test_api_*.py`, `test_auth.py` | `test_health_public_reports_db`, `test_health_says_whether_authentication_is_off`, `test_unauthenticated_401_and_audit_event`, `test_role_matrix`, `test_error_envelope_shape`, `test_provider_crud`, `test_plan_create_validate_start_flow`, `test_migration_actions_transitions`, `test_finalize_confirm_mismatch_400`, `test_events_since`, `test_sse_stream_resume_and_heartbeat`, `test_stats_shape`, `test_metrics_format`, `test_spa_fallback_serves_index`, `test_auth_disabled_only_on_loopback` |
@@ -1120,6 +1120,32 @@ module's docstring; `SEAMLESS_LAB_DESTRUCTIVE=1` for the cutovers). Record the v
 | LAB-CE07 | *to be filled* | EXTENT_TRACKING_PARTIAL, one disk read and one scanned: *to be filled* | *to be filled* |
 | PERF-E2E-SM1b | *to be filled* | the median per size (Performance.md §6.3): *to be filled* | *to be filled* |
 
+### 13.1d Live smoke records — 0.5.0 notifications (*to be filled before the release*)
+
+The senders' live smoke (SDD §24.10, plan task NT12) runs before 0.5.0 ships: `-m live seamless/tests/test_notify_live.py`
+with the switches and variables of the S-CP-LIVE row (the secrets only in the environment of the shell that runs it,
+§14.3). Each test sends one fixed message about no real VM. Record each run with its versions; a row that did not run
+says so and why.
+
+| Case | Test | Date | Versions (Seamless, Python, the service) | Result | Notes |
+|---|---|---|---|---|---|
+| Slack incoming webhook | `test_live_slack_accepts_a_message` | | | | the message seen in the Slack channel |
+| SMTP relay, STARTTLS (587) | `test_live_smtp_delivers_over_starttls` | | the relay's software | | the message in the test mailbox, its `Message-ID` and `Auto-Submitted` |
+| SMTP relay, implicit TLS (465) | `test_live_smtp_delivers_over_implicit_tls` | | the relay's software | | as above |
+| Standard Webhooks receiver | `test_live_webhook_receiver_verifies_the_signature` | | the receiver's Standard Webhooks library | | the receiver's log of the verified id |
+
+The open questions §24.10 asks the smoke to close, answered here with the evidence:
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Slack's answer to a burst above one message a second on one webhook (429 and its `Retry-After`) | | |
+| A relay's answer to 50 recipients in one message | | |
+| Whether the installation's relay still takes a password (Exchange Online's basic SMTP AUTH, `TODO(LAB): confirm`) | | |
+
+A local dry run of the SMTP tests against the in-process relay of `seamless/tests/smtp_support.py` (STARTTLS and implicit TLS on
+a certificate the run makes, its CA as `SEAMLESS_SMTP_CA_FILE`) passes and delivers one message over TLS to each relay
+(2026-10-29); it checks the tests' wiring, not a live result, and fills no row above.
+
 ### 13.2 Exit criteria — release 0.1.0
 
 1. All unit suites green: collection (baseline + A1/A2), control plane on **SQLite and PostgreSQL 16**, dashboard
@@ -1264,6 +1290,12 @@ docker --context colima-seamless rm -f seamless-pg-qa
 #   ( read -rs TYPESAFE_API_KEY && export TYPESAFE_API_KEY && <the pytest command below> )   # a subshell: nothing lingers
 SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1 SEAMLESS_MEMORY_URL=http://127.0.0.1:3111 \
   .venv/bin/pytest -q tests/test_live_integrations.py -rs
+
+# the notification senders' live smoke (§13.1d): secrets and mailbox in the environment, never on the command line, e.g.
+#   ( read -rs SEAMLESS_SECRET_NOTIFY_LIVE_SLACK_URL && export SEAMLESS_SECRET_NOTIFY_LIVE_SLACK_URL && \
+#     SEAMLESS_LIVE_SLACK=1 .venv/bin/pytest -q -m live tests/test_notify_live.py -rs )
+# with SEAMLESS_LIVE_SMTP=1 the SEAMLESS_SMTP_* variables and SEAMLESS_LIVE_SMTP_TO, with SEAMLESS_LIVE_WEBHOOK=1
+# SEAMLESS_LIVE_WEBHOOK_URL and SEAMLESS_SECRET_NOTIFY_LIVE_WEBHOOK_SIGNING_KEY (the S-CP-LIVE row)
 ```
 
 `make seamless-test` runs `cd seamless && .venv/bin/pytest -q`; it passes `SEAMLESS_TEST_PG_URL` through when exported.
