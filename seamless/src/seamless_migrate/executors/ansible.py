@@ -664,8 +664,16 @@ def run_dir(settings: Settings, plan_id: str, migration_id: str) -> Path:
 
 
 def _common_openstack_vars(
-    source: Provider, destination: Provider, osm: Path, plan_osm: Path, conversion_key: Path
+    source: Provider,
+    destination: Provider,
+    osm: Path,
+    plan_osm: Path,
+    conversion_key: Path,
+    projects: tuple[str | None, str | None] = (None, None),
 ) -> dict[str, Any]:
+    """The variables every OpenStack run gets, of its two providers' conversion hosts among them;
+    ``projects`` are the projects whose credentials the run holds, source and destination - None
+    for a provider's own (SDD §7.2, §27.5)."""
     out: dict[str, Any] = {
         "os_migrate_data_dir": str(osm),
         # the installation's, the one key the managed hosts accept - a run's, until it exists, the
@@ -686,7 +694,10 @@ def _common_openstack_vars(
         "os_migrate_conversion_link_per_run": True,
     }
     ssh_user = "cloud-user"
-    for side, provider in (("src", source), ("dst", destination)):
+    for side, provider, project in (
+        ("src", source, projects[0]),
+        ("dst", destination, projects[1]),
+    ):
         if provider.ca_cert_path:
             out[f"os_migrate_{side}_ca_cert"] = provider.ca_cert_path
         host = provider.conversion_host
@@ -706,7 +717,10 @@ def _common_openstack_vars(
             "flavor_name": host.flavor,
             "external_network_name": host.external_network,
             "image_name": host.image,
-            "floating_ip_address": host.address,
+            # the configured address is the provider's own host's floating IP: a project's host
+            # gets none, and the deploy's role takes a floating IP of that project for it (SDD
+            # §7.2; §26.10 decision 14, the owner's decision of 2026-10-30)
+            "floating_ip_address": host_address(provider, project),
         }
         for key, value in optional.items():
             if value:
@@ -822,6 +836,8 @@ def build_vars(
         rdir / "osm",
         plan_dir(ctx.settings, ctx.plan.id) / "osm",
         run_key(ctx.settings, ctx.plan.id),
+        # the run's credentials, as its secrets.yml holds them (SDD §7.2, §27.5)
+        AnsibleExecutor._projects(AnsibleExecutor._step_of(ctx), ctx.plan),
     )
     out["os_migrate_workloads_filter"] = workload_filter(m.vm.name)
     # the link's entry stops admitting its key once the run cannot be running any more: the
@@ -1636,9 +1652,15 @@ class AnsibleExecutor:
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
         # a pre-staging always passes the installation's key: the orchestrator resolved it, and
-        # the deploy generates it when none exists yet (SDD §7.2)
+        # the deploy generates it when none exists yet (SDD §7.2); a host in the plan's project
+        # takes a floating IP of that project, never its provider's address (§26.10 decision 14)
         variables = _common_openstack_vars(
-            source, destination, osm, osm, installation_key(self.settings)
+            source,
+            destination,
+            osm,
+            osm,
+            installation_key(self.settings),
+            self._projects(Step.PRESTAGE, plan),
         )
         # no static link: no plan's link key goes to the hosts - each run makes its own (SDD §7.2,
         # §26.6)

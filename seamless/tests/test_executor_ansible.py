@@ -2404,6 +2404,129 @@ async def test_the_conversion_hosts_of_a_plan_with_projects_are_deployed_in_its_
     assert who["dst"] == "du"  # the provider's own user
 
 
+#: the providers' configured conversion host addresses, each its own host's floating IP (SDD §7.2)
+_HOST_ADDRESSES = {"src": "192.0.2.20", "dst": "192.0.2.10"}
+
+
+def _addressed(t):
+    """``t`` with its source's conversion host at an address of its own too, as DST's is."""
+    host = ConversionHostConfig(name="conv-src", address=_HOST_ADDRESSES["src"])
+    return SimpleNamespace(
+        **{**vars(t), "source": t.source.model_copy(update={"conversion_host": host})}
+    )
+
+
+def _addresses_in(call) -> list[str]:
+    """Which providers' conversion host addresses a playbook's run files hold - its vars.yml,
+    secrets.yml and inventory -; never the files' text, which holds credentials."""
+    files = "\n".join(call["raw"].values())
+    return sorted(side for side, address in _HOST_ADDRESSES.items() if address in files)
+
+
+async def test_a_projects_conversion_host_is_deployed_with_a_floating_ip_of_its_own_project(env):
+    """SDD §7.2, §27.6 (§26.10 decision 14, the owner's decision of 2026-10-30): the configured
+    address (conversion_host.address) is the floating IP of the provider's own host alone. The
+    pre-staging passes it to the deploy as the side's floating IP where the plan names no project,
+    as before, and never for a project's host: the role then takes a floating IP of that project,
+    as it does when no address is given (create_fip.yml), and no file of the deploy's run holds the
+    provider's address."""
+    t = _addressed(_projects(env))
+
+    async def deploy_of(plan):
+        before = len(read_log(env.log))
+        await env.executor.prestage(plan, t.source, t.destination)
+        [deploy] = read_log(env.log)[before:]
+        assert deploy["playbook"] == "deploy_conversion_hosts.yml"
+        return deploy
+
+    def floating(deploy):
+        return {
+            side: deploy["vars"].get(f"os_migrate_{side}_conversion_floating_ip_address")
+            for side in _HOST_ADDRESSES
+        }
+
+    tenant = await deploy_of(make_plan(id="plan-00c0ffee", prestage_resources=[], **t.plan_kw))
+    assert floating(tenant) == {"src": None, "dst": None}
+    assert _addresses_in(tenant) == []
+    # each side's host is still deployed, in its project (SDD §27.5)
+    assert tenant["vars"]["os_migrate_deploy_src_conversion_host"] is True
+    assert tenant["vars"]["os_migrate_deploy_dst_conversion_host"] is True
+    # a project at the destination alone: the source's host is its provider's own, at its address
+    one = await deploy_of(
+        make_plan(id="plan-00c0ffee", prestage_resources=[], destination_project=t.c)
+    )
+    assert floating(one) == {"src": "192.0.2.20", "dst": None}
+    assert _addresses_in(one) == ["src"]
+    # no project: each provider's own host at its configured address, as before
+    plain = await deploy_of(make_plan(id="plan-00c0ffee", prestage_resources=[]))
+    assert floating(plain) == _HOST_ADDRESSES
+
+    # what the deploy does without an address (SDD §7.2): the side's variable defaults to false,
+    # and create_fip.yml then takes a floating IP of the run's credential's project - reusing one
+    # it holds detached - with no address of its own
+    root = find_repo_root()
+    play = yaml.safe_load(
+        (root / "playbooks" / "deploy_conversion_hosts.yml").read_text(encoding="utf-8")
+    )
+    deploys = {
+        task["vars"]["os_migrate_conversion_cloud"]: task["vars"]
+        for task in play[0]["tasks"]
+        if task.get("ansible.builtin.include_role", {}).get("name")
+        == "os_migrate.os_migrate.conversion_host"
+        and "os_migrate_conversion_cloud" in task.get("vars", {})
+    }
+    assert {
+        side: v["os_migrate_conversion_floating_ip_address"] for side, v in deploys.items()
+    } == {
+        side: f"{{{{ os_migrate_{side}_conversion_floating_ip_address | default(false) }}}}"
+        for side in _HOST_ADDRESSES
+    }
+    tasks = yaml.safe_load(
+        (root / "roles" / "conversion_host" / "tasks" / "create_fip.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    [auto] = [
+        task for task in tasks if "not os_migrate_conversion_floating_ip_address" in task["when"]
+    ]
+    module = auto["os_migrate.os_migrate.floating_ip"]
+    assert "floating_ip_address" not in module and module["reuse"] is True
+
+
+async def test_no_run_of_a_projects_side_carries_its_providers_conversion_host_address(env):
+    """SDD §7.2 (§26.10 decision 14, the owner's decision of 2026-10-30): the runs of a plan with
+    projects - a warm pre-copy, its cutover and rollback, a cold cutover and rollback - reach each
+    project's host at the address its server holds, found by its name in the project: no file of
+    theirs - vars.yml, secrets.yml, the inventory - holds a provider's configured address. A side
+    where the plan names no project keeps its provider's own, as before."""
+    t = _addressed(_projects(env))
+    for strategy, steps in (
+        (Strategy.warm, (StepName.PRECOPY, StepName.CUTOVER, StepName.ROLLBACK)),
+        (Strategy.cold, (StepName.CUTOVER, StepName.ROLLBACK)),
+    ):
+        for step in steps:
+            ctx, _ = _project_ctx(env, t, strategy)
+            await env.executor.run(step, ctx)
+        _rolled_back()
+    calls = read_log(env.log)
+    assert {"import_workloads_precopy.yml", "import_workloads.yml"} <= {
+        c["playbook"] for c in calls
+    }
+    for call in calls:
+        assert _addresses_in(call) == [], call["playbook"]
+        assert not any("floating_ip_address" in key for key in call["vars"]), call["playbook"]
+
+    # a project at the destination alone: the source side is its provider's own, at its address
+    before = len(calls)
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, source=t.source, destination=t.destination)
+    ctx.plan = ctx.plan.model_copy(update={"destination_project": t.c})
+    await env.executor.run(StepName.CUTOVER, ctx)
+    for call in read_log(env.log)[before:]:
+        assert _addresses_in(call) == ["src"], call["playbook"]
+        assert call["vars"]["os_migrate_src_conversion_floating_ip_address"] == "192.0.2.20"
+        assert "os_migrate_dst_conversion_floating_ip_address" not in call["vars"]
+
+
 def _plan_ctx(env, plan_id, strategy):
     """A migration of plan ``plan_id`` (SDD §7.2): ctx_for's, moved to that plan."""
     ctx, _ = ctx_for(
