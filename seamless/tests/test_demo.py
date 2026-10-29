@@ -936,3 +936,62 @@ async def test_the_demo_shows_the_heat_and_octavia_findings(tmp_path, store):
     for name in ("web-01", "web-02", "web-03"):
         assert "SRC_VM_LB_MEMBER" not in findings[name]
     assert not [m for m in store.list("migration", Migration) if m.phase == Phase.blocked]
+
+
+async def test_the_demo_source_has_ceph_access_and_a_plan_that_tracks_extents(tmp_path, store):
+    """SDD §7.4, §10, §28.4 (plan task CE11): the demo's RHOSP source declares the demo cluster's
+    Ceph access with its key as written, its rbd pools report that fsid, the finance plan tracks
+    extents, and the migrations it seeds carry their tracked disks - none for a NetApp VM."""
+    from seamless_migrate.domain.models import Migration, Plan
+    from seamless_migrate.planning.preflight import qualifying_disks, tracking_ready
+    from seamless_migrate.providers.fake import DEMO_CEPH_FSID, DEMO_DST_CEPH_FSID
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    source = store.get("provider", "rhosp17-finance", Provider)
+    assert source.ceph is not None and source.ceph.fsid == DEMO_CEPH_FSID
+    assert source.ceph.key_updated_at is not None and source.ceph.client == "seamless"
+    rbd = [b for b in source.capabilities["storage_backends"] if b["family"] == "rbd"]
+    assert rbd and all(b["ceph_fsid"] == DEMO_CEPH_FSID and b["ceph_pool"] for b in rbd)
+    destination = store.get("provider", "rhoso18", Provider)
+    dst_rbd = [b for b in destination.capabilities["storage_backends"] if b["family"] == "rbd"]
+    assert dst_rbd and all(b["ceph_fsid"] == DEMO_DST_CEPH_FSID for b in dst_rbd)
+    plans = {p.name: p for p in store.list("plan", Plan)}
+    finance = plans["Finance apps (RHOSP 17.1 → RHOSO)"]
+    assert finance.extent_tracking is True
+    assert tracking_ready(finance, source)
+    assert all(not p.extent_tracking for name, p in plans.items() if name != finance.name)
+    migrations = [m for m in store.list("migration", Migration) if m.plan_id == finance.id]
+    by_name = {m.vm.name: m for m in migrations}
+    assert by_name, "the finance plan was validated"
+    for name, m in by_name.items():
+        assert m.tracked_disks == qualifying_disks(m.vm, source), name
+    assert by_name["portal-01"].tracked_disks == []  # its volume is on NetApp
+    tracked = [name for name, m in by_name.items() if m.tracked_disks]
+    assert tracked, "a Ceph VM's migration tracks its volumes"
+
+
+def test_the_demo_destinations_declare_their_conversion_hosts_keys():
+    """SDD §10, §26.3, §26.5 (plan task ST7): host keys are checked by default, and the VMware
+    plan's destination host is one the operator brings, which Seamless never pins from a console
+    the demo does not print: each demo destination declares its conversion host's keys -
+    synthetic ed25519 keys, as an operator reads them out of band -, so no demo plan is blocked by
+    CONV_HOST_KEY_UNKNOWN, and the provider page shows them as declared."""
+    from seamless_migrate.demo import DEMO_PROVIDERS
+    from seamless_migrate.security.host_keys import public_key_problem
+
+    for provider in DEMO_PROVIDERS:
+        if provider.role != ProviderRole.destination:
+            continue
+        keys = provider.conversion_host.ssh_host_keys
+        assert len(keys) == 1 and keys[0].startswith("ssh-ed25519 "), provider.id
+        assert public_key_problem(keys[0]) is None
+    declared = [
+        p.conversion_host.ssh_host_keys[0]
+        for p in DEMO_PROVIDERS
+        if p.role == ProviderRole.destination
+    ]
+    assert len(set(declared)) == len(declared)  # each host its own key

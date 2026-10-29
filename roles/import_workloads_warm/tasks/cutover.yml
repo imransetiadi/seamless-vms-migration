@@ -207,6 +207,13 @@
                 log_file: "{{ import_workloads_warm_prelim.log_file }}"
                 state_file: "{{ import_workloads_warm_prelim.state_file }}"
                 timeout: "{{ os_migrate_timeout }}"
+                # extent tracking (SDD 6.4, 28.5)
+                extents: "{{ os_migrate_warm_extents_final }}"
+                ceph_conf: "{{ os_migrate_warm_ceph_conf | default(omit, true) }}"
+                ceph_keyring: "{{ os_migrate_warm_ceph_keyring | default(omit, true) }}"
+                ceph_client: "{{ os_migrate_warm_ceph_client }}"
+                ceph_pools: "{{ os_migrate_warm_ceph_pools }}"
+                extent_query_timeout: "{{ os_migrate_warm_extent_query_timeout }}"
                 # the run's own link, else upstream's static one (SDD 6.4, 26.6)
                 link: "{{ import_workloads_warm_link or omit }}"
               register: import_workloads_warm_sync
@@ -290,6 +297,8 @@
         state_dir: "{{ os_migrate_warm_state_dir }}"
         timeout: "{{ os_migrate_timeout }}"
         state: absent
+        # a failed final pass keeps the bases for the retry (SDD 28.5)
+        keep_base: "{{ os_migrate_warm_extents_final != 'off' }}"
       register: import_workloads_warm_cleanup
       ignore_errors: true
       when: os_migrate_workload_cleanup_on_failure | bool

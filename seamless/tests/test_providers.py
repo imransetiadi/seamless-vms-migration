@@ -683,6 +683,9 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
                 "vendor": "Open Source",
                 "protocol": "ceph",
                 "family": "rbd",
+                # an rbd pool without location_info (SDD §10, plan task CE6)
+                "ceph_fsid": None,
+                "ceph_pool": None,
             }
         ],
         # an https endpoint, and no service endpoint the stub can tell (SDD §10, Security.md)
@@ -5005,3 +5008,60 @@ async def test_openstack_reads_a_whole_console_without_logging_it(caplog):
     # the last lines, as the verification reads them, still come through the SDK
     assert await provider.console_log("srv-1") == "Booting...\nweb-01 login: "
     assert "HOST KEY" not in caplog.text
+
+
+async def test_the_check_reports_each_rbd_pools_ceph_fsid_and_pool(stub_openstack):
+    """SDD §10, §28.4 (plan task CE6): an rbd entry of storage_backends carries the cluster's
+    fsid and the Ceph pool its location_info names; the other families carry neither key."""
+    fsid = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+    conn = fake_conn()
+    conn.block_storage.backend_pools = lambda: [
+        NS(
+            name="overcloud@ceph#ceph",
+            capabilities={
+                "vendor_name": "Open Source",
+                "storage_protocol": "ceph",
+                "location_info": f"ceph:/etc/ceph/ceph.conf:{fsid}:openstack:volumes",
+            },
+        ),
+        NS(
+            name="overcloud@ontap_nfs#192.0.2.5:/cinder_vol",
+            capabilities={
+                "vendor_name": "NetApp",
+                "storage_protocol": "nfs",
+                "location_info": "ontap:192.0.2.5:/cinder_vol",
+            },
+        ),
+    ]
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    ceph, netapp = caps["storage_backends"]
+    assert ceph["family"] == "rbd"
+    assert (ceph["ceph_fsid"], ceph["ceph_pool"]) == (fsid, "volumes")
+    assert netapp["family"] == "netapp_nfs"
+    assert "ceph_fsid" not in netapp and "ceph_pool" not in netapp
+
+
+async def test_a_pool_without_location_info_reports_no_ceph_fsid(stub_openstack):
+    """SDD §10 (plan task CE6): an rbd pool whose capabilities hold no location_info, or one of
+    another form, reports null for both - the plan's validation names it untracked (§28.9)."""
+    conn = fake_conn()
+    conn.block_storage.backend_pools = lambda: [
+        NS(
+            name="overcloud@ceph#ceph",
+            capabilities={"vendor_name": "Open Source", "storage_protocol": "ceph"},
+        ),
+        NS(
+            name="overcloud@ceph2#ceph2",
+            capabilities={
+                "vendor_name": "Open Source",
+                "storage_protocol": "ceph",
+                "location_info": "garbage",
+            },
+        ),
+    ]
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    for entry in caps["storage_backends"]:
+        assert entry["family"] == "rbd"
+        assert entry["ceph_fsid"] is None and entry["ceph_pool"] is None

@@ -211,6 +211,10 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # announces tenant networks (expose_tenant_networks),
                                                        # which no API shows (§23.6): NET_PREFIX_SPLIT (§9.3);
                                                        # refused on vmware (422)
+           ceph: CephAccess|null,                      # the source cluster's Ceph access, as its operator
+                                                       # declares it (§28.4, plan task CE6): refused on kind
+                                                       # vmware and on role destination (422); its key is
+                                                       # written by PUT …/ceph-key (§12, §13.3)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
@@ -224,6 +228,14 @@ HostKeyPin { server_id: str,                 # the Nova server whose keys they a
              source: "injected"|"console",   # injected at the server's creation (§26.3), or read from its
                                              # console (§10)
              pinned_at: datetime }
+
+CephAccess { fsid: str,                      # the cluster's fsid, a UUID; a pool whose location_info names
+                                             # another is untracked (§28.4)
+             monitors: list[str],            # 1-9 monitor addresses, "host" or "host:port", the conversion
+                                             # host reaches
+             client: str = "seamless",       # the Ceph user without "client." (1-64 letters, digits, ".",
+                                             # "-" or "_")
+             key_updated_at: datetime|null } # server-owned: set by PUT …/ceph-key; POST and PATCH ignore it
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -350,6 +362,9 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         # port with its MAC, all its fixed IPs and its security groups (§6.6, §7.2, §7.3, §9.2);
                                         # "nova": one fixed IP per port, new MAC
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
+       extent_tracking: bool = false,  # the warm passes diff the source cluster's RBD snapshots (§28, plan task CE7):
+                                        # refused (422) for a VMware source; changeable at any time - off, the next
+                                        # pass scans, on, the next pass checks (§28.9)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
        migration_counts: dict[Phase, int],  # read-only, never stored: how many of the plan's migrations are in each
@@ -412,7 +427,18 @@ NotificationChannelView { ...NotificationChannel,   # what the channel routes an
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
-           bytes_transferred: int = 0, duration_s: float|null }
+           bytes_transferred: int = 0, duration_s: float|null,
+           extents: dict[str, ExtentUse] = {} }   # per device, how the pass used the disk's extents (§28.5, plan
+                                                   # task CE7), read from the warm state's pass (§6.3); {} when the
+                                                   # plan does not track extents
+
+ExtentUse { mode: "read"|"checked"|"scanned",   # read: the chunks the extents name alone; checked: a full scan that
+                                                 # compared the extents with what changed; scanned: a full scan alone
+            reason: str|null = null,             # scanned: why - first_pass, not_tracked, encrypted, no_base, base_gone,
+                                                 # resized, missed, unchecked, assumed_zero or query_failed (§28.5)
+            query_s: float|null = null,          # the extent query's seconds
+            missed: int = 0,                     # checked: chunks that changed outside the extents
+            assumed_zero: bool = false }         # the pass skipped the chunks it assumed zero (§6.2)
 
 Finding { code: str, severity: Severity, message: str, remediation: str|null,
           strategies: list[Strategy] = [] }      # empty = applies to every strategy
@@ -499,6 +525,10 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             sync_passes: list[SyncPass] = [], sync_bytes_dropped: int = 0,
             estimate: Estimate|null, estimates: list[Estimate] = [],
             observed_scan_bps: float|null, resolved_mappings: Mappings = {},
+            tracked_disks: list[str] = [],       # the disks (ids) the final pass is expected to read from extents (§9.1,
+                                                 # §28.6): validation lists a tracked plan's qualifying disks; a pass
+                                                 # that scanned one for a lasting reason removes it (plan task CE8)
+            observed_extent_query_s: float|null, # the longest extent query of the last checked pass (§9.1 calibration)
             findings: list[Finding] = [], checkpoint: str|null,
             downtime_started_at: datetime|null, downtime_ended_at: datetime|null,
             actual_downtime_s: float|null, approvals: list[Approval] = [],
@@ -985,6 +1015,10 @@ dst: blocksync receive ⇐ ssh ⇐ blocksync send      dst: create server from d
 src: detach + delete tmp volumes, snapshots        → control plane verification
 ```
 
+A plan that tracks extents (§28, plan task CE4) keeps the Cinder snapshot of each disk's last completed pass as
+its *base* instead of deleting it with the pass's temporary volume, until the next pass of the disk completes;
+the cutover's cleanup after the final pass, a rollback and a cancel's cleanup delete the bases (§6.3, §6.4).
+
 The source VM is never detached from its volumes during pre-copy. Multi-volume snapshots are not
 atomic during pre-copy; this is harmless because the final pass happens after shutdown.
 
@@ -1106,9 +1140,21 @@ gets the file:
   "dest_volumes": { "/dev/vda": {"dest_id": "…", "size": 20, "bootable": true, "name": "…"} },
   "passes": [ { "number": 1, "kind": "full", "started_at": "…", "ended_at": "…",
                 "bytes_scanned": 0, "bytes_changed": 0, "bytes_transferred": 0, "duration_s": 0.0 } ],
-  "pending_snapshot": null | { "transfer_uuid": "…", "volume_map": { … } },
-  "destination_server_id": null }
+  "pending_snapshot": null | { "transfer_uuid": "…", "pass": 2, "volume_map": { … } },
+  "destination_server_id": null,
+  "extent_bases": { "/dev/vda": { "snapshot_id": "…", "pass": 1, "source_volume_id": "…", "size": 20,
+                                  "name_id": "…", "dest_volume_id": "…", "full_read": true } },
+  "extents_off": [] }
 ```
+
+`pending_snapshot.pass` is the number of the pass the snapshot is for (the next one when it was made): the
+snapshot's cleanup reads from it whether that pass completed. `extent_bases` (plan task CE4, §28.4): per device,
+the base of the next extent query - the Cinder snapshot the last completed pass copied, that pass's number, the
+source volume's id, size and `name_id`, the destination volume's id, and whether that pass read the destination in
+full (`false` after an `assume_zero` pass: a base never read from, §28.5). `extents_off` lists the devices whose
+check found a miss: tracking stays off for them until the migration ends (§28.5). Both are `{}`/`[]` for a plan that
+does not track extents, and the cutover's cleanup after the final pass, a rollback that deletes a recorded destination
+server and the rollback role's cleanup clear them (§6.4).
 
 A warm pass records each destination volume it creates (`dest_volumes`) as soon as Cinder accepted it, before it
 waits for it; a volume whose record cannot be written (a full disk) is deleted, once Cinder settled it, before the pass
@@ -1149,8 +1195,8 @@ existed (Seamless 0.1.0) has no file.
 
 | Module | Cloud | Purpose |
 |---|---|---|
-| `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
-| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts - each copy in a private directory, its SHA-256 checked before sudo runs it ("The helper script" below) -, run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding; with `link`, the run's own link, below, whose script the source host runs and which gets no copy), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. The map's entries also carry `name_id` (the volume's `os-vol-mig-status-attr:name_id`, null when the credential cannot read it), `host` (its `os-vol-host-attr:host`, the Cinder pool) and `encrypted`, which the sync's extent tracking reads (§28.4), and `base_gone: true` when the device's recorded base snapshot (§6.3) no longer exists `available` on the same volume - `state: present` checks each base. `keep_base: true` (plan task CE4; false by default) with `state: absent`: when the pass the pending snapshot was made for completed (`pending_snapshot.pass` is the last recorded pass), each volume disk's snapshot stays as the device's base in `extent_bases` - its temporary volume still goes - and the previous base's snapshot is deleted; a pass that did not complete leaves the bases as they were and its snapshot goes as before. `keep_base: false` deletes the pending snapshot and every base snapshot, and clears `extent_bases` and `extents_off`: the cutover's cleanup after its final pass and the rollback's use it. |
+| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts - each copy in a private directory, its SHA-256 checked before sudo runs it ("The helper script" below) -, run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding; with `link`, the run's own link, below, whose script the source host runs and which gets no copy), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. Extent tracking (plan task CE4; SDD §28.4, §28.5): `extents` (`off`, the default, `check` or `read`), `ceph_conf` and `ceph_keyring` (the run's 0600 files, copied to the source conversion host for each query and removed after it, §6.4 the query), `ceph_client`, `ceph_pools` (Cinder pool, the volume's `host`, to Ceph pool) and `extent_query_timeout` (seconds, 300 by default). With `check` or `read`, each volume disk's mode and reason follow §28.5 - `scanned` with `first_pass`, `not_tracked` (no `ceph_pools` entry for its pool, or an image-booted boot disk), `encrypted`, `no_base`, `base_gone`, `resized`, `missed`, `unchecked`, `assumed_zero` or `query_failed`; else `checked` (the sender runs with `--extents FILE --extents-mode check`), or `read` on a final pass given `read` whose disk has a base from a pass that read the destination in full, a `checked` pass before it and no miss (`--extents-mode read`); `read` on another pass checks -, the extents file written beside the sender's script on the source host, and the pass records `extents` per device (`ExtentUse`: `mode`, `reason`, `query_s`, `missed`, `assumed_zero`), `{}` with `off`. A miss adds the device to `extents_off`. Tracking never fails a pass. |
 | `conversion_host_link` | src, dst (conversion hosts) | A run's own link from the dst to the src conversion host (§26.6, plan task ST6; "The link" below): `state: present` makes it - first removing the workload's earlier entries, every expired one and 0.4.0's static link -, or, given `link`, writes the run's `volume_ids` or `ports` into its entry; `state: absent` removes it, or without `link` every entry of the workload. Returns `link`. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; when the state file records no server, or the server it records is gone - deleted since, while a re-run's create whose answer was lost left the earlier id recorded (review RV4-04) - the single server named like the workload that holds one of the recorded volumes, attached through Nova and not to the destination conversion host: built from them, it is the migration's own even when Nova's answer to its create was lost, while a same-named server holding none of them is another one and is kept - review RV3-06; several such servers are an error) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and empties the warm state: the file stays, holding no volume, pass or server (`state_cleared`), as the sign that the workload's migration recorded it (§6.3), and a pending source snapshot's record stays for its cleanup; with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
@@ -1302,6 +1348,13 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_warm_workers` | `4` | `workers` |
 | `os_migrate_warm_parallel_disks` | `4` | `parallel_disks` |
 | `os_migrate_warm_assume_zero` | `false` | `assume_zero` — honoured for `full`/`delta` passes that create the destination volumes, never for `final` (§6.2) |
+| `os_migrate_warm_extents_precopy` | `"off"` | `extents` of the pre-copy passes: `"off"` or `check` (plan task CE4, §28.5); quoted, since YAML reads a bare `off` as false. Also `keep_base` of the pre-copy's snapshot cleanup: true unless `"off"` |
+| `os_migrate_warm_extents_final` | `"off"` | `extents` of the cutover's final pass: `"off"` or `read`; the cutover's cleanup after the final pass deletes the bases (`keep_base: false`), its rescue keeps them unless `"off"` |
+| `os_migrate_warm_ceph_conf` | `""` | `ceph_conf` - the run's minimal `ceph.conf` (§28.4, plan task CE7) |
+| `os_migrate_warm_ceph_keyring` | `""` | `ceph_keyring` - the run's keyring (0600) |
+| `os_migrate_warm_ceph_client` | `seamless` | `ceph_client` |
+| `os_migrate_warm_ceph_pools` | `{}` | `ceph_pools` - Cinder pool to Ceph pool, the provider's tracked pools |
+| `os_migrate_warm_extent_query_timeout` | `300` | `extent_query_timeout` |
 | `os_migrate_warm_python_interpreter` | `python3` | `python_interpreter` |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | `state_dir` |
 | `os_migrate_workloads_preserve_volume_type` | `false` | `preserve_volume_type` |
@@ -1312,6 +1365,9 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_source_stop_poll_s` | `5` | — (seconds between the reads of the wait above; the cold role takes the same default) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 | `os_migrate_conversion_link_per_run` | `false` | — (each run makes its own link, §6.4; the cold role's default too) |
+| `os_migrate_conversion_host_ceph_client` | `false` | — (`conversion_host_content`, plan task CE5): install `ceph-common` on the source conversion host (`os_migrate_conv_src`) for the extent queries of a plan that tracks extents (§28.4); the control plane sets it per plan (CE7). Nothing is installed on the destination host, or without it |
+| `os_migrate_conversion_host_ceph_repository_rhel` | `rhceph-6-tools-for-rhel-<major>-x86_64-rpms` | — the Red Hat Ceph Tools repository `subscription-manager` enables on RHEL before `ceph-common` (`TODO(LAB): confirm` the repository of the lab's RHCS) |
+| `os_migrate_conversion_host_ceph_repository_centos` | `centos-release-ceph-reef` (Stream 10: `-squid`) | — the CentOS Storage SIG release package installed on CentOS Stream, Rocky Linux and AlmaLinux before `ceph-common` (`TODO(LAB): confirm` each); Ubuntu 24.04's archive needs none |
 | `os_migrate_conversion_link_expiry_s` | `604800` | `expiry_s` of `conversion_host_link` (the cold role's default too) |
 
 Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
@@ -1789,6 +1845,16 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
   `clouds.yaml` os-migrate writes into the data dir.
+* The Ceph files (§28.4, plan task CE7): a warm plan that tracks extents (`extent_tracking`) whose source declares
+  `ceph` and holds its key (`provider-{id}.ceph`, §13.3) gets, beside `secrets.yml` and deleted with it, the run's
+  `ceph.conf` (the fsid and `mon_host`) and `ceph.keyring` (`[client.<client>]`, the key), both 0600, named to the
+  roles by `os_migrate_warm_ceph_conf` and `os_migrate_warm_ceph_keyring` with `os_migrate_warm_ceph_client`,
+  `os_migrate_warm_ceph_pools` - the source check's `rbd` entries whose `ceph_fsid` is the provider's, Cinder pool to
+  Ceph pool (§10) - and `os_migrate_warm_extents_precopy: check` for a pre-copy or sync run, `os_migrate_warm_extents_final:
+  read` for the cutover; the pre-staging gets `os_migrate_conversion_host_ceph_client: true` (§6.5). The key reaches
+  neither `vars.yml` nor a log line. A plan without tracking, or whose source has no Ceph access, no key or no `rbd`
+  pool of its fsid, passes no Ceph file and no extent variable: every pass scans. Each pass's `extents` is read from
+  the warm state's pass (§6.3) into `SyncPass.extents` (§4.2).
 * Command: `ansible-playbook -i <inventory> <playbook> -e @vars.yml -e @secrets.yml`, environment
   `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.json` is **not** used; instead stdout lines are logged and
   progress is read by tailing the os-migrate per-workload `state_file` JSON (`{dev: pct}`) and the
@@ -2547,7 +2613,11 @@ follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Ea
 source is stopped. A `warm` pass takes the model's `snapshot + max(scan, Δ/L)` (the scan as §9.1 models it) and records as
 its `duration_s` the part after the snapshot, as the collection's warm sync does, so a pass that ran as the model predicts
 reads back the plan's `S`; `previous_pass_duration` is the previous pass's whole time, its snapshot included (review
-RV38A-05). A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
+RV38A-05). A migration with tracked disks (`Migration.tracked_disks`, §28.6, plan task CE11) records each pass's
+extent use (§28.5): its first pass scans every disk (`first_pass`), a later pre-copy pass checks each tracked disk
+(`checked`, `query_s` = `q`, no miss) and scans the others (`not_tracked`), taking `snapshot + q + max(scan, Δ/L)`
+and recording the part after the snapshot; its final pass reads the tracked disks (`read`) and takes §28.6's term,
+`snapshot + max(scan_U, q + max(Δf/S, Δf/L))`. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
 cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
 downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
 `PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
@@ -3021,6 +3091,7 @@ class EstimatorParams:
     change_rate_bps: float = 2097152.0   # 2 MiB/s default guest write rate
     shutdown_s: float = 60.0; boot_s: float = 120.0; create_s: float = 60.0
     snapshot_s: float = 30.0; handover_per_volume_s: float = 20.0
+    extent_query_s: float = 10.0          # q: one extent query on the source conversion host (§28.6; a duration override)
     v2v_s: float = 300.0; v2v_inplace_s: float = 120.0
     convergence_threshold_bytes: int = 1073741824; max_passes: int = 5
     parallel_disks: int = 4; max_aggregate_scan_bps: float | None = None
@@ -3038,7 +3109,7 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 | Strategy | Pre-copy | Downtime |
 |---|---|---|
 | `cold` | 0, passes = 0 | `shutdown + snapshot + U/L + create + boot` |
-| `warm` | `T1 = snapshot + max(U/L, scan)` (fresh destination volumes are not read: `--assume-zero`); then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` (total passes, including pass 1, never exceed `max_passes`) | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
+| `warm` | `T1 = snapshot + max(U/L, scan)` (fresh destination volumes are not read: `--assume-zero`); then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` (total passes, including pass 1, never exceed `max_passes`). A migration with tracked disks (`Migration.tracked_disks`, §28.6, plan task CE8): its checked passes cost their query too, `Tk = snapshot + q + max(scan, Δk/L)` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)`; with tracked disks `T` and the others `U`: `shutdown + snapshot + max(scan_U, q + max(Δf/S, Δf/L)) + create + boot`, `scan_U` the scan term over `U` alone (0 when `U` is empty) - the SLO rule (§5.3), a Force cutover's figure (§5.4) and the dashboard's port (§16) take the same term |
 | `storage_handover` | 0 | `shutdown + V·handover_per_volume + create + boot` |
 | `vmware_cold` | 0 | `shutdown + U/L + v2v + create + boot` |
 | `vmware_warm` | `T1 = U/L`; `Δk = min(D, c·T(k−1))`, `Tk = 10 + Δk/L` (same loop) | `shutdown + Δf/L + v2v_inplace + create + boot` |
@@ -3069,7 +3140,9 @@ only; the interval is the time between the two snapshots), and the observed per-
 with `B = bytes_scanned` (the pass lasts as long as its largest disk's scan or its streams' share, whichever is
 longer, so a pass that ran as predicted reads back the `S` it was predicted with; review PL-07), taken from
 **delta/final passes only** (pass 1 is usually link-bound and would understate it) — replaces `scan_bps` for that
-migration's estimate (stored as `Migration.observed_scan_bps: float | null`). A pass at the aggregate ceiling
+migration's estimate (stored as `Migration.observed_scan_bps: float | null`); a pass that read any disk from extents
+(an `ExtentUse` of mode `read`, §28.5) never calibrates `S`, and a `checked` pass's longest `query_s` replaces `q`
+(`Migration.observed_extent_query_s`, plan task CE8). A pass at the aggregate ceiling
 (`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. Nor does a pass the link
 may have bound - one that lasted at most 10 % longer than its changes take over the link (`duration_s <=
 1.1 · bytes_transferred / L`, a margin for the sync's own setup): the `S` it reads is only a lower bound, which may
@@ -3208,8 +3281,13 @@ Finding catalog (code — severity — condition):
 | `VMW_SNAPSHOTS_PRESENT` | warning | `snapshot_count > 0` |
 | `VMW_TOOLS_MISSING` | info | `tools_ok is False` |
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
+| `CONV_HOST_KEY_UNKNOWN` | blocker (cold, warm, vmware_*) | while SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is true (§15.1, §26.5), a conversion host the plan needs - the source's and the destination's for an OpenStack source, the destination's alone for a VMware source - has no declared keys (`conversion_host.ssh_host_keys`) and either no pin while Seamless will not create it (`conversion_host.manage` false, or a VMware source's destination host, which the operator brings), or a pin of another server: the validation's provider check reports the host resolving to another server than its pin's, its status message "conversion host replaced: ..." (§10 "Host key pins"), a managed host too. Its runs would be refused before their first playbook (§7.2). The message names each such host by its side, provider and name, and a replaced one by the check's words. A host Seamless manages without a pin is not judged: its pre-staging creates it with an injected key, or a run reads and pins its console (§26.3, §26.8) |
+| `CONV_HOST_KEYS_UNCHECKED` | warning (cold, warm, vmware_*) | SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false (§15.1, §26.8) and a conversion host the plan needs is configured: no hop of the data path checks a conversion host's key |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
+| `CEPH_ACCESS_MISSING` | warning (warm) | the plan tracks extents (`extent_tracking`, §28.9) and its source has no Ceph access (`ceph`), no key (`ceph.key_updated_at` null) or no `rbd` pool whose `ceph_fsid` is its own in its check report (§10): every pass scans in full; the message says which. Not judged for a VMware source, which refuses the switch |
+| `EXTENT_TRACKING_PARTIAL` | info (warm) | the plan tracks extents and its source has access, and a disk of the VM does not qualify (§28.3, §28.4): not a Cinder volume (an image copy, an ephemeral disk), encrypted, a `pool` the source credential cannot read, or a pool that is no `rbd` pool of the cluster; the message names each disk and why. Its final pass scans those disks in full |
+| `EXTENT_TRACKING_MISSED` | warning (warm) | a `checked` pass of this migration found changes outside a disk's extents (`SyncPass.extents[dev].missed` > 0, §4.2, §28.5): the disk scans in full for the rest of the migration; the message names the devices, and the remediation asks for the Ceph releases of the source's compute nodes and cluster (§28.4) |
 
 The GPU rows read the VM's GPUs (a VM recorded without `gpus`, its flavor's extra specs as §22.2 reads them). Since
 plan task G4 a GPU VM's server is created with its GPU flavor, which its plan names and nothing matches (§22.4): its
@@ -3483,7 +3561,10 @@ RHOSO 18.0, §21; `check()` reports `{"admin": bool,
 "roles": [the role names of the credential's token, sorted; left out when they cannot be read], "compute_microversion": str,
 "block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
-"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
+"family": "rbd"|"netapp_nfs"|"netapp_block"|"other", "ceph_fsid"?: str|null, "ceph_pool"?: str|null}], "tls": bool,
+"plain_http": [str]}` - an `rbd` entry alone carries `ceph_fsid` and `ceph_pool`, from the pool's `location_info`
+(`cluster:conf:fsid:user:pool`, Cinder's RBD driver), null when it is missing or not of that form (§28.4, plan task
+CE6) -, both backend lists empty
 without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
 the compute probe; a report without it leaves the role half unjudged there, and a run reads the roles live, §7.2,
 §7.3 step 0, review 20); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
@@ -3618,6 +3699,11 @@ PoolMember { load_balancer: str, pool: str,     # their names, else their ids
 * `VMwareProvider` reads neither: its inventory holds both reads `ok` and empty. The demo's OpenStack
   `FakeSourceProvider` reads its stack and pools (below, "The demo's network cut-over", plan task N11); its VMware one
   reads neither.
+* **The demo's Ceph** (§28.4, plan task CE11): the fake OpenStack source's `rbd` pools report the `ceph_fsid` of the
+  demo cluster (`DEMO_CEPH_FSID`) and their Ceph pool, the fake destination's its own cluster's; the demo's RHOSP source
+  provider declares that access (`ceph`, its key as written) and its finance plan tracks extents (`extent_tracking`),
+  so its Ceph VMs' migrations carry `tracked_disks` and the simulator records their passes' extent use (§7.4), while
+  its NetApp VMs (`portal-01`, `app-01`, `app-02`) scan in full (`EXTENT_TRACKING_PARTIAL` names their volumes, §9.3).
 * **Data minimization** (as §22.12 for Placement): the names of a stack, a resource, a group, a pool and a load
   balancer, and a member's address, are customer data. The read keeps them for the finding that shows them to the
   operator (§9.3), logs neither them nor a failure's message text, and the advisor sends Jev finding codes and
@@ -3667,6 +3753,9 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
     stays `ok`, so a validation goes on.
 
   A check that failed (`error`) looks nothing up. The demo's consoles print no keys block: the demo pins nothing.
+  Its destinations declare their conversion hosts' keys instead (`ssh_host_keys`, plan task ST7): one synthetic
+  ed25519 key each, made up from the host's name - no private half exists -, as an operator reads a brought host's
+  key out of band, so no demo plan meets `CONV_HOST_KEY_UNKNOWN` while keys are checked (§9.3).
 * **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
   `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
   that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
@@ -3917,7 +4006,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 |---|---|---|---|---|
 | GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
-| GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
+| GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
@@ -3926,6 +4015,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
+| PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
@@ -4112,9 +4202,13 @@ is resolved the same way by `security.secrets.resolve_private_key(name) -> str` 
 
 **Credentials entered in the dashboard** (`PUT /providers/{id}/credentials`, `PUT …/conversion-key`,
 admin) are written to the platform's **secret store** — never to the database, never returned — under
-the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key) — so `POST /providers`
-refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh`, or `{other}` is `{id}-ssh`):
-its credentials would overwrite, and its deletion remove, the other's key. The
+the secret name `provider-{id}` (credentials), `provider-{id}-ssh` (conversion-host key) and `provider-{id}.ceph`
+(the Ceph key, `PUT …/ceph-key`, §28.4) — so `POST /providers`
+refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh` or `{other}-ceph`, or `{other}`
+is `{id}-ssh` or `{id}-ceph`: a provider id never holds a `.`, but the `SEAMLESS_SECRET_*` variables read `.` and `-`
+alike, audit AP-04):
+its credentials would overwrite, and its deletion remove, the other's key. `ceph` set to null by PATCH, and the
+provider's deletion, delete `provider-{id}.ceph`. The
 provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
 time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
@@ -4204,6 +4298,8 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
 * PEM blocks - and a block a cut fell inside, an END line with no BEGIN line before it (a console's last lines, §7.5),
   from the text's start to that END line (review RV52-X1, PR #58 review);
+* Ceph keys (§28.4, §28.8, plan task CE6): a keyring's `key = <base64>` line, whole after its `=`, and a bare CephX key
+  - `AQ`, 36 base64 characters and `==`, the 28 bytes `ceph auth get-key` prints - wherever it stands;
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
 * the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
@@ -4653,7 +4749,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
-| `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `false` | whether the playbooks verify the SSH host keys of the conversion hosts (`ANSIBLE_HOST_KEY_CHECKING` of every run; the control plane's own environment no longer decides it). It reaches only the conversion host of a VMware migration: the OpenStack conversion hosts' inventory passes `-o StrictHostKeyChecking=no` itself, and the collection's own ssh and scp (`RemoteShell`) always do, so `true` checks none of the OpenStack hops (D8). Off until SEC-02 lands (Security.md §6.3: a per-run `known_hosts` with pinned keys — still open): a host made for the migration has no key to compare with, so `true` works only with hosts whose keys the control plane's `known_hosts` already holds. The executor logs a warning once per run while it is off |
+| `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `true` | whether the data path checks the conversion hosts' SSH host keys (§26.4, §26.8; the control plane's own environment never decides it). `true` (the default since plan task ST7, every hop being pinned): every run checks each conversion host against its declared keys or its pin - `ANSIBLE_HOST_KEY_CHECKING=True`, the run's `known_hosts`, `StrictHostKeyChecking=yes` on the modules' ssh and scp and on the link (§6.6, §7.2) -, and validation reports `CONV_HOST_KEY_UNKNOWN` for a host without a key (§9.3). `false` keeps 0.4.0's options, unchecked: the executor logs a warning once per run, validation reports `CONV_HOST_KEYS_UNCHECKED`, and the dashboard's provider page warns (`GET /me` `host_key_checking`, §12, §16); each run's restricted link applies either way (§26.6) |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook; a storage handover's call in flight returns first, §7.3), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
@@ -4747,6 +4843,12 @@ is no origin a browser sends (review RV31-03).
   `DST_DNS_INTEGRATION_MISSING`, `NET_PREFIX_SPLIT`, `NET_LB_POOL_SPLIT`, `DST_FIP_ADDRESS_UNAVAILABLE`,
   `NET_DNS_TTL_LONG` and `MAP_LB_POOL_INCOMPATIBLE`; a findings list shows the badge beside each. Binding with plan task
   N12a for the rule and the Hooks page, N12b for the plan form, N12c for the migration page and the findings.
+* Changed-extent tracking (§28, from 0.5.0, plan task CE10): every extent element - the provider form's and card's
+  Ceph access, the plan form's changed-extent tracking section and the plan page's row, the migration page's extent
+  use per pass and per disk, and the findings `CEPH_ACCESS_MISSING`, `EXTENT_TRACKING_PARTIAL` and
+  `EXTENT_TRACKING_MISSED` (§28.9) - carries a "Technology Preview" badge as the GPU elements do, its detail
+  "Technology Preview, validated in simulation: changed-extent tracking has not yet run on the lab's Ceph
+  clusters." (§28.11), until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (plan task CE13).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -4953,7 +5055,14 @@ is no origin a browser sends (review RV31-03).
   Designate, reached with the destination provider's credential, or RFC 2136, with its server and TSIG secret —, zone
   and record, with Add DNS target and Remove, a VM taken out of the plan taking its target with it; and the Octavia
   pool mappings (§8.5), each a source pool's id to a destination pool's id, with Add pool mapping and Remove — the
-  advanced settings' summary naming the network cut-over;
+  advanced settings' summary naming the network cut-over; the changed-extent tracking (plan task CE10, §28.9) under
+  "Changed-extent tracking" with a "Technology Preview" badge, for an OpenStack or RHOSO source alone - a VMware
+  source has no Ceph cluster (§28.9): the section is not shown and `extent_tracking` is sent `false` -: one switch,
+  "Track changed extents on the source Ceph cluster" (`extent_tracking`, off by default), whose hint says that the
+  warm passes diff Cinder's pass snapshots on the source cluster and that the final pass copies only what changed, so
+  the downtime loses its scan, and that the source provider needs its Ceph access and key (`CEPH_ACCESS_MISSING`
+  otherwise) - the advanced settings' summary naming it while on; the plan page's settings show "Changed extents"
+  as "Tracked on the source Ceph cluster" with the badge while the plan tracks them;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
   failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
@@ -5018,7 +5127,13 @@ is no origin a browser sends (review RV31-03).
   less than 1.0 GiB, when the estimated downtime fits the SLO, or after 5 passes", for VMware "CBT passes report no bytes:
   the estimated downtime or the pass limit decides", ADV-16; it names the running pass the
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
-  and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
+  and that the bytes they transferred stay counted, §5.4; on a plan that tracks extents, each pass's extent use per
+  disk, `SyncPass.extents`, §28.5, plan task CE10: the chart's data table gains an Extents column that reads each
+  device as "read", "checked" - with its misses, "checked, 2 missed" - or "scanned" with its reason in words - "not
+  tracked", "encrypted", "first pass", "no base", "base gone", "resized", "missed earlier", "unchecked",
+  "assumed zero", "query failed" -, and the chart's Technology Preview badge; the Disks list marks each disk from
+  the latest pass that recorded its use - "Extents read", "Extents checked", "Scanned: not tracked" - and, in the
+  warning tone, a disk whose extents missed changes, "Extents missed 3 chunks: scans in full from now on"), downtime clock (in demo mode it runs in model time,
   `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
   downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot, hooks (§9.1) — and the
   difference between estimate and actual, ADV-16; apart from them, a migration's DNS tail (`Estimate.dns_tail_s`, §9.1,
@@ -5155,7 +5270,34 @@ is no origin a browser sends (review RV31-03).
   reads `ok` with none and sends Placement nothing, §22.3; a PCI alias flavor's capacity is the Inventory's to mark
   unknown) or whose report holds no `gpu_capacity` (not checked since it was added, since a PATCH reset its report,
   §12, or since 0.3.0); a provider whose check
-  reports plain HTTP says so, naming `plain_http`'s endpoints; the form
+  reports plain HTTP says so, naming `plain_http`'s endpoints; a source's card whose provider declares Ceph access
+  (`ceph`, §28.4; plan task CE10) shows it under "Ceph access" with a "Technology Preview" badge - the cluster's fsid,
+  its monitors, its client, and whether its key is stored ("Key stored 3 days ago", else "No key stored" in the
+  warning tone, as the conversion host's missing key) - and names the `rbd` pools of its check whose `ceph_fsid` is
+  another cluster's, which stay untracked; the form takes, for an OpenStack or RHOSO source, its Ceph access under
+  "Ceph access" with the badge: a switch "Declare the source cluster's Ceph access" (off: `ceph` null, which deletes
+  a stored key, said in its hint), then the fsid (a UUID), the monitors (one per line, 1 to 9, each "host" or
+  "host:port"), the client ("seamless" by default, without "client.") and the key as `ceph auth get-key` prints it,
+  written once with `PUT /providers/{id}/ceph-key` after the provider is saved - a later step of the dialog, kept
+  apart from the provider's save and retried like the credentials - and never shown again ("A Ceph key stored
+  3 days ago. Leave the field empty to keep it; values are never shown again."), required while the access is
+  declared and no key is stored; the form refuses before anything is sent what the API refuses (§4.2, §12) - a fsid
+  that is no UUID, no monitor or more than nine, a monitor that is no address, a client with the "client." prefix or
+  of more than 64 characters, a key that is not base64 of at least 16 bytes - each in the error summary with a link
+  to its field; it sends `ceph` with `POST`, and with `PATCH` only when its fsid, monitors or client changed, never
+  `key_updated_at` (server-owned);
+  an OpenStack or RHOSO card with a conversion host shows
+  its host keys (§26.4; plan task ST7) under "Host keys": the declared keys' SHA256 fingerprints with "Declared" when
+  `conversion_host.ssh_host_keys` holds some, else the pin's (`conversion_host_pin`) with its source ("Injected at
+  creation", "Read from the console"), its server and its time ("Pinned 3 min ago"), else "Not pinned yet: the next
+  check reads the host's console."; each fingerprint as `ssh-keygen -l` prints it (`SHA256:` and the unpadded base64
+  of the key's SHA-256), computed in the browser. While host keys are not checked (`GET /me` `host_key_checking`
+  false, §12) the page warns once above the cards that no conversion host's key is checked and names
+  SEAMLESS_ANSIBLE_HOST_KEY_CHECKING; the form
+  takes, for an OpenStack or RHOSO provider with a conversion host, its declared host keys (`conversion_host.
+  ssh_host_keys`, §4.2) under "Host keys" as a text area of one OpenSSH public key per line (blank lines dropped), and
+  refuses before anything is sent a line that is no ed25519, ECDSA or RSA public key, naming its line number - never
+  quoting it - in the error summary with a link to the field, as the API refuses it (422); it sends the list whole; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first), for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
   §4.2), and for an OpenStack or RHOSO provider, source or destination alike, its declared vGPU profiles
@@ -5407,8 +5549,9 @@ is no origin a browser sends (review RV31-03).
   when it ends, in the API's words, and a read counts for three ticks, as the API demo's do at its default speed (§7.4,
   §22.7). Its estimates are §9.1's, as a
   validation computes them: the control plane's `estimate` with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
-  ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
-  (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
+  ported to `src/lib/forcedEstimate.ts` - the tracked final pass's term among them, with the migration's
+  `tracked_disks` and `observed_extent_query_s` (§28.6, plan task CE8) - and checked against a case table the control
+  plane generates (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
   sum, and the API's `meets_slo`.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
@@ -5808,6 +5951,10 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   subscription; CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9 with EPEL) and on Ubuntu 24.04 LTS or later (apt:
   `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`), and fails on any other OS (§6.5; T7, in
   D15's order). Every image keeps Python 3.6 or later for blocksync (§6.2, D7); an Ubuntu image's user is `ubuntu`.
+* For a plan that tracks extents (§28.4, plan task CE5) the same role installs `ceph-common` on the source conversion
+  host alone, when `os_migrate_conversion_host_ceph_client` is set: from the Red Hat Ceph Tools repository on RHEL,
+  the CentOS Storage SIG on CentOS Stream, Rocky Linux and AlmaLinux, and Ubuntu 24.04's own archive (§6.5; the
+  repository of each image `TODO(LAB): confirm`).
 * VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
 
 ### 21.7 API changes the design absorbs (today)
@@ -7493,7 +7640,9 @@ any playbook, the injected key pair and its pins, a refusal in a run's output as
 `conversion_host.key_refused` - in §4.3 and §7.2 since that task; plan task ST6's - the link (the per-run key, the source
 host's entry, the gate, the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link
 removed), the content install's sshd settings and R-02 (the helper script's private directory and its SHA-256 check) -
-in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task. The facts
+in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task; plan task ST7's - the two findings, the setting's default `true`,
+`GET /me`'s `host_key_checking` and the dashboard's host keys, its warning and the form's declared keys - in §9.3, §12,
+§15.1 and §16 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7808,7 +7957,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 (binding) | ST4 |
 | the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 (binding) | ST5 |
 | the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 (owner decision 10) | §6.2, §6.4, §6.5, §6.6, §7.2 (binding) | ST6 |
-| the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
+| the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, its warning while keys are not checked (`GET /me` `host_key_checking`), the form's declared keys, the findings' catalog | §9.3, §12, §15.1, §16 (binding) | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
 
@@ -8210,7 +8359,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   keeps creating and deleting every snapshot. A source credential that cannot read a volume's host and `name_id` (admin
   reads under the default policies, as `Disk.pool` is, §4.2) leaves the disk untracked.
 * **The base:** the Cinder snapshot the last completed pass copied stays, instead of being deleted with its temporary
-  volume, until the next pass of the disk completes. The warm state records per device (§6.3, proposed `extent_bases`)
+  volume, until the next pass of the disk completes. The warm state records per device (§6.3, `extent_bases`, binding since plan task CE4)
   the snapshot's id, the pass's number, the source volume's id, size and `name_id`, the destination volume's id and
   whether that pass read the destination in full. A volume holds one more snapshot than today (two during a pass): the
   source project's snapshot quota must allow it (Operations.md). The cutover deletes the bases with the final
@@ -8234,12 +8383,12 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   mode, fixed in 17.2.0) needs a diff that starts inside an object, which `rbd diff` never makes. §28.5's checks are the
   guard.
 * **Where it runs:** the source conversion host, with `ceph-common` (installed by `conversion_host_content` for a plan
-  that tracks extents; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
+  that tracks extents - binding in §6.5 and §21.6 since plan task CE5; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
   conversion host sits on its own tenant network behind a router (§6.5), while a director-deployed RHOSP 17.1 keeps
   Ceph on the isolated Storage network (`TODO(LAB): confirm`): the operator routes it there, or uses an existing
   conversion host (`manage` false) that reaches Ceph (owner decision 4). The temporary volume stays the read path.
-* **Credentials** (proposed, §4.2 and §12 with plan task CE6): `Provider.ceph: CephAccess|null`, on an OpenStack or
-  RHOSO source alone (422 on a VMware provider or a destination):
+* **Credentials** (binding in §4.2, §10, §12, §13.3 and §13.4 since plan task CE6): `Provider.ceph: CephAccess|null`,
+  on an OpenStack or RHOSO source alone (422 on a VMware provider or a destination):
   ```text
   CephAccess { fsid: str,                 # the cluster's fsid; a pool whose location_info names another is untracked
                monitors: list[str],       # 1-9 monitor addresses ("host" or "host:port") the conversion host reaches
@@ -8265,14 +8414,19 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
 
 ### 28.5 Passes, blocksync and what the manifest proves
 
-* **How a pass used a disk's extents** (proposed `SyncPass.extents: dict[str, ExtentUse] = {}`, per device, §4.2):
+* **How a pass used a disk's extents** (`SyncPass.extents: dict[str, ExtentUse] = {}`, per device, binding in §4.2 since plan task CE7):
   ```text
   ExtentUse { mode: "read"|"checked"|"scanned",  # read: only the chunks the extents name; checked: a full scan that
                                                  # compared the extents with what changed; scanned: a full scan alone
               reason: str|null = null,           # scanned: why (below)
               query_s: float|null = null,        # the extent query's time
-              missed: int = 0 }                  # checked: chunks that changed outside the extents
+              missed: int = 0,                   # checked: chunks that changed outside the extents
+              assumed_zero: bool = false }       # the pass skipped the chunks it assumed zero (§6.2): a base from
+                                                 # it is never read from (plan task CE4)
   ```
+  The modules' side - the bases kept and deleted, each pass's modes and reasons, the sync's options and the roles'
+  variables - is binding in §6.1, §6.3, §6.4 and §6.5 since plan task CE4; the control plane's `SyncPass.extents`
+  follows with plan task CE7.
   `{}` when the plan does not track extents. The reasons: `first_pass`, `not_tracked` (§28.4), `encrypted`, `no_base`,
   `base_gone` (Cinder no longer has the base `available`), `resized` (the size or `name_id` changed), `missed` (an
   earlier check of this migration missed), `unchecked` (no check of the disk passed yet), `assumed_zero` (the base pass
@@ -8305,7 +8459,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
 
 ### 28.6 Estimator, calibration and convergence
 
-* **The final pass** (proposed, §9.1 with plan task CE8): with `T` the disks it is expected to read from extents and
+* **The final pass** (binding in §4.2, §9.1 and §16 since plan task CE8): with `T` the disks it is expected to read from extents and
   `U` the others, `copy_s = snapshot + max(scan_U, q + max(Δf/S, Δf/L))`, `scan_U` being the scan term over `U` alone
   (0 when `U` is empty) and `q` the new `EstimatorParams.extent_query_s` (default 10 s, `TODO(LAB): confirm`; a
   duration override with the others' bounds). Validation puts a qualifying disk of a plan that tracks extents in `T`;
@@ -8363,9 +8517,9 @@ present, a live migration, the scratch storage of a pull-mode job, and the read 
 
 ### 28.9 Checks, findings and the plan switch
 
-* **The plan switch** (proposed, §4.2 with plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
+* **The plan switch** (binding in §4.2 and §12 since plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
   VMware source. `PATCH /plans/{id}` may change it at any time: off, the next pass scans; on, the next pass checks.
-* **Findings** (proposed; each enters §9.3 with plan task CE9, with its catalog entry, its tests and the mock):
+* **Findings** (binding in §9.3 since plan task CE9, each with its catalog entry, its tests and the mock):
   * CEPH_ACCESS_MISSING, warning (warm): the plan tracks extents, and its source has no Ceph access, no key, or no
     `rbd` pool whose fsid is its own: every pass scans in full;
   * EXTENT_TRACKING_PARTIAL, info (warm): the plan tracks extents, and a disk of the VM does not qualify (not a Cinder
@@ -8435,13 +8589,13 @@ The owner took each default as written on 2026-10-23 (D1):
 | PRD: FR-26 rewritten with its acceptance criteria and release, NFR-05 for passes that read extents, SM-1b and G1's scan removal moved to 0.5.0, PRD §9's 0.2.0 item moved; D1 decided | PRD, §20 | CE1 |
 | blocksync protocol v2, `--extents` and `--extents-mode`, the check's counts | §6.2 (binding) | CE2 |
 | the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 (binding) | CE3 |
-| the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
-| the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
-| `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 | CE6 |
-| `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 | CE7 |
-| `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
-| the findings of §28.9 | §9.3, §16 | CE9 |
-| the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
-| the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 | CE11 |
+| the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5 (binding); §7.2 with CE7 | CE4 |
+| the Ceph client on the source conversion host | §6.5, §21.6 (binding) | CE5 |
+| `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 (binding) | CE6 |
+| `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 (binding) | CE7 |
+| `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §4.2, §5.3, §9.1, §16 (binding) | CE8 |
+| the findings of §28.9 | §9.3 (binding), §16 | CE9 |
+| the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 (binding) | CE10 |
+| the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 (binding) | CE11 |
 | QASuite (FR-26 rows, LAB-CE cases, PERF-E2E-SM1b), Security.md, Operations.md, Performance.md | QASuite, Security.md, Operations.md, Performance.md | CE12 |
 | the lab; the Technology Preview label goes when LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass | QASuite §13 | CE13 |

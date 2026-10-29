@@ -143,7 +143,22 @@ def test_unauthenticated_401_and_audit_event(api):
     assert denied[0].data["path"] == "/api/v1/plans"
     assert "smg_not-a-real-token" not in str([e.model_dump() for e in denied])
     me = api.get("/api/v1/me", Role.approver)
-    assert me.json() == {"name": "approver-user", "role": "approver"}
+    assert me.json() == {"name": "approver-user", "role": "approver", "host_key_checking": True}
+
+
+def test_me_says_whether_host_keys_are_checked_and_health_does_not(tmp_path):
+    """SDD §12, §15.1, §16 (plan task ST7): GET /me tells a signed-in viewer whether the data path
+    checks the conversion hosts' keys - the dashboard's provider page warns while it does not -;
+    the public /health never says it."""
+    settings, tokens = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store.create_schema()
+    off = settings.model_copy(update={"ansible_host_key_checking": False})
+    with TestClient(create_app(off, store)) as client:
+        api = Api(client, store, off, tokens)
+        assert api.get("/api/v1/me", Role.viewer).json()["host_key_checking"] is False
+        assert "host_key_checking" not in client.get("/api/v1/health").json()
+    store.dispose()
 
 
 def test_me_and_forbidden_audit(api):
@@ -285,6 +300,12 @@ ROUTES = [
         "/api/v1/providers/src-osp/credentials",
         Role.admin,
         {"username": "u", "password": "p", "project_name": "x"},
+    ),
+    (
+        "PUT",
+        "/api/v1/providers/src-osp/ceph-key",
+        Role.admin,
+        {"key": "AQFakeCephKeyForTestsOnlyNotRealAtAll0=="},  # gitleaks:allow (no key material)
     ),
     (
         "PUT",
@@ -810,7 +831,11 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
     store.create_schema()
     # an auth-off server is reached by a loopback name only (SDD §13.1, audit AP-03)
     with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
-        assert client.get("/api/v1/me").json() == {"name": "anonymous", "role": "admin"}
+        assert client.get("/api/v1/me").json() == {
+            "name": "anonymous",
+            "role": "admin",
+            "host_key_checking": True,
+        }
         assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
         created = [e for e in store.events(since_seq=0) if e.kind == "provider.created"]
         assert created[0].actor == "anonymous"

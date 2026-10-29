@@ -26,6 +26,18 @@ os_migrate_warm_parallel_disks: 4  # noqa: var-naming[no-role-prefix]
 # are zero-filled). Only safe on backends that return zeros for blocks
 # never written (Ceph RBD, thin LVM, sparse files).
 os_migrate_warm_assume_zero: false  # noqa: var-naming[no-role-prefix]
+# Extent tracking (Seamless Migrate SDD 28): the pre-copy passes check the extents of each disk
+# with a base ("off" or check), and the final pass reads them alone after a clean check ("off" or
+# read). Quoted: YAML reads a bare off as false.
+os_migrate_warm_extents_precopy: "off"  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_extents_final: "off"  # noqa: var-naming[no-role-prefix]
+# The run's Ceph files and user for the extent queries, and the tracked pools (Cinder pool to
+# Ceph pool); the control plane writes them per run.
+os_migrate_warm_ceph_conf: ""  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_ceph_keyring: ""  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_ceph_client: seamless  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_ceph_pools: {}  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_extent_query_timeout: 300  # noqa: var-naming[no-role-prefix]
 # Keep the serialized volume_type of destination volumes (after mapping it to
 # a destination type in the workload data) instead of the destination default.
 os_migrate_workloads_preserve_volume_type: false  # noqa: var-naming[no-role-prefix]

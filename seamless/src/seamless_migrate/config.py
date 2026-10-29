@@ -176,8 +176,10 @@ class Settings(BaseModel):
     k8s_namespace: str | None = None
     ansible_playbook: str = "ansible-playbook"
     collection_root: Path = Field(default_factory=find_repo_root)
-    #: ANSIBLE_HOST_KEY_CHECKING of every playbook run (SDD §15.1): off while SEC-02 is open
-    ansible_host_key_checking: bool = False
+    #: whether every hop of the data path checks the conversion hosts' pinned keys - each run's
+    #: ANSIBLE_HOST_KEY_CHECKING and StrictHostKeyChecking=yes (SDD §15.1, §26.8): on by default
+    #: since every hop is pinned (plan task ST7); false keeps 0.4.0's options, with a warning
+    ansible_host_key_checking: bool = True
     max_concurrent_migrations: int = Field(default=10, ge=1)
     max_concurrent_cutovers: int = Field(default=3, ge=1)
     tick_s: float = Field(default=1.0, gt=0)

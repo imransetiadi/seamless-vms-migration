@@ -785,3 +785,152 @@ describe("Providers: a destination's GPU capacity (SDD §16, §22.11; plan task 
     expect(screen.getAllByRole('group', { name: 'GPU capacity' }).map((group) => group.closest('article'))).toEqual([screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })]);
   });
 });
+
+describe("a source's Ceph access (SDD §16, §28.4, plan task CE10)", () => {
+  // a key-shaped base64 string without key material (write-only, never displayed)
+  const CEPH_KEY = 'AQBrK3NnRVhBTVBMRQAAAAAAAAAAAAAAAAAAAA=='; // gitleaks:allow
+  const FSID = '0f1e2d3c-4b5a-4968-8777-665544332211';
+
+  it("edits a source's Ceph access and writes its key once", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage('admin');
+    // community-lab: an OpenStack source of the seed without Ceph access
+    const source = server.providers.find((p) => p.id === 'community-lab')!;
+    expect([source.role, source.ceph ?? null]).toEqual(['source', null]);
+    const card = await screen.findByRole('article', { name: source.name });
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'Ceph access' });
+    expect(within(section).getByText('Technology Preview')).toBeInTheDocument();
+    await user.click(within(section).getByRole('checkbox', { name: /declare the source cluster's ceph access/i }));
+    await user.type(within(section).getByLabelText(/^cluster fsid/i), FSID);
+    await user.type(within(section).getByLabelText(/^monitors/i), 'mon-a.example.com\nmon-b.example.com:6789');
+    expect(within(section).getByLabelText(/^ceph user/i)).toHaveValue('seamless');
+    await user.type(within(section).getByLabelText(/^ceph key/i), CEPH_KEY);
+    expect(dialog).not.toHaveTextContent(CEPH_KEY);
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(source.ceph).toEqual({ fsid: FSID, monitors: ['mon-a.example.com', 'mon-b.example.com:6789'], client: 'seamless', key_updated_at: expect.any(String) });
+    expect(JSON.stringify(server.providers)).not.toContain(CEPH_KEY);
+    // one write of the key, named by its secret and key, never its value (SDD §28.8)
+    const writes = server.events.filter((e) => e.kind === 'provider.credentials_updated');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.data).toMatchObject({ provider_id: 'community-lab', secret: 'provider-community-lab.ceph', keys: ['key'] });
+    expect(JSON.stringify(writes)).not.toContain(CEPH_KEY);
+    expect(within(await screen.findByRole('article', { name: source.name })).getByRole('group', { name: 'Ceph access' })).toHaveTextContent(/Key stored/);
+  });
+
+  it('never shows a Ceph key again', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    // a source whose access and key are stored, and that no running plan holds (a PATCH of one is refused, SDD §12)
+    const source = server.providers.find((p) => p.id === 'community-lab')!;
+    source.ceph = { fsid: FSID, monitors: ['mon-a.example.com'], client: 'seamless', key_updated_at: '2026-10-01T08:00:00Z' };
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: source.name });
+    const group = within(card).getByRole('group', { name: 'Ceph access' });
+    expect(group).toHaveTextContent(/Key stored/);
+    expect(within(group).getByText('Technology Preview')).toBeInTheDocument();
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'Ceph access' });
+    expect(within(section).getByRole('checkbox', { name: /declare the source cluster's ceph access/i })).toBeChecked();
+    expect(within(section).getByText(/^A Ceph key stored .*never shown again\.$/)).toBeInTheDocument();
+    expect(within(section).getByLabelText(/^ceph key/i)).toHaveValue('');
+    expect(JSON.stringify(source)).not.toMatch(/"key":/);
+    // saving without a key keeps the stored one: nothing is written, and its time stays
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated')).toHaveLength(0);
+    expect(source.ceph?.key_updated_at).toBe('2026-10-01T08:00:00Z');
+  });
+
+  it("marks a pool whose fsid is not the provider's", async () => {
+    const server = createTestServer();
+    const rhosp = server.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    const backends = rhosp.capabilities.storage_backends as Array<Record<string, unknown>>;
+    rhosp.capabilities = {
+      ...rhosp.capabilities,
+      storage_backends: [
+        ...backends,
+        { pool: 'overcloud@tripleo_ceph_dr#volumes-dr', vendor: 'Ceph', protocol: 'ceph', family: 'rbd', ceph_fsid: 'ffffffff-0000-4000-8000-000000000001', ceph_pool: 'volumes-dr' },
+      ],
+    };
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    expect(within(card).getByRole('group', { name: 'Ceph access' })).toHaveTextContent('On another cluster, untracked: overcloud@tripleo_ceph_dr#volumes-dr');
+  });
+});
+
+describe("Providers: a conversion host's host keys (SDD §16, §26.4; plan task ST7)", () => {
+  /** A card's host keys, named by its heading. */
+  const keysOf = (card: HTMLElement) => within(card).getByRole('group', { name: 'Host keys' });
+  const lines = (group: HTMLElement) => within(group).queryAllByRole('listitem').map((item) => item.textContent);
+  // the demo destinations' declared keys (synthetic, as the API demo's) and their fingerprints as ssh-keygen -l prints them
+  const DST = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPG3KNdzNY5BMzcxmBiodxJzFyuk3o+NUwZvY9B8BPyn';
+  const DC3 = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONXdEMQsyylyTGj3eyOnSgAxp5zE4Y8rF+Fpabez7MG';
+  const DST_PRINT = 'SHA256:c7YZ2kyybPWsZp/yLpIl7YrkvASjTK9SIZdcPY+5aP0';
+  const DC3_PRINT = 'SHA256:sEjGO8jPw9A7YTcBql1IsdjRiT9LliDPmN1IP8DtJsY';
+
+  it("shows the conversion host's pinned fingerprints, their source and server", async () => {
+    const server = createTestServer();
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    // declared keys win over a pin: the pin is not shown beside them
+    hibiscus.conversion_host_pin = { server_id: 'srv-dc3-old', keys: [DST], source: 'console', pinned_at: new Date(TEST_NOW - 60_000).toISOString() };
+    const view = renderPage('viewer', server);
+    const rhoso = await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
+    await waitFor(() => expect(lines(keysOf(rhoso))).toEqual([`${DST_PRINT} Declared`]));
+    const dc3 = keysOf(screen.getByRole('article', { name: hibiscus.name }));
+    await waitFor(() => expect(lines(dc3)).toEqual([`${DC3_PRINT} Declared`]));
+    expect(dc3).not.toHaveTextContent(/srv-dc3-old|Read from the console|Pinned/);
+    // neither declared nor pinned: the next check reads its console
+    const rhosp = screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    expect(keysOf(rhosp)).toHaveTextContent("Not pinned yet: the next check reads the host's console.");
+    expect(lines(keysOf(rhosp))).toEqual([]);
+    // a vCenter's host, and a provider without a conversion host, show none
+    for (const name of ['vCenter HQ', 'OpenStack Lab (2023.1)', 'Kolla Edge (Bobcat)', 'RHOSO 18.0 — Staging']) {
+      expect(within(screen.getByRole('article', { name })).queryByRole('group', { name: 'Host keys' }), name).not.toBeInTheDocument();
+    }
+    view.unmount();
+
+    // pinned: each key's fingerprint with its source in words, then its server and its time
+    const pinned = createTestServer();
+    const injectedAt = new Date(TEST_NOW - 3 * 60_000).toISOString();
+    const readAt = new Date(TEST_NOW - 90 * 60_000).toISOString();
+    const prod = pinned.providers.find((p) => p.id === 'rhoso-prod')!;
+    prod.conversion_host = { ...prod.conversion_host!, ssh_host_keys: [] };
+    prod.conversion_host_pin = { server_id: 'srv-conv-dst', keys: [DST, DC3], source: 'injected', pinned_at: injectedAt };
+    pinned.providers.find((p) => p.id === 'rhosp17-dc1')!.conversion_host_pin = { server_id: 'srv-conv-src', keys: [DC3], source: 'console', pinned_at: readAt };
+    renderPage('viewer', pinned);
+    const injected = keysOf(await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' }));
+    await waitFor(() => expect(lines(injected)).toEqual([`${DST_PRINT} Injected at creation`, `${DC3_PRINT} Injected at creation`]));
+    expect(injected).toHaveTextContent('Server srv-conv-dst');
+    const injectedTime = within(injected).getByText(/^Pinned$/).querySelector('time');
+    expect(injectedTime).toHaveAttribute('datetime', injectedAt);
+    expect(injectedTime).toHaveAttribute('title', formatDateTime(injectedAt));
+    const fromConsole = keysOf(screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' }));
+    await waitFor(() => expect(lines(fromConsole)).toEqual([`${DC3_PRINT} Read from the console`]));
+    expect(fromConsole).toHaveTextContent('Server srv-conv-src');
+    expect(within(fromConsole).getByText(/^Pinned$/).querySelector('time')).toHaveAttribute('datetime', readAt);
+    expect(fromConsole).not.toHaveTextContent(/Not pinned yet/);
+  });
+
+  it('warns that host keys are not checked', async () => {
+    const server = createTestServer();
+    server.hostKeyChecking = false;
+    const view = renderPage('viewer', server);
+    // once, above the cards, naming the setting
+    const warning = await screen.findByText(/^Host keys are not checked:/);
+    expect(warning).toHaveTextContent(
+      "Host keys are not checked: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false, so no hop of the data path checks a conversion host's key.",
+    );
+    expect(screen.getAllByText(/Host keys are not checked/)).toHaveLength(1);
+    const firstCard = screen.getAllByRole('article')[0]!;
+    expect(warning.compareDocumentPosition(firstCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    view.unmount();
+    // checked, the default: no warning
+    renderPage('viewer');
+    await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
+    expect(screen.queryByText(/Host keys are not checked/)).not.toBeInTheDocument();
+  });
+});

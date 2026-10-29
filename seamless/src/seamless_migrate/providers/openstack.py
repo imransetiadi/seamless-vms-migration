@@ -33,7 +33,7 @@ from ..planning.preflight import (
     StackRead,
 )
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
-from ..storage import storage_family
+from ..storage import ceph_location, storage_family
 from .base import (
     ProviderConflict,
     ProviderError,
@@ -772,14 +772,18 @@ class OpenStackProvider:
         if admin:
             for pool in _try(lambda: list(conn.block_storage.backend_pools()), []):
                 caps = _attr(pool, "capabilities", default={}) or {}
-                storage.append(
-                    {
-                        "pool": str(_attr(pool, "name")),
-                        "vendor": caps.get("vendor_name"),
-                        "protocol": caps.get("storage_protocol"),
-                        "family": storage_family(caps),
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "pool": str(_attr(pool, "name")),
+                    "vendor": caps.get("vendor_name"),
+                    "protocol": caps.get("storage_protocol"),
+                    "family": storage_family(caps),
+                }
+                if entry["family"] == "rbd":
+                    # the cluster and the pool the extents are read from (SDD §10, §28.4)
+                    entry["ceph_fsid"], entry["ceph_pool"] = ceph_location(
+                        caps.get("location_info")
+                    )
+                storage.append(entry)
             storage.sort(key=lambda b: b["pool"])
         # the role names of its token: what Neutron's port policy names (SDD §10, §6.6); left out
         # when the token cannot tell, so that half of NET_PORT_NOT_PERMITTED is not judged

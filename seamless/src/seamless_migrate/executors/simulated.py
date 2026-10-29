@@ -17,9 +17,19 @@ from typing import Any
 
 from ..config import Settings
 from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
-from ..domain.models import Migration, Plan, Provider, SyncPass, VMRef, next_pass_number, utcnow
+from ..domain.models import (
+    ExtentUse,
+    Migration,
+    Plan,
+    Provider,
+    SyncPass,
+    VMRef,
+    next_pass_number,
+    utcnow,
+)
 from ..planning.estimator import (
     VMWARE_PASS_OVERHEAD_S,
+    final_copy_seconds,
     params_for_plan,
     scan_seconds,
     whole_pass_seconds,
@@ -182,14 +192,38 @@ class SimulatedExecutor:
 
     def _pass_times(self, ctx: StepContext, changed: float, first: bool) -> tuple[float, float]:
         """The pass's whole model time and the duration it records (SDD §7.4): a warm pass takes
-        the model's snapshot + max(scan, Δ/L), its scan as §9.1 models it, and records the part
-        after the snapshot, as the collection's warm sync does (review RV38A-05)."""
+        the model's snapshot + max(scan, Δ/L), its scan as §9.1 models it - a tracked migration's
+        later passes query the extents too, snapshot + q + max(scan, Δ/L) (§28.6) - and records
+        the part after the snapshot, as the collection's warm sync does (review RV38A-05)."""
         p = params_for_plan(ctx.plan)
         if ctx.migration.strategy == Strategy.vmware_warm:
             took = changed / p.link_bps if first else VMWARE_PASS_OVERHEAD_S + changed / p.link_bps
             return took, took
         sync = max(scan_seconds(ctx.migration.vm, p), changed / p.link_bps)
+        if not first and ctx.migration.tracked_disks:
+            sync += p.extent_query_s
         return p.snapshot_s + sync, sync
+
+    def _extent_use(self, ctx: StepContext, mode: str) -> dict[str, ExtentUse]:
+        """How the pass used each disk's extents (SDD §28.5, plan task CE11): {} for a migration
+        without tracked disks; else its first pass scans every disk, a later one checks or reads
+        the tracked disks and scans the others, which are no volume of the cluster."""
+        m = ctx.migration
+        if m.strategy != Strategy.warm or not m.tracked_disks:
+            return {}
+        p = params_for_plan(ctx.plan)
+        tracked = set(m.tracked_disks)
+        uses: dict[str, ExtentUse] = {}
+        for disk in m.vm.disks:
+            dev = disk.device or disk.id
+            if mode == "first_pass":
+                uses[dev] = ExtentUse(mode="scanned", reason="first_pass")
+            elif disk.id in tracked:
+                uses[dev] = ExtentUse(mode=mode, query_s=p.extent_query_s)  # type: ignore[arg-type]
+            else:
+                reason = "encrypted" if disk.encrypted else "not_tracked"
+                uses[dev] = ExtentUse(mode="scanned", reason=reason)
+        return uses
 
     async def _pass(self, step: StepName, ctx: StepContext) -> StepResult:
         vm = ctx.migration.vm
@@ -215,6 +249,7 @@ class SimulatedExecutor:
                 bytes_changed=int(changed),
                 bytes_transferred=int(changed),
                 duration_s=duration,
+                extents=self._extent_use(ctx, "first_pass" if first else "checked"),
             )
         )
         refusal = _demo_refusal(ctx.migration, ctx.plan)
@@ -251,8 +286,9 @@ class SimulatedExecutor:
             )
             if m.strategy == Strategy.warm:
                 # the model's final pass: its snapshot, then its scan as §9.1 models it or its
-                # transfer (SDD §7.4, review RV38A-05)
-                copy_s = p.snapshot_s + max(scan_seconds(vm, p), changed / p.link_bps)
+                # transfer (SDD §7.4, review RV38A-05); over the tracked disks' extents, §28.6's
+                # term (plan task CE11)
+                copy_s = final_copy_seconds(vm, p, changed, m.tracked_disks)
             else:
                 copy_s = changed / p.link_bps + p.v2v_inplace_s
             kind, number = SyncPassKind.final, next_pass_number(m)
@@ -289,6 +325,7 @@ class SimulatedExecutor:
                 bytes_transferred=int(changed),
                 # a warm final pass records the part after its snapshot, as the others do
                 duration_s=copy_s - p.snapshot_s if m.strategy == Strategy.warm else copy_s,
+                extents=self._extent_use(ctx, "read") if kind == SyncPassKind.final else {},
             )
         await self._elapse(ctx, p.create_s, 0, stopped=True)
         self._stopped.pop(m.id, None)

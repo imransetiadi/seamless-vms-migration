@@ -173,6 +173,51 @@ FlavorName = Annotated[str, StringConstraints(min_length=1, max_length=255)]
 ProfileName = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
 
+#: a monitor address: a host name, an IPv4 address or a bracketed IPv6 one, with an optional port
+_MONITOR = re.compile(
+    r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}))(?::[0-9]{1,5})?$"
+)
+_FSID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class CephAccess(_Model):
+    """The source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): the
+    key itself is written by ``PUT /providers/{id}/ceph-key`` and never read back."""
+
+    #: the cluster's fsid, a UUID; a pool whose location_info names another is untracked
+    fsid: str
+    #: 1-9 monitor addresses, "host" or "host:port", the conversion host reaches
+    monitors: list[str] = Field(min_length=1, max_length=9)
+    #: the Ceph user without "client."
+    client: str = Field(default="seamless", pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    #: server-owned: set by PUT …/ceph-key; POST and PATCH ignore it
+    key_updated_at: UTCDateTime | None = None
+
+    @field_validator("fsid")
+    @classmethod
+    def _uuid(cls, fsid: str) -> str:
+        if not _FSID.match(fsid.strip().lower()):
+            raise ValueError("fsid: a Ceph cluster's fsid is a UUID")
+        return fsid.strip().lower()
+
+    @field_validator("monitors")
+    @classmethod
+    def _addresses(cls, monitors: list[str]) -> list[str]:
+        for monitor in monitors:
+            if not _MONITOR.match(monitor):
+                raise ValueError('monitors: each is a monitor address, "host" or "host:port"')
+        return monitors
+
+    @field_validator("client")
+    @classmethod
+    def _user_without_prefix(cls, client: str) -> str:
+        """The user as Ceph's own commands name it in a keyring or `--id`: ``seamless``, never
+        ``client.seamless`` (the keyring section's name)."""
+        if client.lower().startswith("client."):
+            raise ValueError('client: the Ceph user without its "client." prefix')
+        return client
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -200,6 +245,9 @@ class Provider(_Model):
     #: its operator declares that the cloud's OVN BGP agent announces tenant networks
     #: (expose_tenant_networks), which no API shows: NET_PREFIX_SPLIT (SDD §4.2, §9.3, §23.6)
     announces_tenant_networks: bool = False
+    #: the source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): refused on
+    #: vmware and on a destination; its key is written by PUT …/ceph-key (§12, §13.3)
+    ceph: CephAccess | None = None
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -235,6 +283,11 @@ class Provider(_Model):
                     "announces_tenant_networks: an OpenStack BGP declaration cannot be made for "
                     "vmware"
                 )
+            if self.ceph is not None:
+                raise ValueError("ceph: a Ceph access cannot be declared for vmware")
+        if self.ceph is not None and self.role == ProviderRole.destination:
+            # the extents are the source cluster's alone (§28.4)
+            raise ValueError("ceph: a Ceph access can be declared on a source provider alone")
         return self
 
     @property
@@ -1003,6 +1056,9 @@ class PlanSpec(_Model):
     #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its
     #: security groups (SDD §6.6, §7.2, §9.2); "nova": one fixed IP per port and a new MAC
     port_creation_mode: Literal["nova", "neutron"] = "nova"
+    #: the warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28; plan task CE7):
+    #: refused for a VMware source (the routes), changeable at any time (§28.9)
+    extent_tracking: bool = False
     #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
     #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
     nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
@@ -1179,6 +1235,17 @@ class Plan(PlanSpec):
         return None
 
 
+class ExtentUse(_Model):
+    """How a pass used a disk's extents (SDD §4.2, §28.5): read the listed chunks alone, checked
+    them against a full scan, or scanned the disk alone, with the reason of §28.5."""
+
+    mode: Literal["read", "checked", "scanned"]
+    reason: str | None = None
+    query_s: float | None = Field(default=None, ge=0)
+    missed: int = Field(default=0, ge=0)
+    assumed_zero: bool = False
+
+
 class SyncPass(_Model):
     number: int = Field(ge=1)
     kind: SyncPassKind
@@ -1188,6 +1255,8 @@ class SyncPass(_Model):
     bytes_changed: int = 0
     bytes_transferred: int = 0
     duration_s: float | None = None
+    #: per device, how the pass used the disk's extents; {} without tracking (SDD §4.2, §28.5)
+    extents: dict[str, ExtentUse] = Field(default_factory=dict)
 
 
 class Finding(_Model):
@@ -1582,6 +1651,11 @@ class Migration(_Model):
     estimates: list[Estimate] = Field(default_factory=list)
     #: per-stream scan throughput measured by the last warm pass (SDD §9.1 calibration)
     observed_scan_bps: float | None = None
+    #: the disks (ids) the final pass is expected to read from extents (SDD §9.1, §28.6): a
+    #: tracked plan's qualifying disks at validation, less those a pass scanned for a lasting
+    #: reason; and the longest extent query of the last checked pass (plan task CE8)
+    tracked_disks: list[str] = Field(default_factory=list)
+    observed_extent_query_s: float | None = None
     #: mappings matched automatically by pre-flight (e.g. the smallest fitting flavor)
     resolved_mappings: Mappings = Field(default_factory=Mappings)
     findings: list[Finding] = Field(default_factory=list)

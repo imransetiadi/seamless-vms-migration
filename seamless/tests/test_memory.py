@@ -259,6 +259,10 @@ def test_memory_hits_are_redacted_where_they_enter():
         "\x1b[0" * 10922,
         "\\u001" * 6553,
         "\\" * 32767 + "u001b[0m",
+        # a keyring's key line that never ends, and a run that looks like CephX keys (CE6)
+        "key = " + "A" * 32768,
+        "\tkey = AQ" + "x" * 32768,
+        "AQ" * 16384 + "==",
     ],
     ids=[
         "key prefix",
@@ -299,6 +303,9 @@ def test_memory_hits_are_redacted_where_they_enter():
         "colours never end",
         "escape parts",
         "backslashes before an escape",
+        "keyring line never ends",
+        "keyring line of x",
+        "ceph key run",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):

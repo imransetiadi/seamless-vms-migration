@@ -465,3 +465,111 @@ async def test_a_simulated_final_sync_starts_once_the_source_is_stopped():
     final = (await ex.run(StepName.CUTOVER, ctx)).sync_pass
     assert final.kind == SyncPassKind.final
     assert final.started_at >= rec.downtime_at[0]
+
+
+# -- extent tracking (SDD §7.4, §28.5, §28.6; plan task CE11) --------------------------------
+def tracked_mig(**kw):
+    """A warm migration of a VM with a Ceph volume and a NetApp one, the Ceph one tracked."""
+    disks = [
+        make_disk(
+            id="d0",
+            size_gb=100,
+            used_gb=60.0,
+            device="/dev/vda",
+            pool="overcloud@tripleo_ceph#ceph-ssd",
+        ),
+        make_disk(
+            id="d1",
+            size_gb=50,
+            used_gb=20.0,
+            device="/dev/vdb",
+            bootable=False,
+            pool="overcloud@tripleo_netapp#x",
+            volume_type="netapp-nfs",
+        ),
+    ]
+    vm = make_vm(disks=disks, change_rate_bps=2 * 2**20)
+    return make_migration(
+        id="mig-0000000077", strategy=Strategy.warm, vm=vm, tracked_disks=["d0"], **kw
+    )
+
+
+async def test_a_simulated_tracked_migration_checks_its_pre_copy_passes_and_reads_its_final_pass():
+    """SDD §7.4, §28.5: the first pass scans every disk (first_pass); a later pre-copy pass checks
+    the tracked disk - its query q, no miss - and scans the NetApp one (not_tracked), costing the
+    query too; the final pass reads the tracked disk."""
+    from seamless_migrate.planning.estimator import scan_seconds
+
+    ex = SimulatedExecutor(FAST)
+    m = tracked_mig()
+    plan = make_plan(extent_tracking=True)
+    p = params_for_plan(plan)
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    first = (await ex.run(StepName.PRECOPY, ctx)).sync_pass
+    assert {dev: (u.mode, u.reason) for dev, u in first.extents.items()} == {
+        "/dev/vda": ("scanned", "first_pass"),
+        "/dev/vdb": ("scanned", "first_pass"),
+    }
+    m.sync_passes.append(first)
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    second = (await ex.run(StepName.SYNC, ctx)).sync_pass
+    assert second.extents["/dev/vda"].model_dump() == {
+        "mode": "checked",
+        "reason": None,
+        "query_s": p.extent_query_s,
+        "missed": 0,
+        "assumed_zero": False,
+    }
+    assert (second.extents["/dev/vdb"].mode, second.extents["/dev/vdb"].reason) == (
+        "scanned",
+        "not_tracked",
+    )
+    assert second.duration_s == pytest.approx(
+        p.extent_query_s + max(scan_seconds(m.vm, p), second.bytes_changed / p.link_bps), rel=0.11
+    )
+    m.sync_passes.append(second)
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    final = (await ex.run(StepName.CUTOVER, ctx)).sync_pass
+    assert final.kind == SyncPassKind.final
+    assert (final.extents["/dev/vda"].mode, final.extents["/dev/vda"].query_s) == (
+        "read",
+        p.extent_query_s,
+    )
+    assert (final.extents["/dev/vdb"].mode, final.extents["/dev/vdb"].reason) == (
+        "scanned",
+        "not_tracked",
+    )
+    # a migration without tracked disks records no extent use
+    plain = mig()
+    ctx, _ = make_ctx(make_plan(), plain, SRC, DST, FAST)
+    assert (await ex.run(StepName.PRECOPY, ctx)).sync_pass.extents == {}
+
+
+async def test_a_simulated_final_pass_takes_the_tracked_term(monkeypatch):
+    """SDD §7.4, §28.6: with no jitter, a tracked migration's final pass takes snapshot +
+    max(scan_U, q + max(Δf/S, Δf/L)) - the NetApp disk's scan alone against the Ceph disk's
+    read - and the source stays down as long as the tracked final-downtime estimate says."""
+    from seamless_migrate.planning.estimator import estimate_final_downtime, final_copy_seconds
+
+    monkeypatch.setattr(SimulatedExecutor, "_jitter", lambda self, rng: 1.0)
+    ex = SimulatedExecutor(FAST)
+    m = tracked_mig()
+    plan = make_plan(extent_tracking=True)
+    p = params_for_plan(plan)
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+        m.sync_passes.append((await ex.run(step, ctx)).sync_pass)
+    whole = m.sync_passes[-1].duration_s + p.snapshot_s
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    result = await ex.run(StepName.CUTOVER, ctx)
+    final = result.sync_pass
+    delta = min(m.vm.disk_bytes, m.vm.change_rate_bps * whole)
+    assert final.bytes_changed == int(delta)
+    assert final.duration_s == pytest.approx(
+        final_copy_seconds(m.vm, p, delta, ["d0"]) - p.snapshot_s
+    )
+    stopped = result.details["downtime_model_s"]
+    assert stopped + p.boot_s == pytest.approx(
+        estimate_final_downtime(m.vm, Strategy.warm, whole, p, tracked=["d0"])
+    )
+    assert stopped + p.boot_s < estimate_final_downtime(m.vm, Strategy.warm, whole, p)

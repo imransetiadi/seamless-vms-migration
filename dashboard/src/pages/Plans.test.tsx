@@ -1173,3 +1173,27 @@ describe('Plans page', () => {
     expect(screen.getByRole('main')).toHaveFocus();
   });
 });
+
+describe('changed-extent tracking in the plan form (SDD §16, §28.9, plan task CE10)', () => {
+  it('offers extent tracking for an OpenStack source only, with the Technology Preview badge', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'Track the finance disks', 'vcenter-hq');
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    // a VMware source has no Ceph cluster: the section is not offered (SDD §28.9)
+    expect(within(dialog).queryByRole('group', { name: /^changed-extent tracking/i })).not.toBeInTheDocument();
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    const section = within(dialog).getByRole('group', { name: /^changed-extent tracking/i });
+    expect(within(section).getByText('Technology Preview')).toBeInTheDocument();
+    const toggle = within(section).getByRole('checkbox', { name: /track changed extents on the source ceph cluster/i });
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(/needs the source provider's ceph access and key/i);
+    expect(within(dialog).getByText(/^advanced:/i)).not.toHaveTextContent(/changed-extent tracking/i);
+    await user.click(toggle);
+    expect(within(dialog).getByText(/^advanced:/i)).toHaveTextContent(/changed-extent tracking/i);
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Track the finance disks')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Track the finance disks')!.extent_tracking).toBe(true);
+  });
+});

@@ -78,6 +78,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import signal
 import stat
@@ -1202,6 +1203,9 @@ def _arg_interval(value):
 GATE_REFUSED = "seamless-link gate refused: "
 #: the options of the one send the gate runs, in the order the warm sync writes them (SDD 6.4)
 _GATE_SEND_OPTIONS = ["--device", "--chunk-size", "--workers", "--expect-serial"]
+#: the same send over a disk's extents (SDD 28.5): the file beside this script, named for it
+_GATE_EXTENTS_OPTIONS = _GATE_SEND_OPTIONS + ["--extents", "--extents-mode"]
+_GATE_EXTENTS_FILE = re.compile(r"^extents-[A-Za-z0-9_.-]{1,80}\.json$")
 
 
 class _GateRefusal(Exception):
@@ -1232,9 +1236,13 @@ def _gate_send(words, python, volumes):
     names = options[0::2]
     if "--expect-serial" not in names:
         raise _GateRefusal("send without --expect-serial")
-    if len(options) != 2 * len(_GATE_SEND_OPTIONS) or names != _GATE_SEND_OPTIONS:
+    if len(options) == 2 * len(_GATE_SEND_OPTIONS) and names == _GATE_SEND_OPTIONS:
+        extents = None
+    elif len(options) == 2 * len(_GATE_EXTENTS_OPTIONS) and names == _GATE_EXTENTS_OPTIONS:
+        extents = options[9], options[11]
+    else:
         raise _GateRefusal("send with other options")
-    device, chunk_size, workers, serial = options[1::2]
+    device, chunk_size, workers, serial = options[1:8:2]
     if serial not in volumes:
         raise _GateRefusal("volume %s, which is not the run's" % _gate_word(serial))
     for name, value, check in (
@@ -1254,12 +1262,24 @@ def _gate_send(words, python, volumes):
         raise _GateRefusal(
             "%s is the disk of volume %s, not of volume %s" % (_gate_word(device), shown, serial)
         )
-    return head + [
+    argv = head + [
         "--device", device,
         "--chunk-size", str(_arg_chunk_size(chunk_size)),
         "--workers", str(_arg_workers(workers)),
         "--expect-serial", serial,
     ]
+    if extents is not None:
+        path, mode = extents
+        if mode not in EXTENTS_MODES:
+            raise _GateRefusal("send with --extents-mode %s" % _gate_word(mode))
+        if (
+            not os.path.isabs(path)
+            or os.path.dirname(path) != os.path.dirname(os.path.abspath(__file__))
+            or not _GATE_EXTENTS_FILE.match(os.path.basename(path))
+        ):
+            raise _GateRefusal("%s, which is no extents file beside the script" % _gate_word(path))
+        argv += ["--extents", path, "--extents-mode", mode]
+    return argv
 
 
 def _cmd_gate(args):

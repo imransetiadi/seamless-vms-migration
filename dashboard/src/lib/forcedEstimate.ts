@@ -19,6 +19,7 @@ const DEFAULTS = {
   boot_s: 120,
   create_s: 60,
   snapshot_s: 30,
+  extent_query_s: 10,
   handover_per_volume_s: 20,
   v2v_s: 300,
   v2v_inplace_s: 120,
@@ -40,8 +41,8 @@ export const MAX_SYNC_PASSES = 100;
 export const MIN_RATE_BPS = 1;
 export const MAX_DURATION_S = 1_000_000_000;
 
-/** `params_for_plan`, then the migration's calibrated scan rate as the orchestrator applies it. */
-export function paramsFor(plan: PlanEstimatorSettings, observedScanBps?: number | null): EstimatorParams {
+/** `params_for_plan`, then the migration's calibrated scan rate and extent query time as the orchestrator applies them. */
+export function paramsFor(plan: PlanEstimatorSettings, observedScanBps?: number | null, observedExtentQueryS?: number | null): EstimatorParams {
   const p: EstimatorParams = { ...DEFAULTS };
   const fields = p as Record<string, number | null>;
   for (const [key, value] of Object.entries(plan.estimator_overrides ?? {})) {
@@ -54,19 +55,35 @@ export function paramsFor(plan: PlanEstimatorSettings, observedScanBps?: number 
   p.convergence_threshold_bytes = Math.trunc(plan.convergence_threshold_bytes);
   p.max_passes = Math.trunc(plan.max_sync_passes);
   if (observedScanBps) p.scan_bps = Number(observedScanBps);
+  if (observedExtentQueryS) p.extent_query_s = Number(observedExtentQueryS);
   return p;
 }
 
 type DiskVM = Pick<VMRef, 'disks' | 'disk_bytes' | 'used_bytes' | 'change_rate_bps'>;
 
 /** Time to read and hash every disk once: `max(Dmax/S, D/min(S·P, A))`. */
-export function scanSeconds(vm: DiskVM, p: EstimatorParams): number {
-  if (!vm.disks.length) return 0;
-  const largest = Math.max(...vm.disks.map((d) => d.size_gb)) * GIB;
+export function scanSeconds(vm: DiskVM, p: EstimatorParams, disks?: readonly VMRef['disks'][number][]): number {
+  const chosen = disks ?? vm.disks;
+  if (chosen.length === 0) return 0;
+  const largest = Math.max(...chosen.map((d) => d.size_gb)) * GIB;
+  const total = chosen.reduce((sum, d) => sum + d.size_gb, 0) * GIB;
   let aggregate = p.scan_bps * Math.max(1, Math.trunc(p.parallel_disks));
   if (p.max_aggregate_scan_bps !== null && p.max_aggregate_scan_bps > 0) aggregate = Math.min(aggregate, p.max_aggregate_scan_bps);
-  return Math.max(largest / p.scan_bps, vm.disk_bytes / aggregate);
+  return Math.max(largest / p.scan_bps, total / aggregate);
 }
+
+/**
+ * The final pass's copy term (`final_copy_seconds`, SDD §9.1): `snapshot + max(scan, Δf/L)`, or with disks read from
+ * extents `snapshot + max(scan_U, q + max(Δf/S, Δf/L))` over the others' scan (§28.6, plan task CE8).
+ */
+export function finalCopySeconds(vm: DiskVM, p: EstimatorParams, finalDelta: number, tracked?: readonly string[] | null): number {
+  if (!tracked || tracked.length === 0) return p.snapshot_s + Math.max(scanSeconds(vm, p), finalDelta / p.link_bps);
+  const set = new Set(tracked);
+  const untracked = vm.disks.filter((d) => !set.has(d.id));
+  const read = p.extent_query_s + Math.max(finalDelta / p.scan_bps, finalDelta / p.link_bps);
+  return p.snapshot_s + Math.max(scanSeconds(vm, p, untracked), read);
+}
+
 
 /** The expected duration of a warm migration's first pass (SDD §9.1). */
 export function firstPassSeconds(vm: DiskVM, strategy: Strategy, p: EstimatorParams): number {
@@ -105,7 +122,13 @@ function precopyPasses(
 }
 
 /** One strategy's estimate as the control plane's `estimate` computes it (SDD §9.1); eligibility is the selector's. */
-export function estimateStrategy(vm: DiskVM, strategy: Strategy, p: EstimatorParams, sloS: number): Omit<Estimate, 'eligible' | 'reasons'> {
+export function estimateStrategy(
+  vm: DiskVM,
+  strategy: Strategy,
+  p: EstimatorParams,
+  sloS: number,
+  tracked?: readonly string[] | null,
+): Omit<Estimate, 'eligible' | 'reasons'> {
   const rate = vm.change_rate_bps ?? p.change_rate_bps;
   const link = p.link_bps;
   let durations: number[] = [];
@@ -118,9 +141,11 @@ export function estimateStrategy(vm: DiskVM, strategy: Strategy, p: EstimatorPar
       break;
     case 'warm': {
       const scan = scanSeconds(vm, p);
-      const next = (delta: number) => p.snapshot_s + Math.max(scan, delta / link);
+      // a tracked migration's checked passes query the extents too (SDD §28.6)
+      const query = tracked && tracked.length > 0 ? p.extent_query_s : 0;
+      const next = (delta: number) => p.snapshot_s + query + Math.max(scan, delta / link);
       [durations, finalDelta] = precopyPasses(firstPassSeconds(vm, strategy, p), vm.used_bytes, next, vm.disk_bytes, rate, p);
-      copy = p.snapshot_s + Math.max(scan, finalDelta / link);
+      copy = finalCopySeconds(vm, p, finalDelta, tracked);
       break;
     }
     case 'storage_handover':
@@ -158,11 +183,17 @@ export function estimateStrategy(vm: DiskVM, strategy: Strategy, p: EstimatorPar
  * The downtime if cut over after a pass of `lastPassS` seconds (`estimate_final_downtime`, SDD §5.3), the plan's
  * post_create hooks' `hooksS` included (SDD §9.1, plan task N10).
  */
-export function finalDowntime(vm: DiskVM, strategy: Strategy, lastPassS: number, p: EstimatorParams, hooksS = 0): number {
+export function finalDowntime(
+  vm: DiskVM,
+  strategy: Strategy,
+  lastPassS: number,
+  p: EstimatorParams,
+  hooksS = 0,
+  tracked?: readonly string[] | null,
+): number {
   const rate = vm.change_rate_bps ?? p.change_rate_bps;
   const delta = Math.min(vm.disk_bytes, rate * Math.max(0, lastPassS));
-  const [copy, conversion] =
-    strategy === 'vmware_warm' ? [delta / p.link_bps, p.v2v_inplace_s] : [p.snapshot_s + Math.max(scanSeconds(vm, p), delta / p.link_bps), 0];
+  const [copy, conversion] = strategy === 'vmware_warm' ? [delta / p.link_bps, p.v2v_inplace_s] : [finalCopySeconds(vm, p, delta, tracked), 0];
   // in the control plane's order: shutdown, copy, conversion, create, boot, then the hooks when the plan runs some
   const downtime = p.shutdown_s + copy + conversion + p.create_s + p.boot_s;
   return hooksS > 0 ? downtime + hooksS : downtime;
@@ -183,11 +214,13 @@ export function wholePassSeconds(pass: Pick<SyncPass, 'duration_s'>, strategy: S
  * post_create hooks' part of its estimate included (SDD §9.1, plan task N10).
  */
 export function forcedDowntime(
-  m: Pick<Migration, 'vm' | 'strategy' | 'sync_passes' | 'observed_scan_bps'> & Partial<Pick<Migration, 'estimate'>>,
+  m: Pick<Migration, 'vm' | 'strategy' | 'sync_passes' | 'observed_scan_bps'> &
+    Partial<Pick<Migration, 'estimate' | 'tracked_disks' | 'observed_extent_query_s'>>,
   plan: PlanEstimatorSettings,
 ): number {
-  const p = paramsFor(plan, m.observed_scan_bps);
+  const p = paramsFor(plan, m.observed_scan_bps, m.observed_extent_query_s);
   const last = m.sync_passes.filter((s) => s.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const lastS = last ? wholePassSeconds(last, m.strategy, p) : firstPassSeconds(m.vm, m.strategy, p);
-  return finalDowntime(m.vm, m.strategy, lastS, p, m.estimate?.downtime_parts.hooks_s ?? 0);
+  // the disks its final pass reads from extents (SDD §28.6)
+  return finalDowntime(m.vm, m.strategy, lastS, p, m.estimate?.downtime_parts.hooks_s ?? 0, m.tracked_disks ?? []);
 }

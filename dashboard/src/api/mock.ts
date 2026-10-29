@@ -81,7 +81,7 @@ import type {
   DestinationInventory,
   Estimate,
   Event,
-  Me,
+  User,
   Migration,
   Phase,
   Plan,
@@ -103,6 +103,7 @@ import {
   ADVISOR_NOTES_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
+  CephAccess,
   DECISION_TYPES,
   FORCE_REASON_MIN,
   MAX_PROBE_PATH,
@@ -567,6 +568,13 @@ function overrideProblems(overrides: Record<string, unknown>): string[] {
 /** The pre-flight codes a plan may acknowledge for a VM, as the API's ACKNOWLEDGEABLE_FINDINGS (SDD §4.2, §9.3). */
 const ACKNOWLEDGEABLE_FINDINGS: readonly string[] = ['SRC_VM_AUTOSCALED'];
 
+/** `extent_tracking` is refused for a VMware source, which has no Ceph cluster (SDD §28.9, plan task CE7). */
+function refuseExtentTracking(spec: Record<string, unknown>, source: Provider | undefined): void {
+  if (spec.extent_tracking === true && source?.kind === 'vmware') {
+    throw new HttpError(422, 'validation_error', 'extent_tracking: a VMware source has no Ceph cluster to read extents from');
+  }
+}
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
   // the model validates the body first (pydantic's words, five at most), then the API's checks run in their order
   const bounds = PLAN_BOUNDS.flatMap(([field, op, limit]) => {
@@ -873,7 +881,44 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
 }
 
 /** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
-export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks']);
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
+
+/** A Ceph cluster's fsid and a monitor address, as the API's model reads them (SDD §4.2, §28.4). */
+const CEPH_FSID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CEPH_MONITOR = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]{0,252})(?::[0-9]{1,5})?$/;
+
+/**
+ * A provider's Ceph access as the API's model reads it (SDD §4.2, §28.4): an OpenStack or RHOSO source's alone; its
+ * fsid a UUID, 1 to 9 monitor addresses, its client without "client.".
+ */
+function checkCeph(fields: Record<string, unknown>): void {
+  const ceph = fields.ceph;
+  if (ceph === undefined || ceph === null) return;
+  if (typeof ceph !== 'object' || Array.isArray(ceph)) throw new HttpError(422, 'validation_error', 'ceph: Input should be a valid dictionary');
+  if (fields.kind === 'vmware') throw new HttpError(422, 'validation_error', 'Value error, ceph: a Ceph access cannot be declared for vmware');
+  if (fields.role !== 'source') throw new HttpError(422, 'validation_error', 'Value error, ceph: a Ceph access can be declared on a source provider alone');
+  const c = ceph as Record<string, unknown>;
+  if (typeof c.fsid !== 'string' || !CEPH_FSID.test(c.fsid.trim().toLowerCase())) {
+    throw new HttpError(422, 'validation_error', "Value error, fsid: a Ceph cluster's fsid is a UUID");
+  }
+  if (!Array.isArray(c.monitors) || c.monitors.length < 1 || c.monitors.length > 9) {
+    throw new HttpError(422, 'validation_error', 'ceph.monitors: List should have at least 1 item and at most 9');
+  }
+  if (c.monitors.some((m) => typeof m !== 'string' || !CEPH_MONITOR.test(m))) {
+    throw new HttpError(422, 'validation_error', 'Value error, monitors: each is a monitor address, "host" or "host:port"');
+  }
+  const client = c.client === undefined ? 'seamless' : c.client;
+  if (typeof client !== 'string' || client.toLowerCase().startsWith('client.') || !/^[A-Za-z0-9._-]{1,64}$/.test(client)) {
+    throw new HttpError(422, 'validation_error', 'Value error, client: the Ceph user without its "client." prefix');
+  }
+}
+
+/** The stored access: `key_updated_at` is server-owned, a client's value ignored (SDD §4.2). */
+function cephStored(input: unknown, keyAt: string | null): CephAccess | null {
+  if (!input) return null;
+  const c = input as Record<string, unknown>;
+  return { fsid: String(c.fsid).trim().toLowerCase(), monitors: (c.monitors as string[]).slice(), client: c.client === undefined ? 'seamless' : String(c.client), key_updated_at: keyAt };
+}
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -1015,7 +1060,7 @@ function hookProblem(body: Record<string, unknown>): string | null {
 }
 
 export class MockServer {
-  private readonly users = new Map<string, Me>();
+  private readonly users = new Map<string, User>();
   /** What GET /health answers; tests flip it to a degraded state. */
   health: Health = {
     status: 'ok',
@@ -1028,6 +1073,8 @@ export class MockServer {
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
   };
+  /** SEAMLESS_ANSIBLE_HOST_KEY_CHECKING as `GET /me` tells it (SDD §12, §15.1): true by default; tests turn it off. */
+  hostKeyChecking = true;
   readonly providers: Provider[];
   readonly inventories: Record<string, VMRef[] | DestinationInventory>;
   readonly plans: Plan[];
@@ -1740,7 +1787,7 @@ export class MockServer {
   // HTTP
   // ---------------------------------------------------------------------------------------
 
-  principal(token: string | null): Me | null {
+  principal(token: string | null): User | null {
     if (!token) return this.health.auth_disabled ? { name: 'anonymous', role: 'admin' } : null;
     const user = this.users.get(token.trim());
     if (user) return user;
@@ -1767,7 +1814,7 @@ export class MockServer {
    * the control plane's per-address lockout (SDD §15.1), which like the real one only ever answers a
    * route with a role check — the public health routes have none.
    */
-  private require(token: string | null, min: Role, _path: string): Me {
+  private require(token: string | null, min: Role, _path: string): User {
     const me = this.principal(token);
     if (!me) {
       if (token?.trim().toLowerCase() === 'locked') {
@@ -1785,7 +1832,7 @@ export class MockServer {
   }
 
   /** `auth.denied` in the API's shape (SDD §13.1); the in-browser mock's client is the browser. */
-  private auditDenied(reason: string, required: Role, me: Me | null): void {
+  private auditDenied(reason: string, required: Role, me: User | null): void {
     const { method } = this.request;
     const path = `${DEFAULT_API_BASE}/${this.request.path.replace(/^\//, '')}`;
     this.emit({
@@ -1817,7 +1864,7 @@ export class MockServer {
 
     if (method === 'GET' && root === 'health') return ok(this.health);
 
-    if (root === 'me' && method === 'GET') return ok(this.require(token, 'viewer', path));
+    if (root === 'me' && method === 'GET') return ok({ ...this.require(token, 'viewer', path), host_key_checking: this.hostKeyChecking });
 
     if (root === 'users' && !id) {
       const me = this.require(token, 'admin', path);
@@ -1831,7 +1878,7 @@ export class MockServer {
           throw new HttpError(422, 'validation_error', 'Choose a valid user name and role.');
         }
         if (users.some((user) => user.name.toLowerCase() === name.toLowerCase())) throw new HttpError(409, 'conflict', 'a user with this name already exists');
-        const user: Me = { name, role: role as Role };
+        const user: User = { name, role: role as Role };
         const issued = `smg_${crypto.randomUUID()}`;
         this.users.set(issued, user);
         this.emit({ kind: 'user.created', actor: me.name, message: `User ${name} created`, plan_id: null, migration_id: null, data: { name, role } });
@@ -1852,7 +1899,7 @@ export class MockServer {
         const provider = this.providers.find((p) => p.id === id);
         if (!provider) {
           // like the API (SDD §12, §13.2): the route's role first, then the lookup
-          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
+          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key' || sub === 'ceph-key') && method === 'PUT');
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
           if (!sub && method === 'PATCH') this.refusePatchBody(input);
@@ -1867,6 +1914,7 @@ export class MockServer {
         if (!sub && method === 'PATCH') return this.patchProvider(this.require(token, 'admin', path), provider, input);
         if (sub === 'credentials' && method === 'PUT') return this.setCredentials(this.require(token, 'admin', path), provider, input);
         if (sub === 'conversion-key' && method === 'PUT') return this.setConversionKey(this.require(token, 'admin', path), provider, input);
+        if (sub === 'ceph-key' && method === 'PUT') return this.setCephKey(this.require(token, 'admin', path), provider, input);
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
           const users = this.plansThatNeed(id);
@@ -2096,11 +2144,11 @@ export class MockServer {
     return spec;
   }
 
-  private auditPolicy(me: Me, kind: string, id: string, before: AdvisorPolicy | null, after: AdvisorPolicy | null): void {
+  private auditPolicy(me: User, kind: string, id: string, before: AdvisorPolicy | null, after: AdvisorPolicy | null): void {
     this.emit({ kind, plan_id: null, migration_id: null, actor: `user:${me.name}`, message: `advisor policy ${id} ${kind.replace('policy.', '')}`, data: { target_id: id, before, after } });
   }
 
-  private createPolicy(me: Me, input: Record<string, unknown>): MockResponse {
+  private createPolicy(me: User, input: Record<string, unknown>): MockResponse {
     const at = new Date(this.now()).toISOString();
     const policy: AdvisorPolicy = { ...this.policySpec(input), id: `pol-${hex(this.rand, 12)}`, created_at: at, updated_at: at, updated_by: me.name };
     this.policies.push(policy);
@@ -2108,7 +2156,7 @@ export class MockServer {
     return ok(policy, 201);
   }
 
-  private replacePolicy(me: Me, id: string, input: Record<string, unknown>): MockResponse {
+  private replacePolicy(me: User, id: string, input: Record<string, unknown>): MockResponse {
     const index = this.policies.findIndex((p) => p.id === id);
     if (index < 0) throw notFound('advisor_policy', id);
     const before = this.policies[index]!;
@@ -2118,7 +2166,7 @@ export class MockServer {
     return ok(after);
   }
 
-  private deletePolicy(me: Me, id: string): MockResponse {
+  private deletePolicy(me: User, id: string): MockResponse {
     const index = this.policies.findIndex((p) => p.id === id);
     if (index < 0) throw notFound('advisor_policy', id);
     const [before] = this.policies.splice(index, 1);
@@ -2127,7 +2175,7 @@ export class MockServer {
   }
 
   /** Approve or override an advisor decision, like the API (SDD §14.6). */
-  private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
+  private decideRecommendation(me: User, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
     // like the API's body model (SDD §12, reviews RV42B-01, RV43B-07): an override's body is judged before anything
     if (action === 'override') refuseOverrideBody(input);
     if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
@@ -2255,7 +2303,7 @@ export class MockServer {
     return found;
   }
 
-  private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
+  private createProvider(me: User, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
     // a name missing or not a string is refused in pydantic's words, as the API's model refuses it: stored, every text
@@ -2263,13 +2311,14 @@ export class MockServer {
     if (typeof input.name !== 'string') throw new HttpError(422, 'validation_error', input.name === undefined ? 'name: Field required' : 'name: Input should be a valid string');
     if (isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
-    // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
-    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
+    // like the API: provider-{id}, provider-{id}-ssh and provider-{id}-ceph must stay apart from every other provider's (SDD §13.3)
+    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh` || id === `${p.id}-ceph` || p.id === `${id}-ceph`);
     if (clash) {
-      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
+      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id>, provider-<id>-ssh and provider-<id>.ceph`);
     }
     checkDistribution(input);
     checkDeclarations(input);
+    checkCeph(input);
     readBooleans(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
@@ -2284,10 +2333,12 @@ export class MockServer {
       policy_profile: null,
       gpu_profiles: {},
       announces_tenant_networks: false,
+      ceph: null,
     };
     const provider = {
       ...defaults,
       ...(input as unknown as Provider),
+      ceph: cephStored(input.ceph, null),
       capabilities: {},
       status: 'unknown',
       status_message: null,
@@ -2309,7 +2360,7 @@ export class MockServer {
     if (typeof input.name === 'string' && isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
   }
 
-  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+  private patchProvider(me: User, provider: Provider, input: Record<string, unknown>): MockResponse {
     this.refusePatchBody(input);
     const users = this.plans.filter(
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
@@ -2319,15 +2370,35 @@ export class MockServer {
     if ('name' in input && typeof input.name !== 'string') throw new HttpError(422, 'validation_error', 'name: Input should be a valid string');
     checkDistribution({ ...provider, ...input });
     checkDeclarations({ ...provider, ...input });
+    checkCeph({ ...provider, ...input });
     readBooleans(input);
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
+    // a declared access keeps its stored key's time; null deletes the key with it (SDD §28.4)
+    if ('ceph' in input) input = { ...input, ceph: cephStored(input.ceph, input.ceph ? (provider.ceph?.key_updated_at ?? null) : null) };
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort(), ...secretNames(provider) } });
     return ok(provider);
   }
 
+  /** PUT /providers/{id}/ceph-key: write-only, as the API (SDD §12, §28.4); the mock keeps no value, only the stamp. */
+  private setCephKey(me: User, provider: Provider, input: Record<string, unknown>): MockResponse {
+    if (typeof input.key !== 'string') throw new HttpError(422, 'validation_error', input.key === undefined ? 'key: Field required' : 'key: Input should be a valid string');
+    if (input.key.length < 16) throw new HttpError(422, 'validation_error', 'key: String should have at least 16 characters');
+    if (input.key.length > 512) throw new HttpError(422, 'validation_error', 'key: String should have at most 512 characters');
+    if (!provider.ceph) throw new HttpError(422, 'validation_error', 'provider has no ceph access: set `ceph` before its key');
+    const key = pyStrip(input.key);
+    const padding = key.endsWith('==') ? 2 : key.endsWith('=') ? 1 : 0;
+    if (/\s/.test(key) || key.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(key) || (key.length * 3) / 4 - padding < 16) {
+      throw new HttpError(422, 'validation_error', 'key must be the base64 key `ceph auth get-key` prints');
+    }
+    const secret = `provider-${provider.id}.ceph`;
+    provider.ceph = { ...provider.ceph, key_updated_at: new Date(this.now()).toISOString() };
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `ceph key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['key'] } });
+    return ok(provider);
+  }
+
   /** PUT /providers/{id}/credentials: the mock keeps no values, only the "stored" stamp. */
-  private setCredentials(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+  private setCredentials(me: User, provider: Provider, input: Record<string, unknown>): MockResponse {
     refuseCredentialBody('credentials', input);
     // blank as the API's Python strip judges it (review RV24-06)
     const values = Object.fromEntries(Object.entries(input).filter(([, v]) => typeof v === 'string' && pyStrip(v))) as Record<string, string>;
@@ -2351,7 +2422,7 @@ export class MockServer {
     return ok(provider);
   }
 
-  private setConversionKey(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+  private setConversionKey(me: User, provider: Provider, input: Record<string, unknown>): MockResponse {
     refuseCredentialBody('conversion-key', input);
     const key = pyStrip(String(input.private_key ?? ''));
     if (!key.startsWith('-----BEGIN') || !key.includes('PRIVATE KEY-----')) throw new HttpError(422, 'validation_error', 'private_key must be an OpenSSH or PEM private key');
@@ -2374,7 +2445,7 @@ export class MockServer {
    * its default (POST) or at the plan's current value (PATCH), and the refusal precedes every
    * other check, like the API (QASuite S-01).
    */
-  private refusePolicyChange(me: Me, input: Record<string, unknown>, current: Record<string, unknown>): void {
+  private refusePolicyChange(me: User, input: Record<string, unknown>, current: Record<string, unknown>): void {
     if (hasRole(me.role, 'approver')) return;
     const touched = POLICY_FIELDS.filter((key) => key in input && stable(input[key] ?? null) !== stable(current[key] ?? null));
     if (!touched.length) return;
@@ -2454,7 +2525,7 @@ export class MockServer {
   }
 
   /** POST /plans/{id}/finalize (SDD §8.1): every completed migration of a wave or the plan, one approval. */
-  private finalizePlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+  private finalizePlan(me: User, plan: Plan, input: Record<string, unknown>): MockResponse {
     const waveId = typeof input.wave_id === 'string' ? input.wave_id : null;
     const wave = waveId ? plan.waves.find((w) => w.id === waveId) : null;
     if (waveId && !wave) throw notFound('wave', waveId);
@@ -2624,7 +2695,7 @@ export class MockServer {
     throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
   }
 
-  private createPlan(me: Me, raw: Record<string, unknown>): MockResponse {
+  private createPlan(me: User, raw: Record<string, unknown>): MockResponse {
     const input = withCanonicalNicOverrides(raw);
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
@@ -2637,6 +2708,7 @@ export class MockServer {
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
+    refuseExtentTracking(input, source);
     this.refuseUnknownHooks(input);
     const now = this.now();
     const plan: Plan = {
@@ -2689,7 +2761,7 @@ export class MockServer {
     if (busy.length) throw new HttpError(409, 'conflict', inFlightRefusal(busy, before));
   }
 
-  private patchPlan(me: Me, plan: Plan, raw: Record<string, unknown>): MockResponse {
+  private patchPlan(me: User, plan: Plan, raw: Record<string, unknown>): MockResponse {
     const input = withCanonicalNicOverrides(raw);
     // like the API (SDD §12): the body is a partial PlanCreate, a field it cannot change is refused first
     const unknown = Object.keys(input).filter((key) => !PLAN_EDITABLE_FIELDS.has(key)).sort();
@@ -2713,6 +2785,7 @@ export class MockServer {
     }
     // like the API (SDD §12): the plan it would store is checked, kept fields included
     refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
+    refuseExtentTracking({ ...(plan as unknown as Record<string, unknown>), ...input }, this.providers.find((p) => p.id === (input.source_provider_id ?? plan.source_provider_id)));
     this.refuseUnknownHooks({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';
@@ -2738,7 +2811,7 @@ export class MockServer {
     });
   }
 
-  private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+  private autoWaves(me: User, plan: Plan, input: Record<string, unknown>): MockResponse {
     // like the API (SDD §12): the body is checked first, an integer from 1 to 1000, never clamped
     const size = input.max_wave_size ?? 10;
     if (typeof size !== 'number' || !Number.isInteger(size)) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be a valid integer');
@@ -2810,6 +2883,8 @@ export class MockServer {
       estimate: null,
       estimates: [],
       observed_scan_bps: null,
+      tracked_disks: [],
+      observed_extent_query_s: null,
       resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
       findings: [],
       checkpoint: null,
@@ -2847,7 +2922,7 @@ export class MockServer {
     return m;
   }
 
-  private validatePlan(me: Me, plan: Plan): MockResponse {
+  private validatePlan(me: User, plan: Plan): MockResponse {
     // like orchestrator.validate_plan (SDD §8.1, §16): a completed plan is validated again (audit DB-01)
     if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before validating it again');
     if (plan.status === 'cancelled') throw new HttpError(409, 'conflict', 'a cancelled plan cannot be validated');
@@ -2921,7 +2996,7 @@ export class MockServer {
     return ok(report);
   }
 
-  private startPlan(me: Me, plan: Plan): MockResponse {
+  private startPlan(me: User, plan: Plan): MockResponse {
     // a failed plan (pre-staging failed) starts again and pre-stages again, as in the API (SDD §8)
     if (!['validated', 'paused', 'failed'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated, paused or failed plans can start (this plan is ${plan.status}).`);
     const blocked = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked');
@@ -2943,7 +3018,7 @@ export class MockServer {
     return ok(plan);
   }
 
-  private pausePlan(me: Me, plan: Plan): MockResponse {
+  private pausePlan(me: User, plan: Plan): MockResponse {
     if (plan.status !== 'running') throw new HttpError(409, 'conflict', `Only running plans can be paused (this plan is ${plan.status}).`);
     plan.status = 'paused';
     plan.updated_at = new Date(this.now()).toISOString();
@@ -2952,7 +3027,7 @@ export class MockServer {
   }
 
   /** POST /plans/{id}/cancel, like the API (SDD §12): retires a plan none of whose migrations started; nothing is deleted. */
-  private cancelPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+  private cancelPlan(me: User, plan: Plan, input: Record<string, unknown>): MockResponse {
     refuseCancelBody(input); // the API refuses the body before its route runs
     if (plan.status === 'cancelled') return ok(plan);
     if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before cancelling it');
@@ -2991,7 +3066,7 @@ export class MockServer {
     return ok(plan);
   }
 
-  private setStrategy(me: Me, m: Migration, input: Record<string, unknown>): MockResponse {
+  private setStrategy(me: User, m: Migration, input: Record<string, unknown>): MockResponse {
     const strategy = input.strategy as Strategy;
     if (!STRATEGIES.includes(strategy)) throw new HttpError(422, 'validation_error', 'Unknown strategy.');
     if (!['pending', 'ready', 'blocked'].includes(m.phase)) throw new HttpError(409, 'conflict', `Strategy can only change in pending, ready or blocked (now ${m.phase}).`);
@@ -3018,7 +3093,7 @@ export class MockServer {
     return ok(m);
   }
 
-  private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>, sent = true): MockResponse {
+  private migrationAction(me: User, m: Migration, action: string, input: Record<string, unknown>, sent = true): MockResponse {
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action a client sends (SDD §12)

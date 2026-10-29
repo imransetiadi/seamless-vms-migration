@@ -129,6 +129,19 @@ export interface ConversionHostConfig {
 
 /** A conversion host's pinned host keys (SDD §4.2, §26.4): server-owned - the provider check writes it (§10), the API
  * returns it and never writes it. */
+/** The source cluster's Ceph access, as its operator declares it (SDD §4.2, §28.4): its key is written by
+ * `PUT /providers/{id}/ceph-key` and never read back. */
+export interface CephAccess {
+  /** The cluster's fsid, a UUID. */
+  fsid: string;
+  /** 1-9 monitor addresses, "host" or "host:port". */
+  monitors: string[];
+  /** The Ceph user without "client."; "seamless" by default. */
+  client: string;
+  /** Server-owned: when the key was last written; null before. */
+  key_updated_at: Timestamp | null;
+}
+
 export interface HostKeyPin {
   /** The Nova server whose keys they are: the pin applies to it alone. */
   server_id: string;
@@ -176,15 +189,17 @@ export interface Provider {
   /** Server-owned: its conversion host's pinned host keys (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it.
    * Older fixtures omit it (null). */
   conversion_host_pin?: HostKeyPin | null;
+  /** The source cluster's Ceph access (SDD §4.2, §28.4): an OpenStack or RHOSO source alone. Older fixtures omit it (null). */
+  ceph?: CephAccess | null;
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
 export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
-  Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks'>>;
+  Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks' | 'ceph'>>;
 
 /** `PATCH /providers/{id}`: the editable fields (SDD §12). */
 export type ProviderPatch = Partial<
-  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks'>
+  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks' | 'ceph'>
 >;
 
 /** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
@@ -618,6 +633,9 @@ export interface Plan {
    * groups (SDD §6.6); `nova`: one fixed IP per port and a new MAC.
    */
   port_creation_mode: PortCreationMode;
+  /** The warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28.9): refused for a VMware source. Older
+   * fixtures omit it (false). */
+  extent_tracking?: boolean;
   /** Per VM (source id), per NIC MAC (lower case): its RHOSO network and addresses; OpenStack sources (SDD §4.2). */
   nic_overrides: Record<string, Record<string, NicOverride>>;
   /**
@@ -647,6 +665,17 @@ export interface SyncPass {
   bytes_changed: number;
   bytes_transferred: number;
   duration_s: number | null;
+  /** Per device, how the pass used the disk's extents (SDD §4.2, §28.5); {} or omitted without tracking. */
+  extents?: Record<string, ExtentUse>;
+}
+
+/** How a pass used a disk's extents (SDD §4.2, §28.5). */
+export interface ExtentUse {
+  mode: 'read' | 'checked' | 'scanned';
+  reason: string | null;
+  query_s: number | null;
+  missed: number;
+  assumed_zero: boolean;
 }
 
 export interface Finding {
@@ -925,6 +954,11 @@ export interface Migration {
   estimates: Estimate[];
   /** Per-stream scan throughput measured by the last delta pass (SDD §9.1 calibration), null before it. */
   observed_scan_bps: number | null;
+  /** The disks (ids) the final pass is expected to read from extents (SDD §9.1, §28.6): a tracked plan's qualifying
+   * disks at validation, less those a pass scanned for a lasting reason. */
+  tracked_disks: string[];
+  /** The longest extent query of the last checked pass (SDD §9.1 calibration), null before one. */
+  observed_extent_query_s: number | null;
   /** Mappings matched automatically by pre-flight, e.g. the smallest fitting flavor (`MAP_FLAVOR_AUTO`). */
   resolved_mappings: Mappings;
   findings: Finding[];
@@ -1264,12 +1298,19 @@ export interface Health {
   orchestrator: OrchestratorHealth;
 }
 
-export interface Me {
+/** A dashboard user, as `GET /users` lists it (SDD §12). */
+export interface User {
   name: string;
   role: Role;
 }
 
-export interface UserCreated extends Me {
+/** `GET /me` (SDD §12): the signed-in user, and whether the data path checks the conversion hosts' keys. */
+export interface Me extends User {
+  /** SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (SDD §15.1, §26.8): false, no hop checks a conversion host's key - the provider page warns (§16). */
+  host_key_checking: boolean;
+}
+
+export interface UserCreated extends User {
   token: string;
 }
 

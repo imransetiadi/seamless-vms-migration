@@ -576,10 +576,18 @@ def test_the_shared_forced_estimate_cases(case):
     params = params_for_plan(make_plan(**case["plan"]))
     if case["observed_scan_bps"]:
         params = replace(params, scan_bps=float(case["observed_scan_bps"]))
+    if case.get("observed_extent_query_s"):
+        params = replace(params, extent_query_s=float(case["observed_extent_query_s"]))
     vm = VMRef.model_validate(case["vm"])
-    # the post_create hooks' part of the migration's estimate, when a case gives it (§9.1)
+    # the post_create hooks' part of the migration's estimate, when a case gives it (§9.1), and
+    # the disks its final pass reads from extents (§28.6)
     got = estimate_forced_downtime(
-        vm, Strategy(case["strategy"]), case["last_pass_s"], params, case.get("hooks_s", 0.0)
+        vm,
+        Strategy(case["strategy"]),
+        case["last_pass_s"],
+        params,
+        case.get("hooks_s", 0.0),
+        case.get("tracked"),
     )
     assert got == pytest.approx(case["expected_s"], rel=1e-12)
 
@@ -598,7 +606,13 @@ def test_the_shared_estimate_cases(case):
     the dashboard's port, the figures of its offline mock, is checked against the same table."""
     plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
-    got = estimate(vm, Strategy(case["strategy"]), params_for_plan(plan), plan.downtime_slo_s)
+    got = estimate(
+        vm,
+        Strategy(case["strategy"]),
+        params_for_plan(plan),
+        plan.downtime_slo_s,
+        tracked=case.get("tracked"),
+    )
     got, want = got.model_dump(mode="json"), case["expected"]
     for key in ("strategy", "passes", "final_delta_bytes", "meets_slo"):
         assert got[key] == want[key], key
@@ -760,3 +774,153 @@ async def test_the_later_figures_take_the_hooks_part_from_the_estimate(tmp_path,
         assert forced.force_cutover.estimated_downtime_s == pytest.approx(expected + 420)
     finally:
         await h.orch.stop()
+
+
+# -- extent tracking (SDD §9.1, §28.6; plan task CE8) ----------------------------------------
+from seamless_migrate.domain.models import ExtentUse  # noqa: E402
+from seamless_migrate.planning.estimator import (  # noqa: E402
+    MAX_DURATION_S,
+    final_copy_seconds,
+    observed_extent_query_s,
+    tracked_disks,
+)
+
+
+def tracked_vm(sizes=(200,), used=(120.0,), rate=2 * MIB):
+    disks = [
+        make_disk(id=f"d{i}", size_gb=size, used_gb=u, device=f"/dev/vd{'abcdef'[i]}")
+        for i, (size, u) in enumerate(zip(sizes, used, strict=True))
+    ]
+    return make_vm(disks=disks, change_rate_bps=rate)
+
+
+def test_a_tracked_final_pass_drops_the_scan_term():
+    """SDD §28.6: a final pass over the listed chunks alone costs the query and the delta's read
+    and transfer - snapshot + q + max(Δf/S, Δf/L) - instead of the whole disk's scan."""
+    vm = tracked_vm()
+    tracked = estimate(vm, Strategy.warm, P, 300, tracked=["d0"])
+    plain = estimate(vm, Strategy.warm, P, 300)
+    delta = tracked.final_delta_bytes
+    assert tracked.downtime_parts["copy_s"] == pytest.approx(
+        P.snapshot_s + P.extent_query_s + max(delta / P.scan_bps, delta / P.link_bps)
+    )
+    assert plain.downtime_parts["copy_s"] == pytest.approx(P.snapshot_s + 409.6)
+    assert tracked.downtime_s < plain.downtime_s
+    # the SLO rule's and a Force cutover's figure take the same term (SDD §5.3, §5.4)
+    final = estimate_final_downtime(vm, Strategy.warm, 480.0, P, tracked=["d0"])
+    d = 2 * MIB * 480
+    assert final == pytest.approx(60 + 30 + 10 + max(d / P.scan_bps, d / P.link_bps) + 60 + 120)
+    assert estimate_forced_downtime(vm, Strategy.warm, 480.0, P, tracked=["d0"]) == final
+    # a disk that is no longer tracked scans as before
+    assert estimate_final_downtime(vm, Strategy.warm, 480.0, P, tracked=[]) == pytest.approx(
+        estimate_final_downtime(vm, Strategy.warm, 480.0, P)
+    )
+
+
+def test_a_partly_tracked_vm_keeps_the_scan_of_its_untracked_disks():
+    """SDD §28.6: scan_U is the scan term over the untracked disks alone - the largest of them
+    at S, or their total over the streams - and 0 when every disk is tracked."""
+    vm = tracked_vm(sizes=(200, 100), used=(120.0, 50.0))
+    delta = 900 * MIB
+    read = P.extent_query_s + max(delta / P.scan_bps, delta / P.link_bps)
+    assert final_copy_seconds(vm, P, delta, ["d0"]) == pytest.approx(
+        P.snapshot_s + max(204.8, read)
+    )
+    assert final_copy_seconds(vm, P, delta, ["d1"]) == pytest.approx(
+        P.snapshot_s + max(409.6, read)
+    )
+    assert final_copy_seconds(vm, P, delta, ["d0", "d1"]) == pytest.approx(P.snapshot_s + read)
+    assert final_copy_seconds(vm, P, delta, None) == pytest.approx(P.snapshot_s + 409.6)
+    # scan_seconds over a subset: the subset's largest disk and total
+    assert scan_seconds(vm, P, [d for d in vm.disks if d.id == "d1"]) == pytest.approx(204.8)
+    assert scan_seconds(vm, P, []) == 0.0
+
+
+def test_a_checked_pass_costs_its_extent_query():
+    """SDD §28.6: a tracked migration's pre-copy passes after the first check the extents too:
+    Tk = snapshot + q + max(scan, Δk/L)."""
+    vm = tracked_vm()
+    tracked = estimate(vm, Strategy.warm, P, 300, tracked=["d0"])
+    plain = estimate(vm, Strategy.warm, P, 300)
+    assert tracked.passes == plain.passes == 3
+    assert tracked.precopy_s == pytest.approx(plain.precopy_s + 2 * P.extent_query_s)
+    first = first_pass_seconds(vm, Strategy.warm, P)
+    assert tracked.precopy_s == pytest.approx(first + 2 * (P.snapshot_s + P.extent_query_s + 409.6))
+
+
+def test_extent_query_s_is_a_duration_override_with_its_bounds():
+    """SDD §9.1: extent_query_s is a plan override like the other durations - finite, positive,
+    at most 10**9 s - and params_for_plan applies it."""
+    assert invalid_estimator_overrides({"extent_query_s": 5}) == []
+    assert invalid_estimator_overrides({"extent_query_s": 0}) == [
+        "extent_query_s: must be a finite positive number"
+    ]
+    assert invalid_estimator_overrides({"extent_query_s": MAX_DURATION_S + 1}) == [
+        f"extent_query_s: must be at most {MAX_DURATION_S} s"
+    ]
+    assert (
+        params_for_plan(make_plan(estimator_overrides={"extent_query_s": 5})).extent_query_s == 5.0
+    )
+    assert P.extent_query_s == 10.0
+
+
+def test_a_pass_that_read_extents_never_calibrates_the_scan_rate():
+    """SDD §28.6: a pass that read any disk from extents scanned nothing in full: it tells no S;
+    a checked pass scanned in full and calibrates S as before."""
+    t0 = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
+    checked = SyncPass(
+        number=2, kind="delta", started_at=t0, ended_at=t0 + timedelta(seconds=50),
+        bytes_scanned=40 * GIB, bytes_changed=100 * MIB, duration_s=50.0,
+        extents={"/dev/vda": ExtentUse(mode="checked", query_s=2.0)},
+    )  # fmt: skip
+    two_disks = make_vm(disks=[make_disk(id="a", size_gb=20), make_disk(id="b", size_gb=20)])
+    assert observed_scan_rate(checked, two_disks, P) == pytest.approx(40 * GIB / 50 / 2)
+    read = checked.model_copy(
+        update={"extents": {"/dev/vda": ExtentUse(mode="read", query_s=2.0),
+                            "/dev/vdb": ExtentUse(mode="checked", query_s=1.0)}}
+    )  # fmt: skip
+    assert observed_scan_rate(read, two_disks, P) is None
+
+
+def test_a_checked_pass_calibrates_the_extent_query_time():
+    """SDD §28.6: a checked pass's longest query replaces q; a pass that checked no disk - one
+    that scanned alone, or read - leaves it as it was."""
+    t0 = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
+    base = SyncPass(number=2, kind="delta", started_at=t0, duration_s=50.0)
+    checked = base.model_copy(update={"extents": {
+        "/dev/vda": ExtentUse(mode="checked", query_s=3.5),
+        "/dev/vdb": ExtentUse(mode="checked", query_s=7.25),
+        "/dev/vdc": ExtentUse(mode="scanned", reason="query_failed", query_s=20.0),
+    }})  # fmt: skip
+    assert observed_extent_query_s(checked) == 7.25
+    assert observed_extent_query_s(base) is None
+    scanned = base.model_copy(
+        update={"extents": {"/dev/vda": ExtentUse(mode="scanned", reason="first_pass")}}
+    )
+    assert observed_extent_query_s(scanned) is None
+    read = base.model_copy(update={"extents": {"/dev/vda": ExtentUse(mode="read", query_s=4.0)}})
+    assert observed_extent_query_s(read) is None
+    # the tracked disks after a pass: a lasting reason removes a disk, a passing one keeps it
+    vm = tracked_vm(sizes=(200, 100), used=(120.0, 50.0))
+    missed = base.model_copy(update={"extents": {
+        "/dev/vda": ExtentUse(mode="scanned", reason="missed"),
+        "/dev/vdb": ExtentUse(mode="scanned", reason="query_failed"),
+    }})  # fmt: skip
+    assert tracked_disks(vm, ["d0", "d1"], [missed]) == ["d1"]
+    assert tracked_disks(vm, ["d0", "d1"], []) == ["d0", "d1"]
+    assert tracked_disks(vm, ["d0"], [checked]) == ["d0"]
+
+
+def test_the_sdd_28_worked_example():
+    """SDD §28.6's worked example: the 200 GiB disk of §9.1 (120 GiB used, 2 MiB/s) runs pass 1
+    in about 1,013 s, then checked passes of about 450 s, and its final downtime is about 287 s -
+    60 + 30 + 10 + 7.2 + 60 + 120 - instead of 680 s."""
+    vm = tracked_vm()
+    got = estimate(vm, Strategy.warm, P, 300, tracked=["d0"])
+    assert got.passes == 3
+    assert first_pass_seconds(vm, Strategy.warm, P) == pytest.approx(1013.04)
+    assert got.precopy_s == pytest.approx(1013.04 + 2 * 449.6)
+    assert got.downtime_s == pytest.approx(287.19, abs=0.05)
+    assert got.meets_slo is True
+    plain = estimate(vm, Strategy.warm, P, 300)
+    assert plain.downtime_s == pytest.approx(679.6) and plain.meets_slo is False

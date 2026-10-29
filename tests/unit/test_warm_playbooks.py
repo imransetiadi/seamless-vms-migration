@@ -78,7 +78,7 @@ def load(path):
     if not os.path.exists(path):
         return {"server_id": server_id, "server_name": name, "transfer_uuid": None,
                 "dest_volumes": {}, "passes": [], "pending_snapshot": None,
-                "destination_server_id": None}
+                "destination_server_id": None, "extent_bases": {}, "extents_off": []}
     with open(path) as f:
         return json.load(f)
 
@@ -154,7 +154,14 @@ elif NAME == "import_workload_warm_snapshot":
         save(path, state)
         result = {"changed": True, "transfer_uuid": uuid,
                   "volume_map": state["pending_snapshot"]["volume_map"]}
-    elif state["pending_snapshot"] is not None:
+    elif state["pending_snapshot"] is not None or state.get("extent_bases"):
+        if args.get("keep_base") and state["pending_snapshot"] is not None:
+            # the completed pass's snapshot stays as the base (SDD 6.4, plan task CE4)
+            state["extent_bases"] = {"/dev/vda": {
+                "snapshot_id": "snap-" + state["pending_snapshot"]["transfer_uuid"],
+                "pass": len(state["passes"])}}
+        elif not args.get("keep_base"):
+            state["extent_bases"], state["extents_off"] = {}, []
         state["pending_snapshot"] = None
         save(path, state)
         result = {"changed": True}
@@ -169,7 +176,10 @@ elif NAME == "import_workload_warm_sync":
     sync_pass = {"number": len(state["passes"]) + 1, "kind": kind,
                  "started_at": "2026-10-08T10:00:00.000Z",
                  "ended_at": "2026-10-08T10:00:01.000Z", "bytes_scanned": 100,
-                 "bytes_changed": 10, "bytes_transferred": 5, "duration_s": 1.0}
+                 "bytes_changed": 10, "bytes_transferred": 5, "duration_s": 1.0,
+                 "extents": {} if args.get("extents", "off") == "off" else {
+                     "/dev/vda": {"mode": "checked", "reason": None, "query_s": 0.1,
+                                  "missed": 0, "assumed_zero": False}}}
     state["passes"].append(sync_pass)
     save(path, state)
     result = {"changed": True, "transfer_uuid": args["transfer_uuid"], "sync_pass": sync_pass,
@@ -1264,3 +1274,69 @@ def test_a_link_refused_before_the_stop_leaves_the_source_running(env, playbook)
     # the rescue removes its workload's every entry, the link that failed having none
     assert sequence[sequence.index("conversion_host_link:present") + 1] == (
         "conversion_host_link:absent")
+
+
+# --------------------------------------------------------------------------------------------
+# extent tracking through the roles (SDD 6.5, 28.5; plan task CE4)
+
+CEPH_VARS = {
+    "os_migrate_warm_ceph_conf": "/data/run/ceph.conf",
+    "os_migrate_warm_ceph_keyring": "/data/run/keyring",
+    "os_migrate_warm_ceph_client": "seamless",
+    "os_migrate_warm_ceph_pools": {"hostgroup@ceph#ceph": "volumes"},
+    "os_migrate_warm_extent_query_timeout": 120,
+}
+
+
+def test_pre_copy_passes_check_and_the_final_pass_reads_when_tracking_is_on(env):
+    """SDD 6.5: os_migrate_warm_extents_precopy reaches the pre-copy's sync as extents, with the
+    Ceph files, the user, the pools and the timeout, and its snapshot cleanups keep the base;
+    os_migrate_warm_extents_final reaches the final pass, whose cleanup deletes the bases."""
+    rc, out, calls = env.run(
+        "import_workloads_precopy", os_migrate_warm_extents_precopy="check", **CEPH_VARS
+    )
+    assert rc == 0, out
+    sync = next(c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
+    assert sync["extents"] == "check"
+    assert sync["ceph_conf"] == "/data/run/ceph.conf" and sync["ceph_keyring"] == "/data/run/keyring"
+    assert sync["ceph_client"] == "seamless" and sync["ceph_pools"] == {"hostgroup@ceph#ceph": "volumes"}
+    assert sync["extent_query_timeout"] == 120
+    cleanups = [c["args"] for c in calls if c["module"] == "import_workload_warm_snapshot" and c["args"].get("state") == "absent"]
+    assert cleanups and all(c["keep_base"] is True for c in cleanups)
+
+    rc, out, calls = env.run(
+        "import_workloads_cutover", os_migrate_warm_extents_final="read", **CEPH_VARS
+    )
+    assert rc == 0, out
+    sync = next(c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
+    assert sync["pass_kind"] == "final" and sync["extents"] == "read"
+    cleanups = [c["args"] for c in calls if c["module"] == "import_workload_warm_snapshot" and c["args"].get("state") == "absent"]
+    assert cleanups and not any(c.get("keep_base") for c in cleanups)
+
+
+def test_no_pass_uses_extents_when_tracking_is_off(env):
+    """SDD 6.5: by default no pass tracks extents - extents is "off" on every sync - and no
+    snapshot cleanup keeps a base."""
+    for playbook in ("import_workloads_precopy", "import_workloads_cutover"):
+        rc, out, calls = env.run(playbook)
+        assert rc == 0, out
+        syncs = [c["args"] for c in calls if c["module"] == "import_workload_warm_sync"]
+        assert syncs and all(s["extents"] == "off" for s in syncs)
+        cleanups = [c["args"] for c in calls if c["module"] == "import_workload_warm_snapshot" and c["args"].get("state") == "absent"]
+        assert cleanups and not any(c.get("keep_base") for c in cleanups)
+    assert env.state("srv-1")["extent_bases"] == {}
+
+
+def test_the_cutover_deletes_the_bases_after_its_final_pass(env):
+    """SDD 28.4: the pre-copy passes leave each disk's base; the cutover's cleanup after its final
+    pass deletes them, so a finalized migration leaves no snapshot behind."""
+    rc, out, calls = env.run(
+        "import_workloads_precopy", os_migrate_warm_extents_precopy="check", **CEPH_VARS
+    )
+    assert rc == 0, out
+    assert env.state("srv-1")["extent_bases"]
+    rc, out, calls = env.run(
+        "import_workloads_cutover", os_migrate_warm_extents_final="read", **CEPH_VARS
+    )
+    assert rc == 0, out
+    assert env.state("srv-1")["extent_bases"] == {} and env.state("srv-1")["extents_off"] == []

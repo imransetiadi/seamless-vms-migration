@@ -421,3 +421,34 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 });
+
+describe('changed-extent tracking (SDD §16, §28, plan task CE10)', () => {
+  it("a source card's Ceph access, and the provider form's Ceph access section with its errors", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/providers', 'admin');
+    await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
+    await settled();
+    const card = screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    within(card).getByRole('group', { name: 'Ceph access' });
+    expect(await violations()).toEqual([]);
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'Ceph access' });
+    await user.clear(within(section).getByLabelText(/^cluster fsid/i));
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a tracked migration's extent use per pass and per disk, and its plan's switch", async () => {
+    // the seed is deterministic: the same migration in the page's own server
+    const probe = createTestServer();
+    const tracked = probe.plans.find((p) => p.extent_tracking)!;
+    const id = probe.migrations.find((m) => m.plan_id === tracked.id && m.strategy === 'warm' && m.sync_passes.length >= 2)!.id;
+    renderAt(`/migrations/${id}`, 'operator');
+    await screen.findByRole('region', { name: /sync-pass convergence/i }, { timeout: 8_000 });
+    await settled();
+    expect(screen.getByRole('list', { name: 'Disks' })).toHaveTextContent(/Extents/);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+});

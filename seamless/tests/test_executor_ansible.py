@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ import yaml
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
 from seamless_migrate.domain.models import (
+    CephAccess,
     ConversionHostConfig,
     GpuDevice,
     HostKeyPin,
@@ -34,6 +36,9 @@ from seamless_migrate.executors.ansible import (
     apply_mappings,
     build_inventory,
     build_vars,
+    ceph_pools,
+    ceph_run_files,
+    ceph_tracking,
     classify_failure,
     effective_mappings,
     resolve_network_refs,
@@ -329,6 +334,9 @@ def env(tmp_path, monkeypatch):
         clouds_yaml=clouds,
         secrets_dir=tmp_path / "secrets",
         collection_root=find_repo_root(),
+        # these tests are about the rest of a run; the host key checks, on by default since plan
+        # task ST7, have their own tests, which turn them on (SDD §7.2, §26.8)
+        ansible_host_key_checking=False,
     )
     registry = FakeRegistry()
     executor = AnsibleExecutor(settings, providers=registry, poll_s=0.02)
@@ -5401,6 +5409,7 @@ async def test_missing_ansible_playbook_binary_is_permanent(env):
         clouds_yaml=env.settings.clouds_yaml,
         secrets_dir=env.settings.secrets_dir,
         collection_root=env.settings.collection_root,
+        ansible_host_key_checking=env.settings.ansible_host_key_checking,
     )
     executor = AnsibleExecutor(broken, providers=env.registry, poll_s=0.02)
     plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
@@ -7063,3 +7072,236 @@ async def test_each_run_has_its_own_ssh_control_path_while_host_keys_are_checked
         assert call["env"]["ANSIBLE_SSH_CONTROL_PATH_DIR"] == str(plan_dir(env) / "cp")
         assert call["control_path_dir"] == [[], "0o700"]
     assert not (plan_dir(env) / "cp").exists()
+
+
+# --------------------------------------------------------------------------------------------
+# extent tracking: the Ceph run files, the roles' variables, each pass's extent use (SDD §7.2,
+# §28.4, §28.5; plan task CE7)
+
+CEPH_FSID = "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e"
+CEPH_KEY = "AQFakeCephKeyForTestsOnlyNotRealAtAll0=="  # gitleaks:allow (synthetic, no key material)
+TRACKED_SRC = SRC.model_copy(
+    update={
+        "ceph": CephAccess(
+            fsid=CEPH_FSID, monitors=["mon1.ceph.example", "mon2.ceph.example:6789"]
+        ),
+        "capabilities": {
+            "storage_backends": [
+                {
+                    "pool": "hostgroup@ceph#ceph",
+                    "vendor": "Open Source",
+                    "protocol": "ceph",
+                    "family": "rbd",
+                    "ceph_fsid": CEPH_FSID,
+                    "ceph_pool": "volumes",
+                },
+                {
+                    "pool": "hostgroup@ceph2#ssd",
+                    "vendor": "Open Source",
+                    "protocol": "ceph",
+                    "family": "rbd",
+                    "ceph_fsid": "11111111-2222-4333-8444-555555555555",
+                    "ceph_pool": "ssd",
+                },
+                {
+                    "pool": "hostgroup@ceph3#noinfo",
+                    "vendor": "Open Source",
+                    "protocol": "ceph",
+                    "family": "rbd",
+                    "ceph_fsid": None,
+                    "ceph_pool": None,
+                },
+                {
+                    "pool": "hostgroup@ontap#flex",
+                    "vendor": "NetApp",
+                    "protocol": "iSCSI",
+                    "family": "netapp_block",
+                },
+            ]
+        },
+    }
+)
+
+
+def write_ceph_key(env, provider_id="src-osp", key=CEPH_KEY):
+    secret = env.settings.secrets_dir / f"provider-{provider_id}.ceph"
+    secret.mkdir(parents=True, exist_ok=True)
+    (secret / "key").write_text(key)
+
+
+def tracked_ctx(env, **kw):
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, extent_tracking=True)
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.warm, **kw)
+    return make_ctx(plan, mig, TRACKED_SRC, DST, env.settings)
+
+
+async def test_a_tracked_plan_passes_the_ceph_files_and_each_runs_extent_mode(env):
+    """SDD §7.2, §28.4: a warm plan that tracks extents, whose source has Ceph access and a key,
+    names the run's ceph.conf and keyring to the roles with the user, the pools and the timeout;
+    a pre-copy or sync run checks, the cutover reads."""
+    write_ceph_key(env)
+    ctx, _ = tracked_ctx(env)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    precopy = read_log(env.log)[-1]["vars"]
+    assert precopy["os_migrate_warm_extents_precopy"] == "check"
+    assert "os_migrate_warm_extents_final" not in precopy
+    assert precopy["os_migrate_warm_ceph_conf"] == str(run_dir(env) / "ceph.conf")
+    assert precopy["os_migrate_warm_ceph_keyring"] == str(run_dir(env) / "ceph.keyring")
+    assert precopy["os_migrate_warm_ceph_client"] == "seamless"
+    assert precopy["os_migrate_warm_ceph_pools"] == {"hostgroup@ceph#ceph": "volumes"}
+    assert precopy["os_migrate_warm_extent_query_timeout"] == 300
+    await env.executor.run(StepName.SYNC, ctx)
+    assert read_log(env.log)[-1]["vars"]["os_migrate_warm_extents_precopy"] == "check"
+    await env.executor.run(StepName.CUTOVER, ctx)
+    cutover = read_log(env.log)[-1]["vars"]
+    assert cutover["os_migrate_warm_extents_final"] == "read"
+    assert "os_migrate_warm_extents_precopy" not in cutover
+    assert cutover["os_migrate_warm_ceph_pools"] == {"hostgroup@ceph#ceph": "volumes"}
+
+
+async def test_the_ceph_files_are_0600_and_deleted_after_the_run(env, monkeypatch):
+    """SDD §7.2: the run's ceph.conf and keyring are 0600 beside secrets.yml while the playbook
+    runs and gone after it, whatever its outcome; the keyring holds the client's key."""
+    write_ceph_key(env)
+    ctx, _ = tracked_ctx(env)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    call = read_log(env.log)[-1]
+    assert call["ceph_files"] == {"ceph.conf": "0o600", "ceph.keyring": "0o600"}
+    assert not (run_dir(env) / "ceph.conf").exists()
+    assert not (run_dir(env) / "ceph.keyring").exists()
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", "Unable to find flavor rhoso.small")
+    with pytest.raises(PermanentStepError):
+        await env.executor.run(StepName.SYNC, ctx)
+    assert read_log(env.log)[-1]["ceph_files"] == {"ceph.conf": "0o600", "ceph.keyring": "0o600"}
+    assert not (run_dir(env) / "ceph.conf").exists()
+    assert not (run_dir(env) / "ceph.keyring").exists()
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    conf, keyring = ceph_run_files(ctx)
+    assert (
+        conf[1]
+        == f"[global]\nfsid = {CEPH_FSID}\nmon_host = mon1.ceph.example,mon2.ceph.example:6789\n"
+    )
+    assert keyring[1] == f"[client.seamless]\n\tkey = {CEPH_KEY}\n"
+
+
+async def test_the_ceph_key_reaches_neither_vars_yml_nor_a_log_line(env, caplog):
+    """SDD §7.2, §28.8: the key is in the keyring alone - not in vars.yml, the inventory, the
+    secrets' keys, a log line or the migration's log."""
+    write_ceph_key(env)
+    ctx, rec = tracked_ctx(env)
+    with caplog.at_level(logging.DEBUG):
+        await env.executor.run(StepName.PRECOPY, ctx)
+    for call in read_log(env.log):
+        assert CEPH_KEY not in json.dumps(call["vars"]) and CEPH_KEY not in call["inventory"]
+        assert CEPH_KEY not in call["raw"]["vars.yml"]
+        assert "ceph" not in " ".join(call["secret_keys"]).lower()
+    assert CEPH_KEY not in caplog.text
+    assert CEPH_KEY not in "\n".join(rec.logs)
+
+
+async def test_ceph_pools_are_the_source_pools_of_the_providers_fsid(env):
+    """SDD §10, §28.4: the tracked pools are the source check's rbd entries whose ceph_fsid is
+    the provider's - another cluster's, one without location_info and a NetApp pool are not;
+    without one, the plan passes no Ceph file."""
+    assert ceph_pools(TRACKED_SRC) == {"hostgroup@ceph#ceph": "volumes"}
+    assert ceph_pools(SRC) == {}
+    other = TRACKED_SRC.model_copy(
+        update={
+            "ceph": TRACKED_SRC.ceph.model_copy(
+                update={"fsid": "11111111-2222-4333-8444-555555555555"}
+            )
+        }
+    )
+    assert ceph_pools(other) == {"hostgroup@ceph2#ssd": "ssd"}
+    none = TRACKED_SRC.model_copy(
+        update={
+            "ceph": TRACKED_SRC.ceph.model_copy(
+                update={"fsid": "99999999-2222-4333-8444-555555555555"}
+            )
+        }
+    )
+    assert ceph_pools(none) == {}
+    write_ceph_key(env)
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, extent_tracking=True)
+    assert ceph_tracking(plan, none, env.settings) is None
+    assert ceph_tracking(plan, TRACKED_SRC, env.settings)["pools"] == {
+        "hostgroup@ceph#ceph": "volumes"
+    }
+
+
+async def test_each_pass_records_its_extent_use_from_the_warm_state(env, monkeypatch):
+    """SDD §4.2, §6.3, §28.5: each pass's extents, as the sync wrote them in the warm state,
+    reach the migration's SyncPass; a pass without tracking records {}."""
+    write_ceph_key(env)
+    ctx, rec = tracked_ctx(env)
+    use = {
+        "/dev/vda": {
+            "mode": "checked",
+            "reason": None,
+            "query_s": 1.25,
+            "missed": 0,
+            "assumed_zero": False,
+        },
+        "/dev/vdb": {
+            "mode": "scanned",
+            "reason": "not_tracked",
+            "query_s": None,
+            "missed": 0,
+            "assumed_zero": False,
+        },
+    }
+    monkeypatch.setenv("ANSIBLE_FAKE_EXTENTS", json.dumps(use))
+    result = await env.executor.run(StepName.PRECOPY, ctx)
+    assert {dev: u.model_dump() for dev, u in result.sync_pass.extents.items()} == use
+    monkeypatch.delenv("ANSIBLE_FAKE_EXTENTS")
+    ctx2, _ = ctx_for(env)
+    result = await env.executor.run(StepName.SYNC, ctx2)
+    assert result.sync_pass.extents == {}
+
+
+async def test_a_plan_without_tracking_passes_no_ceph_file(env):
+    """SDD §7.2: a plan whose tracking is off, or whose source has no Ceph access or no key,
+    passes no Ceph file and no extent variable - every pass scans - and the pre-staging installs
+    no Ceph client."""
+    extent_vars = {
+        "os_migrate_warm_extents_precopy",
+        "os_migrate_warm_extents_final",
+        "os_migrate_warm_ceph_conf",
+        "os_migrate_warm_ceph_keyring",
+        "os_migrate_warm_ceph_client",
+        "os_migrate_warm_ceph_pools",
+        "os_migrate_warm_extent_query_timeout",
+    }
+    write_ceph_key(env)
+    # tracking off, with access and key
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(
+        id="mig-00000000aa",
+        plan_id=plan.id,
+        vm=make_vm(source_id="srv-1", name="web-01"),
+        strategy=Strategy.warm,
+    )
+    ctx, _ = make_ctx(plan, mig, TRACKED_SRC, DST, env.settings)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    call = read_log(env.log)[-1]
+    assert not extent_vars & set(call["vars"]) and call["ceph_files"] == {}
+    assert ceph_run_files(ctx) == []
+    # tracking on, no access
+    ctx, _ = ctx_for(env)
+    ctx = make_ctx(
+        ctx.plan.model_copy(update={"extent_tracking": True}), ctx.migration, SRC, DST, env.settings
+    )[0]
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert not extent_vars & set(read_log(env.log)[-1]["vars"])
+    # tracking on, access, no key
+    shutil.rmtree(env.settings.secrets_dir / "provider-src-osp.ceph")
+    ctx, _ = tracked_ctx(env)
+    await env.executor.run(StepName.SYNC, ctx)
+    assert not extent_vars & set(read_log(env.log)[-1]["vars"])
+    assert not (run_dir(env) / "ceph.keyring").exists()
+    await env.executor.prestage(ctx.plan, TRACKED_SRC, DST)
+    assert read_log(env.log)[-1]["vars"]["os_migrate_conversion_host_ceph_client"] is False
+    write_ceph_key(env)
+    await env.executor.prestage(ctx.plan, TRACKED_SRC, DST)
+    assert read_log(env.log)[-1]["vars"]["os_migrate_conversion_host_ceph_client"] is True

@@ -9,12 +9,16 @@ approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrat
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+from datetime import UTC, datetime
 
 from .config import Settings
 from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
     AdvisorPolicy,
+    CephAccess,
     ConversionHostConfig,
     DnsTarget,
     Mappings,
@@ -31,6 +35,7 @@ from .orchestrator import Orchestrator
 from .planning.probes import is_database, suggest_probes
 from .providers.base import ProviderError
 from .providers.fake import (
+    DEMO_CEPH_FSID,
     DEMO_DESTINATION_POOL,
     DEMO_DNS_NEW_ADDRESS,
     DEMO_DNS_VM,
@@ -68,6 +73,17 @@ DEMO_APPROVAL_COMMENTS = (
     "Agreed with the application team for tonight's window; rollback steps reviewed.",
 )
 
+
+def _demo_host_key(host: str) -> str:
+    """A synthetic ed25519 public key of the demo conversion host ``host``, in OpenSSH's one-line
+    form: what an operator declares after reading it out of band (SDD §10, §26.3). Made up from the
+    name, so no private half exists anywhere."""
+    kind = b"ssh-ed25519"
+    point = hashlib.sha256(b"seamless demo conversion host " + host.encode()).digest()
+    blob = b"".join(len(part).to_bytes(4, "big") + part for part in (kind, point))
+    return f"ssh-ed25519 {base64.b64encode(blob).decode()} {host}"
+
+
 DEMO_PROVIDERS = (
     Provider(
         id="rhosp17-finance",
@@ -79,6 +95,12 @@ DEMO_PROVIDERS = (
         distribution="rhosp",
         conversion_host=ConversionHostConfig(
             name="os-migrate-conv-src", flavor="m1.large", external_network="public"
+        ),
+        # the demo cluster's Ceph access, its key as written (SDD §10, §28.4, plan task CE11)
+        ceph=CephAccess(
+            fsid=DEMO_CEPH_FSID,
+            monitors=["ceph-mon-0.dc1.example.com", "ceph-mon-1.dc1.example.com"],
+            key_updated_at=datetime(2026, 10, 1, 9, 0, tzinfo=UTC),
         ),
     ),
     Provider(
@@ -103,6 +125,8 @@ DEMO_PROVIDERS = (
             flavor="m1.large",
             external_network="public",
             address="192.0.2.50",
+            # the VMware plan's host, which the operator brings: its keys declared (SDD §26.3)
+            ssh_host_keys=[_demo_host_key("os-migrate-conv-dst")],
         ),
         gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),
@@ -121,6 +145,7 @@ DEMO_PROVIDERS = (
             flavor="m1.large",
             external_network="public",
             address="192.0.2.60",
+            ssh_host_keys=[_demo_host_key("os-migrate-conv-dc3")],
         ),
         gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),
@@ -152,6 +177,8 @@ async def _plans(settings: Settings) -> list[Plan]:
             downtime_slo_s=600,
             require_approval=False,
             auto_cutover=True,
+            # the finance plan tracks its Ceph volumes' extents (SDD §28, plan task CE11)
+            extent_tracking=True,
             keep_warm_interval_s=120,
             verification=VerificationConfig(timeout_s=120),
             probe_overrides={vm_id: probes for vm_id, probes in probed.items() if probes},

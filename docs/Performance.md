@@ -97,7 +97,7 @@ it (or on a documented deviation recorded with the results).
 | NFR-02b | WAN-bound transfer saturates **≥ 90 %** of a 10 Gbit/s link with ≥ 4 parallel disks | PRD §7 |
 | NFR-03 | 1,000 VMs per plan; 10 concurrent migrations and 3 concurrent cutovers by default | PRD §7 |
 | SM-1 | Median warm cutover downtime **≤ 10 min** (largest disk ≤ 100 GiB); **p95 ≤ 25 min (1,500 s)** (largest disk ≤ 500 GiB); storage handover **≤ 6 min** regardless of size | PRD §8 |
-| SM-1b | 0.2.0 target with changed-extent tracking: **≤ 5 min median independent of disk size** | PRD §8, FR-26, SDD §20 D1 |
+| SM-1b | Changed-extent tracking (0.5.0, a Technology Preview; FR-26 and PRD §9 had put it in 0.2.0): **≤ 5 min median independent of disk size** | PRD §8, FR-26, SDD §28 |
 | SM-2 | Inventory → validated plan for 100 VMs ≤ 1 hour | PRD §8 |
 
 SM-1 and SM-2 are this document's shorthand for the bullets of PRD §8.
@@ -118,7 +118,7 @@ at 500 MiB/s)".
 | NFR-02b | `10 Gbit/s × 90 % = 1,125 MiB/s` ⇒ 3 streams at 400–500 MiB/s, 4 streams give margin | Consistent with "≥ 4 parallel disks" (the default `P`); a single SSH stream is window-limited on high-RTT links (§5.3) |
 | SM-1 median | largest disk 50–100 GiB ⇒ **6.2–7.9 min** | Met |
 | SM-1 p95, ≤ 500 GiB | single 500 GiB disk: **21.6 min at `S` = 500 MiB/s**; **25.8 min at the NFR-02a floor of 400 MiB/s** | Met only if the measured per-stream `S` ≥ **416 MiB/s** (note 3) — LAB-W12 decides |
-| SM-1b, 0.2.0 ≤ 5 min | `F` alone is 4.5 min, leaving ≈ 30 s for the final delta | Reachable only when the scan term is removed (`rbd diff` between pass snapshots, libvirt checkpoints; SDD §20 D1) **and** the real fixed costs do not exceed the planning defaults; calibrate `F` |
+| SM-1b, ≤ 5 min (0.5.0) | a tracked final pass is `F + q + Δf/L` (§4.6): **287 s** for 200 GiB, **297 s** for 500 GiB (301 s at `S` = 400 MiB/s), **314 s** for 1 TiB on 1 Gbit/s; 282–289 s on 10 Gbit/s | Met in the model up to 500 GiB on 1 Gbit/s and for every size on 10 Gbit/s, with little to spare: `F` alone is 270 s, so the real fixed costs and `q` decide (PERF-E2E-SM1b, LAB-CE01); only the disks the final pass reads from extents lose their scan (SDD §28.4, §28.5) |
 | SM-2 | Planning cost is O(VMs): one inventory sweep, pre-flight per VM, quota aggregation per project | Verified by PERF-CP-04 (100-VM plan, demo providers and a lab inventory) |
 
 1. **Population and aggregate ceiling (G1a).** The PRD defines the G1a population by the *largest* disk, but the
@@ -136,8 +136,8 @@ at 500 MiB/s)".
 3. **p95 (SM-1).** The 1,500 s budget leaves `scan ≤ 1,230 s`, i.e. `S ≥ 416 MiB/s` for 500 GiB. At the planning
    rate of 500 MiB/s the margin is 206 s (3.4 min); at the NFR-02a floor of 400 MiB/s the target is missed by
    50 s. Parallel scanning does not help a single disk (`Dmax/S` dominates), so the remedies are a faster
-   stream (more `workers`, more vCPUs, faster storage) or splitting data over several disks; beyond that the
-   0.2.0 scan removal is the answer.
+   stream (more `workers`, more vCPUs, faster storage) or splitting data over several disks; beyond that
+   changed-extent tracking (0.5.0, §4.6) is the answer.
 
 ---
 
@@ -149,6 +149,7 @@ at 500 MiB/s)".
 |---|---|---|
 | `cold` | none | `shutdown + snapshot + U/L + create + boot` |
 | `warm` | `T1 = snapshot + max(U/L, scan)`, `Δ1 = U`; then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
+| `warm`, extent tracking (0.5.0, SDD §28.6) | `T1` as above (the first pass scans); then `checked` passes `Tk = snapshot + q + max(scan, Δk/L)`, the same loop | `shutdown + snapshot + max(scan_U, q + max(Δf/S, Δf/L)) + create + boot`: `scan_U` the scan term over the disks that scan in full (0 when every disk reads from extents), `q` the extent query (`extent_query_s`, 10 s) |
 | `storage_handover` | none | `shutdown + V·handover_per_volume + create + boot` |
 | `vmware_cold` | none | `shutdown + U/L + v2v + create + boot` |
 | `vmware_warm` | `T1 = U/L`; `Tk = 10 + Δk/L` (same loop) | `shutdown + Δf/L + v2v_inplace + create + boot` |
@@ -163,7 +164,8 @@ Derived properties worth knowing:
 1. **The scan floor.** After shutdown the final pass must still read and hash the devices on both sides, so warm
    downtime is `F + scan` unless `Δf/L > scan`. That needs a change rate above ≈ 116 MiB/s on a 1 Gbit/s link for a
    200 GiB disk — in practice never. **A faster network does not reduce warm downtime; a faster per-stream scan, or
-   more disks scanned in parallel, does.** The scan term is exactly what 0.2.0 removes (§11).
+   more disks scanned in parallel, does.** The scan term is exactly what changed-extent tracking removes from the
+   final pass (0.5.0, §4.6, §11).
 2. **Warm beats cold only when `U/L > scan`.** For a single disk that is `U/D > L/S`: 25 % at 125 MiB/s (1 Gbit/s),
    50 % at 250 MiB/s, never at ≥ 500 MiB/s. For `V ≥ P` equal disks it is `U/D > L/(S·P)`: 6.25 % at 1 Gbit/s,
    12.5 % at 2 Gbit/s, 25 % at 4 Gbit/s, 62.5 % at 10 Gbit/s.
@@ -218,7 +220,7 @@ Single-disk VMs (`scan = D/S`, as before the parallel-disk term):
 | 200 GiB | 20.9 | 11.3 | 6.1 | 11.3 | 4.3 | outside G1a; SM-1 p95 met |
 | 300 GiB | 29.1 | 14.7 | 7.0 | 14.7 | 4.3 | SM-1 p95 met |
 | 500 GiB | 45.5 | 21.6 | 8.6 | 21.6 | 4.3 | SM-1 p95 met at `S` = 500, **missed at 400 (25.8)** |
-| 1 TiB | 88.4 | 39.5 | 12.9 | 39.5 | 4.3 | outside the 0.1.0 targets (0.2.0) |
+| 1 TiB | 88.4 | 39.5 | 12.9 | 39.5 | 4.3 | outside the 0.1.0 targets; 5.2 min tracked (§4.6) |
 
 A 500 GiB VM in different layouts, 1 Gbit/s, `P` = 4 (the last two columns cap the aggregate read rate at
 1,190 MiB/s):
@@ -261,6 +263,35 @@ delta never matters in this range.
 `vmware_cold`: `60 + 983 + 300 + 60 + 120` = 1,523 s (**25.4 min**). `vmware_warm`: `T1 = 983 s`,
 pass 2 carries `Δ2 = 1,966 MiB` in `10 + 15.7 = 26 s`; `1,966 MiB > 1 GiB` ⇒ pass 3 carries `Δ3 = 51 MiB` in 10 s ⇒
 stop; final delta 21 MiB; downtime `60 + 0.2 + 120 + 60 + 120` = **360 s (6.0 min)**, independent of the disk size.
+
+### 4.6 Changed-extent tracking (0.5.0, Technology Preview; `q` = 10 s, `c` = 2 MiB/s, `S` = 500 MiB/s, *model*)
+
+With `Plan.extent_tracking` and a source that holds Ceph access (SDD §28), the first pass scans, every later pre-copy
+pass is a `checked` pass - a full scan that also compares Ceph's `rbd diff` of the pass snapshots with what changed,
+`Tk = snapshot + q + max(scan, Δk/L)` -, and the final pass reads only the listed chunks of each disk the checks
+proved: `copy_s = snapshot + max(scan_U, q + max(Δf/S, Δf/L))`. Pre-copy keeps today's cost and calibration (owner
+decision 5); the downtime loses the scan of every disk the final pass reads.
+
+The 200 GiB disk of §4.2 on 1 Gbit/s: pass 1 takes 1,013 s, then checked passes of `30 + 10 + 410 = 450 s`; the final
+delta is `2 MiB/s × 450 s` ≈ 900 MiB, 7.2 s over the link (1.8 s to read), so the downtime is
+`60 + 30 + 10 + 7.2 + 60 + 120` = **287 s (4.8 min)** instead of 680 s. The final delta grows with the last checked
+pass, which scans, so the downtime still grows with the disk - slowly:
+
+| Disk (60 % used) | checked pass | final delta | tracked downtime, 1 Gbit/s | tracked, 10 Gbit/s | today, warm 1 Gbit/s |
+|---|---|---|---|---|---|
+| 200 GiB | 450 s | 900 MiB | **287 s (4.8 min)** | 282 s | 680 s (11.3 min) |
+| 500 GiB | 1,064 s | 2.1 GiB | **297 s (5.0 min)**, 301 s at `S` = 400 MiB/s | 284 s | 1,294 s (21.6 min) |
+| 1 TiB | 2,088 s | 4.1 GiB | **314 s (5.2 min)** | 289 s | 2,370 s (39.5 min) |
+
+SM-1b's 300 s median is met in the model up to 500 GiB on 1 Gbit/s and for every size on 10 Gbit/s, with little to
+spare: `F` = 270 s is the floor, and the real fixed costs and `q` decide (PERF-E2E-SM1b). What the model does not
+remove: a disk that scans in full in the final pass (`scan_U`: not a Cinder RBD volume of the cluster, encrypted, a
+miss in an earlier check, a failed query - the reasons of SDD §28.5 and Operations.md §7.3) keeps today's term, and
+the estimate counts it from `Migration.tracked_disks`. The SLO rule moves a tracked migration to `awaiting_cutover`
+after its first checked pass; a `checked` pass calibrates `S` as today and its longest query replaces `q`
+(`observed_extent_query_s`); a pass that read any disk from extents never calibrates `S` (SDD §28.6). Under owner
+decision 5's alternative - the passes after a first clean check read too - the last pre-copy pass is short and each
+size takes about 281 s, on one checked interval of evidence.
 
 ---
 
@@ -409,6 +440,7 @@ QASuite §9 (PERF-E2E). Downtime is `actual_downtime_s` over ≥ 10 runs.
 | P-L 200 GiB, cold | LAB-C01 (on P-L) | `cold`, 1 G | 1,253 s (20.9 min) | none (reference) | — | *to be filled* |
 | P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes, the measured shutdown added to the clock (SDD §7.3) | — | *to be filled* |
 | VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 3 → *to be filled* | *to be filled* |
+| **Tracked (0.5.0): P-M 100 GiB, P-L 200 GiB, P-XL 500 GiB and a 1 TiB disk, 2 MiB/s writer, `extent_tracking`** | **LAB-CE01** | `warm`, 10 G and 1 G (≥ 10 and 5 runs per size) | §4.6: 282–289 s (10 G); 1 G: P-L 287 s, P-XL 297 s, 1 TiB 314 s (`q` = 10 s) | **PERF-E2E-SM1b**: median ≤ 300 s per size; each estimate ±30 % (G2); `q` and `F` recorded | 1 scan + checked passes → *to be filled* | *to be filled* (with the measured `q`, `observed_extent_query_s`) |
 
 ### 6.4 Calibrating the estimator
 
@@ -494,7 +526,9 @@ is left to the operator is the plan-level starting point, so that the very first
 
 | Symptom | Likely cause | Action |
 |---|---|---|
-| Downtime ≈ `270 s + scan` and does not improve with a faster link | Scan floor (§4.1) | Raise `S` (more `workers`, faster storage) or scan more disks in parallel (`parallel_disks`, split large volumes); use handover; `rbd diff` (0.2.0) |
+| Downtime ≈ `270 s + scan` and does not improve with a faster link | Scan floor (§4.1) | Raise `S` (more `workers`, faster storage) or scan more disks in parallel (`parallel_disks`, split large volumes); use handover; turn on changed-extent tracking for a Ceph source (`Plan.extent_tracking`, §4.6; 0.5.0 Technology Preview) |
+| A tracked migration's downtime is `270 s + scan` after all | the final pass scanned a disk: its `sync_passes[-1].extents[<device>]` is `scanned` with a reason, or the estimate's `tracked_disks` left it out | read the reason (Operations.md §7.3): a disk that does not qualify keeps its scan; after `missed`, `base_gone`, `resized` or `query_failed` fix the cause and let the next passes check again before the cutover |
+| The final pass's or a checked pass's `query_s` is tens of seconds, and the estimate was 10 s | fast-diff off or the object map invalid (one request per object), far or slow monitors | `rbd info` shows the features and flags; `rbd object-map rebuild`; after a checked pass the calibration replaces `q` (`observed_extent_query_s`), or set `extent_query_s` in `estimator_overrides` |
 | Multi-disk VM slower than `270 s + D/(S·P)` | Aggregate read ceiling of the host (1,190 MiB/s on 10 GbE, 2–3 streams on 4 vCPU) | Measure `S_agg` (§6.1); set `max_aggregate_scan_bps` to it (§6.4); add vCPUs or a second conversion-host pair |
 | Warm never leaves `syncing`; five passes, each at the scan floor | `Δ* > convergence_threshold_bytes` (every single disk above ≈ 235 GiB at 2 MiB/s) | Raise the threshold to ≥ `1.2·Δ*` or set `max_sync_passes: 2` (§7.3) |
 | Pre-copy slower than `U/L` | LVM-backed Cinder: snapshot→volume is a full copy; SSH cipher; CPU-bound hashing | §7.4; check `volume_backends` from the provider check; benchmark the cipher; add vCPUs |
@@ -761,7 +795,7 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 
 | Limit | Impact | Plan |
 |---|---|---|
-| Hash-scan floor (SDD §20 D1): every warm pass reads and hashes the devices on both sides | downtime ≥ `F + scan`; a single disk above ≈ 160 GiB exceeds 10 min, a single 500 GiB disk needs `S` ≥ 416 MiB/s for the 25 min p95 | **0.2.0** changed-extent tracking (FR-26): Ceph-direct `rbd diff` between pass snapshots (opt-in, needs Ceph credentials) and hypervisor-assisted libvirt checkpoints; target ≤ 5 min median independent of disk size (PRD §8) |
+| Hash-scan floor (SDD §20 D1): every warm pass reads and hashes the devices on both sides | downtime ≥ `F + scan`; a single disk above ≈ 160 GiB exceeds 10 min, a single 500 GiB disk needs `S` ≥ 416 MiB/s for the 25 min p95 | **0.5.0** changed-extent tracking (FR-26, SDD §28; a Technology Preview): Ceph-direct `rbd diff` between Cinder's pass snapshots, opt-in per source provider (its Ceph access and a metadata-only key) and per plan; the final pass loses the scan of every disk it reads from extents (§4.6: 287–314 s on 1 Gbit/s up to 1 TiB); libvirt dirty bitmaps stay out (SDD §28.7); target ≤ 5 min median independent of disk size (PRD §8, PERF-E2E-SM1b) |
 | Aggregate read ceiling of a conversion host (≈ 1,190 MiB/s on 10 GbE; 2–3 full-rate streams on 4 vCPU) | `P × S` overstates the scan rate of multi-disk VMs; G1a can be missed by VMs above ≈ 380 GiB in total | calibration measures the real rate per migration; `scan_bps` and `max_aggregate_scan_bps` via `Plan.estimator_overrides`; conversion-host pools (below) |
 | Calibration needs a completed delta pass | the first estimate uses defaults and plan overrides; single-pass migrations are never calibrated (§1; SDD §9.1 calibrates from delta/final passes only) | persist observed rates per provider pair as the next default (proposed; not in SDD §9.1) |
 | Single stream per disk and per SSH channel | WAN throughput bounded by `window/RTT` | multi-stream sync (several SSH channels per disk, chunk-range sharding); HPN-SSH |

@@ -62,6 +62,15 @@ SCRIPT = textwrap.dedent(
         record["servers"] = [
             (r.get("params") or {{}}).get("name")
             for r in resources if r.get("type") == "openstack.compute.Server"]
+    # the run's Ceph files as the playbook finds them (SDD 7.2, 28.4): each one's mode, or None
+    record["ceph_files"] = {{}}
+    for key in ("os_migrate_warm_ceph_conf", "os_migrate_warm_ceph_keyring"):
+        ceph_path = merged.get(key)
+        if ceph_path:
+            mode = None
+            if os.path.exists(ceph_path):
+                mode = oct(stat.S_IMODE(os.stat(ceph_path).st_mode))
+            record["ceph_files"][os.path.basename(ceph_path)] = mode
     # what decides how Ansible's ssh checks a host's key and shares its connections (SDD 7.2)
     record["env"] = {{key: os.environ.get(key) for key in (
         "ANSIBLE_HOST_KEY_CHECKING", "ANSIBLE_SSH_CONTROL_PATH_DIR", "ANSIBLE_SSH_CONTROL_PATH")}}
@@ -193,6 +202,21 @@ SCRIPT = textwrap.dedent(
         (logs / (stem + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
         time.sleep(float(os.environ.get("ANSIBLE_FAKE_SLEEP", "0.3")))
 
+    def fake_extents(base, n):
+        # what ANSIBLE_FAKE_EXTENTS says the pass used of each disk's extents (SDD 28.5): JSON, or
+        # "@FILE" read at each run; a "by_pass" map answers by the pass number, "final" for the
+        # cutover's, else "default" - so a lab rehearsal scripts a whole migration's passes
+        raw = os.environ.get("ANSIBLE_FAKE_EXTENTS", "{{}}")
+        if raw.startswith("@"):
+            with open(raw[1:]) as fh:
+                raw = fh.read()
+        use = json.loads(raw)
+        if "by_pass" in use:
+            by = use["by_pass"]
+            key = "final" if base == "import_workloads_cutover.yml" else str(n)
+            return by.get(key, by.get("default", {{}}))
+        return use
+
     if base in ("import_workloads_precopy.yml", "import_workloads_cutover.yml"):
         warm = osm / "workload_warm"
         warm.mkdir(exist_ok=True)
@@ -209,7 +233,9 @@ SCRIPT = textwrap.dedent(
             state["passes"].append({{"number": n, "kind": kind,
                 "started_at": "2026-10-08T10:00:00Z", "ended_at": "2026-10-08T10:05:00Z",
                 "bytes_scanned": 1000, "bytes_changed": 1000 // n,
-                "bytes_transferred": 900 // n, "duration_s": 300.0 / n}})
+                "bytes_transferred": 900 // n, "duration_s": 300.0 / n,
+                # how the pass used each disk's extents, as a test says (SDD 6.3, 28.5)
+                "extents": fake_extents(base, n)}})
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))

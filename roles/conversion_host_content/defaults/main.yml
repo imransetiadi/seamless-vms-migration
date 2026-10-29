@@ -36,3 +36,13 @@ os_migrate_conversion_link_keypair_private_path: "{{ os_migrate_data_dir }}/conv
 os_migrate_conversion_host_ssh_user: cloud-user
 os_migrate_conversion_host_ssh_user_enable_password_access: false
 os_migrate_conversion_host_ssh_user_password: weak_password_disabled_by_default
+
+# The Ceph client for the extent queries of a plan that tracks extents (Seamless Migrate SDD 6.5,
+# 21.6, 28.4; plan task CE5): ceph-common on the source conversion host alone, from each image
+# family's repository; the control plane sets it per plan. Nothing is installed without it.
+os_migrate_conversion_host_ceph_client: false  # noqa: var-naming[no-role-prefix]
+# The Red Hat Ceph Tools repository subscription-manager enables on RHEL, and the CentOS Storage
+# SIG release package the rest of the RHEL family installs, before ceph-common (TODO(LAB): confirm
+# each); Ubuntu 24.04's archive needs none.
+os_migrate_conversion_host_ceph_repository_rhel: "rhceph-6-tools-for-rhel-{{ ansible_distribution_major_version }}-x86_64-rpms"  # noqa: var-naming[no-role-prefix]
+os_migrate_conversion_host_ceph_repository_centos: "centos-release-ceph-{{ 'squid' if ansible_distribution_major_version is version('10', '>=') else 'reef' }}"  # noqa: var-naming[no-role-prefix]

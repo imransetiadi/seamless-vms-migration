@@ -13,12 +13,14 @@ import {
   type TooltipProps,
 } from 'recharts';
 import { SYNC_PASSES_LATEST, type ConvergedBy, type ForceCutover, type Strategy, type SyncPass } from '../api/types';
+import { passExtentsText, tracksExtents } from '../lib/extents';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { niceByteTicks } from '../lib/ticks';
 import { useElementWidth } from '../lib/useElementWidth';
 import { useChartColors } from '../theme/useChartColors';
 import { ChartDataTable, ChartTooltipBody } from './ChartParts';
 import { EmptyState } from './EmptyState';
+import { TechPreviewBadge } from './TechPreviewBadge';
 
 export interface SyncPassChartProps {
   passes: SyncPass[];
@@ -121,6 +123,8 @@ export function SyncPassChart({
   const [measureRef, width] = useElementWidth<HTMLDivElement>();
   const narrow = width > 0 && width < 420;
   const sorted = useMemo(() => [...passes].sort((a, b) => a.number - b.number), [passes]);
+  // a plan that tracks extents: each pass's use per disk goes in the data table (SDD §16, §28.5, plan task CE10)
+  const extents = tracksExtents(sorted);
   const cbt = strategy === 'vmware_warm';
   const ended = sorted.filter((p) => p.ended_at !== null);
   const bars = ended.filter((p) => p.kind !== 'full');
@@ -276,9 +280,15 @@ export function SyncPassChart({
           </li>
         </ul>
       )}
+      {extents && (
+        <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <TechPreviewBadge feature="extents" />
+          Each pass's extent use per disk - read, checked or scanned with its reason - is in the data table.
+        </p>
+      )}
       <ChartDataTable
         caption="Sync passes"
-        columns={['Pass', 'Kind', 'Started', 'Duration', 'Scanned', 'Changed', 'Transferred']}
+        columns={['Pass', 'Kind', 'Started', 'Duration', 'Scanned', 'Changed', 'Transferred', ...(extents ? ['Extents'] : [])]}
         rows={sorted.map((p) => ({
           key: String(p.number),
           header: <span className="num">#{p.number}</span>,
@@ -289,6 +299,7 @@ export function SyncPassChart({
             formatBytes(p.bytes_scanned),
             p.ended_at ? formatBytes(p.bytes_changed) : '—',
             formatBytes(p.bytes_transferred),
+            ...(extents ? [passExtentsText(p)] : []),
           ],
         }))}
       />

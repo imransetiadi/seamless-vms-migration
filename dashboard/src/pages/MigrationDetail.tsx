@@ -34,6 +34,7 @@ import { VerificationPanel } from '../components/VerificationPanel';
 import { decidable, decidingRecommendationId, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
 import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
+import { diskExtentText, extentsMissed, latestExtentUse } from '../lib/extents';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { gpuWaitBegins, gpuWaitEnds, hasGpuPanel } from '../lib/gpu';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
@@ -494,6 +495,8 @@ function MigrationAdvisor({ m }: { m: Migration }) {
 
 function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const vm = m.vm;
+  // how the latest pass used each disk's extents, on a plan that tracks them (SDD §16, §28.5, plan task CE10)
+  const extentUse = latestExtentUse(m.sync_passes);
   const osId = useId();
   const guest = guestOsOf(vm);
   const vmware = m.strategy === 'vmware_cold' || m.strategy === 'vmware_warm';
@@ -527,21 +530,34 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
         <dd className="min-w-0">{m.destination_server_id ? <code className="text-xs">{m.destination_server_id}</code> : 'Not created yet'}</dd>
       </dl>
       <div>
-        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Disks</h3>
-        <ul className="flex flex-col gap-1">
-          {vm.disks.map((d) => (
-            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded-sm border border-border px-2 py-1">
-              <span className="font-mono text-xs">
-                {d.device ?? d.name ?? d.id} {d.bootable && <span className="text-muted-foreground">(boot)</span>}
-              </span>
-              <span className="num text-xs text-muted-foreground">
-                {d.size_gb} GiB · {d.kind}
-                {d.volume_type ? ` · ${d.volume_type}` : ''}
-                {d.multiattach ? ' · multi-attach' : ''}
-                {d.encrypted ? ' · encrypted' : ''}
-              </span>
-            </li>
-          ))}
+        <h3 id={`${m.id}-disks`} className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Disks
+        </h3>
+        <ul aria-labelledby={`${m.id}-disks`} className="flex flex-col gap-1">
+          {vm.disks.map((d) => {
+            // how the latest pass used the disk's extents, on a plan that tracks them (SDD §16, §28.5, plan task CE10)
+            const use = extentUse[d.device ?? d.id];
+            return (
+              <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded-sm border border-border px-2 py-1">
+                <span className="font-mono text-xs">
+                  {d.device ?? d.name ?? d.id} {d.bootable && <span className="text-muted-foreground">(boot)</span>}
+                </span>
+                <span className="num text-xs text-muted-foreground">
+                  {d.size_gb} GiB · {d.kind}
+                  {d.volume_type ? ` · ${d.volume_type}` : ''}
+                  {d.multiattach ? ' · multi-attach' : ''}
+                  {d.encrypted ? ' · encrypted' : ''}
+                </span>
+                {use && (
+                  <span className={cn('flex w-full flex-wrap items-center gap-1.5 text-xs', extentsMissed(use) ? 'text-status-warning' : 'text-muted-foreground')}>
+                    {extentsMissed(use) && <TriangleAlert aria-hidden className="size-3.5 shrink-0" />}
+                    {diskExtentText(use)}
+                    <TechPreviewBadge feature="extents" />
+                  </span>
+                )}
+              </li>
+            );
+          })}
         </ul>
       </div>
       <div>

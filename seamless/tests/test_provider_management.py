@@ -694,6 +694,7 @@ def test_a_provider_deletion_the_store_cannot_finish_is_audited_naming_what_it_l
     [deleted] = [e for e in api.store.events() if e.kind == "provider.deleted"]
     assert deleted.data == {
         "provider_id": "vc-dc2",
+        # the Ceph key was never written, so its "not found" is no secret left (SDD §13.3)
         "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh"],
     }
 
@@ -730,7 +731,7 @@ def test_a_provider_deletion_whose_store_cannot_be_searched_or_built_is_audited_
     [deleted] = [e for e in api.store.events() if e.kind == "provider.deleted"]
     assert deleted.data == {
         "provider_id": "vc-dc2",
-        "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh"],
+        "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh", "provider-vc-dc2.ceph"],
     }
 
 
@@ -1146,3 +1147,174 @@ def test_the_kubernetes_secret_store_always_checks_the_api_servers_certificate(m
     # no parameter can turn the check off: the store takes a CA file, never a verify switch
     parameters = inspect.signature(secret_store.KubernetesSecretStore).parameters
     assert "ca_cert" in parameters and "verify" not in parameters
+
+
+# --------------------------------------------------------------------------------------------
+# the source cluster's Ceph access and its key (SDD §4.2, §12, §13.3, §28.4; plan task CE6)
+
+CEPH = {
+    "fsid": "0b2a0b6c-5e8d-4c21-9f3e-1c0f3b1a2d3e",
+    "monitors": ["mon1.ceph.example", "mon2.ceph.example:6789"],
+    "client": "seamless",
+}
+#: a CephX key's shape - 28 bytes, base64 - with no key material (synthetic)
+CEPH_KEY = "AQFakeCephKeyForTestsOnlyNotRealAtAll0=="  # gitleaks:allow
+
+
+def test_a_source_provider_records_its_ceph_access(api):
+    """SDD §4.2, §28.4: an OpenStack source declares its cluster's fsid, monitors and user; the key
+    is not among them, and key_updated_at starts null."""
+    res = patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH})
+    assert res.status_code == 200, res.text
+    assert res.json()["ceph"] == {**CEPH, "key_updated_at": None}
+    assert api.get("/api/v1/providers/src-osp").json()["ceph"] == {**CEPH, "key_updated_at": None}
+    created = api.post("/api/v1/providers", json={**SOURCE, "id": "src-two", "ceph": CEPH})
+    assert created.status_code == 201, created.text
+    assert created.json()["ceph"]["key_updated_at"] is None
+    # the client defaults to seamless; the shapes of §4.2 are checked
+    short = patch(
+        api, "/api/v1/providers/src-osp", {"ceph": {k: v for k, v in CEPH.items() if k != "client"}}
+    )
+    assert short.status_code == 200 and short.json()["ceph"]["client"] == "seamless"
+    for bad, word in (
+        ({**CEPH, "fsid": "not-a-uuid"}, "fsid"),
+        ({**CEPH, "monitors": []}, "monitors"),
+        ({**CEPH, "monitors": [f"mon{i}.example" for i in range(10)]}, "monitors"),
+        ({**CEPH, "monitors": ["mon1.example", "not a host"]}, "monitors"),
+        ({**CEPH, "client": "client.seamless"}, "client"),
+        ({**CEPH, "client": ""}, "client"),
+        ({**CEPH, "key": CEPH_KEY}, "key"),
+    ):
+        res = patch(api, "/api/v1/providers/src-osp", {"ceph": bad})
+        assert res.status_code == 422 and word in res.json()["error"]["message"], (bad, res.text)
+
+
+def test_ceph_access_is_refused_on_vmware_and_on_a_destination(api):
+    """SDD §4.2, §28.4: the extents are the source cluster's; a vCenter has no Ceph, and a
+    destination's Ceph is never read."""
+    res = api.post("/api/v1/providers", json={**VCENTER, "ceph": CEPH})
+    assert res.status_code == 422 and "ceph" in res.json()["error"]["message"], res.text
+    res = patch(api, "/api/v1/providers/dst-rhoso", {"ceph": CEPH})
+    assert res.status_code == 422 and "ceph" in res.json()["error"]["message"], res.text
+    assert api.get("/api/v1/providers/dst-rhoso").json()["ceph"] is None
+
+
+def test_the_ceph_key_is_write_only(api):
+    """SDD §12, §13.3: PUT …/ceph-key takes the key `ceph auth get-key` prints, stores it in the
+    secret store and records the time alone; no response, listing or event carries it."""
+    before = put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY})
+    assert before.status_code == 422 and "ceph" in before.json()["error"]["message"], before.text
+    assert patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH}).status_code == 200
+    bad = put(api, "/api/v1/providers/src-osp/ceph-key", {"key": "not base64 at all!!"})
+    assert bad.status_code == 422 and "base64" in bad.json()["error"]["message"], bad.text
+    res = put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ceph"]["key_updated_at"] is not None and CEPH_KEY not in res.text
+    assert body["ceph"]["fsid"] == CEPH["fsid"]  # the rest of the access is kept
+    assert body["status"] == "unknown" and body["capabilities"] == {}  # reset as by PATCH
+    assert CEPH_KEY not in api.get("/api/v1/providers").text
+    assert CEPH_KEY not in api.get("/api/v1/providers/src-osp").text
+    assert read_secret("provider-src-osp.ceph", api.settings) == {"key": CEPH_KEY}
+    missing = put(api, "/api/v1/providers/nope/ceph-key", {"key": CEPH_KEY})
+    assert missing.status_code == 404
+
+
+def test_the_ceph_key_is_stored_under_the_providers_ceph_secret_name(api):
+    """SDD §13.3: the secret is provider-{id}.ceph, key `key`, a 0600 file in the file store; a
+    second PUT replaces it, so one secret holds the key."""
+    from seamless_migrate.security.secret_store import ceph_key_secret_name
+
+    assert ceph_key_secret_name("src-osp") == "provider-src-osp.ceph"
+    assert patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH}).status_code == 200
+    assert put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY}).status_code == 200
+    path = api.settings.secrets_dir / "provider-src-osp.ceph" / "key"
+    assert path.read_text(encoding="utf-8").strip() == CEPH_KEY
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    other = "AQFakeCephKeyForTestsOnlyNotRealAtAll1=="  # gitleaks:allow
+    assert put(api, "/api/v1/providers/src-osp/ceph-key", {"key": other}).status_code == 200
+    assert read_secret("provider-src-osp.ceph", api.settings) == {"key": other}
+    # one secret (the store's own .lock file beside it is not one)
+    names = (p.name for p in api.settings.secrets_dir.iterdir() if not p.name.startswith("."))
+    assert sorted(name for name in names if "ceph" in name) == ["provider-src-osp.ceph"]
+
+
+def test_an_id_that_would_read_another_providers_ceph_secret_is_refused(api):
+    """SDD §13.3 (audit AP-04): the SEAMLESS_SECRET_ variables read `.` and `-` alike, so
+    'src-osp-ceph' would read src-osp's Ceph key as its credentials: refused both ways, as -ssh."""
+    clash = api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-ceph"})
+    assert clash.status_code == 409, clash.text
+    assert "src-osp" in clash.json()["error"]["message"]
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-b-ceph"}).status_code == 201
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-b"}).status_code == 409
+    # ids that only look alike are fine
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-cephx"}).status_code == 201
+
+
+def test_removing_ceph_access_deletes_its_key(api):
+    """SDD §13.3: `ceph` set to null removes the secret with it - a key without an access to use
+    it would stay in the store for good."""
+    assert patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH}).status_code == 200
+    assert put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY}).status_code == 200
+    assert read_secret("provider-src-osp.ceph", api.settings) == {"key": CEPH_KEY}
+    res = patch(api, "/api/v1/providers/src-osp", {"ceph": None})
+    assert res.status_code == 200 and res.json()["ceph"] is None, res.text
+    assert read_secret("provider-src-osp.ceph", api.settings) == {}
+    # setting the access again starts without a key
+    res = patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH})
+    assert res.status_code == 200 and res.json()["ceph"]["key_updated_at"] is None
+
+
+def test_deleting_a_provider_deletes_its_ceph_key(api):
+    """SDD §13.3: the secrets the store manages for a provider go with it."""
+    assert (
+        api.post("/api/v1/providers", json={**SOURCE, "id": "src-two", "ceph": CEPH}).status_code
+        == 201
+    )
+    assert put(api, "/api/v1/providers/src-two/ceph-key", {"key": CEPH_KEY}).status_code == 200
+    assert read_secret("provider-src-two.ceph", api.settings) == {"key": CEPH_KEY}
+    assert (
+        api.client.delete("/api/v1/providers/src-two", headers=api.h(Role.admin)).status_code == 204
+    )
+    assert read_secret("provider-src-two.ceph", api.settings) == {}
+
+
+def test_the_ceph_key_is_audited_by_name_never_by_value(api, caplog):
+    """SDD §4.3, §13.3, §28.8: provider.credentials_updated names the secret and the key's name;
+    no event and no log line carries the key."""
+    assert patch(api, "/api/v1/providers/src-osp", {"ceph": CEPH}).status_code == 200
+    with caplog.at_level(logging.DEBUG):
+        assert put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY}).status_code == 200
+    events = api.store.events(kinds=["provider.credentials_updated"])
+    assert events[-1].data == {
+        "provider_id": "src-osp",
+        "secret": "provider-src-osp.ceph",
+        "keys": ["key"],
+    }
+    assert events[-1].actor == "admin-user"
+    everything = str([e.model_dump() for e in api.store.events(since_seq=0, limit=100000)])
+    assert CEPH_KEY not in everything and CEPH_KEY not in caplog.text
+
+
+def test_the_ceph_key_time_is_server_owned(api):
+    """SDD §4.2: key_updated_at is set by PUT …/ceph-key alone; POST and PATCH ignore what a
+    client sends there, and a PATCH of the access keeps the time the key was written."""
+    stamped = {**CEPH, "key_updated_at": "2020-01-01T00:00:00Z"}
+    created = api.post("/api/v1/providers", json={**SOURCE, "id": "src-two", "ceph": stamped})
+    assert created.status_code == 201 and created.json()["ceph"]["key_updated_at"] is None
+    assert (
+        patch(api, "/api/v1/providers/src-osp", {"ceph": stamped}).json()["ceph"]["key_updated_at"]
+        is None
+    )
+    written = put(api, "/api/v1/providers/src-osp/ceph-key", {"key": CEPH_KEY}).json()["ceph"][
+        "key_updated_at"
+    ]
+    assert written is not None
+    moved = patch(
+        api,
+        "/api/v1/providers/src-osp",
+        {"ceph": {**CEPH, "monitors": ["mon3.example"], "key_updated_at": "2020-01-01T00:00:00Z"}},
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["ceph"]["monitors"] == ["mon3.example"]
+    assert moved.json()["ceph"]["key_updated_at"] == written
