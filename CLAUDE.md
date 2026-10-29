@@ -120,7 +120,7 @@ make dashboard-build                         # npm ci + npm run build  (cd dashb
 make seamless-colima-up                      # macOS only; on Linux it says that Colima is not needed
 scripts/compose-init.sh && make seamless-up  # or: make seamless-demo
 make seamless-logs                           # follow logs;  make seamless-down  # stop (keeps data)
-# Every platform's lifecycle (SDD §17.2, docs/Operations.md): up | down | stop | start | restart | scale 0|1 | capacity | status | logs
+# Every platform's lifecycle (SDD §17.2, docs/Operations.md): up | down | stop | start | restart | scale 0|1|2 (2 on a cluster with the HA component and a ReadWriteMany seamless-data) | capacity | status | logs
 scripts/seamless-ctl.sh docker|podman|kubernetes|openshift ACTION [--dry-run]
 ```
 
