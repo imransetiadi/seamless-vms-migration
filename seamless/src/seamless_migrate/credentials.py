@@ -2,8 +2,10 @@
 rule of the control plane. ``credential_project`` reads §27.5's table and a plan's
 ``source_project`` and ``destination_project``, and answers the Keystone project whose credential
 a step acts with on a side, or None for the provider's own; ``implementation`` hands what acts
-with it from the provider registry, and ``host_pin`` the pin of the conversion host it reaches
-(§26.4). No executor, helper or route picks a credential, or a pin, on its own, and a project
+with it from the provider registry, ``host_pin`` the pin of the conversion host it reaches
+(§26.4), and ``declared_keys`` and ``host_address`` that host's declared keys and the address it
+is looked up by - the provider's own host's alone (§10, §26.10 decisions 12 and 13). No
+executor, helper or route picks a credential, a pin or a host on its own, and a project
 credential the plan names is never replaced by the provider's own (§27.5, "No fallback")."""
 
 from __future__ import annotations
@@ -130,6 +132,30 @@ def with_host_pin(provider: Provider, project_id: str | None, pin: HostKeyPin) -
     entry = held.model_copy(update={"conversion_host_pin": pin})
     credentials = {**provider.project_credentials, project_id: entry}
     return provider.model_copy(update={"project_credentials": credentials})
+
+
+def declared_keys(provider: Provider, project_id: str | None) -> tuple[str, ...]:
+    """The keys an operator declares for the conversion host the credential of ``project_id``
+    reaches on ``provider``'s side (SDD §4.2, §10, §26.3; the owner's decision of 2026-10-29,
+    §26.10 decision 12): the provider's ``conversion_host.ssh_host_keys`` for its own credential
+    (None) - its own host's -, none for a project's host, a server Seamless creates in that
+    project, which its project's pin alone checks whatever the provider declares."""
+    host = provider.conversion_host
+    if project_id is not None or host is None:
+        return ()
+    return tuple(host.ssh_host_keys)
+
+
+def host_address(provider: Provider, project_id: str | None) -> str | None:
+    """The address the conversion host the credential of ``project_id`` reaches is looked up by
+    when no server bears its name (SDD §7.2, §10; the owner's decision of 2026-10-29, §26.10
+    decision 13): the provider's ``conversion_host.address`` for its own credential (None) - its
+    own host's -, none for a project's host, which is looked up by its name in its project alone
+    and so never resolves to the provider's own host."""
+    host = provider.conversion_host
+    if project_id is not None or host is None:
+        return None
+    return host.address
 
 
 class _Placement:

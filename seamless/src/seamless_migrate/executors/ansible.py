@@ -32,7 +32,15 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..conversion_key import installation_key, run_key
-from ..credentials import Step, credential_project, for_step, host_pin, implementation
+from ..credentials import (
+    Step,
+    credential_project,
+    declared_keys,
+    for_step,
+    host_address,
+    host_pin,
+    implementation,
+)
 from ..domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
 from ..domain.fsm import source_stopped
 from ..domain.models import (
@@ -1444,13 +1452,14 @@ def _read_hosts_report(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     return servers("created"), servers("found")
 
 
-def _host_label(provider: Provider, side: str) -> str:
-    """What names a side's conversion host when nothing found it: its name, else its address,
-    else its side's alias - the collection's default name (SDD §7.2, §10)."""
+def _host_label(provider: Provider, side: str, project: str | None = None) -> str:
+    """What names a side's conversion host when nothing found it: its name, else its address -
+    the provider's own host's alone, never a project's (``host_address``) -, else its side's
+    alias - the collection's default name (SDD §7.2, §10, §26.10 decision 13)."""
     host = provider.conversion_host
     if host is None:
         return SIDE_ALIASES[side]
-    return host.name or host.address or SIDE_ALIASES[side]
+    return host.name or host_address(provider, project) or SIDE_ALIASES[side]
 
 
 @dataclass
@@ -1844,29 +1853,31 @@ class AnsibleExecutor:
         project: str | None = None,
     ) -> _Host:
         """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
-        keys, else the pin of the server it resolves to - looked up as the provider check finds
-        it; a lookup that fails is a transient failure. A host without a pin has its console read
-        once through ``book``, which pins what it shows (§26.8). A host the run then has no key
-        for is refused before any playbook: "host key unknown", or "conversion host replaced"
-        when its pin is another server's (§26.5). Given ``rollback`` - a rollback's log: it must
-        start the source whatever its hosts' keys - nothing is refused or read, and a lookup that
-        fails is logged: the host then resolves to no server, and no pin applies. Given
-        ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by its
-        name alone, as the role looks it up, and one the role will create - no server bears its
-        name - gets a key injected, its private half to wait at ``creates`` (§26.3). ``project``
-        is the project whose credential the run reaches the host with - in the plan's project
-        when it names one there, else None for the provider's own (§7.2, §27.5) -: that
-        credential looks the host up, and its pin is the host's (``host_pin``, §26.4)."""
+        keys - the provider's own host's alone, never a project's (``declared_keys``, §26.10
+        decision 12) -, else the pin of the server it resolves to - looked up as the provider
+        check finds it; a lookup that fails is a transient failure. A host without a pin has its
+        console read once through ``book``, which pins what it shows (§26.8). A host the run then
+        has no key for is refused before any playbook: "host key unknown", or "conversion host
+        replaced" when its pin is another server's (§26.5). Given ``rollback`` - a rollback's
+        log: it must start the source whatever its hosts' keys - nothing is refused or read, and
+        a lookup that fails is logged: the host then resolves to no server, and no pin applies.
+        Given ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by
+        its name alone, as the role looks it up, and one the role will create - no server bears
+        its name - gets a key injected, its private half to wait at ``creates`` (§26.3).
+        ``project`` is the project whose credential the run reaches the host with - in the plan's
+        project when it names one there, else None for the provider's own (§7.2, §27.5) -: that
+        credential looks the host up - a project's by its name alone, in that project (§26.10
+        decision 13) -, and its pin is the host's (``host_pin``, §26.4)."""
         client = implementation(self.providers, provider, project)
         host = provider.conversion_host
-        declared = tuple(host.ssh_host_keys) if host is not None else ()
-        name = _host_label(provider, side)
+        declared = declared_keys(provider, project)
+        name = _host_label(provider, side, project)
         if declared:
             known = KnownHost(alias, None, declared)
             return _Host(side, alias, provider, name, None, known, project=project)
         try:
             if creates is None:
-                name, server = await self._find_conversion_host(provider, side, client)
+                name, server = await self._find_conversion_host(provider, side, client, project)
             else:
                 # the role looks its server up by its exact name, and creates it when none bears
                 # it (SDD §6.5)
@@ -1889,8 +1900,7 @@ class AnsibleExecutor:
             # a host without a pin: its console, read once, pins what it shows (SDD §26.8)
             provider = await book.pin_from_console(provider)
             pin = host_pin(provider, project)
-        declared = tuple(provider.conversion_host.ssh_host_keys) if provider.conversion_host else ()
-        known = KnownHost(alias, server, declared, pin)
+        known = KnownHost(alias, server, declared_keys(provider, project), pin)
         checked = _Host(side, alias, provider, name, server, known, project=project)
         if rollback is None and not checked.keys:
             if pin is not None and server is not None and pin.server_id != server:
@@ -1905,21 +1915,27 @@ class AnsibleExecutor:
         return checked
 
     async def _find_conversion_host(
-        self, provider: Provider, side: str, impl: Any
+        self, provider: Provider, side: str, impl: Any, project: str | None = None
     ) -> tuple[str, str | None]:
         """The server the side's conversion host resolves to, as the provider check finds it
         (SDD §10) - with ``impl``, the run's credential there (§27.5): by its name - its side's
         alias when it has none -, else by its address; with what found it, or what names it when
-        nothing did. Raises ProviderError."""
+        nothing did. A project's host - ``project`` the credential's - is found by its name
+        alone, in that project, never by the provider's address (``host_address``, §26.10
+        decision 13): one no server there bears the name of is not found, a lookup that fails.
+        Raises ProviderError."""
         host = provider.conversion_host
         name = (host.name if host is not None else None) or SIDE_ALIASES[side]
         server = await impl.find_server(name)
         if server is not None:
             return name, str(server)
-        if host is not None and host.address:
-            server = await impl.server_of_address(host.address)
+        address = host_address(provider, project)
+        if address:
+            server = await impl.server_of_address(address)
             if server is not None:
-                return host.address, str(server)
+                return address, str(server)
+        if project is not None:
+            raise ProviderError(f"no server is named {name} in project {project}")
         return _host_label(provider, side), None
 
     # -- steps ---------------------------------------------------------------------------------
