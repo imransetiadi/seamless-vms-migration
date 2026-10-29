@@ -37,6 +37,8 @@ import {
   type GpuCheckReport,
   type Hook,
   type Migration,
+  type NotificationChannelView,
+  type NotificationSubscription,
   type Plan,
   type Provider,
   type PlanFinalizeResult,
@@ -4205,5 +4207,153 @@ describe("the mock's Ceph access and tracked passes (SDD §12, §28.4, §28.5, p
     const untracked = server.migrations.find((m) => m.strategy === 'warm' && !server.plans.find((p) => p.id === m.plan_id)!.extent_tracking)!;
     expect(untracked.sync_passes.every((p) => !p.extents || Object.keys(p.extents).length === 0)).toBe(true);
     expect(untracked.tracked_disks).toEqual([]);
+  });
+});
+
+describe('mock notifications: the catalog an admin keeps and the subscriptions (SDD §12, §24.3, §24.4, plan task NT9)', () => {
+  // a made-up incoming webhook path, too short for a secret scanner's pattern (plan: synthetic fixtures)
+  const SLACK = 'https://hooks.slack.com/services/T000/B000/notasecret';
+
+  it('keeps channels and subscriptions as the API does', async () => {
+    const { server, client } = setup('admin');
+    const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+    // the seeded channel of each kind, in name order, each with its cursor; an admin reads recipients and URLs in full
+    const seeded = await client.get<NotificationChannelView[]>('/notifications/channels');
+    expect(seeded.map((c) => [c.name, c.kind, c.cursor?.last_outcome ?? null])).toEqual([
+      ['itsm-webhook', 'webhook', 'failed'],
+      ['ops-mailbox', 'email', 'sent'],
+      ['ops-slack', 'slack', 'sent'],
+    ]);
+    expect(seeded[1]).toMatchObject({ recipients: ['ops@example.com', 'migration-team@example.com'], recipient_count: 2, url: null, url_host: null });
+    expect(seeded[0]).toMatchObject({ url: 'https://itsm.example.com/hooks/seamless', url_host: 'itsm.example.com', recipients: [], recipient_count: 0, cursor: expect.objectContaining({ failures_in_a_row: 2, last_reason: 'HTTP 503' }) });
+    // any other role reads their number and the URL's host, and writes nothing
+    for (const role of ['viewer', 'operator', 'approver'] as const) {
+      const channels = await as(role).get<NotificationChannelView[]>('/notifications/channels');
+      expect(channels.map((c) => [c.name, c.recipients, c.recipient_count, c.url, c.url_host])).toEqual([
+        ['itsm-webhook', [], 0, null, 'itsm.example.com'],
+        ['ops-mailbox', [], 2, null, null],
+        ['ops-slack', [], 0, null, null],
+      ]);
+      await expect(as(role).post('/notifications/channels', { name: 'x1', kind: 'slack' })).rejects.toMatchObject({ status: 403 });
+      await expect(as(role).patch('/notifications/channels/ops-slack', { enabled: false })).rejects.toMatchObject({ status: 403 });
+      await expect(as(role).delete('/notifications/channels/ops-slack')).rejects.toMatchObject({ status: 403 });
+      await expect(as(role).put('/notifications/channels/ops-slack/secret', { url: SLACK })).rejects.toMatchObject({ status: 403 });
+      await expect(as(role).post('/notifications/channels/ops-slack/test', {})).rejects.toMatchObject({ status: 403 });
+    }
+
+    // the catalog's rules, in the API's words
+    const created = await client.post<NotificationChannelView>('/notifications/channels', { name: 'app-owners', kind: 'email', recipients: ['owner@example.com'] });
+    expect(created).toMatchObject({ description: null, url: null, redact_names: false, enabled: true, recipient_count: 1, url_host: null, cursor: null });
+    await expect(client.post('/notifications/channels', { name: 'app-owners', kind: 'email', recipients: ['owner@example.com'] })).rejects.toMatchObject({ status: 409, message: "channel 'app-owners' already exists" });
+    const refusals: Array<[Record<string, unknown>, string]> = [
+      [{}, 'name: Field required; kind: Field required'],
+      [{ name: 'Bad_Name', kind: 'email', recipients: ['a@example.com'] }, "name: String should match pattern '^[a-z0-9][a-z0-9-]{1,62}$'"],
+      [{ name: 'x1', kind: 'sms' }, "kind: Input should be 'email', 'slack' or 'webhook'"],
+      [{ name: 'x1', kind: 'slack', enabled: 'yes' }, 'enabled: Input should be a valid boolean'],
+      [{ name: 'x1', kind: 'slack', nope: 1 }, 'not a field of this object: nope'],
+      [{ name: 'x1', kind: 'email' }, 'Value error, recipients: an email channel needs 1-50 addresses'],
+      [{ name: 'x1', kind: 'email', recipients: Array.from({ length: 51 }, (_, i) => `u${i}@example.com`) }, 'Value error, recipients: an email channel needs 1-50 addresses'],
+      [{ name: 'x1', kind: 'email', recipients: ['not an address'] }, 'Value error, recipients: each an address, local-part@domain, of at most 254 characters'],
+      [{ name: 'x1', kind: 'email', recipients: ['a@example.com'], url: 'https://x.example' }, 'Value error, url: an email channel takes none'],
+      [{ name: 'x1', kind: 'slack', recipients: ['a@example.com'] }, 'Value error, recipients: a slack channel takes none'],
+      [{ name: 'x1', kind: 'slack', url: SLACK }, "Value error, url: a slack channel takes none - the webhook's URL is its secret (notify-x1, key url)"],
+      [{ name: 'x1', kind: 'webhook' }, 'Value error, url: a webhook channel needs it'],
+      [{ name: 'x1', kind: 'webhook', url: 'http://h.example/x' }, 'Value error, url: an https:// URL with a host'],
+      [{ name: 'x1', kind: 'webhook', url: 'https://u:p@h.example/x' }, "Value error, url: no user information - put the credential in the hook's secret"],
+    ];
+    for (const [body, message] of refusals) await expect(client.post('/notifications/channels', body)).rejects.toMatchObject({ status: 422, message });
+    await expect(client.patch('/notifications/channels/app-owners', { kind: 'slack', name: 'x' })).rejects.toMatchObject({ status: 422, message: 'fields cannot be changed: kind, name' });
+    await expect(client.patch('/notifications/channels/gone', { enabled: false })).rejects.toMatchObject({ status: 404, message: "notification_channel 'gone' not found" });
+    await expect(client.patch('/notifications/channels/app-owners', { url: 'https://x.example' })).rejects.toMatchObject({ status: 422, message: 'Value error, url: an email channel takes none' });
+    expect(await client.patch<NotificationChannelView>('/notifications/channels/app-owners', { enabled: false, redact_names: true })).toMatchObject({ enabled: false, redact_names: true, recipient_count: 1 });
+    await expect(client.post('/notifications/channels/app-owners/test', {})).rejects.toMatchObject({ status: 409, message: 'channel app-owners is disabled: enable it first' });
+
+    // the secret: write-only, named after the channel, its rules per kind; a test without it fails, with it it is sent, and nothing leaves the mock
+    await expect(client.put('/notifications/channels/app-owners/secret', { url: SLACK })).rejects.toMatchObject({ status: 422, message: "an email channel has no secret: the relay's credential is the installation's (SEAMLESS_SMTP_SECRET, SDD §24.3)" });
+    await client.post('/notifications/channels', { name: 'team-slack', kind: 'slack' });
+    await expect(client.put('/notifications/channels/team-slack/secret', { signing_key: 'whsec_x' })).rejects.toMatchObject({ status: 422, message: 'a slack channel\'s secret is {"url"} alone' });
+    await expect(client.put('/notifications/channels/team-slack/secret', { url: 'https://example.com/x' })).rejects.toMatchObject({ status: 422, message: 'url: a Slack incoming webhook URL, https://hooks.slack.com/services/...' });
+    await expect(client.put('/notifications/channels/team-slack/secret', { url: 'https://hooks.slack.com/services/T000/B000/no secret' })).rejects.toMatchObject({ status: 422, message: 'url: a Slack incoming webhook URL, as Slack gave it' });
+    await expect(client.put('/notifications/channels/gone/secret', { url: SLACK })).rejects.toMatchObject({ status: 404 });
+    expect(await client.post('/notifications/channels/team-slack/test', {})).toEqual({ outcome: 'failed', reason: 'no_secret' });
+    expect(await client.put<NotificationChannelView>('/notifications/channels/team-slack/secret', { url: SLACK })).toMatchObject({ name: 'team-slack', kind: 'slack', url: null });
+    expect(JSON.stringify(await client.get('/notifications/channels/team-slack'))).not.toContain('notasecret');
+    expect(await client.post('/notifications/channels/team-slack/test', {})).toEqual({ outcome: 'sent', reason: null });
+    expect(await client.post('/notifications/channels/ops-mailbox/test', {})).toEqual({ outcome: 'sent', reason: null });
+    await client.post('/notifications/channels', { name: 'itsm-2', kind: 'webhook', url: 'https://itsm.example.com/x' });
+    await expect(client.put('/notifications/channels/itsm-2/secret', { signing_key: 'whsec_short' })).rejects.toMatchObject({ status: 422, message: 'signing_key: whsec_ and the base64 of 24 to 64 random bytes' });
+    await expect(client.put('/notifications/channels/itsm-2/secret', { url: SLACK })).rejects.toMatchObject({ status: 422, message: 'a webhook channel\'s secret is {"signing_key"} alone' });
+    const key = `whsec_${btoa(String.fromCharCode(...new Uint8Array(32)))}`;
+    expect(await client.put<NotificationChannelView>('/notifications/channels/itsm-2/secret', { signing_key: key })).toMatchObject({ name: 'itsm-2' });
+    // the tests are recorded as deliveries with the trigger test, the cursor unmoved (SDD §12, §24.3)
+    expect(server.events.filter((e) => e.kind.startsWith('notification.')).map((e) => [e.kind, e.data.channel, e.data.trigger, e.data.reason ?? null])).toEqual([
+      ['notification.failed', 'team-slack', 'test', 'no_secret'],
+      ['notification.sent', 'team-slack', 'test', null],
+      ['notification.sent', 'ops-mailbox', 'test', null],
+    ]);
+    expect((await client.get<NotificationChannelView>('/notifications/channels/team-slack')).cursor).toBeNull();
+    expect(server.events.filter((e) => e.kind === 'channel.updated').map((e) => e.data)).toEqual([
+      { name: 'app-owners', kind: 'email', fields: ['enabled', 'redact_names'] },
+      { name: 'team-slack', kind: 'slack', fields: ['secret'] },
+      { name: 'itsm-2', kind: 'webhook', fields: ['secret'] },
+    ]);
+
+    // the subscriptions: an operator's to a plan, an admin's to every plan, once per channel and plan
+    const planId = server.plans[0]!.id;
+    const before = await client.get<Plan>(`/plans/${planId}`);
+    const seededSubs = await client.get<NotificationSubscription[]>('/notifications/subscriptions');
+    expect(seededSubs.map((s) => [s.channel, s.plan_id]).sort()).toEqual([
+      ['itsm-webhook', 'plan-2d5c8b93'],
+      ['ops-mailbox', null],
+      ['ops-slack', 'plan-4f2a9c1e'],
+    ]);
+    expect(seededSubs.map((s) => s.id)).toEqual([...seededSubs.map((s) => s.id)].sort());
+    const operator = as('operator');
+    const sub = await operator.post<NotificationSubscription>('/notifications/subscriptions', { channel: 'team-slack', plan_id: planId });
+    expect(sub).toMatchObject({ id: expect.stringMatching(/^sub-[0-9a-f]{8}$/), channel: 'team-slack', plan_id: planId, topics: ['approval', 'downtime', 'problem'], created_by: 'bayu' });
+    expect(await client.get<NotificationSubscription[]>('/notifications/subscriptions', { query: { plan_id: planId, channel: 'team-slack' } })).toEqual([sub]);
+    expect(await client.get<NotificationSubscription[]>('/notifications/subscriptions', { query: { channel: 'ops-mailbox' } })).toHaveLength(1);
+    // adding one leaves the plan as it is (SDD §24.4)
+    expect(await client.get<Plan>(`/plans/${planId}`)).toMatchObject({ status: before.status, updated_at: before.updated_at });
+    await expect(operator.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: planId })).rejects.toMatchObject({ status: 409, message: `channel team-slack already has subscription ${sub.id} to plan ${planId}` });
+    await expect(operator.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: null })).rejects.toMatchObject({ status: 403, message: 'a subscription to every plan requires the admin role' });
+    expect(server.events.at(-1)).toMatchObject({ kind: 'auth.denied', actor: 'bayu', data: { required_role: 'admin', reason: 'a subscription to every plan requires the admin role' } });
+    await expect(as('viewer').post('/notifications/subscriptions', { channel: 'team-slack', plan_id: planId })).rejects.toMatchObject({ status: 403, message: 'this action requires the operator role' });
+    const subRefusals: Array<[Record<string, unknown>, string]> = [
+      [{ channel: 'gone', plan_id: planId }, "channel: no channel 'gone' in the catalog"],
+      [{ channel: 'team-slack', plan_id: 'plan-gone' }, "plan_id: no plan 'plan-gone'"],
+      [{ channel: 'team-slack', plan_id: planId, topics: [] }, 'topics: List should have at least 1 item after validation, not 0'],
+      [{ channel: 'team-slack', plan_id: planId, topics: ['weather'] }, "topics.0: Input should be 'approval', 'downtime', 'problem', 'outcome' or 'progress'"],
+      [{ channel: 'team-slack', plan_id: planId, topics: ['outcome', 'outcome'] }, 'topics: Value error, topics: outcome more than once'],
+      [{ channel: 'team-slack' }, 'plan_id: Field required'],
+      [{ channel: 'team-slack', plan_id: planId, extra: 1 }, 'not a field of this object: extra'],
+    ];
+    for (const [body, message] of subRefusals) await expect(operator.post('/notifications/subscriptions', body)).rejects.toMatchObject({ status: 422, message });
+    const every = await client.post<NotificationSubscription>('/notifications/subscriptions', { channel: 'team-slack', plan_id: null, topics: ['outcome'] });
+    expect(every).toMatchObject({ plan_id: null, topics: ['outcome'], created_by: 'rina' });
+    await expect(client.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: null })).rejects.toMatchObject({ status: 409, message: `channel team-slack already has subscription ${every.id} to every plan` });
+    // a channel a subscription names cannot be deleted, each named with its plan or every plan, by id
+    const named = [sub, every].sort((a, b) => (a.id < b.id ? -1 : 1)).map((s) => `${s.id} (${s.plan_id === null ? 'every plan' : `plan ${s.plan_id}`})`);
+    await expect(client.delete('/notifications/channels/team-slack')).rejects.toMatchObject({ status: 409, message: `channel team-slack is named by subscription(s) ${named.join(', ')}: remove them first` });
+    // an every-plan subscription is an admin's to remove
+    await expect(operator.delete(`/notifications/subscriptions/${every.id}`)).rejects.toMatchObject({ status: 403, message: 'a subscription to every plan requires the admin role' });
+    await expect(client.delete('/notifications/subscriptions/sub-00000000')).rejects.toMatchObject({ status: 404, message: "notification_subscription 'sub-00000000' not found" });
+    await operator.delete(`/notifications/subscriptions/${sub.id}`);
+    await client.delete(`/notifications/subscriptions/${every.id}`);
+    await client.delete('/notifications/channels/team-slack');
+    await expect(client.get('/notifications/channels/team-slack')).rejects.toMatchObject({ status: 404, message: "notification_channel 'team-slack' not found" });
+    await expect(client.delete('/notifications/channels/team-slack')).rejects.toMatchObject({ status: 404 });
+    // its secret and cursor went with it: a new channel of the name has none
+    await client.post('/notifications/channels', { name: 'team-slack', kind: 'slack' });
+    expect(await client.post('/notifications/channels/team-slack/test', {})).toEqual({ outcome: 'failed', reason: 'no_secret' });
+    expect(server.events.filter((e) => e.kind.startsWith('subscription.')).map((e) => [e.kind, e.plan_id, e.data.channel])).toEqual([
+      ['subscription.created', planId, 'team-slack'],
+      ['subscription.created', null, 'team-slack'],
+      ['subscription.deleted', planId, 'team-slack'],
+      ['subscription.deleted', null, 'team-slack'],
+    ]);
+    expect(server.events.filter((e) => e.kind === 'channel.deleted').map((e) => e.data)).toEqual([{ name: 'team-slack', kind: 'slack' }]);
+    // the catalog's events carry no URL, recipient or secret (SDD §24.7)
+    expect(JSON.stringify(server.events.filter((e) => e.kind.startsWith('channel.') || e.kind.startsWith('notification.')))).not.toMatch(/example\.com|notasecret|whsec_/);
   });
 });

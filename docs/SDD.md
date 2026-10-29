@@ -4893,7 +4893,8 @@ is no origin a browser sends (review RV31-03).
   "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
   in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
   only forgets it). The items stand in five labelled groups, in this order: Migrations — Overview (`/`), Plans
-  (`/plans`, also current on a migration's page), Hooks (`/hooks`, plan task N12a); Clouds — Providers, Inventory; Activity — Events; Advisor —
+  (`/plans`, also current on a migration's page), Hooks (`/hooks`, plan task N12a); Clouds — Providers, Inventory; Activity — Events,
+  Notifications (`/notifications`, plan task NT9); Advisor —
   Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
   trail (`/advisor/audit`); Administration — Users (`/users`), for an admin alone: every other role's navigation
   leaves the group out — the item is hidden, not kept in place unavailable with its reason as an action is
@@ -5196,7 +5197,16 @@ is no origin a browser sends (review RV31-03).
   audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   the migrations a validation re-assesses: in `pending`, `blocked` or `ready`, or one an earlier version left in
   `validating`, never a `ready` one whose source is stopped, which it leaves as it is (§5.4, review RV52-D3) — and
-  says how many), `/migrations/:id` (its Findings
+  says how many; a Notifications panel (plan task NT9, §24.9): the plan's subscriptions,
+  `GET /notifications/subscriptions?plan_id=`, and the every-plan ones that reach it, `GET /notifications/subscriptions`
+  with `plan_id` null, each its channel with its kind and its topics in words, an every-plan one marked "Every plan";
+  "No channel follows this plan." when none does, and unavailable with Retry when they cannot be loaded; an operator
+  adds one — Add subscription: Channel (one of the catalog, `GET /notifications/channels`, unavailable with the reason
+  while the catalog is empty or not loaded) and Topics, the defaults checked (Approval, Downtime, Problem), at least
+  one, `POST /notifications/subscriptions` with the plan's id, a refused one showing the API's reason — or removes
+  the plan's own (`DELETE /notifications/subscriptions/{id}`; an every-plan one is removed on the Notifications page by
+  an admin, and the panel says so); adding or removing one leaves the plan's status as it is (§24.4), and the panel
+  changes no plan field; below the operator role Add and Remove are unavailable, saying why), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
   stepper — one row; on a phone two columns read top-down, half the height of one —, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
@@ -5426,6 +5436,39 @@ is no origin a browser sends (review RV31-03).
   reverts. Any other role reads the catalog and is told that registering hooks requires the admin role. The offline
   mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` with §12's rules and refusals
   in the API's words, an admin's writes alone, and a plan naming catalog hooks alone - and holds none at first),
+  `/notifications` (Notifications, the Activity group's page beside Events, plan task NT9, §24.9 — "Where the
+  installation's events go: email, Slack and webhook channels, and the plans each one follows. A channel decides where
+  the installation's data goes, so only an admin keeps the catalog." — on `GET /notifications/channels` and
+  `GET /notifications/subscriptions` for every role, and their writes for the roles of §24.4, §12. The catalog, in name
+  order: each channel's name, kind (Email, Slack, Webhook), description and state — Enabled or Disabled, each with its
+  icon; its last outcome, "Sent" or "Failed", with its time and, failed, its reason and the failures in a row
+  ("3 failures in a row"), or "No message yet" while its cursor recorded none —; for an admin its recipients and a
+  webhook's URL, for any other role the number of recipients ("{n} recipients") and the URL's host, as the API answers
+  them to the role (`NotificationChannelView`, §24.3); never a Slack URL or a signing key, which no route returns;
+  "No channels registered." when there are none, unavailable with Retry when the catalog cannot be loaded. For an
+  admin, Add channel: Name (the hook name rule, its hint as the Hooks page's), Kind (Email by default), Description,
+  the kind's own fields — Recipients (one address a line, 1-50, each local-part@domain) or, for a webhook, URL
+  (https://, with no user information); a Slack channel's URL is its secret, so its form has no URL —, and Redact names
+  (its messages name the VM, the plan and the wave by their ids); a refused registration — the API's 422 for an email
+  channel while the relay is unset among them — keeps what was typed and shows the API's reason. A channel's Edit opens
+  that form with its values, its name and kind read only (§12: immutable), saved with
+  `PATCH /notifications/channels/{name}`; Enable and Disable send that PATCH's `enabled`; Delete asks to confirm in a
+  `ConfirmDialog` naming the channel and what goes with it (its cursor and the secret the store manages), and a refused
+  one shows the API's reason — the subscriptions that name it; Set secret, on a Slack or webhook channel, opens a dialog
+  that writes `PUT /notifications/channels/{name}/secret` and shows no value the page did not just type or make: for
+  Slack the incoming webhook's URL (`https://hooks.slack.com/services/…`), for a webhook a Signing key, typed or
+  generated in the browser — `whsec_` and the base64 of 32 bytes from `crypto.getRandomValues` — and shown once, with
+  Copy, to configure the receiver, until the dialog closes; Send test (`POST /notifications/channels/{name}/test`) is
+  unavailable, saying why, on a disabled channel, and its outcome is shown beside the channel, "Test sent" or "Test
+  failed: {reason}", until the next test or a reload. Every-plan subscriptions: each with its channel and topics
+  (Approval, Downtime, Problem, Outcome, Progress) and, for an admin, Add — Channel (one of the catalog) and Topics,
+  the defaults checked (Approval, Downtime, Problem) — and Remove (`DELETE /notifications/subscriptions/{id}`), a
+  refused one showing the API's reason; "No every-plan subscriptions." when there are none. Any other role reads the
+  catalog and the subscriptions and is told that changing channels requires the admin role. The offline mock keeps
+  channels, cursors and subscriptions as the API does — the routes of §12 with their rules, roles and refusals in the
+  API's words, the secret written and never returned, and a test that answers an outcome and sends nothing: `sent` for
+  an email channel or one whose secret was set, else `failed` with the reason `no_secret` — and holds one seeded
+  channel of each kind, each subscribed to a seeded plan, with a cursor that recorded an outcome),
   `/users` (Users, the Administration group's page — "Give each person their own dashboard access and role. Their
   name identifies their actions in Events." — on `GET /users` and `POST /users` alone, §12, §13.1. For an admin,
   two panels. Add user: User name, its hint the rule of §13.1 (1-128 letters, digits, dots, underscores, `@` or
@@ -7290,6 +7333,9 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
     names.
   * The seeded demo has one channel of each kind, subscribed to its plans. The demo's cutovers show their
     notifications on the Events page and their state on the Notifications page.
+
+The Notifications page, the plan page's Notifications panel and the offline mock are binding in §16 since plan task
+NT9.
 
 ### 24.10 Validation
 

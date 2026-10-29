@@ -64,6 +64,11 @@ import type {
   AppProbe,
   Health,
   Hook,
+  NotificationChannel,
+  NotificationChannelView,
+  NotificationCursor,
+  NotificationSubscription,
+  NotifyTopic,
   ProbeKind,
   ProbeResult,
   VerificationCheck,
@@ -103,6 +108,8 @@ import {
   ADVISOR_NOTES_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
+  DEFAULT_NOTIFY_TOPICS,
+  NOTIFY_TOPICS,
   CephAccess,
   DECISION_TYPES,
   FORCE_REASON_MIN,
@@ -1059,6 +1066,126 @@ function hookProblem(body: Record<string, unknown>): string | null {
   return null;
 }
 
+/** The fields a NotificationChannel has, in the model's order: what pydantic reports its errors by (SDD §4.2, §24.3). */
+const CHANNEL_FIELDS = ['name', 'kind', 'description', 'recipients', 'url', 'redact_names', 'enabled', 'created_at', 'updated_at'];
+/** PATCH /notifications/channels/{name}'s fields (SDD §12): the name, the kind and the server-owned ones are immutable. */
+const CHANNEL_EDITABLE = ['description', 'recipients', 'url', 'redact_names', 'enabled'];
+const CHANNEL_KINDS = ['email', 'slack', 'webhook'];
+/** An email channel's recipients (SDD §24.3): 1-50 addresses, each an RFC 5322 addr-spec in its dot-atom form of at most 254 characters. */
+const MAX_RECIPIENTS = 50;
+const MAX_ADDR_SPEC = 254;
+const ATEXT = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+";
+const ADDR_SPEC = new RegExp(`^${ATEXT}(?:\\.${ATEXT})*@${ATEXT}(?:\\.${ATEXT})*$`);
+/** A Slack incoming webhook's URL (SDD §24.3): the credential, kept in the secret alone. */
+const SLACK_WEBHOOK_PREFIX = 'https://hooks.slack.com/services/';
+/** A Standard Webhooks signing key (SDD §24.3): the prefix and the base64 of 24 to 64 bytes. */
+const SIGNING_KEY_PREFIX = 'whsec_';
+const SUBSCRIPTION_FIELDS = ['channel', 'plan_id', 'topics'];
+/** The reason the mock's test gives a Slack or webhook channel whose secret was never set (SDD §16): it sends nothing. */
+const NO_SECRET = 'no_secret';
+
+/** What the API's `_https_url` refuses (SDD §4.2): a webhook's URL is https:// with a host and no user information. */
+function httpsUrlProblem(url: string): string | null {
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(url);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || parsed.protocol !== 'https:' || !parsed.hostname) return 'url: an https:// URL with a host';
+  if (parsed.username || parsed.password || /^https:\/\/[^/?#]*@/i.test(url)) return "url: no user information - put the credential in the hook's secret";
+  return null;
+}
+
+/** What the API's NotificationChannel model refuses in `body` (SDD §4.2, §12, §24.3), in pydantic's words as the API's 422 carries them. */
+function channelProblem(body: Record<string, unknown>): string | null {
+  const extra = Object.keys(body).filter((key) => !CHANNEL_FIELDS.includes(key)).sort();
+  if (extra.length) return `not a field of this object: ${extra.join(', ')}`;
+  const fields: string[] = [];
+  if (body.name === undefined) fields.push('name: Field required');
+  else if (typeof body.name !== 'string') fields.push('name: Input should be a valid string');
+  else if (!HOOK_NAME.test(body.name)) fields.push(`name: String should match pattern '${HOOK_NAME.source}'`);
+  if (body.kind === undefined) fields.push('kind: Field required');
+  else if (!CHANNEL_KINDS.includes(body.kind as string)) fields.push("kind: Input should be 'email', 'slack' or 'webhook'");
+  for (const key of ['description', 'url']) if (!(body[key] === undefined || body[key] === null || typeof body[key] === 'string')) fields.push(`${key}: Input should be a valid string`);
+  if (body.recipients !== undefined) {
+    if (!Array.isArray(body.recipients)) fields.push('recipients: Input should be a valid list');
+    else body.recipients.forEach((address, i) => typeof address === 'string' || fields.push(`recipients.${i}: Input should be a valid string`));
+  }
+  for (const key of ['redact_names', 'enabled']) if (body[key] !== undefined && typeof body[key] !== 'boolean') fields.push(`${key}: Input should be a valid boolean`);
+  if (fields.length) return fields.slice(0, 5).join('; ');
+  // the model's own rules, in its order (SDD §4.2, §24.3)
+  const kind = body.kind as NotificationChannel['kind'];
+  const recipients = (body.recipients ?? []) as string[];
+  const url = (body.url ?? null) as string | null;
+  if (kind === 'email') {
+    if (recipients.length < 1 || recipients.length > MAX_RECIPIENTS) return `Value error, recipients: an email channel needs 1-${MAX_RECIPIENTS} addresses`;
+    if (recipients.some((address) => address.length > MAX_ADDR_SPEC || !ADDR_SPEC.test(address))) return `Value error, recipients: each an address, local-part@domain, of at most ${MAX_ADDR_SPEC} characters`;
+    if (url !== null) return 'Value error, url: an email channel takes none';
+    return null;
+  }
+  if (recipients.length) return `Value error, recipients: a ${kind} channel takes none`;
+  if (kind === 'webhook') {
+    if (url === null) return 'Value error, url: a webhook channel needs it';
+    const problem = httpsUrlProblem(url);
+    if (problem) return `Value error, ${problem}`;
+  } else if (url !== null) return `Value error, url: a slack channel takes none - the webhook's URL is its secret (notify-${body.name as string}, key url)`;
+  return null;
+}
+
+/** What the API's SubscriptionCreate refuses in `body` (SDD §12, §24.4), in pydantic's words. */
+function subscriptionProblem(body: Record<string, unknown>): string | null {
+  const extra = Object.keys(body).filter((key) => !SUBSCRIPTION_FIELDS.includes(key)).sort();
+  if (extra.length) return `not a field of this object: ${extra.join(', ')}`;
+  const fields: string[] = [];
+  if (body.channel === undefined) fields.push('channel: Field required');
+  else if (typeof body.channel !== 'string') fields.push('channel: Input should be a valid string');
+  else if (!HOOK_NAME.test(body.channel)) fields.push(`channel: String should match pattern '${HOOK_NAME.source}'`);
+  if (body.plan_id === undefined) fields.push('plan_id: Field required');
+  else if (body.plan_id !== null && typeof body.plan_id !== 'string') fields.push('plan_id: Input should be a valid string');
+  const topics = body.topics;
+  if (topics !== undefined) {
+    if (!Array.isArray(topics)) fields.push('topics: Input should be a valid list');
+    else {
+      topics.forEach((topic, i) => NOTIFY_TOPICS.includes(topic as NotifyTopic) || fields.push(`topics.${i}: Input should be 'approval', 'downtime', 'problem', 'outcome' or 'progress'`));
+      if (topics.length === 0) fields.push('topics: List should have at least 1 item after validation, not 0');
+      const twice = [...new Set(topics.filter((topic, i) => topics.indexOf(topic) !== i))].sort();
+      if (twice.length) fields.push(`topics: Value error, topics: ${twice.join(', ')} more than once`);
+    }
+  }
+  return fields.length ? fields.slice(0, 5).join('; ') : null;
+}
+
+/** Whether `value` is a Standard Webhooks signing key (SDD §24.3): `whsec_` and the strict base64 of 24 to 64 bytes. */
+function isSigningKey(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.startsWith(SIGNING_KEY_PREFIX)) return false;
+  const encoded = value.slice(SIGNING_KEY_PREFIX.length);
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0) return false;
+  try {
+    const bytes = atob(encoded).length;
+    return bytes >= 24 && bytes <= 64;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `value` is a Slack incoming webhook's URL as Slack gave it (SDD §24.3), else why not. */
+function slackUrlProblem(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.startsWith(SLACK_WEBHOOK_PREFIX)) return `url: a Slack incoming webhook URL, ${SLACK_WEBHOOK_PREFIX}...`;
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(value);
+  } catch {
+    parsed = null;
+  }
+  // eslint-disable-next-line no-control-regex -- the API refuses a control character in the URL
+  if (!parsed || parsed.hostname !== 'hooks.slack.com' || parsed.username || parsed.password || /[\s\x00-\x1f]/.test(value) || value.length > 2048) return 'url: a Slack incoming webhook URL, as Slack gave it';
+  return null;
+}
+
+const byName = <T extends { name: string }>(a: T, b: T) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+const byId = <T extends { id: string }>(a: T, b: T) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
 export class MockServer {
   private readonly users = new Map<string, User>();
   /** What GET /health answers; tests flip it to a degraded state. */
@@ -1088,6 +1215,14 @@ export class MockServer {
   readonly events: Event[];
   /** The hook catalog an admin keeps, by name (SDD §12, §23.3): none at first. */
   readonly hooks = new Map<string, Hook>();
+  /** The notification catalog an admin keeps, by name (SDD §12, §24.3): one seeded channel of each kind. */
+  readonly channels: Map<string, NotificationChannel>;
+  /** The subscriptions, by id (SDD §24.4). */
+  readonly subscriptions: Map<string, NotificationSubscription>;
+  /** Each channel's cursor, by its name (SDD §24.6): the delivery state the page shows. */
+  readonly cursors: Map<string, NotificationCursor>;
+  /** The channels whose secret was written, `notify-{name}` in the API (SDD §24.3): the mock keeps no value, since it sends nothing. */
+  readonly channelSecrets: Set<string>;
   /** Source power states the demo set (POST /demo/vms/…/power, SDD §8.1). */
   private readonly power = new Map<string, 'running' | 'stopped'>();
   private seq: number;
@@ -1123,6 +1258,11 @@ export class MockServer {
     this.snapshots = new Map(fixtures.snapshots.map((snapshot) => [snapshot.sha256, snapshot]));
     this.policies = fixtures.policies;
     this.events = fixtures.events;
+    this.channels = new Map(fixtures.channels.map((channel) => [channel.name, channel]));
+    this.subscriptions = new Map(fixtures.subscriptions.map((sub) => [sub.id, sub]));
+    this.cursors = new Map(fixtures.cursors.map((cursor) => [cursor.channel, cursor]));
+    // the seeded Slack and webhook channels have their secret: their tests are sent
+    this.channelSecrets = new Set(fixtures.channels.filter((channel) => channel.kind !== 'email').map((channel) => channel.name));
     this.seq = this.events.at(-1)?.seq ?? 0;
     this.advise = options.advise ?? simulatedAdvice;
   }
@@ -1887,6 +2027,7 @@ export class MockServer {
     }
 
     if (root === 'hooks') return this.hooksRoute(method, id, input, token, path);
+    if (root === 'notifications') return this.notificationsRoute(method, id, sub, subsub, input, query, token, path);
 
     if (root === 'providers') {
       if (!id) {
@@ -2690,6 +2831,183 @@ export class MockServer {
       if (reverting.length) throw new HttpError(409, 'conflict', `hook ${name} is the revert of hook(s) ${reverting.join(', ')}: change their revert first`);
       this.hooks.delete(name);
       event('hook.deleted', hook);
+      return { status: 204 };
+    }
+    throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+  }
+
+  /** The notification routes (SDD §12, §24.3, §24.4, plan task NT9): the catalog with its secrets and tests, and the subscriptions. */
+  private notificationsRoute(method: string, kind: string | undefined, id: string | undefined, action: string | undefined, input: Record<string, unknown>, query: URLSearchParams, token: string | null, path: string): MockResponse {
+    if (kind === 'channels') return this.channelsRoute(method, id, action, input, token, path);
+    if (kind === 'subscriptions' && !action) return this.subscriptionsRoute(method, id, input, query, token, path);
+    throw new HttpError(404, 'not_found', 'Not Found');
+  }
+
+  /** A channel as the API answers it to a role (SDD §24.3): recipients and the URL in full for an admin alone, else their number and the host. */
+  private channelView(channel: NotificationChannel, full: boolean): NotificationChannelView {
+    let host: string | null = null;
+    if (channel.url) {
+      try {
+        host = new URL(channel.url).hostname || null;
+      } catch {
+        host = null;
+      }
+    }
+    return { ...channel, recipients: full ? [...channel.recipients] : [], url: full ? channel.url : null, recipient_count: channel.recipients.length, url_host: host, cursor: this.cursors.get(channel.name) ?? null };
+  }
+
+  /** GET, POST, PATCH and DELETE /notifications/channels, PUT …/secret and POST …/test (SDD §12, §24.3): the API's rules, refusals and events. */
+  private channelsRoute(method: string, name: string | undefined, action: string | undefined, input: Record<string, unknown>, token: string | null, path: string): MockResponse {
+    const writes = method !== 'GET';
+    const me = this.require(token, writes ? 'admin' : 'viewer', path);
+    const full = me.role === 'admin';
+    // a channel.* event carries the name and the kind: never a URL, a recipient or a secret's value (SDD §24.7)
+    const event = (kind: string, channel: NotificationChannel, data: Record<string, unknown> = {}) =>
+      this.emit({ kind, plan_id: null, migration_id: null, actor: me.name, message: `notification channel ${channel.name} ${kind.split('.')[1]}`, data: { name: channel.name, kind: channel.kind, ...data } });
+    if (!name) {
+      if (method === 'GET') return ok([...this.channels.values()].sort(byName).map((channel) => this.channelView(channel, full)));
+      if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+      const problem = channelProblem(input);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+      const now = new Date(this.now()).toISOString();
+      const channel: NotificationChannel = {
+        name: input.name as string,
+        kind: input.kind as NotificationChannel['kind'],
+        description: (input.description as string | null | undefined) ?? null,
+        recipients: [...((input.recipients as string[] | undefined) ?? [])],
+        url: (input.url as string | null | undefined) ?? null,
+        redact_names: (input.redact_names as boolean | undefined) ?? false,
+        enabled: (input.enabled as boolean | undefined) ?? true,
+        created_at: now,
+        updated_at: now,
+      };
+      if (this.channels.has(channel.name)) throw new HttpError(409, 'conflict', `channel ${pyRepr(channel.name)} already exists`);
+      this.channels.set(channel.name, channel);
+      event('channel.created', channel);
+      return ok(this.channelView(channel, true), 201);
+    }
+    if (method === 'PATCH' && !action) {
+      // the API refuses the immutable fields before it looks the channel up (SDD §12)
+      const unknown = Object.keys(input).filter((key) => !CHANNEL_EDITABLE.includes(key)).sort();
+      if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
+    }
+    const channel = this.channels.get(name);
+    if (!channel) throw notFound('notification_channel', name);
+    if (action === 'secret') {
+      if (method !== 'PUT') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+      return this.setChannelSecret(channel, input, event);
+    }
+    if (action === 'test') {
+      if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+      return this.testChannel(channel);
+    }
+    if (action) throw new HttpError(404, 'not_found', 'Not Found');
+    if (method === 'GET') return ok(this.channelView(channel, full));
+    if (method === 'PATCH') {
+      const merged = { ...channel, ...input } as Record<string, unknown>;
+      const problem = channelProblem(merged);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+      const updated: NotificationChannel = { ...(merged as unknown as NotificationChannel), recipients: [...((merged.recipients as string[] | undefined) ?? [])], created_at: channel.created_at, updated_at: new Date(this.now()).toISOString() };
+      this.channels.set(name, updated);
+      event('channel.updated', updated, { fields: Object.keys(input).sort() });
+      return ok(this.channelView(updated, true));
+    }
+    if (method === 'DELETE') {
+      const subs = [...this.subscriptions.values()].filter((sub) => sub.channel === name).sort(byId);
+      if (subs.length) {
+        const named = subs.map((sub) => `${sub.id} (${sub.plan_id === null ? 'every plan' : `plan ${sub.plan_id}`})`);
+        throw new HttpError(409, 'conflict', `channel ${name} is named by subscription(s) ${named.join(', ')}: remove them first`);
+      }
+      // its cursor and the secret the store manages go with it (SDD §12, §24.3)
+      this.channels.delete(name);
+      this.cursors.delete(name);
+      this.channelSecrets.delete(name);
+      event('channel.deleted', channel);
+      return { status: 204 };
+    }
+    throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+  }
+
+  /** PUT /notifications/channels/{name}/secret (SDD §12, §24.3): write-only, the kind's key alone, its value under the kind's rule; the mock keeps no value. */
+  private setChannelSecret(channel: NotificationChannel, input: Record<string, unknown>, event: (kind: string, channel: NotificationChannel, data?: Record<string, unknown>) => Event): MockResponse {
+    const key = channel.kind === 'slack' ? 'url' : channel.kind === 'webhook' ? 'signing_key' : null;
+    if (key === null) throw new HttpError(422, 'validation_error', "an email channel has no secret: the relay's credential is the installation's (SEAMLESS_SMTP_SECRET, SDD §24.3)");
+    const keys = Object.keys(input);
+    if (keys.length !== 1 || keys[0] !== key) throw new HttpError(422, 'validation_error', `a ${channel.kind} channel's secret is {"${key}"} alone`);
+    if (key === 'url') {
+      const problem = slackUrlProblem(input.url);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+    } else if (!isSigningKey(input.signing_key)) throw new HttpError(422, 'validation_error', `signing_key: ${SIGNING_KEY_PREFIX} and the base64 of 24 to 64 random bytes`);
+    this.channelSecrets.add(channel.name);
+    event('channel.updated', channel, { fields: ['secret'] });
+    return ok(this.channelView(channel, true));
+  }
+
+  /** POST /notifications/channels/{name}/test (SDD §12, §24.3): the outcome of one try, recorded as a delivery with the trigger test; the mock sends nothing (SDD §16). */
+  private testChannel(channel: NotificationChannel): MockResponse {
+    if (!channel.enabled) throw new HttpError(409, 'conflict', `channel ${channel.name} is disabled: enable it first`);
+    const sent = channel.kind === 'email' || this.channelSecrets.has(channel.name);
+    const reason = sent ? null : NO_SECRET;
+    this.emit({
+      kind: sent ? 'notification.sent' : 'notification.failed',
+      plan_id: null,
+      migration_id: null,
+      actor: 'system',
+      message: `Seamless Migrate test message -> ${channel.name}`,
+      data: { channel: channel.name, kind: channel.kind, trigger: 'test', event_seq: null, key: `${channel.name}_test_${Math.floor(this.now() / 1000)}`, tries: 1, reason, refused: 0 },
+    });
+    return ok({ outcome: sent ? 'sent' : 'failed', reason });
+  }
+
+  /** GET, POST and DELETE /notifications/subscriptions (SDD §12, §24.4): an operator's to a plan, an admin's to every plan, once per channel and plan. */
+  private subscriptionsRoute(method: string, id: string | undefined, input: Record<string, unknown>, query: URLSearchParams, token: string | null, path: string): MockResponse {
+    const everyPlanIsAnAdmins = (me: User) => {
+      if (me.role === 'admin') return;
+      const reason = 'a subscription to every plan requires the admin role';
+      this.auditDenied(reason, 'admin', me);
+      throw new HttpError(403, 'forbidden', reason);
+    };
+    const event = (kind: string, sub: NotificationSubscription, me: User) => {
+      const where = sub.plan_id === null ? 'every plan' : `plan ${sub.plan_id}`;
+      this.emit({ kind, plan_id: sub.plan_id, migration_id: null, actor: me.name, message: `subscription ${sub.id} of channel ${sub.channel} to ${where} ${kind.split('.')[1]}`, data: { id: sub.id, channel: sub.channel, plan_id: sub.plan_id, topics: [...sub.topics] } });
+    };
+    if (!id) {
+      if (method === 'GET') {
+        this.require(token, 'viewer', path);
+        const planId = query.get('plan_id');
+        const channel = query.get('channel');
+        return ok([...this.subscriptions.values()].filter((sub) => (planId === null || sub.plan_id === planId) && (channel === null || sub.channel === channel)).sort(byId));
+      }
+      if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+      const me = this.require(token, 'operator', path);
+      const problem = subscriptionProblem(input);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+      const channel = input.channel as string;
+      const planId = input.plan_id as string | null;
+      if (planId === null) everyPlanIsAnAdmins(me);
+      if (!this.channels.has(channel)) throw new HttpError(422, 'validation_error', `channel: no channel ${pyRepr(channel)} in the catalog`);
+      if (planId !== null && !this.plans.some((plan) => plan.id === planId)) throw new HttpError(422, 'validation_error', `plan_id: no plan ${pyRepr(planId)}`);
+      const other = [...this.subscriptions.values()].filter((sub) => sub.channel === channel).sort(byId).find((sub) => sub.plan_id === planId);
+      if (other) throw new HttpError(409, 'conflict', `channel ${channel} already has subscription ${other.id} to ${planId === null ? 'every plan' : `plan ${planId}`}`);
+      const sub: NotificationSubscription = {
+        id: `sub-${hex(this.rand, 8)}`,
+        channel,
+        plan_id: planId,
+        topics: [...((input.topics as NotifyTopic[] | undefined) ?? DEFAULT_NOTIFY_TOPICS)],
+        created_by: me.name,
+        created_at: new Date(this.now()).toISOString(),
+      };
+      this.subscriptions.set(sub.id, sub);
+      event('subscription.created', sub, me);
+      return ok(sub, 201);
+    }
+    if (method === 'DELETE') {
+      const me = this.require(token, 'operator', path);
+      const sub = this.subscriptions.get(id);
+      if (!sub) throw notFound('notification_subscription', id);
+      if (sub.plan_id === null) everyPlanIsAnAdmins(me);
+      this.subscriptions.delete(id);
+      event('subscription.deleted', sub, me);
       return { status: 204 };
     }
     throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
