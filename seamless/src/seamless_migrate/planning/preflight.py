@@ -619,9 +619,14 @@ CATALOG: dict[str, CatalogEntry] = {
     "CONV_HOST_KEY_UNKNOWN": CatalogEntry(
         Severity.blocker,
         (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
-        "Declare the conversion host's public keys on its provider (conversion_host."
-        "ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and "
-        "pre-stage again, which creates it with an injected key.",
+        # declared keys are the provider's own host's alone (SDD §9.3; §26.10 decisions 11, 12)
+        "For the provider's own conversion host: declare its public keys on the provider "
+        "(conversion_host.ssh_host_keys), read out of band, or, while it has no pin, let the "
+        "provider check pin them from its console; one Seamless manages can also be deleted and "
+        "pre-staged again, which creates it with an injected key. For a project's host, which "
+        "the provider's declared keys do not reach: let the plan's pre-staging create it in that "
+        "project and pin it with an injected key - delete a replaced one first -, or, while it "
+        "has no pin, let a run pin it from its console with that project's credential.",
     ),
     "CONV_HOST_KEYS_UNCHECKED": CatalogEntry(
         Severity.warning,

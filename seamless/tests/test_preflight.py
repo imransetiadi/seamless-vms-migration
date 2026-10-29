@@ -2978,6 +2978,38 @@ def test_finding_conv_host_key_unknown_for_a_projects_host_whatever_its_provider
     assert judged(missing, tenant_plan) == []
 
 
+def test_finding_conv_host_key_unknown_says_what_helps_on_each_side():
+    """SDD §9.3, §26.3, §26.4 (§26.10 decisions 11 and 12): declared keys help the provider's own
+    host alone, so the remediation tells the two apart. The provider's own host: its keys
+    declared on the provider, read out of band, or, while it has no pin, pinned from its console
+    by the provider check; one Seamless manages also deleted and pre-staged again. A project's
+    host: the plan's pre-staging creates it in the project and pins it - a replaced one deleted
+    first -, or, while it has no pin, a run pins it from its console with that project's
+    credential; declaring keys is no way out for it. The finding carries that remediation."""
+    remediation = CATALOG["CONV_HOST_KEY_UNKNOWN"].remediation
+    own, project = remediation.split(" For a project's host")
+    assert own.startswith("For the provider's own conversion host: ")
+    for words in (
+        "declare its public keys on the provider (conversion_host.ssh_host_keys), read out of band",
+        "while it has no pin, let the provider check pin them from its console",
+        "one Seamless manages can also be deleted and pre-staged again",
+    ):
+        assert words in own, words
+    for words in (
+        "which the provider's declared keys do not reach",
+        "let the plan's pre-staging create it in that project and pin it with an injected key",
+        "delete a replaced one first",
+        "while it has no pin, let a run pin it from its console with that project's credential",
+    ):
+        assert words in project, words
+    assert "ssh_host_keys" not in project and "declare its" not in project
+    found = only(
+        check(source=_brought(SRC), destination=_brought(DST), host_key_checking=True),
+        "CONV_HOST_KEY_UNKNOWN",
+    )
+    assert found.remediation == remediation
+
+
 def test_finding_conv_host_key_unknown_not_for_a_host_seamless_will_create():
     """SDD §9.3, §26.3: a host Seamless manages gets its key injected when its pre-staging creates
     it, or its console read and pinned when it exists: no finding without a pin. Nor for a
