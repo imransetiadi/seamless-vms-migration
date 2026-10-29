@@ -414,10 +414,19 @@ class Notifier:
         cursor.failures_in_a_row = (
             0 if cursor.last_outcome == "sent" else cursor.failures_in_a_row + 1
         )
-        version, _ = await asyncio.to_thread(
-            self.store.put_with_event, "notification_cursor", cursor, outcome, version
-        )
-        await self.bus.catch_up()  # the streams read the outcome from the store (§12)
+        return await self._write_outcome(cursor, outcome, version)
+
+    async def _write_outcome(self, cursor: NotificationCursor, outcome: Event, version: int) -> int:
+        """The outcome's event and the cursor in one store transaction (§11, §24.6), timed and
+        numbered under the bus's emit lock and published at once, as every event is (SDD §4.2):
+        the Events page lists events by time, and an outcome timed before that lock was listed out
+        of seq order after an event another writer - another channel - wrote meanwhile."""
+        async with self.bus.emit_lock:
+            timed = outcome.model_copy(update={"ts": utcnow()})
+            version, written = await asyncio.to_thread(
+                self.store.put_with_event, "notification_cursor", cursor, timed, version
+            )
+            self.bus.publish(written, persist=True)
         return version
 
     async def _record_expired(
@@ -447,11 +456,7 @@ class Notifier:
         cursor.last_outcome, cursor.last_reason = "failed", "expired"
         cursor.last_outcome_at = self._now()
         cursor.failures_in_a_row += 1
-        version, _ = await asyncio.to_thread(
-            self.store.put_with_event, "notification_cursor", cursor, outcome, version
-        )
-        await self.bus.catch_up()
-        return version
+        return await self._write_outcome(cursor, outcome, version)
 
     # ------------------------------------------------------------------- the test route
 

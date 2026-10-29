@@ -2,6 +2,7 @@
 expiry, the dedupe key, the restart, and what is never notified - against fake senders."""
 
 import asyncio
+import contextlib
 from collections.abc import Mapping
 from datetime import timedelta
 
@@ -16,7 +17,7 @@ from seamless_migrate.domain.models import (
     NotificationSubscription,
     utcnow,
 )
-from seamless_migrate.events import EventBus
+from seamless_migrate.events import EventBus, emit
 from seamless_migrate.notify.notifier import Notifier, SendResult, Timing
 from seamless_migrate.store import NotFound, Store
 from tests.factories import make_migration, make_plan
@@ -520,5 +521,70 @@ async def test_an_event_written_after_a_channel_is_read_waits_for_the_next_pass(
     async def body():
         [seen] = await lab.wait_outcomes(1)
         assert seen.kind == "notification.sent" and seen.data["event_seq"] == fresh[0].seq
+
+    await run(lab, body)
+
+
+@pytest.mark.parametrize(
+    ("hours_old", "other_writes"),
+    [(0, "while_it_is_written"), (2, "while_it_is_written"), (0, "before_its_write")],
+    ids=["sent", "expired", "sent-after-a-writer-that-held-the-lock"],
+)
+async def test_an_outcome_event_is_timed_in_seq_order_with_the_others(lab, hours_old, other_writes):
+    """SDD §4.2: an event's ts is taken under the lock that writes and numbers the events, so
+    their order in time is their seq order - the Events page lists events by time. An outcome's
+    event, a message's or a run of expired ones', was timed before that lock and written outside
+    it: an event another writer wrote meanwhile - another channel's outcome - took the earlier
+    seq and the later time, and the page listed the two out of seq order (plan task NT10: the
+    demo's channels did it about once in fifteen messages). Taken under the lock, the time also
+    follows an event a writer that held the lock wrote while the outcome was being built."""
+    lab.channel()
+    lab.subscribe("ops-slack")
+    lab.downtime(1, ts=utcnow() - timedelta(hours=hours_old))
+    loop = asyncio.get_running_loop()
+    original = lab.store.put_with_event
+    other = []
+    sent = asyncio.Event()
+
+    def put_with_event(kind, model, event, expected_version):
+        if kind == "notification_cursor" and not other:
+            # another writer emits while the outcome is being written: it waits for the lock
+            # that write holds, or - nothing held - writes first
+            other.append(
+                asyncio.run_coroutine_threadsafe(
+                    emit(lab.store, lab.bus, "plan.paused", "paused", plan_id=lab.plan.id), loop
+                )
+            )
+            with contextlib.suppress(TimeoutError):
+                other[0].result(timeout=0.5)
+        return original(kind, model, event, expected_version)
+
+    async def send(channel, message, key, secret):
+        result = await FakeSender.send(lab.sender, channel, message, key, secret)
+        sent.set()  # the notifier builds the outcome next, and runs on to its write
+        return result
+
+    if other_writes == "while_it_is_written":
+        lab.store.put_with_event = put_with_event
+    else:
+        lab.sender.send = send
+
+    async def body():
+        if other_writes == "before_its_write":
+            async with lab.bus.emit_lock:  # a writer holds the lock while the outcome is built
+                await sent.wait()
+                # written now, while the outcome waits for the lock: timed after its building
+                paused = lab.store.append_event(
+                    Event(kind="plan.paused", plan_id=lab.plan.id, message="paused")
+                )
+        [outcome] = await lab.wait_outcomes(1)
+        if other_writes == "while_it_is_written":
+            paused = await asyncio.wrap_future(other[0])
+        assert outcome.kind == ("notification.failed" if hours_old else "notification.sent")
+        assert (outcome.data["reason"] == "expired") == bool(hours_old)
+        by_time = sorted([outcome, paused], key=lambda e: (e.ts, e.seq))
+        assert [e.seq for e in by_time] == sorted([outcome.seq, paused.seq]), [
+            (e.kind, e.seq, e.ts) for e in by_time
+        ]
 
     await run(lab, body)
