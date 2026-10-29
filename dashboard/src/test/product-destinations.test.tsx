@@ -11,7 +11,9 @@ import { renderWithApp } from './utils';
 describe('the product names every destination it migrates into (SDD §1 naming, §21, review RV20-04)', () => {
   it('on the Overview page', async () => {
     renderWithApp(<Overview />, { route: '/', token: 'viewer' });
-    expect(await screen.findByText(`Live VM migrations to ${DESTINATIONS}.`)).toBeInTheDocument();
+    expect(await screen.findByText(`Live state of VM migrations into ${DESTINATIONS}.`)).toBeInTheDocument();
+    // never "live migration": a move without downtime is a non-goal (SDD §1), and every migration here has downtime
+    expect(document.body).not.toHaveTextContent(/\blive (VM )?migrations?\b/i);
   });
 
   it("in the page's description", () => {

@@ -313,7 +313,8 @@ export default function Overview() {
     <>
       <PageHeader
         title="Overview"
-        description={`Live VM migrations to ${DESTINATIONS}.`}
+        // the live state of migrations, never "live migration": a move without downtime is a non-goal (SDD §1)
+        description={`Live state of VM migrations into ${DESTINATIONS}.`}
         actions={
           <SelectField
             label="Plan"
