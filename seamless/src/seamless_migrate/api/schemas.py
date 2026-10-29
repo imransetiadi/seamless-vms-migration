@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -194,6 +195,16 @@ class OrchestratorHealth(BaseModel):
     healthy: bool
 
 
+class LeaderHealth(BaseModel):
+    """/health's leader (SDD §12, §25.6): whether this replica leads, and the lease's holder, epoch
+    and acquisition while it is valid - each None while no replica leads."""
+
+    leading: bool
+    holder: str | None = None
+    epoch: int | None = None
+    since: datetime | None = None
+
+
 class Health(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
@@ -203,7 +214,9 @@ class Health(BaseModel):
     #: authentication is off: Sign in offers to continue without a token only then (SDD §12, §16)
     auth_disabled: bool
     db: Literal["ok", "error"]
+    #: the leader's orchestrator, whichever replica answers (SDD §12, §25.6)
     orchestrator: OrchestratorHealth
+    leader: LeaderHealth
 
 
 class Me(BaseModel):

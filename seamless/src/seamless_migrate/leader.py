@@ -17,6 +17,11 @@ campaigns again once that stop ended.
 its restore of the fake clouds -, the orchestrator's ``start()`` and the notifier; a deposition
 stops them; the server's stop stops them, then releases the lease with ``leader.released`` in one
 transaction.
+
+Each renewal writes the orchestrator's health into the lease row, and each retry period the tick
+loop is unhealthy the leader writes it alone, renewing nothing, so every replica reports the
+leader's orchestrator; a follower is ready while its campaign tries the lease (SDD §12, §25.6; plan
+task HA4).
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from .domain import fsm
 from .domain.models import Event
 from .events import new_event
 from .executors.base import ProcessGroups
-from .lease import Lease, Taken, lease_engine
+from .lease import Lease, LeaseRow, Taken, lease_engine, read_lease
 from .store import Fenced, Store, documents, events, write_event
 
 log = logging.getLogger(__name__)
@@ -52,6 +57,10 @@ FIRST_TRY_S = 30.0
 #: how long a stop waits for each of the elector's threads to end; one held up in a database call
 #: past it is a daemon, left to end by itself
 JOIN_S = 5.0
+#: a follower's campaign is alive while it tried the lease within max(this many retry periods,
+#: CAMPAIGN_STALE_S) - the tick's rule (SDD §12)
+CAMPAIGN_STALE_PERIODS = 5
+CAMPAIGN_STALE_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -137,7 +146,8 @@ class Elector:
 
     ``on_acquired(epoch, event)`` runs in the elector's thread once it took the lease - ``event``
     the leader.acquired its takeover wrote -, and ``on_deposed(epoch, reason)`` in the deposing
-    thread once its kill is sent."""
+    thread once its kill is sent. ``report()`` is the orchestrator's health, which the leader writes
+    into the lease row (SDD §12)."""
 
     def __init__(
         self,
@@ -146,6 +156,7 @@ class Elector:
         groups: ProcessGroups,
         *,
         healthy: Callable[[], bool] = lambda: True,
+        report: Callable[[], dict[str, Any] | None] = lambda: None,
         renew_deadline_s: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -153,6 +164,7 @@ class Elector:
         self.store = store
         self.groups = groups
         self.healthy = healthy
+        self.report = report
         self.renew_deadline_s = (
             lease.lease_s * RENEW_SHARE if renew_deadline_s is None else float(renew_deadline_s)
         )
@@ -168,6 +180,9 @@ class Elector:
         self._idle.set()
         self._first_try = threading.Event()
         self._threads: list[threading.Thread] = []
+        #: the campaign's and the renewals' thread, and when its last try of the lease ended
+        self._runner: threading.Thread | None = None
+        self._tried_at: float | None = None
         self._unhealthy_said = False
         self._following_said = False
         self.on_acquired: Callable[[int, Event | None], None] = lambda epoch, event: None
@@ -187,6 +202,21 @@ class Elector:
         with self._cond:
             return self._epoch is not None and self._monotonic() < self._deadline
 
+    def campaigning(self) -> bool:
+        """Whether the campaign is alive, which a follower's readiness judges (SDD §12): its thread
+        runs and its last try of the lease - taken, held by another or failed - ended within
+        max(5 retry periods, 30 s)."""
+        runner = self._runner
+        with self._cond:
+            tried = self._tried_at
+        stale = max(CAMPAIGN_STALE_PERIODS * self.lease.retry_s, CAMPAIGN_STALE_S)
+        return (
+            runner is not None
+            and runner.is_alive()
+            and tried is not None
+            and self._monotonic() - tried <= stale
+        )
+
     # -- the threads ----------------------------------------------------------------------------
     def start(self) -> None:
         """Start the campaign's thread and the watchdog's."""
@@ -194,6 +224,8 @@ class Elector:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
+            if name == "seamless-elector":
+                self._runner = thread
 
     def wait_first_try(self, timeout: float) -> bool:
         """Until the first campaign was tried: whether it was within ``timeout``."""
@@ -226,14 +258,20 @@ class Elector:
                 if self._closed:
                     return
                 epoch, stopping = self._epoch, self._stopping
+            tried = False
             try:
                 if epoch is not None:
+                    tried = True
                     self._renew(epoch, stopping)
                 elif not stopping and self._idle.is_set():
+                    tried = True
                     self._campaign()
             except Exception as exc:  # noqa: BLE001 - the thread goes on; its next try may work
                 log.warning("the elector of the orchestrator lease failed: %s", _why(exc))
             finally:
+                if tried:
+                    with self._cond:
+                        self._tried_at = self._monotonic()
                 self._first_try.set()
             with self._cond:
                 self._cond.wait_for(lambda: self._closed, timeout=self.lease.retry_s)
@@ -293,7 +331,28 @@ class Elector:
             log.warning("the tick loop's health could not be read: %s", _why(exc))
             return False
 
+    def _report(self) -> dict[str, Any] | None:
+        try:
+            return self.report()
+        except Exception as exc:  # noqa: BLE001 - a health that cannot be read is not written
+            log.warning("the orchestrator's health could not be read: %s", _why(exc))
+            return None
+
+    def _write_health(self, epoch: int, health: dict[str, Any] | None) -> None:
+        """While the tick loop is unhealthy: the orchestrator's health alone, renewing nothing, so
+        every replica reports the stall (SDD §12); a write that finds the lease taken deposes."""
+        if health is None:
+            return
+        try:
+            written = self.lease.write_health(epoch, health)
+        except Exception as exc:  # noqa: BLE001 - written again at the next period
+            log.debug("could not write the orchestrator's health at epoch %d: %s", epoch, _why(exc))
+            return
+        if not written:
+            self.depose(f"the lease was taken: its health at epoch {epoch} wrote nothing", epoch)
+
     def _renew(self, epoch: int, stopping: bool) -> None:
+        health = self._report()
         if not stopping and not self._healthy():
             if not self._unhealthy_said:
                 log.warning(
@@ -302,11 +361,12 @@ class Elector:
                     epoch,
                 )
                 self._unhealthy_said = True
+            self._write_health(epoch, health)
             return
         self._unhealthy_said = False
         noted = self._monotonic()  # before it sends: the expiry the database sets comes after
         try:
-            renewed = self.lease.renew(epoch)
+            renewed = self.lease.renew(epoch, health=health)
         except Exception as exc:  # noqa: BLE001 - tried again at the next period
             log.warning("could not renew the orchestrator lease of epoch %d: %s", epoch, _why(exc))
             return
@@ -425,6 +485,7 @@ class Leadership:
             store,
             orchestrator.process_groups,
             healthy=self._healthy,
+            report=self._report,
             renew_deadline_s=renew_deadline_s,
             monotonic=monotonic,
         )
@@ -455,6 +516,15 @@ class Leadership:
     def leads(self) -> bool:
         return self.elector.leads()
 
+    def campaigning(self) -> bool:
+        """Whether this replica's campaign is alive: a follower's readiness (SDD §12)."""
+        return self.elector.campaigning()
+
+    def row(self) -> LeaseRow | None:
+        """The lease row as the store's engine reads it now - not the elector's, whose one
+        connection is its own (SDD §8): what /health and the relay read (§12)."""
+        return read_lease(self.store.engine)
+
     def depose(self, reason: str) -> None:
         self.elector.depose(reason)
 
@@ -463,6 +533,9 @@ class Leadership:
 
     def _healthy(self) -> bool:
         return bool(self.orchestrator.health()["healthy"])
+
+    def _report(self) -> dict[str, Any]:
+        return dict(self.orchestrator.health())
 
     # -- the server's life cycle --------------------------------------------------------------
     async def start(self) -> None:

@@ -35,6 +35,7 @@ import {
   type Event,
   type GpuCapacity,
   type GpuCheckReport,
+  type Health,
   type Hook,
   type Migration,
   type NotificationChannelView,
@@ -2551,6 +2552,14 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
   it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {
     const { client } = setup('viewer');
     expect(await client.get<{ demo: boolean; demo_speed: number | null }>('/health')).toMatchObject({ demo: true, demo_speed: 1 });
+  });
+
+  it('answers GET /health with one replica that leads', async () => {
+    // the offline mock is one replica, which took the orchestrator's lease when it started (SDD §12, §16, §25.6)
+    const { client } = setup(null);
+    const health = await client.get<Health>('/health');
+    expect(health.leader).toEqual({ leading: true, holder: expect.stringMatching(/^seamless-/), epoch: 1, since: new Date(NOW).toISOString() });
+    expect(health.orchestrator).toMatchObject({ running: true, healthy: true });
   });
 
   it('records a Force cutover with the last pass and the estimate, and a request that is no approval', async () => {

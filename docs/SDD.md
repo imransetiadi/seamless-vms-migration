@@ -4411,7 +4411,8 @@ JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP
 `bad_request`), 401 (no/invalid token), 403 (role), 404, 405 (`method_not_allowed`), 409 (invalid
 transition / conflict), 413 (`payload_too_large`, below), 422 (schema), 429 (`too_many_requests`, the
 auth lockout of §15.1), 500 (`internal_error`, message never carries internals), 502
-(`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
+(`provider_error`, the redacted provider message), 503 (`/ready` while degraded; `no_leader` with `Retry-After: 2`,
+a follower's answer while no replica leads or the leader does not answer, below). Every response,
 including error responses written by the server-error handler and the answers to CORS preflights (with
 `SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
 `bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
@@ -4448,8 +4449,8 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
-| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool},"leader":{"leading":bool,"holder":str\|null,"epoch":int\|null,"since":datetime\|null}}` — `status` and `db` judge the replica that answers (plan task HA4): `degraded` when the database is unreachable or, on the replica that leads (§8), the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed, and on a follower when its campaign is dead (no try of the lease for max(5 × the retry period, 30 s), §8, §11); probes use it; `orchestrator`: the leader's, whichever replica answers (below); `leader` (§25.6): `leading`, whether this replica leads, and the lease's `holder`, `epoch` and `acquired_at` (`since`) while the lease is valid as this replica reads the row (§11), each null while no replica leads or the row cannot be read - a leader that cannot read it names its own holder and epoch, `since` null -; a server whose store holds no lease (a test's) leads alone: `leading` true, the rest null; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
+| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness): it judges the replica that answers, so both replicas are ready while one leads (§25.6) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
@@ -4537,6 +4538,41 @@ Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are 
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
 disabled (Security.md R-04). Every response carries the security headers of Security.md R-05.
 
+**The followers** (§25.6, plan task HA4). A server replica that does not lead (§8) answers `/api/v1/health`,
+`/api/v1/ready` and `/api/v1/metrics`, the API documents and the dashboard's files itself, and relays every other
+request whose path is `/api/v1` or lies under it - the event stream too - to the lease's `address` as it reads the
+row at the request (§11), over plain HTTP (§25.9), once the body limit above passed: a body over it is refused by the
+follower and never relayed.
+* *What it sends:* the method, the path as the caller sent it and its query, the body, and of the caller's headers
+  `Authorization`, `Content-Type` and `Accept-Encoding` alone - no cookie, no hop-by-hop header, no other -, with
+  `X-Forwarded-For` extended by the caller's address as the follower reads it (its own lockout's, §13.1) and the
+  marker `X-Seamless-Relayed: 1`. The leader authenticates, authorizes, audits and answers the request as a direct
+  one (§13.1); the follower checks no token of it and passes the answer back as it came - its status, its headers
+  but the hop-by-hop ones, `Date` and `Server`, and its body as it flows.
+* *The marker:* a replica that does not lead answers a request marked `X-Seamless-Relayed` that it would relay with
+  503 `no_leader` and never relays it again (the lease was taken meanwhile); the leader serves a marked request as any
+  other, so a marker a client sets itself gains nothing.
+* *Its bounds:* the relay connects within the retry period, 2 s (§11); it reads the event stream without a bound and
+  ends it when the leader's end of it ends - the client reconnects with `?since=` and gets what it missed from the
+  next leader, the ephemeral events of the gap lost as across a restart (§4.3) -, and gives every other request 300 s
+  from its sending to the last byte of its answer. An answer cut off midway ends where it was cut.
+* *503 `no_leader`*, with `Retry-After: 2`: while no replica leads - the row is missing or expired, or names this
+  replica, deposed before its lease lapsed -; when the leader does not answer - no connection, an error before its
+  answer, or no answer within the 300 s -; and with authentication off, which binds a loopback address alone (§13.1):
+  the leader's refusal of another site's page reads the caller's `Host` and `Origin`, which a relay does not carry,
+  so a follower then relays nothing. A failed relay is logged with its method and path, never a header, the query or
+  the body.
+* *The leader's orchestrator on every replica:* the leader writes its orchestrator's object into the lease row's
+  `health` (§11) with each renewal and, each retry period its tick loop is unhealthy and it renews nothing (§8), alone;
+  a takeover clears it. `/health` reports the leader's own object on the leader, and on a follower the one the row
+  holds: the leader's as of its last write; one before its start (`running` false, `last_tick_age_s` null, `ticks` 0,
+  `healthy` true) until a new leader's first write; and while no replica leads, or the row cannot be read, one that
+  does not run (`running` and `healthy` false, `last_tick_age_s` null, `ticks` 0). A follower's `status`, `db` and
+  `/ready` judge the follower alone, so both replicas are ready while one leads, and the dashboard reads the leader's
+  orchestrator whichever replica answered (§16).
+
+A server whose store holds no lease (a test's) leads alone and relays nothing.
+
 ```text
 ValidationReport { plan_id: str, ok: bool,
                    migrations: [{ migration_id, vm_name, strategy, phase, findings: Finding[],
@@ -4608,6 +4644,11 @@ the principal's name (`unauthenticated` without one), `message` `METHOD path: re
 `{path, method, reason, required_role, client}` - the path as the client sent it, percent-encoded, so a NUL reads
 `%00` and the record is written on PostgreSQL too (§11, review ST-03) -, never the token; at most 30 per client
 address and minute are recorded.
+A follower (§12, plan task HA4) checks no token of a request it relays: the leader authenticates, refuses and
+records it with the caller's address the follower appended to `X-Forwarded-For` - uvicorn reads it there when
+`FORWARDED_ALLOW_IPS` lists the replicas' addresses beside the router's (§25.9) -, so the leader's lockout and its
+`auth.denied` count the caller, never the follower. A follower records `auth.denied`, and counts failures in its
+own lockout, only for what it answers itself: `/metrics` and the API documents.
 
 Admins can add people from Dashboard **Users** (`POST /users`). Names are 1-128 ASCII letters,
 digits, dots, underscores, `@` or hyphens, starting with a letter or digit; surrounding whitespace
@@ -5307,6 +5348,15 @@ is no origin a browser sends (review RV31-03).
   "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
   menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
   holding the full sidebar's groups and session; without motion when `prefers-reduced-motion` asks.
+* The orchestrator and its leader (§12, §25.6, plan task HA4): the session's orchestrator line reads `/health`'s
+  `orchestrator` - the leader's, whichever replica answered - as running with its last tick's age, starting, stalled
+  or stopped, and under it the leading replica (`leader.holder`), or "No replica leads" while none does (`holder`
+  null on a replica that does not lead). The notice above every page (a polite live region, empty while all is
+  well) says what keeps the migrations from advancing: the control plane not answering its health checks; a
+  degraded health, naming the database when it is unreachable; the leader's orchestrator loop not running or
+  unhealthy, with its last tick's age, whichever replica answered - naming the leading replica when the one that
+  answered does not lead -; and, while no replica leads, that migrations wait until one takes over. The offline
+  mock answers with one replica that leads.
 * Destination wording (§1 naming, plan T6): the dashboard names RHOSO 18.0 and community OpenStack as destinations
   where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
@@ -8090,6 +8140,10 @@ at each takeover are binding in §8 and §10 since plan task HA3.
 * **The CLI** is unchanged: no lease, no tick, and its validations' cleanups in its own process (§15). `seamless
   status` names the leader and its epoch (HA5).
 
+The relay, its marker header `X-Seamless-Relayed` and 503 `no_leader`, `/health`'s `leader`, the leader's
+orchestrator in the lease row and on every replica, `/ready` judging the replica that answers and the dashboard's
+orchestrator indicator are binding in §12, §13.1 and §16 since plan task HA4.
+
 ### 25.7 Deployment
 
 * **OpenShift and Kubernetes: an HA component**, a kustomize component that both overlays may include; the base stays
@@ -8138,7 +8192,8 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
   both epochs.
 
 The events, with their data's names (`previous_holder`, `previous_epoch`, `resumes`), are binding in §4.3 and §11
-since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8).
+since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8);
+`/health`'s `leader` is binding in §12 since plan task HA4.
 The gauges are binding in §18 and the leader line of `seamless status` in §15 since plan task HA5: each scrape reads
 the epoch in the lease's row, 0 before any lease; neither gauge carries a label; and `status` names no leader for a
 lease that expired by the database's clock.
@@ -8222,7 +8277,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | PRD: FR-27's priority and acceptance criteria, the 0.2.0 row as delivered, a 0.5.0 row; D2 decided | PRD, §20 | HA1 |
 | the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
-| the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
+| the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 (binding) | HA4 |
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
