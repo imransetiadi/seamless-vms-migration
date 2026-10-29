@@ -25,10 +25,10 @@ export function PhaseDistribution({ byPhase }: { byPhase: Partial<Record<Phase, 
         const meta = phaseMeta(phase);
         const tone = TONE_CLASSES[meta.tone];
         return (
-          <li key={phase} className="grid grid-cols-[minmax(7.5rem,9.5rem)_minmax(0,1fr)_2.5rem] items-center gap-2 text-sm">
+          <li key={phase} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-2 text-sm">
             <span className={cn('flex min-w-0 items-center gap-1.5', tone.text)}>
               <meta.icon aria-hidden className="size-3.5 shrink-0" />
-              <span className="min-w-0 wrap-break-word text-foreground">{meta.label}</span>
+              <span className="min-w-0 wrap-anywhere text-foreground">{meta.label}</span>
             </span>
             <span aria-hidden className="h-2 overflow-hidden rounded-full bg-muted">
               <span

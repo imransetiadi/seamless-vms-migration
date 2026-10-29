@@ -132,9 +132,9 @@ function useNavMode(): [NavMode, () => void] {
 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
-    <Link to="/" className={cn('flex min-h-11 items-center gap-2 rounded-md', compact && 'justify-center')}>
-      <BrandMark className="size-7 shrink-0" />
-      <span className={cn('flex flex-col leading-tight', compact && 'sr-only')}>
+    <Link to="/" className={cn('flex min-h-11 min-w-0 items-center gap-3 rounded-lg', compact && 'justify-center')}>
+      <BrandMark className="size-8 shrink-0 drop-shadow-sm" />
+      <span className={cn('flex min-w-0 flex-col wrap-anywhere leading-tight', compact && 'sr-only')}>
         {/* a space of its own between the lines: only CSS sets them apart, and the link's name must not rely on it */}
         <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>{' '}
         <span className="text-xs text-muted-foreground">to {BRAND_DESTINATIONS}</span>
@@ -178,7 +178,7 @@ function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: Nav
                       className={cn(
                         'flex min-h-11 rounded-md transition-colors duration-200',
                         rail
-                          ? 'flex-col items-center justify-center gap-1 border-l-2 px-1 py-1.5 text-center text-[11px] leading-tight'
+                          ? 'flex-col items-center justify-center gap-1 border-l-2 px-1 py-1.5 text-center text-xs leading-tight'
                           : 'items-center gap-3 border-l-2 px-3 text-sm',
                         // room for the failed count under the label
                         rail && pill && 'pb-6',
@@ -201,7 +201,7 @@ function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: Nav
                           'pointer-events-none absolute inline-flex items-center gap-1 rounded-sm border border-status-danger/50 bg-card font-medium text-status-danger',
                           // in the rail under the label, inside the item; in the sidebar at the item's right end
                           rail
-                            ? 'bottom-1.5 left-1/2 -translate-x-1/2 whitespace-nowrap px-1 text-[10px]'
+                            ? 'bottom-1.5 left-1/2 -translate-x-1/2 whitespace-nowrap px-1 text-xs'
                             : 'right-2 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-xs',
                         )}
                       >
@@ -303,7 +303,7 @@ function RailSession() {
   const signOut = useSignOut();
   const anonymous = me.data?.name === 'anonymous';
   const railButton =
-    'flex min-h-11 w-full cursor-pointer flex-col items-center justify-center gap-1 rounded-md px-1 py-1.5 text-center text-[11px] leading-tight text-foreground transition-colors duration-200 hover:bg-muted';
+    'flex min-h-11 w-full cursor-pointer flex-col items-center justify-center gap-1 rounded-md px-1 py-1.5 text-center text-xs leading-tight text-foreground transition-colors duration-200 hover:bg-muted';
   return (
     <div className="flex flex-col items-center gap-1 border-t border-border pt-2">
       <LiveIndicator stacked className="py-1" />
@@ -477,7 +477,7 @@ export function Layout() {
           aria-label={full ? 'Collapse navigation' : 'Expand navigation'}
           className={cn(
             'flex min-h-11 cursor-pointer items-center rounded-md text-muted-foreground transition-colors duration-200 hover:bg-muted hover:text-foreground',
-            full ? 'gap-2 px-2 text-sm' : 'flex-col justify-center gap-1 px-1 py-1.5 text-[11px] leading-tight',
+            full ? 'gap-2 px-2 text-sm' : 'flex-col justify-center gap-1 px-1 py-1.5 text-xs leading-tight',
           )}
         >
           {full ? <PanelLeftClose aria-hidden className="size-4 shrink-0" /> : <PanelLeftOpen aria-hidden className="size-4 shrink-0" />}
@@ -486,7 +486,7 @@ export function Layout() {
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
+        <header className="sticky top-0 z-nav flex flex-wrap items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
           <button
             type="button"
             ref={menuButtonRef}
@@ -538,7 +538,7 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1400px] flex-1 px-4 pb-4 pt-2 outline-hidden md:px-6 md:py-6"
+          className="mx-auto w-full max-w-[1400px] flex-1 wrap-anywhere px-4 pb-4 pt-2 outline-hidden md:px-6 md:py-6"
         >
           <HealthNotice />
           <StreamNotice />

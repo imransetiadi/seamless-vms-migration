@@ -56,7 +56,7 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
             <li
               key={phase}
               aria-current={state === 'current' ? 'step' : undefined}
-              className="relative flex min-w-0 items-center gap-2 md:flex-col md:gap-1 md:px-1 md:text-center"
+              className="relative flex min-w-0 flex-wrap items-center gap-2 md:flex-col md:gap-1 md:px-1 md:text-center"
             >
               {index > 0 && (
                 <span
@@ -82,7 +82,7 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
               </span>
               <span
                 className={cn(
-                  'min-w-0 text-xs leading-tight',
+                  'min-w-0 max-w-full wrap-anywhere text-xs leading-tight',
                   state === 'current' || state === 'interrupted' ? 'font-semibold text-foreground' : 'text-muted-foreground',
                   state === 'done' && 'text-foreground',
                 )}

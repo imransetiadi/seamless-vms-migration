@@ -119,7 +119,7 @@ export function DowntimeClock({
           role="timer"
           aria-label="Downtime"
           className={cn(
-            'num text-4xl font-semibold leading-none',
+            'num min-w-0 wrap-anywhere text-4xl font-semibold leading-none',
             slo?.tone === 'danger' ? 'text-status-danger' : startedAt ? 'text-foreground' : 'text-muted-foreground',
           )}
         >

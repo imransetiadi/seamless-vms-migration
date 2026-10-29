@@ -54,8 +54,8 @@ function ServiceCard({
         ? { tone: 'neutral' as const, icon: CircleSlash, label: 'Off' }
         : { tone: 'danger' as const, icon: CircleX, label: 'Unavailable' };
   return (
-    <section aria-label={title} className="card flex flex-col gap-3 p-4">
-      <div className="flex items-start justify-between gap-2">
+    <section aria-label={title} className="card flex min-w-0 flex-col wrap-anywhere gap-3 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
         <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
           <Icon aria-hidden className="size-5 text-muted-foreground" />
           {title}
@@ -65,7 +65,7 @@ function ServiceCard({
           <StatusBadge tone={badge.tone} icon={badge.icon} label={badge.label} size="md" />
         </div>
       </div>
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
         {lines.map(([k, v]) => (
           <div key={k} className="contents">
             <dt className="text-muted-foreground">{k}</dt>

@@ -154,3 +154,32 @@ for (const width of [320, 390, 768, 1440]) {
     }
   });
 }
+
+base('the Sign in button stays where it is when the health check answers: no layout shift under the pointer', async ({ page }) => {
+  // the most the answer adds below the form: "reachable" and the note that authentication is off
+  const server = new MockServer();
+  server.health.auth_disabled = true;
+  for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    let release!: () => void;
+    const answered = new Promise<void>((resolve) => { release = resolve; });
+    await page.unrouteAll();
+    await page.route('**/api/v1/**', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const path = url.pathname.replace('/api/v1', '');
+      if (path === '/health') await answered;
+      const response = server.handle(request.method(), path, url.searchParams, request.postDataJSON(), null);
+      await route.fulfill({ status: response.status, json: response.body ?? {} });
+    });
+    await page.goto('/login');
+    const signIn = page.getByRole('button', { name: 'Sign in', exact: true });
+    await expect(signIn).toBeVisible();
+    const before = await signIn.boundingBox();
+    release();
+    await expect(page.getByText('Authentication is off on this server')).toBeVisible();
+    const after = await signIn.boundingBox();
+    expect(before && after, `${viewport.width}px`).toBeTruthy();
+    expect(Math.abs((after?.y ?? 0) - (before?.y ?? 0)), `${viewport.width}px: the button moved`).toBeLessThan(1);
+  }
+});

@@ -25,7 +25,7 @@ export function ThemeToggle({
       title={`Switch to ${next} theme`}
       className={cn(
         'inline-flex min-h-11 min-w-11 cursor-pointer items-center justify-center rounded-md text-foreground transition-colors duration-200 hover:bg-muted',
-        stacked ? 'flex-col gap-1 px-1 py-1.5 text-center text-[11px] leading-tight' : 'gap-2 px-2 text-sm',
+        stacked ? 'flex-col gap-1 px-1 py-1.5 text-center text-xs leading-tight' : 'gap-2 px-2 text-sm',
         className,
       )}
     >

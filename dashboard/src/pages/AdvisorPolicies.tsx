@@ -53,7 +53,7 @@ function PolicyCard({
   // worded as the audit trail lists a policy change (SDD §14.5)
   const scope = builtIn ? 'Plans no other policy covers' : policyScopeText(policy.scope, names);
   return (
-    <li>
+    <li className="min-w-0">
       {/* addressable as #policy-{id}: the plan settings link to the policy in force (SDD §16, ADV-20) */}
       <article
         id={`policy-${policy.id}`}
@@ -72,7 +72,7 @@ function PolicyCard({
           </div>
           <ModeBadge policy={policy} />
         </header>
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-sm">
+        <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-sm">
           <dt className="text-muted-foreground">Applies to</dt>
           <dd className="min-w-0 wrap-break-word">{scope}</dd>
           <dt className="text-muted-foreground">Decisions</dt>
