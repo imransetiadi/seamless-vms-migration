@@ -1,0 +1,80 @@
+# The HA component (SDD 17, 25.7): two replicas of the control plane on two nodes. The one that holds the lease in
+# PostgreSQL runs the orchestrator, and the other relays the API and the event stream to it (SDD 25.6). A Technology
+# Preview until the lab's failover cases pass (SDD 25.10).
+#
+# Enable it in the overlay you apply, by its two commented components: lines - deploy/openshift/kustomization.yaml
+# on OpenShift, deploy/kubernetes/kustomization.yaml on Kubernetes (which includes this component through
+# deploy/kubernetes/ha) - and only with a ReadWriteMany storage class: a claim's access modes never change, so /data
+# moves to a new claim once, with the control plane stopped (docs/Operations.md). scripts/seamless-ctl.sh up and
+# start then restore the count below (SDD 17.2).
+#
+# It sets:
+#   * 2 replicas - the count scripts/seamless-ctl.sh reads -, on two nodes by a required pod anti-affinity: during a
+#     drain the evicted replica waits for a node without the other, which leads meanwhile;
+#   * strategy Recreate, kept;
+#   * pdb.yaml: a disruption budget of one, which a replica that is not ready never blocks;
+#   * seamless-data ReadWriteMany: the new leader reads the run directories the old one wrote;
+#   * networkpolicy.yaml: the relay between the replicas, on the API port alone;
+#   * FORWARDED_ALLOW_IPS: the pod network, where the replicas are, so the leader's lockout and audit count the
+#     caller of a relayed request, never the follower (SDD 13.1, 25.9).
+# No Kubernetes RBAC: the lease is the database's.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - pdb.yaml
+  - networkpolicy.yaml
+
+replicas:
+  - name: seamless
+    count: 2
+
+patches:
+  - target:
+      kind: Deployment
+      name: seamless
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: seamless
+      spec:
+        # kept (SDD 25.7, owner decision 6): a rollout ends the old pods before it starts new ones, so one version
+        # runs at a time - the first upgrade never runs 0.4.0's unfenced orchestrator beside a newer one; an upgrade
+        # stays an outage of the control plane, which --drain keeps cutovers out of (SDD 17.2)
+        strategy:
+          type: Recreate
+        template:
+          spec:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: seamless
+                    topologyKey: kubernetes.io/hostname
+            containers:
+              - name: seamless
+                env:
+                  # uvicorn takes the caller's address from X-Forwarded-For only from these addresses: the pod
+                  # network, where the replicas are - and, on OpenShift's default networks, the router's hop.
+                  # ADJUST with the pod network of ../networkpolicy.yaml's except ranges, and add the router's
+                  # addresses when its hop comes from elsewhere (comma-separated; never "*"): it relies on the
+                  # NetworkPolicies, which admit only the router and the other replica to the API port. This value
+                  # replaces one set in ../deployment.yaml.
+                  - name: FORWARDED_ALLOW_IPS
+                    value: 10.128.0.0/14
+  - target:
+      kind: PersistentVolumeClaim
+      name: seamless-data
+    patch: |
+      - op: replace
+        path: /spec/accessModes
+        value:
+          - ReadWriteMany
+      # ADJUST unless the cluster's default class serves ReadWriteMany: a class that does, and that encrypts in
+      # transit - a run's secret files cross the storage network while a playbook runs (SDD 25.9). On OpenShift,
+      # OpenShift Data Foundation's CephFS class:
+      # - op: add
+      #   path: /spec/storageClassName
+      #   value: ocs-storagecluster-cephfs

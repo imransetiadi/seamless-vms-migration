@@ -7,8 +7,9 @@
 # privileges, the manifests' own writable mounts (emptyDir -> tmpfs, PVC -> a scratch volume, Secrets
 # left out) — once with OpenShift's arbitrary UID and once with the UID the Kubernetes overlay sets:
 #
-#   * PostgreSQL (always): the image pinned in deploy/kubernetes/kustomization.yaml with the mounts of
-#     deploy/openshift/postgres-statefulset.yaml; ready when /usr/libexec/check-container passes.
+#   * PostgreSQL (always): the image pinned in deploy/kubernetes/kustomization.yaml with the mounts and the arguments
+#     of deploy/openshift/postgres-statefulset.yaml; ready when /usr/libexec/check-container passes and the server
+#     shows each -c setting of its arguments as the application role reads it (SDD 17, 25.7).
 #   * the control plane (when CP_IMAGE is set): the ConfigMap's settings in demo mode with the
 #     Deployment's literal env and mounts; ready when /api/v1/health answers "ok", then Ansible runs
 #     with the executor's ANSIBLE_HOME under the data directory.
@@ -75,6 +76,21 @@ if kind == "Deployment" and len(sys.argv) > 3:
 PY
 }
 
+# Print the arguments a manifest gives its container - what follows the image -, one per line (python3 + PyYAML).
+manifest_command() {
+  "$PYTHON" - "$@" <<'PY'
+import sys
+import yaml
+
+kind, path = sys.argv[1], sys.argv[2]
+obj = next(d for d in yaml.safe_load_all(open(path)) if d and d["kind"] == kind)
+container = obj["spec"]["template"]["spec"]["containers"][0]
+assert "command" not in container, "a command replaces the image's entrypoint: check it by hand"
+for arg in container.get("args", []):
+    print(arg)
+PY
+}
+
 pinned_postgres() {
   "$PYTHON" - "$OVERLAY" <<'PY'
 import sys
@@ -103,31 +119,57 @@ wait_for() {
   done
 }
 
-# run_hardened USER IMAGE ARGS...: start the container the way the cluster runs it.
+# run_hardened USER IMAGE ARGS... [-- COMMAND...]: start the container the way the cluster runs it - ARGS docker run's,
+# COMMAND what follows the image, as a manifest's container args.
 run_hardened() {
-  local user=$1 image=$2
+  local user=$1 image=$2 args=() command=()
   shift 2
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    args+=("${1//@DATA@/$NAME-data}")
+    shift
+  done
+  [ $# -eq 0 ] || { shift; command=("$@"); }
   cleanup
   d volume create "$NAME-data" >/dev/null
-  local args=()
-  for arg in "$@"; do args+=("${arg//@DATA@/$NAME-data}"); done
   d run -d --name "$NAME" --read-only --user "$user" --cap-drop ALL \
-    --security-opt no-new-privileges "${args[@]}" "$image" >/dev/null
+    --security-opt no-new-privileges "${args[@]}" "$image" ${command[@]+"${command[@]}"} >/dev/null
+}
+
+# settings_hold ARGS...: each "-c name=value" of a container's arguments as the server shows it to the application
+# role, over TCP as the control plane connects; the password stays in the container's environment.
+settings_hold() {
+  local setting shown
+  while [ $# -gt 0 ]; do
+    if [ "$1" = -c ] && [ $# -ge 2 ]; then
+      setting=$2
+      shift
+      # shellcheck disable=SC2016 # expanded by the container's shell
+      shown=$(d exec "$NAME" sh -c 'PGPASSWORD=$POSTGRESQL_PASSWORD psql -h 127.0.0.1 -U "$POSTGRESQL_USER" \
+        -d "$POSTGRESQL_DATABASE" -tAc "SHOW $1"' sh "${setting%%=*}" 2>&1) || true
+      if [ "$shown" != "${setting#*=}" ]; then
+        echo "  the server shows ${setting%%=*} as '$shown', not ${setting#*=}"
+        return 1
+      fi
+    fi
+    shift
+  done
 }
 
 check_postgres() {
-  local image user line mounts=()
+  local image user line mounts=() command=()
   image=$(pinned_postgres)
   while IFS= read -r line; do mounts+=("$line"); done < <(manifest_args StatefulSet "$STATEFULSET")
+  while IFS= read -r line; do command+=("$line"); done < <(manifest_command StatefulSet "$STATEFULSET")
   export POSTGRESQL_USER=rocheck POSTGRESQL_DATABASE=rocheck
   POSTGRESQL_PASSWORD=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   export POSTGRESQL_PASSWORD
   for user in 1000680000:0 26:26; do
     echo "PostgreSQL $image as $user ($(basename "$STATEFULSET"))"
     run_hardened "$user" "$image" "${mounts[@]}" \
-      --env=POSTGRESQL_USER --env=POSTGRESQL_DATABASE --env=POSTGRESQL_PASSWORD
-    if wait_for /usr/libexec/check-container && d exec "$NAME" /usr/libexec/check-container --live >/dev/null; then
-      echo "  ready"
+      --env=POSTGRESQL_USER --env=POSTGRESQL_DATABASE --env=POSTGRESQL_PASSWORD -- ${command[@]+"${command[@]}"}
+    if wait_for /usr/libexec/check-container && d exec "$NAME" /usr/libexec/check-container --live >/dev/null &&
+      settings_hold ${command[@]+"${command[@]}"}; then
+      echo "  ready${command[*]:+, with ${command[*]}}"
     else
       failures=$((failures + 1))
     fi

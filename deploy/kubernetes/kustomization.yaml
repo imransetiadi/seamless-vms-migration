@@ -9,6 +9,7 @@
 #   * OpenShift pod/service networks in the egress policies -> the cluster's (kubeadm defaults below)
 #   * registry.redhat.io/rhel9/postgresql-16 -> quay.io/sclorg/postgresql-16-c9s, pinned by digest (same image interface,
 #     public; keep the Red Hat image when you have a pull secret for registry.redhat.io)
+#   * the HA component     -> ha/, with this overlay's pod network (SDD 25.7)
 #
 # Deploy:
 #   1. Build and push the image (repository root; it builds the dashboard when dashboard/dist is absent):
@@ -23,9 +24,20 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# deploy/openshift's namespace, on what this overlay adds itself too - the Ingress, the HA component's objects -, so
+# an apply without -n puts them beside the rest (SDD 17)
+namespace: seamless-migrate
+
 resources:
   - ../openshift
   - ingress.yaml
+
+# Two replicas on two nodes (SDD 17, 25.7; a Technology Preview): uncomment the two lines below - only with a
+# ReadWriteMany storage class, once /data moved to the new claim with the control plane stopped (docs/Operations.md).
+# ha/ is deploy/openshift/ha with this overlay's pod network: enable it here, never in deploy/openshift as well;
+# scripts/seamless-ctl.sh up and start restore its two replicas.
+# components:
+#   - ha
 
 images:
   - name: image-registry.openshift-image-registry.svc:5000/seamless-migrate/seamless-migrate

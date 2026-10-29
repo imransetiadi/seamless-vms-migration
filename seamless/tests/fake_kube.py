@@ -41,7 +41,11 @@ kubectl and the API server do (review 38b, read from their sources):
   waits out a pod still terminating in a slot and recreates it (the controller's
   stateful_set_control.go; review RV45A-09);
 * a ``scale`` or a ``patch`` with ``--dry-run=server`` is judged as the real one, applies nothing
-  and counts no ConfigMap patch (review RV45A-02).
+  and counts no ConfigMap patch (review RV45A-02);
+* the control plane's data claim ``seamless-data`` (``pvc``): a ``get`` of its ``spec.accessModes``
+  answers them space-separated, or NotFound while there is none - nothing, exit 0, with
+  ``--ignore-not-found`` -, and ``apply -k`` creates a missing one with the access modes the
+  overlay asks for (``overlay_data_modes``, the base's ReadWriteOnce unless set; SDD §17, §17.2).
 """
 
 from __future__ import annotations
@@ -184,6 +188,14 @@ def found(kind):  # the object, or kubectl's NotFound
 
 
 verb = words[0]
+if verb == "get" and words[1] == "pvc/seamless-data":
+    claim = st.get("pvc")
+    if claim is None and flags.get("--ignore-not-found"):
+        done()
+    if claim is None:
+        done('Error from server (NotFound): persistentvolumeclaims "seamless-data" not found\n', 1)
+    assert flags.get("-o") == "jsonpath={.spec.accessModes[*]}", flags
+    done(" ".join(claim["accessModes"]))
 missing = verb == "get" and words[1] in KINDS and st[KINDS[words[1]]] is None
 if missing and flags.get("--ignore-not-found"):
     done()
@@ -298,6 +310,8 @@ if verb == "set" and words[1] == "resources":
     new_template()
     done("deployment.apps/seamless resource requirements updated\n")
 if verb == "apply":
+    if st.get("pvc") is None:  # the claim as the overlay asks for it
+        st["pvc"] = {"accessModes": list(st.get("overlay_data_modes", ["ReadWriteOnce"]))}
     made = [kind for kind in ("configmap", "statefulset", "deployment") if st[kind] is None]
     for kind in made:  # a first up: created, PostgreSQL before the control plane
         st[kind] = json.loads(json.dumps(MANIFEST[kind]))
@@ -311,11 +325,16 @@ done()
 
 
 def cluster(
-    replicas: int = 1, postgres: int = 1, limits: dict | None = None, evicted: bool = False
+    replicas: int = 1,
+    postgres: int = 1,
+    limits: dict | None = None,
+    evicted: bool = False,
+    data_modes: tuple[str, ...] = ("ReadWriteOnce",),
 ) -> dict:
     """A running stack as the manifests define it: requests 500m/1Gi, limits 4/4Gi
-    (deploy/openshift/deployment.yaml), the ConfigMap's 10 and 3 (configmap.yaml); ``evicted``
-    adds a Failed pod of the control plane, evicted under node pressure days before."""
+    (deploy/openshift/deployment.yaml), the ConfigMap's 10 and 3 (configmap.yaml), the claim
+    ``seamless-data`` with ``data_modes`` - the base's ReadWriteOnce (pvc.yaml) unless given -;
+    ``evicted`` adds a Failed pod of the control plane, evicted under node pressure days before."""
     config = {"SEAMLESS_MAX_CONCURRENT_MIGRATIONS": "10", "SEAMLESS_MAX_CONCURRENT_CUTOVERS": "3"}
     limits = limits or {"cpu": "4", "memory": "4Gi"}
     pods = [
@@ -340,13 +359,14 @@ def cluster(
                 {"name": f"seamless-postgres-{i}", "phase": "Running"} for i in range(postgres)
             ],
         },
+        "pvc": {"accessModes": list(data_modes)},
     }
 
 
 def empty() -> dict:
-    """A namespace the manifests were never applied to - a first ``up``: no ConfigMap, StatefulSet
-    or Deployment until ``apply -k`` creates them."""
-    return {"serial": 1, "configmap": None, "deployment": None, "statefulset": None}
+    """A namespace the manifests were never applied to - a first ``up``: no ConfigMap, StatefulSet,
+    Deployment or claim until ``apply -k`` creates them."""
+    return {"serial": 1, "configmap": None, "deployment": None, "statefulset": None, "pvc": None}
 
 
 def install(bin_dir: Path, state_file: Path, state: dict) -> dict[str, str]:

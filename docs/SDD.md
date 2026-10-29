@@ -6165,11 +6165,12 @@ is no origin a browser sends (review RV31-03).
   §17.1). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
-  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
+  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica, 2 with the HA component below,
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `shareProcessNamespace`
   — the pod's pause process is PID 1 and reaps what Ansible leaves behind, the ssh `ControlPersist` masters,
   as `init: true` does in Compose; `seamless serve` would leave them as zombies — liveness
-  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only;
+  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only - and,
+  with the HA component, from the other replica on the API port alone -;
   egress to cloud APIs - the OpenStack services the control plane calls on their community and RHOSP 17.1 public
   ports, Placement (§22.3), Heat, Octavia (§10, §8.5) and Designate (§8.4) among them, RHOSO 18.0's on 443 -,
   vCenter, conversion hosts, Jev, agentmemory, an RFC 2136 DNS target's server on TCP 53 (§8.4), a webhook hook's
@@ -6186,15 +6187,53 @@ is no origin a browser sends (review RV31-03).
   6443 egress rules except the cluster's pod and service networks instead of OpenShift's (kubeadm/kind
   defaults `10.244.0.0/16`, `10.96.0.0/12`, and `169.254.0.0/16` — adjust per cluster; OpenShift's
   ranges are ordinary private addresses there); PostgreSQL from `quay.io/sclorg/postgresql-16-c9s`
-  pinned by digest (the image interface of `registry.redhat.io/rhel9/postgresql-16`).
+  pinned by digest (the image interface of `registry.redhat.io/rhel9/postgresql-16`); the namespace
+  `seamless-migrate` also on what the overlay adds itself - the Ingress and the HA component's objects -, as
+  `deploy/openshift` sets it on its own, so an `apply -k` without `-n` puts them beside the rest (plan task HA6).
   kustomize silently ignores a patch whose target matches nothing, so CI renders the overlay and asserts
   each patch's result.
 * Dashboard-entered credentials (`SEAMLESS_SECRET_STORE=kubernetes`, §13.3): the `seamless`
   ServiceAccount gets a namespaced Role (`secrets`: get, create, update, delete) and its token is
   mounted; the API answers 503 for the credential routes when the store cannot reach the API server.
-* Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
-  a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
-  existing database through the `seamless-db` Secret).
+* **One replica, or two with the HA component** (§25.7, plan task HA6). The base runs one replica, which runs on any
+  cluster; whichever runs it, the lease elects the one replica that runs the orchestrator (§8, §11). The HA component
+  is the kustomize component `deploy/openshift/ha`, which the OpenShift overlay includes, and which the Kubernetes
+  overlay includes through `deploy/kubernetes/ha` - the same component with that overlay's pod network -, each by
+  the two `components:` lines its kustomization carries commented. It sets:
+  * `replicas: 2` - its `replicas` field, the count `seamless-ctl.sh` reads (§17.2) - with a required pod
+    anti-affinity on `kubernetes.io/hostname`: the replicas run on two nodes, and during a drain the evicted one waits
+    for a node without the other, which leads meanwhile;
+  * `strategy: Recreate`, kept: a rollout ends the old pods before it starts new ones, so one version runs at a time
+    and an upgrade stays an outage of the control plane, which `--drain` keeps cutovers out of (§17.2);
+  * the PodDisruptionBudget `seamless`, `maxUnavailable: 1` and `unhealthyPodEvictionPolicy: AlwaysAllow` (stable
+    since Kubernetes 1.31; `TODO(LAB): confirm` on NFR-10's 1.28): a drain evicts one replica at a time, and a
+    replica that is not ready never blocks it;
+  * `seamless-data` ReadWriteMany: the new leader reads the run directories the old one wrote (§25.1). Its class is
+    the cluster's - a `storageClassName` the component carries commented, a CephFS class of OpenShift Data Foundation
+    on OpenShift (`TODO(LAB): confirm` the class and its encryption in transit, §25.9). A claim's access modes never
+    change, so an installation moves `/data` to a new claim once, with the control plane stopped (Operations.md);
+  * the NetworkPolicy `seamless-allow-relay`: ingress from and egress to the control plane's own pods on the API
+    port, TCP 8080, alone - the relay of §25.6 - and nothing else between the replicas. No Kubernetes RBAC is
+    added: the lease is the database's;
+  * uvicorn's `FORWARDED_ALLOW_IPS`: the cluster's pod network, where the replicas are - and, on the default
+    networks, the router's or ingress controller's hop -, so the leader's lockout and audit count the caller, never
+    the follower (§13.1, §25.9): OpenShift's default `10.128.0.0/14`, and in `deploy/kubernetes/ha` the Kubernetes
+    overlay's `10.244.0.0/16`, each adjusted with the NetworkPolicies' ranges. It relies on the NetworkPolicies,
+    which admit only the router and the other replica to the API port.
+
+  CI renders both overlays with the component enabled as an installation enables it, validates them with
+  kubeconform as without it, and asserts what each of its patches must produce.
+* **PostgreSQL** (§25.7). The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an existing
+  database through the `seamless-db` Secret), one pod: two control plane nodes help only with a database that
+  outlives a node, and while its node is down no replica leads. Its server starts with `tcp_keepalives_idle` 10,
+  `tcp_keepalives_interval` 5 and `tcp_keepalives_count` 6 - a client that vanished is dropped within 40 s, and with
+  it its session locks, a cut-off leader's VM-claim lock among them (§5.4) - and `idle_in_transaction_session_timeout`
+  10 s, under which the application role runs: a leader cut off inside a write holds its key-share lock no longer
+  (§11, §25.4). They are the image's `run-postgresql` arguments, which it hands to `postgres` as `-c` options, so
+  they hold for whichever role the control plane connects as - the image's owner role, or an application role of
+  Security.md §9.4 -; `pg_dump` and `pg_restore` lift the timeout for their own sessions. A database of one's own
+  needs them set: the keepalives on its server, the timeout for the application role (`ALTER ROLE … SET
+  idle_in_transaction_session_timeout = '10s'`) - `TODO(LAB): confirm` which ones a managed service lets one change.
 * Backups (optional, `deploy/openshift/backup/`): a CronJob runs `pg_dump -Fc` nightly from the database's own
   image into the `seamless-backups` PVC under the restricted security context, with its own NetworkPolicies
   (egress to PostgreSQL, ingress from the backup pods), keeping `BACKUP_KEEP_DAYS` days; `restore-job.yaml` and
@@ -6281,25 +6320,37 @@ CI (QASuite §14.5) proves the Linux path:
 `scripts/seamless-ctl.sh PLATFORM ACTION [options]` runs a deployment's lifecycle the same way on every platform:
 `docker` and `podman` drive the single-host stack of §17.1 through its Make targets (`SEAMLESS_ENGINE`), and
 `kubernetes` and `openshift` drive the manifests of §17 through `kubectl` or `oc` in one namespace (`--namespace`,
-default `seamless-migrate`). It never runs a second orchestrator and never deletes data - removing the volumes stays
-`make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its PVCs stays a manual act.
+default `seamless-migrate`). It never runs a second orchestrator - one control plane on the single host, and on a
+cluster one or two replicas, of which the lease's leader alone runs the orchestrator (§17, §25) - and never deletes
+data - removing the volumes stays `make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its
+PVCs stays a manual act.
 
 | Action | `docker`, `podman` | `kubernetes`, `openshift` |
 |---|---|---|
-| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | PostgreSQL scaled out of band brought back to one replica first, its extra pods awaited gone as `start` awaits them - before the apply, which may roll the control plane's pod at once (a new image in the overlay) onto every database (reviews RV42A-02, RV43A-01); a namespace without the StatefulSet yet - a first `up`, which the read answers as not found - has none, and any other failure of that read is refused (2) before the apply (review RV44A-04) -, then `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
+| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | PostgreSQL scaled out of band brought back to one replica first, its extra pods awaited gone as `start` awaits them - before the apply, which may roll the control plane's pod at once (a new image in the overlay) onto every database (reviews RV42A-02, RV43A-01); a namespace without the StatefulSet yet - a first `up`, which the read answers as not found - has none, and any other failure of that read is refused (2) before the apply (review RV44A-04) -; with the HA component, a `seamless-data` that exists and is not ReadWriteMany refused (2) the same way, since a claim's access modes never change and the apply could not make it one (§17); then `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL scaled to one replica and the control plane to the overlay's count, 1 or 2 with the HA component (below) - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
 | `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its running pod gone - a pod that failed or succeeded (one evicted) is not waited for: the scale-down never deletes it (review RV38B-03) -, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
 | `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its running pod gone |
-| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to one, both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, both with 2 before anything changed (review RV44A-08) |
+| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to the overlay's count (below), both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, and so is a count of 2 while `seamless-data` is not ReadWriteMany (below), all with 2 before anything changed (review RV44A-08) |
 | `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited; a control plane at 0 replicas (`stop`) is scaled to one instead, as the single host's restart creates and starts it (review RV38B-04) |
-| `scale N` | `N` 0 is `stop`, 1 is `start` | the same |
+| `scale N` | `N` 0 is `stop`, 1 is `start` | `N` 0 is `stop`; 1 and 2 are `start` with that count instead of the overlay's, 2 only while `seamless-data` is ReadWriteMany (below) |
 | `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | `--cpu` and `--memory` first checked by a server-side dry run of the Deployment's patch (a limit below the requests changes nothing, review RV38B-02), then the settings patched into the ConfigMap `seamless-config`, then one patch of the pod template - the limits and a restart annotation, so the pod restarts once and reads the settings even when the limits stay as they are (review RV38B-01) -, awaited. When that patch fails, or its rollout does - a LimitRange or a quota refusing the new pod's limits, which the Deployment's dry run cannot see (admission judges the pod) -, the settings the ConfigMap held are put back and the template rolled back (`rollout undo`, after the put-back so the pod it starts reads the settings as they were, awaited by the Deployment becoming `Available`: its `Progressing` condition keeps a passed deadline after an undo, review RV42A-07) - a put-back that fails still has the template rolled back, its failure named with what the settings then need: put back by hand, and after an undo done a restart once the undo's pod is available - that pod read the new ones (reviews RV42A-03, RV43A-03) -; after an undo that failed, put back first, as the pod of the rollback by hand reads them, and no restart (review RV44A-07) -, so the control plane runs again as it was, and the script exits 1 naming what failed and anything it could not put back, never advising a second undo: an undo done whose pod is not `Available` within `--timeout` is named as such - the template is back, and its pod's refusal shows in the ReplicaSet's events -, and only an undo that failed names the revision to roll back to (reviews RV41A-06, RV41A-07, RV43A-02); the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
-| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given |
+| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given, then the leading pod: the host name of the health's `leader.holder` (§12) - the holder without the 8 hex digits of its process, and a pod's host name is its name -, or that no replica leads while `holder` is null on a replica that does not lead |
 | `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
 
-* **Scale.** `scale` takes 0 or 1 and refuses any other count: the orchestrator is a singleton (§17, D2), and a
-  second replica would run two orchestrators against one database. Scaling up is capacity - concurrency slots and
-  CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
-  while the conversion hosts move the data (Performance.md).
+* **Scale.** On the single host `scale` takes 0 or 1: it runs one control plane, since two containers on one host
+  fail with it (§25.7). On a cluster it takes 0, 1 or 2, and 2 only while `seamless-data` is ReadWriteMany - its
+  claim's `spec.accessModes` -, since the two replicas run on two nodes and the new leader reads the run directories
+  the old one wrote (§17, §25.7); a claim that is not is refused, naming why, before anything changed. Any other count
+  is refused. Two replicas run one orchestrator, the lease's leader's, and the other relays the API to it (§25.6): a
+  second replica adds availability, not capacity. Scaling up is capacity - concurrency slots and CPU and memory for
+  the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -, while the conversion
+  hosts move the data (Performance.md).
+* **The overlay's count**, which a cluster's `up` and `start` restore, is read from the overlay's files, never from
+  the cluster - an earlier `down` left 0 there -: the count of `deploy/openshift/ha`'s `replicas` field when the
+  overlay's kustomization lists the HA component under `components:` (`deploy/kubernetes`'s, or that of the
+  `deploy/openshift` it builds), else 1 (§17). A count it cannot read, or one other than 1 or 2, is refused before
+  anything changed. `restart` - a rollout ends both replicas, and a control plane at 0 replicas starts with one -,
+  `capacity`, `--drain` and `resume` are unchanged: a drain's calls reach the leader through the relay.
 * **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
   without `SEAMLESS_DEMO` in their environment or in `.env` - whether `.env` sets it is read as Compose reads it
   (below, review RV41A-04) - they read it from the running or stopped container, so a demo stack comes back a demo
@@ -8056,7 +8107,7 @@ acting.
    Layer 1 is binding in §11 since plan task HA2 - the epoch read under a key-share lock at the start of each write,
    the takeover's `FOR UPDATE`, the renewal that changes no key column, `Fenced`, `auth.denied` aside, the refusals
    logged with both epochs, the CLI's store unfenced -, and the deposition on a `Fenced` write in §8 and §11 since plan
-   task HA3, but for the application role's `idle_in_transaction_session_timeout` (HA6).
+   task HA3; the application role's `idle_in_transaction_session_timeout` is binding in §17 since plan task HA6.
 2. **Actions on the clouds start only while the lease holds.** Before a step's attempt, a hook, a floating IP move, a
    DNS swap or an Octavia member change (§8, §8.2–§8.5), the orchestrator checks its deadline and reads the epoch in
    the lease row. A pause between this check and the action defeats it (Kleppmann); layer 3 and the margin cover that.
@@ -8178,6 +8229,9 @@ orchestrator indicator are binding in §12, §13.1 and §16 since plan task HA4.
   unchanged: a rollout ends both replicas, and a drain's calls reach the leader through the relay. `docker` and
   `podman` keep `scale` 0 or 1.
 
+The HA component, the PostgreSQL settings and `seamless-ctl.sh`'s cluster `scale` of 0, 1 or 2, the count `up` and
+`start` restore and `status`'s leading pod are binding in §17 and §17.2 since plan task HA6.
+
 ### 25.8 Observability
 
 Proposed; each enters §4.3, §12 or §18 with its task, since tests read those tables (HA3–HA5):
@@ -8279,7 +8333,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 (binding) | HA4 |
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
-| the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
+| the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 (binding) | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
 

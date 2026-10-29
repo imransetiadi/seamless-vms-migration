@@ -1,0 +1,17 @@
+# A drain evicts one replica at a time, and a replica that is not ready never blocks it (SDD 17, 25.7):
+# unhealthyPodEvictionPolicy is stable since Kubernetes 1.31, beta and on by default since 1.27. The base's single
+# replica has no budget, which would block every drain (Security.md 9.1).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: seamless
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
