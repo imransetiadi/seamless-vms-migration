@@ -4982,6 +4982,17 @@ is no origin a browser sends (review RV31-03).
   selection; no draft or credentials are persisted in browser storage. An unchanged form closes directly,
   and a successful save never asks to discard. These requirements close UI-01 through UI-08 in
   `docs/UI-UX-AUDIT-2026-10-15.md` without changing the migration APIs or role policy.
+* UI audit remediation (2026-10-29): unbroken tenant names wrap without widening the page. Native required
+  fields participate in browser validation; forms with custom validation keep their error summaries. Changed
+  provider, advisor-policy and plan forms warn before Escape, Cancel, route navigation, Back or reload; Keep
+  editing preserves the draft in memory. Clean forms and successful saves close without a discard warning.
+  List filters, sorting, displayed history and Events Pause survive detail-Back within the same dashboard
+  session; dialog-only VM selectors stay local. Events says Live only while the transport is connected.
+  Recommendation audit history identifies its loaded window and supports older pages using the existing
+  `before` cursor; no matches in a partial window never means no recorded history. Missing entities offer
+  navigation recovery, while temporary failures retain Retry. Advisor has section shortcuts for recommendations,
+  incident search, notes and the data explanation. Browser regressions cover Chromium and WebKit; this is not
+  a claim of testing Safari settings, assistive technology or physical devices in every supported environment.
 * Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
   if it had not been asked — the result names each item whose request failed, with Retry for those
   items, which stay named while their Retry runs, and the announcement counts them ("Checked 2 of 3 providers: 2
@@ -5466,7 +5477,11 @@ is no origin a browser sends (review RV31-03).
   Once created the panel reads "User {name} created": the one-time token in a read-only field that takes the focus
   and selects itself, "Save this token now. It cannot be shown again after leaving this page or selecting Done.",
   whom to share it with and for which access, Copy token (the clipboard; when the browser refuses, that the token is
-  to be selected and copied by hand) and Done, which clears the form and puts the focus on User name. The token is
+  to be selected and copied by hand), an acknowledgement that the token was saved securely, and Done, which is
+  unavailable until acknowledgement and then clears the form and puts the focus on User name. Navigating away
+  before acknowledgement warns that the token cannot be shown again; confirmed navigation still drops it.
+  If lost, the server administrator can provision a new credential under a different name with
+  `seamless token create`; the existing user's token is not recoverable. The token is
   the response's (`Cache-Control: no-store`, §12) and lives in the page alone, never in browser storage (§13.1),
   until Done or a navigation drops it. Dashboard users: each user's name and role — the bootstrap tokens' and the
   database's, as `GET /users` lists them, never a token or digest —, "No dashboard users configured." when there
