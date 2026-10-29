@@ -227,6 +227,8 @@ class CephAccess(_Model):
 #: a Keystone project's id as a provider's project credentials key it: 1-64 letters, digits, "-"
 #: or "_" (SDD §4.2, §27.4)
 ProjectId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+#: why a value is refused as a project's id (SDD §4.2, §12)
+PROJECT_ID_RULE = "a Keystone project's id, 1-64 letters, digits, '-' or '_'"
 
 
 def is_project_id(value: str) -> bool:
@@ -327,6 +329,14 @@ class Provider(_Model):
         """The name a text gives the provider (SDD §1 naming): its name, else its id - a name stored
         blank before the API refused one (review RV20-11) never reads "in : ..."."""
         return self.id if is_blank(self.name) else self.name
+
+    @property
+    def own_project_id(self) -> str | None:
+        """The Keystone project its own credential's token is scoped to, as its last check read it
+        (the check report's ``project``, SDD §10, §27.7); None until a check names one."""
+        project = self.capabilities.get("project")
+        found = project.get("id") if isinstance(project, dict) else None
+        return found if isinstance(found, str) and found else None
 
 
 class ProviderCreate(Provider):
@@ -497,6 +507,10 @@ class VMRef(_Model):
     source_id: str
     name: str
     project: str | None = None
+    #: OpenStack: its project's Keystone id, the server's own as Nova reports it, beside its name;
+    #: None for VMware and for a VM recorded before - kept as given, as its name is (SDD §4.2,
+    #: §27.4)
+    project_id: str | None = None
     flavor: str | None = None
     vcpus: int
     ram_mb: int
@@ -1091,6 +1105,11 @@ class PlanSpec(_Model):
     #: the warm passes diff the source cluster's RBD snapshots (SDD §4.2, §28; plan task CE7):
     #: refused for a VMware source (the routes), changeable at any time (§28.9)
     extent_tracking: bool = False
+    #: the Keystone projects, by id, whose credentials read and move the plan's VMs at the source
+    #: and the destination - the providers' project credentials for them -; None: the provider's
+    #: own (SDD §4.2, §27.4, §27.5, plan task TC4). Refused for a VMware source (the routes)
+    source_project: str | None = None
+    destination_project: str | None = None
     #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
     #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
     nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
@@ -1126,6 +1145,15 @@ class PlanSpec(_Model):
         return {
             vm: {mac.lower(): entry for mac, entry in nics.items()} for vm, nics in value.items()
         }
+
+    @field_validator("source_project", "destination_project")
+    @classmethod
+    def _project_id(cls, value: str | None) -> str | None:
+        """A project as a provider's project credentials key one - no credential could serve
+        another -, else a 422 naming the field (SDD §4.2, §12, plan task TC4)."""
+        if value is not None and not is_project_id(value):
+            raise PydanticCustomError("project_id", PROJECT_ID_RULE)
+        return value
 
 
 class PlanCreate(PlanSpec):
@@ -1251,6 +1279,8 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
 
 #: Fields a client may send in ``PlanCreate`` / ``PATCH /plans/{id}``.
 PLAN_EDITABLE_FIELDS = frozenset(PlanSpec.model_fields)
+#: a plan's projects, in the order a refusal names them (SDD §4.2, §12, §27.4, plan task TC4)
+PROJECT_FIELDS = ("source_project", "destination_project")
 
 
 class Plan(PlanSpec):

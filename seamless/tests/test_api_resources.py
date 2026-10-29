@@ -1,8 +1,10 @@
 import asyncio
 import inspect
 import json
+import secrets
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import fastapi.routing
 import httpx
@@ -20,10 +22,12 @@ from seamless_migrate.domain.models import (
     Migration,
     PhaseChange,
     Plan,
+    ProjectCredential,
     Provider,
     SyncPass,
     utcnow,
 )
+from seamless_migrate.security.secret_store import project_secret_name
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
@@ -757,6 +761,205 @@ def test_a_provider_declares_that_its_cloud_announces_tenant_networks(api):
     assert api.get("/api/v1/providers/vc-03").json()["announces_tenant_networks"] is False
 
 
+#: what the API answers for a value that is no Keystone project's id (SDD §4.2, §12)
+PROJECT_ID_RULE = "a Keystone project's id, 1-64 letters, digits, '-' or '_'"
+
+
+def _keystone_project(cloud, name):
+    """A made-up tenant project ``name`` and an application credential of it, `member` and
+    `reader`, as the in-process cloud's Keystone holds it (plan task TC4): its project's, its own
+    and its user's ids and its secret generated in the test."""
+    tenant = SimpleNamespace(
+        name=name,
+        project_id=secrets.token_hex(16),
+        credential_id=secrets.token_hex(16),
+        secret=secrets.token_urlsafe(32),
+        user_id=secrets.token_hex(16),
+    )
+    cloud.app_credentials[tenant.credential_id] = {
+        "secret": tenant.secret,
+        "user_id": tenant.user_id,
+        "project": {
+            "id": tenant.project_id,
+            "name": name,
+            "domain": {"id": "default", "name": "D"},
+        },
+        "roles": ["member", "reader"],
+    }
+    return tenant
+
+
+def test_the_inventory_of_a_project_is_read_with_its_credential(tmp_path, monkeypatch):
+    """SDD §10, §12, §27.4 (plan task TC4): GET /providers/{id}/inventory?project= reads with that
+    project's credential - the application credential an admin wrote for it, signed in with through
+    Seamless's own connect() over the in-process keystoneauth session of tests/cloud_support.py, on
+    a connection of its own closed after the read -: a source's VMs of that project, each with its
+    project's id, and a destination's view of that project. Without the query the provider's own
+    credential reads, and so it does for the project its last check names as its own - unless the
+    provider holds a credential for that project too, which then reads it. Nothing of a credential
+    reaches an answer."""
+    import functools
+
+    from seamless_migrate.providers import registry
+    from seamless_migrate.providers.openstack import OpenStackProvider
+    from tests.cloud_support import AUTH_URL, InProcessCloud
+
+    cloud = InProcessCloud(tmp_path / "cloud")
+    closed: list[str] = []
+
+    def connecting(provider, settings, project_id=None):
+        conn = cloud.connect(provider, settings, project_id)
+        if project_id is not None:
+            conn.close = lambda: closed.append(project_id)
+        return conn
+
+    monkeypatch.setattr(
+        registry, "OpenStackProvider", functools.partial(OpenStackProvider, connect_fn=connecting)
+    )
+    settings, tokens = api_settings(
+        tmp_path,
+        demo=False,
+        clouds_yaml=cloud.settings.clouds_yaml,
+        secrets_dir=cloud.settings.secrets_dir,
+    )
+    store = Store(f"sqlite:///{tmp_path / 'api.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        api = Api(client, store, settings, tokens)
+        reach = {"cloud": "dst", "endpoint": AUTH_URL, "conversion_host": None}
+        for provider in (SOURCE, DESTINATION):
+            assert api.post("/api/v1/providers", json={**provider, **reach}).status_code == 201
+        tenant_a = _keystone_project(cloud, "tenant-a")
+        tenant_b = _keystone_project(cloud, "tenant-b")
+        for provider_id, tenant in (("src-osp", tenant_a), ("dst-rhoso", tenant_b)):
+            written = api.client.put(
+                f"/api/v1/providers/{provider_id}/projects/{tenant.project_id}/credentials",
+                headers=api.h(Role.admin),
+                json={
+                    "application_credential_id": tenant.credential_id,
+                    "application_credential_secret": tenant.secret,
+                },
+            )
+            assert written.status_code == 200, written.text
+        own = cloud.project["id"]
+        cloud.servers = [
+            {"id": "srv-own", "name": "web-01"},
+            {"id": "srv-a", "name": "ledger-01", "project_id": tenant_a.project_id},
+        ]
+
+        read = api.get(f"/api/v1/providers/src-osp/inventory?project={tenant_a.project_id}")
+        assert read.status_code == 200, read.text
+        assert [(vm["name"], vm["project"], vm["project_id"]) for vm in read.json()] == [
+            ("ledger-01", "tenant-a", tenant_a.project_id)
+        ]
+        assert (cloud.sign_ins, closed) == ([tenant_a.credential_id], [tenant_a.project_id])
+        # the provider's own credential without the query...
+        mine = api.get("/api/v1/providers/src-osp/inventory")
+        assert [(vm["name"], vm["project_id"]) for vm in mine.json()] == [("web-01", own)]
+        assert cloud.sign_ins[1:] == ["svc"]
+        # ...and for its own project, once its check named it (the check signs in with the
+        # provider's project credentials too, §10)
+        checked = api.post("/api/v1/providers/src-osp/check", Role.operator)
+        assert checked.json()["capabilities"]["project"]["id"] == own, checked.text
+        signed, shut = len(cloud.sign_ins), len(closed)
+        again = api.get(f"/api/v1/providers/src-osp/inventory?project={own}")
+        assert again.status_code == 200 and again.json() == mine.json(), again.text
+        assert set(cloud.sign_ins[signed:]) <= {"svc"} and len(closed) == shut
+        # a destination's view of its project, read with that project's credential
+        view = api.get(f"/api/v1/providers/dst-rhoso/inventory?project={tenant_b.project_id}")
+        assert view.status_code == 200, view.text
+        assert (view.json()["projects"], view.json()["roles"]) == (
+            ["tenant-b"],
+            ["member", "reader"],
+        )
+        assert (cloud.sign_ins[-1], closed[-1]) == (tenant_b.credential_id, tenant_b.project_id)
+        # a credential the provider holds for its own project is that project's credential
+        finance = _keystone_project(cloud, "finance")
+        cloud.app_credentials[finance.credential_id]["project"] = cloud.project
+        written = api.client.put(
+            f"/api/v1/providers/src-osp/projects/{own}/credentials",
+            headers=api.h(Role.admin),
+            json={
+                "application_credential_id": finance.credential_id,
+                "application_credential_secret": finance.secret,
+            },
+        )
+        assert written.status_code == 200, written.text
+        held = api.get(f"/api/v1/providers/src-osp/inventory?project={own}")
+        assert held.status_code == 200 and held.json() == mine.json(), held.text
+        assert (cloud.sign_ins[-1], closed[-1]) == (finance.credential_id, own)
+        answers = read.text + view.text + held.text
+        tenants = (tenant_a, tenant_b, finance)
+        leaked = [t.name for t in tenants if t.secret in answers or t.credential_id in answers]
+        assert leaked == []
+    store.dispose()
+
+
+def test_the_inventory_of_a_project_without_a_credential_answers_404(api, monkeypatch):
+    """SDD §12, §27.4 (plan task TC4): GET /providers/{id}/inventory?project= answers 404 for a
+    project that is neither the provider's own - as its last check names it - nor one it holds a
+    credential for, and reads nothing: another provider's credential for it does not count, nor a
+    project before a check named it as the provider's own, nor any project of a vCenter. A value
+    that is no project id is a 422 that never quotes it. The demo's fakes, which cannot sign in with
+    a project credential until plan task TC9, answer a project they hold one for with a provider
+    error."""
+    tenant_a, tenant_b = secrets.token_hex(16), secrets.token_hex(16)
+    held = ProjectCredential(secret=project_secret_name("dst-rhoso", tenant_a), updated_at=utcnow())
+    destination = api.store.get("provider", "dst-rhoso", Provider)
+    api.store.put(
+        "provider", destination.model_copy(update={"project_credentials": {tenant_a: held}})
+    )
+    vcenter = {
+        "id": "vc-dc2",
+        "name": "vCenter DC2",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.dc2.example/sdk",
+    }
+    assert api.post("/api/v1/providers", json=vcenter).status_code == 201
+    assert api.post("/api/v1/providers/vc-dc2/check", Role.operator).json()["status"] == "ok"
+    providers = api.client.app.state.services.orchestrator.providers
+    built: list[str] = []
+    get, for_project = providers.get, providers.for_project
+    monkeypatch.setattr(providers, "get", lambda p: built.append(p.id) or get(p))
+    monkeypatch.setattr(
+        providers, "for_project", lambda p, project: built.append(p.id) or for_project(p, project)
+    )
+
+    def inventory(provider_id, project):
+        return api.get(f"/api/v1/providers/{provider_id}/inventory?project={project}")
+
+    for provider_id, project in (
+        ("src-osp", tenant_a),  # dst-rhoso's credential, not src-osp's
+        ("dst-rhoso", tenant_b),
+        ("src-osp", "project-finance"),  # its own, but no check named it yet
+        ("vc-dc2", tenant_a),
+    ):
+        res = inventory(provider_id, project)
+        assert res.status_code == 404, res.text
+        assert res.json()["error"]["message"] == (
+            f"provider {provider_id} holds no credential for project {project}, nor is it the "
+            "project of its own credential, as its last check names it"
+        )
+    for malformed in ("", "tenant%20a", "a" * 65):
+        res = inventory("src-osp", malformed)
+        assert res.status_code == 422, res.text
+        assert res.json()["error"]["message"] == f"project: {PROJECT_ID_RULE}"
+    assert built == []
+    # once a check named it, the provider's own project reads with its own credential
+    assert api.post("/api/v1/providers/src-osp/check", Role.operator).status_code == 200
+    built.clear()
+    own = inventory("src-osp", "project-finance")
+    assert own.status_code == 200 and len(own.json()) == 24, own.text
+    assert built == ["src-osp"]
+    # a project the demo's fake holds a credential for: it cannot sign in with it
+    held = inventory("dst-rhoso", tenant_a)
+    assert held.status_code == 502, held.text
+    assert held.json()["error"]["message"] == (
+        "dst-rhoso: it cannot sign in with a project credential"
+    )
+
+
 NAME_CASES = json.loads(
     (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text()
 )["cases"]
@@ -826,6 +1029,185 @@ def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(a
     api.store.put("migration", failed)
     moved = edit({"destination_provider_id": "dst-rhoso-2"})
     assert moved.status_code == 200, moved.text
+
+
+def test_a_plan_names_its_source_and_destination_projects(api):
+    """SDD §4.2, §12, §27.4 (plan task TC4): a plan names the Keystone project it moves on each side
+    by id - none unless it names one, so a plan as 0.4.0 stored it keeps its providers' own
+    credentials -; POST and PATCH take them from an operator, each a project id as a provider's
+    project credentials key one, else 422 naming the field and nothing written; PATCH clears one
+    with null, and its event names the fields the body set."""
+    tenant_a, tenant_b = secrets.token_hex(16), secrets.token_hex(16)
+    body = {
+        "name": "a tenant pair",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    plain = api.post("/api/v1/plans", Role.operator, json=body)
+    assert plain.status_code == 201, plain.text
+    assert (plain.json()["source_project"], plain.json()["destination_project"]) == (None, None)
+    named = {"source_project": tenant_a, "destination_project": tenant_b}
+    created = api.post("/api/v1/plans", Role.operator, json={**body, **named})
+    assert created.status_code == 201, created.text
+    url = f"/api/v1/plans/{created.json()['id']}"
+    stored = api.get(url).json()
+    assert (stored["source_project"], stored["destination_project"]) == (tenant_a, tenant_b)
+    assert api.store.get("plan", stored["id"], Plan).source_project == tenant_a
+
+    def edit(change: dict):
+        return api.client.patch(url, headers=api.h(Role.operator), json=change)
+
+    swapped = edit({"source_project": tenant_b, "destination_project": None})
+    assert swapped.status_code == 200, swapped.text
+    assert (swapped.json()["source_project"], swapped.json()["destination_project"]) == (
+        tenant_b,
+        None,
+    )
+    [updated] = [e for e in api.store.events() if e.kind == "plan.updated"]
+    assert updated.data == {"fields": ["destination_project", "source_project"]}
+
+    # no project id: refused naming the field, on POST and on PATCH; nothing written
+    before = len(api.store.events(since_seq=0, limit=100000))
+    for field, value in (
+        ("source_project", "tenant a"),
+        ("destination_project", ""),
+        ("source_project", "a" * 65),
+        ("destination_project", "tenant.a"),
+    ):
+        for res in (
+            api.post("/api/v1/plans", Role.operator, json={**body, "name": "bad", field: value}),
+            edit({field: value}),
+        ):
+            assert res.status_code == 422, res.text
+            assert res.json()["error"]["message"] == f"{field}: {PROJECT_ID_RULE}"
+    assert len(api.store.events(since_seq=0, limit=100000)) == before
+    assert [p["name"] for p in api.get("/api/v1/plans").json()] == ["a tenant pair"] * 2
+    kept = api.get(url).json()
+    assert (kept["source_project"], kept["destination_project"]) == (tenant_b, None)
+
+
+def test_a_vmware_plan_names_no_project(api):
+    """SDD §4.2, §27.9 (plan task TC4): vCenter has no Keystone projects, and the migration kit acts
+    with the destination provider's own credential, so a plan whose source is a VMware one names no
+    project on either side - 422 naming the fields, on POST and on PATCH, whether the edit names a
+    project or moves a plan naming one to a vCenter source, nothing written -; a VMware plan naming
+    none is created and edited as before."""
+    vcenter = {
+        "id": "vc-dc2",
+        "name": "vCenter DC2",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.dc2.example/sdk",
+    }
+    assert api.post("/api/v1/providers", Role.admin, json=vcenter).status_code == 201
+    tenant = secrets.token_hex(16)
+    body = {
+        "name": "vmware",
+        "source_provider_id": "vc-dc2",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    why = (
+        "a VMware plan names no project: vCenter has no Keystone projects, and the migration kit "
+        "acts with its providers' own credentials"
+    )
+    for named in (
+        {"source_project": tenant},
+        {"destination_project": tenant},
+        {"destination_project": tenant, "source_project": tenant},
+    ):
+        refused = api.post("/api/v1/plans", Role.operator, json={**body, **named})
+        assert refused.status_code == 422, refused.text
+        fields = ", ".join(f for f in ("source_project", "destination_project") if f in named)
+        assert refused.json()["error"]["message"] == f"{fields}: {why}"
+    assert api.get("/api/v1/plans").json() == []
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    url = f"/api/v1/plans/{created.json()['id']}"
+    refused = api.client.patch(
+        url, headers=api.h(Role.operator), json={"destination_project": tenant}
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["message"] == f"destination_project: {why}"
+    assert api.get(url).json()["destination_project"] is None
+    renamed = api.client.patch(url, headers=api.h(Role.operator), json={"description": "dc2"})
+    assert renamed.status_code == 200, renamed.text
+    # an OpenStack plan naming a project cannot move its source to a vCenter
+    osp = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={**body, "name": "osp", "source_provider_id": "src-osp", "source_project": tenant},
+    )
+    assert osp.status_code == 201, osp.text
+    moved = api.client.patch(
+        f"/api/v1/plans/{osp.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"source_provider_id": "vc-dc2"},
+    )
+    assert moved.status_code == 422, moved.text
+    assert moved.json()["error"]["message"] == f"source_project: {why}"
+    assert api.get(f"/api/v1/plans/{osp.json()['id']}").json()["source_provider_id"] == "src-osp"
+
+
+def test_a_plans_projects_cannot_change_while_one_of_its_migrations_is_failed(api):
+    """SDD §12, §27.4 (plan task TC4): as its providers, a plan's projects do not change while one
+    of its migrations is failed - its rollback acts with its attempt's credentials - nor while one
+    is in flight, as no edit does; any other edit stays open, to fix the cause before a retry, and
+    a project resent as stored is no change. With a provider changed too, the 409 names the
+    providers. Once the migration is rolled back, the projects change."""
+    tenant_a, tenant_b = secrets.token_hex(16), secrets.token_hex(16)
+    body = {
+        "name": "switch projects",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api, n=2),
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    other = api.store.get("provider", "dst-rhoso", Provider).model_copy(update={"id": "dst-two"})
+    api.store.put("provider", other, expected_version=0)
+    failed = api.store.list("migration", Migration, plan_id=plan["id"])[0]
+    failed.phase = Phase.failed  # its pre-copy failed; the source VM kept running
+    api.store.put("migration", failed)
+    url = f"/api/v1/plans/{plan['id']}"
+
+    def edit(change: dict):
+        return api.client.patch(url, headers=api.h(Role.operator), json=change)
+
+    refusal = (
+        f"roll back or cancel the failed migration ({failed.vm.name}) before changing the plan's "
+        "projects: its rollback acts with its attempt's credentials"
+    )
+    refused = edit({"source_project": tenant_a})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == refusal
+    refused = edit({"destination_project": tenant_b})  # either side
+    assert refused.status_code == 409 and refused.json()["error"]["message"] == refusal
+    both = edit({"destination_provider_id": "dst-two", "destination_project": tenant_b})
+    assert both.status_code == 409 and "plan's providers" in both.json()["error"]["message"]
+    assert edit({"description": "fix the network mapping"}).status_code == 200  # for the retry
+    assert edit({"source_project": None}).status_code == 200  # as stored: no change
+    failed = api.store.get("migration", failed.id, Migration)
+    failed.phase = Phase.rolled_back
+    api.store.put("migration", failed)
+    named = edit({"source_project": tenant_a, "destination_project": tenant_b})
+    assert named.status_code == 200, named.text
+    # failed again: a change is refused, a clear too; the same projects resent are none
+    failed.phase = Phase.failed
+    api.store.put("migration", failed)
+    assert edit({"source_project": None}).json()["error"]["message"] == refusal
+    assert edit({"destination_project": tenant_a}).status_code == 409
+    resent = edit({"source_project": tenant_a, "destination_project": tenant_b, "name": "again"})
+    assert resent.status_code == 200, resent.text
+    # in flight: no edit at all
+    failed.phase = Phase.syncing
+    api.store.put("migration", failed)
+    in_flight = edit({"source_project": tenant_b})
+    assert in_flight.status_code == 409, in_flight.text
+    assert in_flight.json()["error"]["message"].endswith("before editing the plan")
+    stored = api.get(url).json()
+    assert (stored["source_project"], stored["destination_project"]) == (tenant_a, tenant_b)
 
 
 def test_the_in_flight_refusal_says_what_releases_each_vm(api):

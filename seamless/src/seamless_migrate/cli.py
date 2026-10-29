@@ -308,6 +308,7 @@ def _dashboard_user_named(settings: Settings, name: str) -> bool:
 
 
 def _resolve_providers(store: Any, spec: PlanCreate) -> None:
+    from .plan_checks import vmware_project_refusal
     from .store import NotFound
 
     for provider_id, role in (
@@ -325,6 +326,11 @@ def _resolve_providers(store: Any, spec: PlanCreate) -> None:
             raise CliError(
                 "extent_tracking: a VMware source has no Ceph cluster to read extents from"
             )
+        if role == "source" and provider.kind == ProviderKind.vmware:
+            # as POST and PATCH /plans refuse them (SDD §12, §27.9, plan task TC4)
+            refusal = vmware_project_refusal(spec)
+            if refusal is not None:
+                raise CliError(refusal)
     # SDD §15: the hooks it names, as POST and PATCH /plans check them (§12, plan task N3)
     from .domain.models import Hook
     from .plan_checks import unknown_hook
@@ -376,10 +382,11 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         kind, verb = "plan.created", "created"
         data: dict[str, Any] = {"name": plan.name, "vms": len(plan.vm_ids)}
     else:
+        from .domain.models import PROJECT_FIELDS
         from .orchestrator import (
             PROVIDER_FIELDS,
             blocks_plan_change,
-            failed_provider_change_refusal,
+            changed_clouds_refusal,
             in_flight_refusal,
         )
         from .store import ConflictError
@@ -392,11 +399,18 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         busy = [m for m in migrations if blocks_plan_change(m)]
         if busy:
             raise CliError(in_flight_refusal(busy, "editing the plan"))
-        if any(getattr(spec, f) != getattr(existing, f) for f in PROVIDER_FIELDS):
-            # SDD §12: a failed migration's rollback acts on the clouds its attempt used
-            failed = [m.vm.name for m in migrations if m.phase == Phase.failed]
-            if failed:
-                raise CliError(failed_provider_change_refusal(failed))
+        # SDD §12, §27.4: a failed migration's rollback acts on the clouds its attempt used, with
+        # its attempt's credentials; a field the file leaves out keeps its value, no change
+        refusal = changed_clouds_refusal(
+            [
+                f
+                for f in (*PROVIDER_FIELDS, *PROJECT_FIELDS)
+                if f in document and getattr(spec, f) != getattr(existing, f)
+            ],
+            [m.vm.name for m in migrations if m.phase == Phase.failed],
+        )
+        if refusal is not None:
+            raise CliError(refusal)
         # the file's keys are the PATCH body: what it leaves out keeps its value, and the plan it
         # would store is checked, kept fields included (SDD §15, §12)
         merged = PlanCreate.model_validate(
@@ -409,6 +423,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
             check_plan_spec(merged)
         except PlanSpecError as exc:
             raise CliError(str(exc)) from None
+        _resolve_providers(store, merged)  # with its kept fields, as PATCH checks them (§12)
         plan = Plan.model_validate(
             {
                 **existing.model_dump(mode="json"),

@@ -1638,21 +1638,13 @@ def test_a_project_credential_write_drops_only_its_projects_check(api, monkeypat
     assert set(res.json()["project_credentials"]) == {tenant_a}
 
 
-class _PlanNamingProjects(Plan):
-    """A plan as plan task TC4 stores one, naming its projects by id (SDD §4.2 with TC4, §27.4):
-    until TC4 adds the fields to Plan, the deletion reads plans stored with them through this."""
-
-    source_project: str | None = None
-    destination_project: str | None = None
-
-
-def test_a_project_credential_a_plan_needs_cannot_be_deleted(api, monkeypatch):
+def test_a_project_credential_a_plan_needs_cannot_be_deleted(api):
     """SDD §12, §27.4: DELETE …/projects/{project_id}/credentials answers 409 while a plan needs the
     project, judged as DELETE /providers/{id} judges a provider - a plan that names the project on
-    the provider's side and has not completed, or completed with a VM not finalized - each named; a
-    plan that names the same id on its other provider, or no project, does not. Then the secret,
-    the entry and the project's entry of the check report go, and an unknown project is a 404."""
-    monkeypatch.setattr(routes_providers, "Plan", _PlanNamingProjects)
+    the provider's side (its source_project or destination_project, §4.2, plan task TC4) and has
+    not completed, or completed with a VM not finalized - each named; a plan that names the same id
+    on its other provider, or no project, does not. Then the secret, the entry and the project's
+    entry of the check report go, and an unknown project is a 404."""
     tenant_a, tenant_b, tenant_c = _project_id(), _project_id(), _project_id()
     for provider_id, project in (
         ("src-osp", tenant_a),
@@ -1662,8 +1654,7 @@ def test_a_project_credential_a_plan_needs_cannot_be_deleted(api, monkeypatch):
         assert _write(api, provider_id, project) == 200
 
     def store_plan(status, **projects):
-        data = {**make_plan(status=status).model_dump(), **projects}
-        plan = _PlanNamingProjects.model_validate(data)
+        plan = make_plan(status=status, **projects)
         api.store.put("plan", plan)
         return plan
 

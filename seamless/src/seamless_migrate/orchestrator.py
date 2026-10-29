@@ -334,18 +334,34 @@ def blocks_plan_change(m: Migration) -> bool:
 #: have edited, re-waved, started or paused the plan meanwhile under its own plan lock
 _VALIDATION_WATCHES = PLAN_EDITABLE_FIELDS | {"waves", "status"}
 
-#: a plan's clouds: a failed migration's rollback acts on the ones its attempt used (SDD §12)
+#: a plan's clouds: a failed migration's rollback acts on the ones its attempt used (SDD §12); its
+#: projects (PROJECT_FIELDS) likewise, as it acts with its attempt's credentials (§27.4)
 PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
 
 
-def failed_provider_change_refusal(failed: list[str]) -> str:
-    """The 409 of a change of a plan's providers while migrations named ``failed`` are failed
-    (SDD §12), the same from PATCH /plans/{id} and from `seamless plan apply` (§15)."""
+def failed_provider_change_refusal(failed: list[str], *, projects: bool = False) -> str:
+    """The 409 of a change of a plan's providers - its projects with ``projects`` - while
+    migrations named ``failed`` are failed (SDD §12, §27.4), the same from PATCH /plans/{id} and
+    from `seamless plan apply` (§15)."""
     noun = "migration" if len(failed) == 1 else "migrations"
+    changing, why = (
+        ("projects", "its rollback acts with its attempt's credentials")
+        if projects
+        else ("providers", "its rollback acts on the clouds its attempt used")
+    )
     return (
         f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before changing the "
-        "plan's providers: its rollback acts on the clouds its attempt used"
+        f"plan's {changing}: {why}"
     )
+
+
+def changed_clouds_refusal(changed: Collection[str], failed: list[str]) -> str | None:
+    """The 409 of an edit that changes ``changed`` of a plan's PROVIDER_FIELDS and PROJECT_FIELDS
+    while the migrations named ``failed`` are failed - the providers' when one of them changes -,
+    None when it changes none or none is failed (SDD §12, §27.4)."""
+    if not changed or not failed:
+        return None
+    return failed_provider_change_refusal(failed, projects=not set(changed) & set(PROVIDER_FIELDS))
 
 
 def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
@@ -1422,9 +1438,10 @@ class Orchestrator:
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
         src_impl = self.providers.get(source)
         dst_impl = self.providers.get(destination)
-        # the plan's projects, by id (SDD §4.2 with plan task TC4; until then a plan names none)
-        src_caps = await self._caps(source, actor, getattr(plan, "source_project", None))
-        dst_caps = await self._caps(destination, actor, getattr(plan, "destination_project", None))
+        # the plan's projects, by id (SDD §4.2, §10, plan task TC4): each side's check signs in
+        # with the plan's project credential there alone
+        src_caps = await self._caps(source, actor, plan.source_project)
+        dst_caps = await self._caps(destination, actor, plan.destination_project)
         # as the checks left them: their pins, and a host they found replaced (SDD §9.3, §10)
         as_checked = {
             p.id: p

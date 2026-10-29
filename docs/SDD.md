@@ -282,7 +282,12 @@ GpuDevice { kind: "vgpu"|"passthrough",  # a GPU of a VM or a flavor's GPU reque
                                                 # whose traits Placement checks on the GPU's own provider (§22.3)
             alias: str|null = null }            # OpenStack passthrough: the PCI alias
 
-VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
+VMRef { source_id: str, name: str, project: str|null,
+        project_id: str|null = null,  # OpenStack: its project's Keystone id, as Nova reports the server's
+                                      # own (tenant_id) whichever credential read it, beside project (its
+                                      # name); null for VMware and for a VM recorded before (§10, §27.4,
+                                      # plan task TC4)
+        flavor: str|null, vcpus: int, ram_mb: int,
         disks: list[Disk], nics: list[Nic],
         power_state: "running"|"stopped"|"paused"|"error"|"transitioning"|"unknown",  # transitioning: a Nova task in flight (RESIZE, VERIFY_RESIZE, MIGRATING, RESCUE, REBUILD, REBOOT, BUILD)
         os_type: str|null, host: str|null, tags: dict[str,str] = {},
@@ -303,8 +308,8 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
    free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
    is written U+FFFD as the model is built - no export filter or mapping reads them -, and so is one in a
    GPU's profile, alias and traits, though a GPU mapping names a vGPU by its profile: the mapping matches
-   the profile as written, the one form a stored VM holds (§22.2, PR #57 review); name, project, flavor, a
-   NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02); a NIC's
+   the profile as written, the one form a stored VM holds (§22.2, PR #57 review); name, project, project_id,
+   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02); a NIC's
    network an earlier version stored with one reads with U+FFFD as the store reads it, and only then (§11,
    review RV52-S1)
 
@@ -376,6 +381,14 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        extent_tracking: bool = false,  # the warm passes diff the source cluster's RBD snapshots (§28, plan task CE7):
                                         # refused (422) for a VMware source; changeable at any time - off, the next
                                         # pass scans, on, the next pass checks (§28.9)
+       source_project: str|null = null,   # the Keystone project, by id, whose credential reads and moves the plan's
+                                        # VMs at the source - the source provider's project credential for it
+                                        # (§27.4, §27.5); null: the source provider's own credential (plan task TC4)
+       destination_project: str|null = null,   # the same at the destination. Each a project id as a provider's
+                                        # project_credentials keys one (1-64 letters, digits, - or _), else 422
+                                        # naming the field; both refused (422) for a VMware source (§27.9); a change
+                                        # of either refused (409) while a migration is in flight or failed, as a
+                                        # changed provider's is (§12)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
        migration_counts: dict[Phase, int],  # read-only, never stored: how many of the plan's migrations are in each
@@ -3745,6 +3758,9 @@ the provider's own, `auth_url` for the credential's; one that cannot be read cou
 destination's check adds §10.1's `destination_release` keys -
 `release_range`, `release`, `support_tier` and `policy_profile`;
 volume disks carry their Cinder `pool`;
+a VM's `project_id` is its server's project's id as Nova reports it (`tenant_id`) - the server's own, whichever
+credential read it: an admin's `get_vm` reads another project's VM by id (§27.1) -, and its `project` that project's
+name, its id when the name cannot be read (§4.2, §27.4, plan task TC4);
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
@@ -3767,7 +3783,13 @@ quotas; and a community OpenStack destination, `hibiscus-dc3` - kind `openstack`
 `release` `2026.2` - that shares that inventory and whose check reports 2026.2's maxima, compute 2.104 and block
 storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 and the secure-RBAC profile, §10.1).
 `providers.registry.build(provider, settings)` returns the right implementation (fake when `settings.demo`; a fake
-destination is given its provider and reports by its kind). The demo seeds two running plans, both to `rhoso18`:
+destination is given its provider and reports by its kind). `ProviderRegistry.for_project(provider, project_id)`
+returns one that acts with the provider's credential for that Keystone project (§13.3, §27.4, plan task TC4): an
+`OpenStackProvider` on a connection of its own, built for the call and never cached - each read signs in afresh,
+with the credential as an admin last wrote it -, which its caller closes after its read (the inventory's `project`
+query, §12). Which step acts with which credential, and caching them, is plan task TC5's (§27.5). The demo's fakes
+cannot sign in with a project credential until plan task TC9 gives them tenant projects (§27.10), nor can a VMware
+provider, which holds none: a provider error. The demo seeds two running plans, both to `rhoso18`:
 the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and maps `g1.vgpu` to `g1.a100-4c` (`mappings.flavors`), so `gpu-ml-01` migrates; the VMware
@@ -3961,9 +3983,9 @@ answered - the provider check (`POST /providers/{id}/check`) signs in with each 
 (`Provider.project_credentials`, §4.2), one provider call each (`check_project`, above), one after the other in the
 order of their project ids: the bound ends a call's wait, not its thread (below), so a Keystone that never answers
 pins one worker thread at a time. A validation's check (§8) signs in with the plan's project credentials alone - its
-`source_project` on its source provider, its `destination_project` on its destination (§4.2 with plan task TC4; until
-then a plan names none, and a validation's check signs in with no project credential); a project the provider holds
-no credential for has nothing to sign in with (validation's refusal of it comes with plan task TC5, §27.5).
+`source_project` on its source provider, its `destination_project` on its destination (§4.2, plan task TC4), none for
+a plan that names none; a project the provider holds no credential for has nothing to sign in with (validation's
+refusal of it comes with plan task TC5, §27.5).
 * **The sign-in.** `OpenStackProvider.check_project` opens a connection of its own with the project's entry (§13.3:
   the provider credential's auth URL, else its endpoint) and closes it after the call, so each check signs in afresh:
   one `POST /v3/auth/tokens`, a request keystoneauth never logs - the token's body it writes at DEBUG names the
@@ -4000,8 +4022,9 @@ no credential for has nothing to sign in with (validation's refusal of it comes 
 * **Secrets.** Nothing of a project credential - its secret, or its application credential's id - reaches the report,
   an event or a log line; `provider.checked` keeps its data (§4.3).
 * **The demo.** The fakes' checks name their credentials' own projects: the OpenStack source's `finance`
-  (`project-finance`), its VMs' project, and each destination's `demo` (`project-demo`), which owns its own networks
-  (`network_details`), each in the domain `Default`.
+  (`project-finance`), its VMs' project - whose id each of them carries (`VMRef.project_id`, plan task TC4) -, and
+  each destination's `demo` (`project-demo`), which owns its own networks (`network_details`), each in the domain
+  `Default`.
 
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
@@ -4294,7 +4317,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
 | PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`; that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
-| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2 with plan task TC4, §27.4; until then no plan names one) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
+| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
@@ -4312,11 +4335,11 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/notifications/subscriptions` | operator | `{"channel", "plan_id", "topics"?}` (§24.4); `plan_id` null, every plan, is an admin's: an operator gets 403 and an `auth.denied` naming the admin role, as for an approver-only plan field (§13.1) | `201 NotificationSubscription` with `created_by` the principal; 422 for an unknown channel or plan, a topic §24.5 does not name, no topic, or a topic twice; 409 when the channel already has a subscription to that plan (or to every plan). The check and the write hold the lock `DELETE /notifications/channels/{name}` holds. Adding one leaves the plan's status and `updated_at` as they are. Event `subscription.created` |
 | DELETE | `/notifications/subscriptions/{id}` | operator | — | `204`; an every-plan subscription is an admin's (403 and `auth.denied` for an operator). Event `subscription.deleted` |
 | POST | `/notifications/channels/{name}/test` | admin | — | `{"outcome": "sent"|"failed", "reason": str|null}` after one try of a fixed message through the channel's sender, within the timeouts of §24.6 (§8.7); 409 for a disabled channel. Recorded as a delivery with the trigger `test` (`notification.sent` or `notification.failed`) |
-| GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
+| GET | `/providers/{id}/inventory` | viewer | query `project` (optional: a Keystone project's id; §27.4, plan task TC4) | `VMRef[]` (source) or `DestinationInventory` (destination), read with the provider's own credential; with `project`, with that project's credential - the project credential the provider holds for it (`project_credentials`, §4.2), else its own credential when the project is that credential's own, as its last check names it (the check report's `project`, §10) -, a project credential's read on a connection of its own, closed after it (`ProviderRegistry.for_project`, §10); 404 for a project that is neither, nothing read; 422 for a `project` that is not 1-64 letters, digits, `-` or `_` (as the project credential routes answer for their `project_id`), never quoting it |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), a `network_cutover` whose point names a hook twice or a hook the catalog lacks (checked under the lock of `DELETE /hooks/{name}`, which a plan's creation and edit take as they take `DELETE /providers/{id}`'s - it is the same lock), or whose DNS target lacks what its kind needs or has what it does not take (§4.2), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), a `network_cutover` whose point names a hook twice or a hook the catalog lacks (checked under the lock of `DELETE /hooks/{name}`, which a plan's creation and edit take as they take `DELETE /providers/{id}`'s - it is the same lock), or whose DNS target lacks what its kind needs or has what it does not take (§4.2), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped; a `source_project` or `destination_project` that is not 1-64 letters, digits, `-` or `_` is refused with 422 naming the field, and either with a VMware source, checked with the providers under the lock of `DELETE /providers/{id}` (§4.2, §27.9, plan task TC4)) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
-| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (on the cold path it finds the destination server by the migration's record; a name serves only a migration cut over before records existed, after the stop, §7.2) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
+| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers and its projects: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (on the cold path it finds the destination server by the migration's record; a name serves only a migration cut over before records existed, after the stop, §7.2), and so is a changed `source_project` or `destination_project`, since it acts with its attempt's credentials (§27.4, plan task TC4; a value the body leaves out, or sends as the plan holds it, is no change; with a provider changed too, the 409 names the providers) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
@@ -8398,9 +8421,11 @@ The proposed fields, routes, check keys, findings and gate rule stay out of the 
 (§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did; a proposed finding code is written here
 without code quotes. Plan task TC2's provider field, routes, secret name and deletion rules are binding in §4.2, §4.3,
 §12 and §13.3 since that task; plan task TC3's check of each project credential, with the check report keys `projects`
-and `project`, in §10 and §21.5 since that task. The facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia
-come from their documentation and, for Cinder's manage, its source, all read 2026-10-23. A fact only an excerpt showed,
-and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
+and `project`, in §10 and §21.5 since that task; plan task TC4's `VMRef.project_id`, the inventory's `project` query and
+the plan's `source_project` and `destination_project` with their edit rules in §4.2, §10 and §12 since that task. The
+facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
+manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
+`TODO(LAB): confirm`.
 
 ### 27.1 What 0.4.0 has
 
@@ -8481,7 +8506,7 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
   refused (409), never written over. The `SEAMLESS_SECRET_*` variables read `.` and `-` alike, so `POST /providers`
   refuses (409) an id ending in `-project-` and 16 hex digits whose prefix is another provider's id, and that provider
   while such an id exists, as it refuses the `-ssh` pair (§13.3, audit AP-04).
-* **A plan names its projects** by id (§4.2 with TC4):
+* **A plan names its projects** by id (binding in §4.2 and §12 since plan task TC4):
   ```text
   Plan { ...,
          source_project: str|null = null,        # whose credential reads and moves the plan's VMs at the source;
@@ -8492,8 +8517,9 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
   flight or `failed`, since a rollback acts with its attempt's credentials. `mappings.projects` keeps renaming the
   references to other projects; mapping the VMs' own project to another than `destination_project` stays
   `DST_PROJECT_MISSING`.
-* **VMs carry their project's id:** `VMRef.project_id: str|null` beside `project` (its name), null for VMware and for a
-  VM recorded before. `GET /providers/{id}/inventory?project=<project id>` (viewer) reads a source's VMs, or a
+* **VMs carry their project's id** (binding in §4.2, §10 and §12 since plan task TC4): `VMRef.project_id: str|null`
+  beside `project` (its name), null for VMware and for a VM recorded before.
+  `GET /providers/{id}/inventory?project=<project id>` (viewer) reads a source's VMs, or a
   destination's view, with that project's credential; 404 for a project that is neither the provider's own nor one it
   holds a credential for; without the query, its own credential as today.
 
@@ -8690,7 +8716,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | PRD: a functional requirement for project credentials, the 0.2.0 row as delivered, a 0.5.0 row; D20 decided | PRD, §20 | TC1 |
 | `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 (binding) | TC2 |
 | the check of each project credential: the report keys `projects` and `project` | §10, §21.5 (binding) | TC3 |
-| `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 | TC4 |
+| `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 (binding) | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 | TC5 |
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure | §5.4, §7.1 | TC7 |

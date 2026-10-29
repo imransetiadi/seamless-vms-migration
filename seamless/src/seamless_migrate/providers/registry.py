@@ -9,6 +9,7 @@ from typing import Any
 from ..config import Settings
 from ..domain.enums import ProviderKind, ProviderRole
 from ..domain.models import Provider
+from .base import ProviderError
 from .fake import FakeDestinationProvider, FakeSourceProvider
 from .openstack import OpenStackProvider
 from .vmware import VMwareProvider
@@ -70,6 +71,17 @@ class ProviderRegistry:
         if cached is not None:
             _close(cached[1])  # the replaced implementation must not keep its session
         return impl
+
+    def for_project(self, provider: Provider, project_id: str) -> Any:
+        """An implementation that acts with the provider's credential for the Keystone project
+        ``project_id`` (SDD §10, §13.3, §27.4, plan task TC4): an OpenStackProvider on a connection
+        of its own, built for the call and never cached, so each read signs in afresh with the
+        credential as an admin last wrote it; its caller closes it after its read. The demo's fakes
+        cannot sign in with a project credential until plan task TC9 (§27.10), nor can a VMware
+        provider, which holds none: a provider error."""
+        if self.settings.demo or provider.kind == ProviderKind.vmware:
+            raise ProviderError(f"{provider.id}: it cannot sign in with a project credential")
+        return OpenStackProvider(provider, self.settings, project_id=project_id)
 
     def forget(self, provider_id: str) -> None:
         with self._lock:

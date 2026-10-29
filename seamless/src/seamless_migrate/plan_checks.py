@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Literal
 
-from .domain.models import PlanSpec, invalid_plan_settings, repeated_vm_ids
+from .domain.models import PROJECT_FIELDS, PlanSpec, invalid_plan_settings, repeated_vm_ids
 from .planning.estimator import invalid_estimator_overrides
 
 #: SDD §12: the longest plan name and description a request may set; the stored model stays
@@ -46,6 +46,18 @@ def check_plan_spec(spec: PlanSpec) -> None:
     overrides = invalid_estimator_overrides(spec.estimator_overrides)
     if overrides:
         raise PlanSpecError("bad_request", f"invalid estimator_overrides: {'; '.join(overrides)}")
+
+
+def vmware_project_refusal(spec: PlanSpec) -> str | None:
+    """Why a plan with a VMware source cannot be stored naming a project (SDD §4.2, §12, §15,
+    §27.9, plan task TC4) - the fields it names -; None when it names none."""
+    named = [field for field in PROJECT_FIELDS if getattr(spec, field) is not None]
+    if not named:
+        return None
+    return (
+        f"{', '.join(named)}: a VMware plan names no project: vCenter has no Keystone projects, "
+        "and the migration kit acts with its providers' own credentials"
+    )
 
 
 def unknown_hook(spec: PlanSpec, catalog: Collection[str]) -> str | None:
