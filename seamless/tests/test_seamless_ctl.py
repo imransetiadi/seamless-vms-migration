@@ -149,17 +149,32 @@ ACTIVE = "--field-selector=status.phase!=Failed,status.phase!=Succeeded"
 OTHER_DATABASES = ACTIVE + ",metadata.name!=seamless-postgres-0"
 
 
-@pytest.mark.parametrize("platform", PLATFORMS)
-@pytest.mark.parametrize("count", ["2", "3", "-1", "one", ""])
+HOSTS = ("docker", "podman")
+#: the counts scale refuses: on the single host all but 0 and 1, on a cluster all but 0, 1 and 2 -
+#: whose scale 2 needs a ReadWriteMany data volume
+#: (test_a_cluster_scale_two_needs_a_readwritemany_data_volume)
+SCALE_REFUSALS = [
+    (platform, count)
+    for platform in PLATFORMS
+    for count in ["2", "3", "-1", "one", ""]
+    if platform in HOSTS or count != "2"
+]
+
+
+@pytest.mark.parametrize(("platform", "count"), SCALE_REFUSALS)
 def test_scale_takes_zero_or_one_and_refuses_a_second_orchestrator(tmp_path, platform, count):
-    """SDD §17.2, §17 (D2): the orchestrator is a singleton - a second replica would run two
-    orchestrators against one database -, so scale refuses every count but 0 and 1 before it runs
-    anything."""
+    """SDD §17.2, §25.7: the single host runs one control plane - a second container on the same
+    host fails with it -, so docker and podman take 0 or 1; a cluster takes 0, 1 or 2 - two
+    replicas on two nodes, of which the lease's leader runs the orchestrator. Every other count is
+    refused before anything runs, and no refusal calls the orchestrator a singleton any more."""
     proc, calls, _ = _run(tmp_path, platform, "scale", *([count] if count else []))
     assert proc.returncode == 2, proc.stderr
-    assert "0 or 1" in proc.stderr and calls == []
+    assert calls == []
+    counts = "0 or 1" if platform in HOSTS else "0, 1 or 2"
+    assert counts in proc.stderr and "singleton" not in proc.stderr, proc.stderr
     if count in ("2", "3"):
-        assert "single" in proc.stderr and "SDD §17" in proc.stderr
+        assert "SDD §17.2" in proc.stderr, proc.stderr
+        assert ("single host" if platform in HOSTS else "two replicas") in proc.stderr
 
 
 @pytest.mark.parametrize("engine", ["docker", "podman"])
@@ -262,6 +277,69 @@ def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
     ]
     other = "oc" if tool == "kubectl" else "kubectl"
     assert _args(calls, other) == []
+
+
+#: an overlay's two commented lines, and the same lines as an installation enables the HA
+#: component (SDD §17)
+HA_COMMENTED = "# components:\n#   - ha\n"
+HA_ENABLED = "components:\n  - ha\n"
+
+
+def _overlays(tmp_path, enabled_in: str | None = None) -> None:
+    """deploy/openshift and deploy/kubernetes in the scratch tree ``_run`` uses, the HA component
+    enabled in ``enabled_in``'s kustomization as an installation enables it."""
+    deploy = tmp_path / "tree" / "deploy"
+    for overlay in ("openshift", "kubernetes"):
+        shutil.copytree(ROOT / "deploy" / overlay, deploy / overlay)
+    if enabled_in:
+        kustomization = deploy / enabled_in / "kustomization.yaml"
+        text = kustomization.read_text()
+        assert HA_COMMENTED in text
+        kustomization.write_text(text.replace(HA_COMMENTED, HA_ENABLED))
+
+
+@pytest.mark.parametrize(
+    ("platform", "enabled_in", "replicas"),
+    [
+        ("openshift", None, 1),
+        ("openshift", "openshift", 2),
+        ("openshift", "kubernetes", 1),  # the Kubernetes overlay's, never OpenShift's
+        ("kubernetes", None, 1),
+        ("kubernetes", "kubernetes", 2),
+        ("kubernetes", "openshift", 2),  # in deploy/openshift, which the Kubernetes overlay builds
+    ],
+)
+def test_a_cluster_up_and_start_restore_the_overlays_replicas(
+    tmp_path, platform, enabled_in, replicas
+):
+    """SDD §17.2, §25.7: up and start bring the control plane back to the overlay's count - 1 for
+    the base, the HA component's 2, its replicas field, where the overlay lists the component, or
+    the deploy/openshift the Kubernetes overlay builds does -, read from the overlay's files and
+    never from the cluster, where a down left 0. A first up applies the overlay's claim and then
+    scales; an up after a down and a start scale what is there."""
+    tool = "oc" if platform == "openshift" else "kubectl"
+    shared = ["ReadWriteMany"] if replicas == 2 else ["ReadWriteOnce"]
+    first_up = fake_kube.empty()
+    first_up["overlay_data_modes"] = shared
+    stopped = fake_kube.cluster(replicas=0, postgres=0, data_modes=tuple(shared))
+    for action, state in (("up", first_up), ("up", stopped), ("start", stopped)):
+        run = tmp_path / f"{action}-{state['deployment'] is None}"
+        _overlays(run, enabled_in)
+        proc, calls, _ = _run(run, platform, action, cluster=state)
+        after = _cluster_after(run)
+        assert proc.returncode == 0, (action, proc.stderr)
+        assert after["deployment"]["replicas"] == replicas, action
+        assert len(fake_kube.running(after)) == replicas, action
+        scales = [c for c in _args(calls, tool) if "scale deployment/seamless" in c]
+        assert scales == [f"-n seamless-migrate scale deployment/seamless --replicas={replicas}"]
+    if replicas == 2:  # a count other than 1 or 2 is refused before anything changed
+        run = tmp_path / "three"
+        _overlays(run, enabled_in)
+        component = run / "tree" / "deploy" / "openshift" / "ha" / "kustomization.yaml"
+        component.write_text(component.read_text().replace("count: 2", "count: 3"))
+        proc, _, _ = _run(run, platform, "start", cluster=stopped)
+        assert proc.returncode == 2 and _cluster_after(run) == stopped, proc.stderr
+        assert "must be 1 or 2" in proc.stderr and "not '3'" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -383,6 +461,54 @@ def test_a_cluster_stop_and_scale_zero_leave_postgresql_running(tmp_path, platfo
         ]
 
 
+#: the read of seamless-data's access modes, from its claim's spec (SDD §17.2)
+DATA_MODES = "get pvc/seamless-data -o jsonpath={.spec.accessModes[*]}"
+#: the ways to two replicas a claim that is not ReadWriteMany refuses: (argv, HA component, claim)
+NOT_SHARED = [
+    (["scale", "2"], False, ["ReadWriteOnce"]),
+    (["scale", "2"], False, None),  # a claim it cannot read
+    (["start"], True, ["ReadWriteOnce"]),
+    (["up"], True, ["ReadWriteOnce"]),  # before its apply: a claim's access modes never change
+]
+
+
+@pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
+@pytest.mark.parametrize(
+    ("argv", "ha", "claim"), NOT_SHARED, ids=["scale 2", "scale 2 no claim", "start", "up"]
+)
+def test_a_cluster_scale_two_needs_a_readwritemany_data_volume(
+    tmp_path, platform, tool, overlay, argv, ha, claim
+):
+    """SDD §17.2, §25.7: two replicas run on two nodes, and the new leader reads the run
+    directories the old one wrote - scale 2, and up and start restoring the HA component's 2,
+    take a seamless-data claim that asks for ReadWriteMany, read from its spec (a class that binds
+    at the first consumer leaves a new claim unbound until a pod uses it). One that does not, or
+    one it cannot read, is refused with 2 before anything changed, naming why; up refuses it
+    before its apply, which could not change it. With a ReadWriteMany claim, scale 2 runs two."""
+    shared = fake_kube.cluster(replicas=1, data_modes=("ReadWriteMany",))
+    proc, calls, _ = _run(tmp_path / "shared", platform, "scale", "2", cluster=shared)
+    after = _cluster_after(tmp_path / "shared")
+    assert proc.returncode == 0, proc.stderr
+    assert after["deployment"]["replicas"] == 2 and len(fake_kube.running(after)) == 2
+    lines = _args(calls, tool)
+    writes = [i for i, line in enumerate(lines) if line.split()[2] in ("scale", "apply", "patch")]
+    assert lines.index(f"-n seamless-migrate {DATA_MODES}") < writes[0], lines
+
+    state = fake_kube.cluster(replicas=0 if argv == ["start"] else 1, postgres=0)
+    state["pvc"] = None if claim is None else {"accessModes": claim}
+    run = tmp_path / "refused"
+    _overlays(run, overlay.split("/")[1] if ha else None)
+    proc, calls, _ = _run(run, platform, *argv, cluster=state)
+    assert proc.returncode == 2, proc.stderr
+    assert _cluster_after(run) == state  # nothing changed
+    assert [c for c in _args(calls, tool) if c.split()[2] in ("scale", "apply", "patch")] == []
+    if claim is None:
+        assert "cannot read pvc/seamless-data" in proc.stderr, proc.stderr
+    else:
+        assert "ReadWriteMany" in proc.stderr and "it is ReadWriteOnce" in proc.stderr, proc.stderr
+        assert "nothing was changed" in proc.stderr, proc.stderr
+
+
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
 def test_a_cluster_restart_rolls_the_deployment_and_waits(tmp_path, platform, tool, overlay):
     """SDD §17.2: restart is a rollout restart of the Deployment - Recreate ends the old pod before
@@ -395,6 +521,52 @@ def test_a_cluster_restart_rolls_the_deployment_and_waits(tmp_path, platform, to
         "-n seamless-migrate rollout restart deployment/seamless",
         "-n seamless-migrate rollout status deployment/seamless --timeout=600s",
     ]
+
+
+#: /health's leader (SDD §12): a follower answered, and the lease names the leading pod - its host
+#: name, a Deployment's pod's name, and 8 hex digits of its process
+LEADS = {
+    "leading": False,
+    "holder": "seamless-7c9d8b6f5d-q2w8z-0a1b2c3d",
+    "epoch": 4,
+    "since": "2026-10-30T08:00:00Z",
+}
+NOBODY = {"leading": False, "holder": None, "epoch": None, "since": None}
+
+
+@pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
+@pytest.mark.parametrize(
+    ("leader", "says"),
+    [(LEADS, "leading pod: seamless-7c9d8b6f5d-q2w8z"), (NOBODY, "no replica leads"), (None, None)],
+    ids=["a leader", "no leader", "before the lease"],
+)
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")], ids=["compact", "spaced"])
+def test_cluster_status_names_the_leading_pod(
+    tmp_path, platform, tool, overlay, leader, says, separators
+):
+    """SDD §17.2, §12, §25.6: with --url, status asks /health after listing the Deployment, the
+    StatefulSet and their pods, prints its answer and names the leading pod - the host name of
+    leader.holder, which is its pod's name - whichever replica answered; while no replica leads it
+    says so. An API from before the lease names no leader, and status says nothing of one."""
+    health = {"status": "ok", "version": "0.5.0", "db": "ok", "orchestrator": {"running": False}}
+    if leader is not None:
+        health["leader"] = leader
+    body = json.dumps(health, separators=separators)
+    rules = [{"cmd": "curl", "has": ["/api/v1/health"], "answers": [{"stdout": body}]}]
+    proc, calls, _ = _run(tmp_path, platform, "status", "--url", CLUSTER_URL, rules=rules)
+    assert proc.returncode == 0, proc.stderr
+    assert _args(calls, tool) == [
+        "-n seamless-migrate get deployment/seamless statefulset/seamless-postgres",
+        "-n seamless-migrate get pods -l app.kubernetes.io/name in (seamless,seamless-postgres)",
+    ]
+    assert _args(calls, "curl") == [f"-fsS --max-time 10 {CLUSTER_URL}/api/v1/health"]
+    assert body in proc.stdout
+    named = [line for line in proc.stdout.splitlines() if "lead" in line and line != body]
+    if says is None:
+        assert named == [], proc.stdout
+    else:
+        assert len(named) == 1 and named[0].startswith(says), proc.stdout
+        assert "0a1b2c3d" not in named[0]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -686,6 +858,7 @@ DRY_RUN_CLUSTER_ACTIONS = [
     ["stop"],
     ["scale", "0"],
     ["scale", "1"],
+    ["scale", "2"],
     ["status", "--url", CLUSTER_URL],
     ["logs"],
     ["capacity", "--max-migrations", "20", "--memory", "8Gi"],
