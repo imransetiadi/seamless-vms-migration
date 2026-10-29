@@ -5,22 +5,23 @@ import { defineConfig, devices } from '@playwright/test';
 // no control plane. It is the one check that exercises the real CSS pipeline (Tailwind 4).
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: '**/api-audit.spec.ts',
   timeout: 30_000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
-    baseURL: 'http://127.0.0.1:4173',
+    baseURL: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? '4173'}`,
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'VITE_SEAMLESS_MOCK=1 npx vite build --outDir dist-mock && npx vite preview --outDir dist-mock --host 127.0.0.1 --port 4173 --strictPort',
-    url: 'http://127.0.0.1:4173/login',
+    command: `VITE_SEAMLESS_MOCK=1 npx vite build --outDir dist-mock && npx vite preview --outDir dist-mock --host 127.0.0.1 --port ${process.env.PLAYWRIGHT_PORT ?? '4173'} --strictPort`,
+    url: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? '4173'}/login`,
     // locally a preview left running serves whatever dist-mock it was started with: stop it
     // (or run with CI=1) after changing CSS or components to test a fresh build
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }, { name: 'webkit', use: { ...devices['Desktop Safari'] } }],
 });

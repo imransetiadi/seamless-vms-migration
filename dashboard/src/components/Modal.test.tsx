@@ -1,5 +1,6 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { createRef, StrictMode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { Button } from './Button';
 import { Modal } from './Modal';
@@ -39,6 +40,164 @@ function Dialog() {
 }
 
 describe('Modal (SDD §16)', () => {
+  it('skips CSS-hidden controls at the end of the dialog when wrapping Tab', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<Modal open onClose={() => {}} labelledBy="title">
+      <h2 id="title">Edit</h2><input aria-label="Name" /><button>Save</button>
+      <div style={{ display: 'none' }}><button>Hidden action</button></div>
+    </Modal>);
+    screen.getByRole('button', { name: 'Save' }).focus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+  });
+
+  it('skips hidden inputs and controls disabled by their fieldset when focusing and wrapping Tab', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(
+      <Modal open onClose={() => {}} labelledBy="title">
+        <h2 id="title">Edit plan</h2>
+        <input type="hidden" value="source-id" />
+        <fieldset disabled>
+          <legend>Unavailable source</legend>
+          <input aria-label="Unavailable name" />
+          <button type="button">Unavailable action</button>
+        </fieldset>
+        <input aria-label="Name" />
+        <button type="button">Save</button>
+        <fieldset disabled>
+          <legend>Unavailable destination</legend>
+          <select aria-label="Unavailable network"><option>Network</option></select>
+          <textarea aria-label="Unavailable notes" />
+        </fieldset>
+        <input type="hidden" value="destination-id" />
+      </Modal>,
+    );
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByRole('button', { name: 'Save' })).toHaveFocus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+  });
+
+  it('keeps Tab inside when an error summary before the first control has focus', async () => {
+    const user = userEvent.setup({ delay: null });
+    const summaryRef = createRef<HTMLHeadingElement>();
+    render(
+      <>
+        <a href="#background">Background action</a>
+        <Modal open onClose={() => {}} labelledBy="summary" initialFocusRef={summaryRef}>
+          <h2 ref={summaryRef} id="summary" tabIndex={-1}>Fix the form</h2>
+          <input aria-label="Name" />
+          <h3 tabIndex={-1}>Details</h3>
+          <button type="button">Cancel</button>
+          <p tabIndex={-1}>End of form</p>
+        </Modal>
+      </>,
+    );
+    expect(summaryRef.current).toHaveFocus();
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    summaryRef.current?.focus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+    const details = screen.getByRole('heading', { name: 'Details' });
+    details.focus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    details.focus();
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+    screen.getByText('End of form').focus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+  });
+
+  it('recovers Tab when focus leaves the top dialog, including a dialog without controls', async () => {
+    const user = userEvent.setup({ delay: null });
+    const dialog = (controls: boolean) => (
+      <Modal open onClose={() => {}} labelledBy="title">
+        <h2 id="title">Working</h2>
+        {controls && <><button type="button">First</button><button type="button">Last</button></>}
+      </Modal>
+    );
+    const view = render(dialog(true));
+    (document.activeElement as HTMLElement).blur();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('button', { name: 'First' })).toHaveFocus();
+    (document.activeElement as HTMLElement).blur();
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByRole('button', { name: 'Last' })).toHaveFocus();
+    view.rerender(dialog(false));
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('dialog', { name: 'Working' })).toHaveFocus();
+  });
+
+  it('preserves a pre-existing inert root and body style through StrictMode cleanup', () => {
+    const appRoot = document.createElement('div');
+    appRoot.id = 'root';
+    appRoot.setAttribute('inert', '');
+    document.body.append(appRoot);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'clip';
+    const view = render(<StrictMode><Dialog /></StrictMode>);
+    try {
+      expect(appRoot).toHaveAttribute('inert');
+      expect(document.body.style.overflow).toBe('hidden');
+      view.unmount();
+      expect(appRoot).toHaveAttribute('inert');
+      expect(document.body.style.overflow).toBe('clip');
+    } finally {
+      view.unmount();
+      appRoot.remove();
+      document.body.style.overflow = previousOverflow;
+    }
+  });
+
+  it('keeps lower dialogs and the page inert until the last dialog closes, in either order', () => {
+    const appRoot = document.createElement('div');
+    appRoot.id = 'root';
+    document.body.append(appRoot);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'clip';
+    const dialogs = (outer: boolean, inner: boolean) => (
+      <>
+        <Modal open={outer} onClose={() => {}} labelledBy="outer">
+          <h2 id="outer">Outer</h2>
+          <button type="button">Outer action</button>
+        </Modal>
+        <Modal open={inner} onClose={() => {}} labelledBy="inner">
+          <h2 id="inner">Inner</h2>
+          <button type="button">Inner action</button>
+        </Modal>
+      </>
+    );
+    const view = render(dialogs(true, false));
+    try {
+      const outer = screen.getByRole('dialog', { name: 'Outer' });
+      const action = within(outer).getByRole('button', { name: 'Outer action' });
+      view.rerender(dialogs(true, true));
+      expect(outer).toHaveAttribute('inert');
+      view.rerender(dialogs(true, false));
+      expect(outer).not.toHaveAttribute('inert');
+      expect(action).toHaveFocus();
+      expect(appRoot).toHaveAttribute('inert');
+      expect(document.body.style.overflow).toBe('hidden');
+      view.rerender(dialogs(true, true));
+      const innerAction = screen.getByRole('button', { name: 'Inner action' });
+      view.rerender(dialogs(false, true));
+      expect(innerAction).toHaveFocus();
+      expect(appRoot).toHaveAttribute('inert');
+      expect(document.body.style.overflow).toBe('hidden');
+      view.rerender(dialogs(false, false));
+      expect(appRoot).not.toHaveAttribute('inert');
+      expect(document.body.style.overflow).toBe('clip');
+    } finally {
+      view.unmount();
+      appRoot.remove();
+      document.body.style.overflow = previousOverflow;
+    }
+  });
+
   it('traps focus over what Tab reaches: a radio group counts once, at its checked radio (WCAG 2.4.3)', async () => {
     const user = userEvent.setup({ delay: null });
     render(<Dialog />);

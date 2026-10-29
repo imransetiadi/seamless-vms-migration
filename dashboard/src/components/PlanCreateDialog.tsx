@@ -1,3 +1,5 @@
+import { flushSync } from 'react-dom';
+import { UnsavedChangesGuard } from './UnsavedChangesGuard';
 import { CircleAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -663,7 +665,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     }
     create.mutate(body, {
       onSuccess: (created) => {
-        onClose();
+        // Remove the draft blocker before navigating to the successfully created plan.
+        flushSync(onClose);
         navigate(`/plans/${created.id}`);
       },
     });
@@ -702,28 +705,33 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
   const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover', 'cutover'].some((k) => k in errors);
+  const navigationGuard = <UnsavedChangesGuard dirty={open && (saving.isPending || stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline)} pending={saving.isPending} />;
   const close = () => {
     if (stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline) setDiscarding(true);
     else onClose();
   };
   if (discarding) {
     return (
-      <ConfirmDialog
-        open={open}
-        title="Discard unsaved plan changes?"
-        description="Your changes have not been saved. Discard them or return to editing."
-        confirmLabel="Discard changes"
-        cancelLabel="Keep editing"
-        tone="danger"
-        returnFocusRef={returnFocusRef}
-        onConfirm={() => { setDiscarding(false); onClose(); }}
-        onCancel={() => setDiscarding(false)}
-      />
+      <>
+        {navigationGuard}
+        <ConfirmDialog
+          open={open}
+          title="Discard unsaved plan changes?"
+          description="Your changes have not been saved. Discard them or return to editing."
+          confirmLabel="Discard changes"
+          cancelLabel="Keep editing"
+          tone="danger"
+          returnFocusRef={returnFocusRef}
+          onConfirm={() => { setDiscarding(false); onClose(); }}
+          onCancel={() => setDiscarding(false)}
+        />
+      </>
     );
   }
 
   return (
     <Modal open={open} onClose={close} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef} returnFocusRef={returnFocusRef}>
+      {navigationGuard}
       <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
@@ -820,6 +828,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
             {inventory.error && <ErrorBanner error={inventory.error} title="Cannot read the source inventory" onRetry={() => void inventory.refetch()} />}
             {source && vms.length > 0 && (
               <VmTable
+                key={form.sourceId}
                 vms={vms}
                 providerKind={source.kind}
                 selected={form.vmIds}

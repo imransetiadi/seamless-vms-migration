@@ -1,31 +1,32 @@
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
-import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from 'react';
-import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { Component, lazy, Suspense, useState, type ErrorInfo, type ReactNode } from 'react';
+import { createBrowserRouter, RouterProvider, Route, Routes, useLocation } from 'react-router-dom';
 import { ApiProvider } from './api/ApiProvider';
 import type { ApiClient } from './api/client';
 import { Layout } from './components/Layout';
 import { RequireAuth } from './components/RequireAuth';
 import { LoadingBlock } from './components/Skeleton';
 import { Button } from './components/Button';
+import { routeChunk, reloadPage } from './lib/routeChunk';
 import { ThemeProvider } from './theme/ThemeProvider';
 
 // Route-level code splitting: charts (Recharts) only load with the pages that use them.
-const Overview = lazy(() => import('./pages/Overview'));
-const Plans = lazy(() => import('./pages/Plans'));
-const PlanDetail = lazy(() => import('./pages/PlanDetail'));
-const MigrationDetail = lazy(() => import('./pages/MigrationDetail'));
-const Providers = lazy(() => import('./pages/Providers'));
-const Users = lazy(() => import('./pages/Users'));
-const Hooks = lazy(() => import('./pages/Hooks'));
-const Inventory = lazy(() => import('./pages/Inventory'));
-const Events = lazy(() => import('./pages/Events'));
-const Notifications = lazy(() => import('./pages/Notifications'));
-const Advisor = lazy(() => import('./pages/Advisor'));
-const AdvisorAudit = lazy(() => import('./pages/AdvisorAudit'));
-const AdvisorPolicies = lazy(() => import('./pages/AdvisorPolicies'));
-const RecommendationDetail = lazy(() => import('./pages/RecommendationDetail'));
-const Login = lazy(() => import('./pages/Login'));
-const NotFound = lazy(() => import('./pages/NotFound'));
+const Overview = lazy(() => routeChunk('Overview', () => import('./pages/Overview')));
+const Plans = lazy(() => routeChunk('Plans', () => import('./pages/Plans')));
+const PlanDetail = lazy(() => routeChunk('PlanDetail', () => import('./pages/PlanDetail')));
+const MigrationDetail = lazy(() => routeChunk('MigrationDetail', () => import('./pages/MigrationDetail')));
+const Providers = lazy(() => routeChunk('Providers', () => import('./pages/Providers')));
+const Users = lazy(() => routeChunk('Users', () => import('./pages/Users')));
+const Hooks = lazy(() => routeChunk('Hooks', () => import('./pages/Hooks')));
+const Inventory = lazy(() => routeChunk('Inventory', () => import('./pages/Inventory')));
+const Events = lazy(() => routeChunk('Events', () => import('./pages/Events')));
+const Notifications = lazy(() => routeChunk('Notifications', () => import('./pages/Notifications')));
+const Advisor = lazy(() => routeChunk('Advisor', () => import('./pages/Advisor')));
+const AdvisorAudit = lazy(() => routeChunk('AdvisorAudit', () => import('./pages/AdvisorAudit')));
+const AdvisorPolicies = lazy(() => routeChunk('AdvisorPolicies', () => import('./pages/AdvisorPolicies')));
+const RecommendationDetail = lazy(() => routeChunk('RecommendationDetail', () => import('./pages/RecommendationDetail')));
+const Login = lazy(() => routeChunk('Login', () => import('./pages/Login')));
+const NotFound = lazy(() => routeChunk('NotFound', () => import('./pages/NotFound')));
 
 export class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   override state = { failed: false };
@@ -45,7 +46,7 @@ export class PageErrorBoundary extends Component<{ children: ReactNode }, { fail
       <section role="alert" className="card mx-auto mt-8 max-w-xl p-6">
         <h1 className="text-xl font-semibold text-foreground">This page could not be loaded</h1>
         <p className="mt-2 text-sm text-muted-foreground">The page could not start. Check the connection, then reload. If it still fails, contact your administrator.</p>
-        <Button size="lg" variant="primary" className="mt-4" onClick={() => window.location.reload()}>
+        <Button size="lg" variant="primary" className="mt-4" onClick={reloadPage}>
           Reload page
         </Button>
       </section>
@@ -117,13 +118,12 @@ export interface AppProps {
 }
 
 export default function App({ client, queryClient }: AppProps) {
+  const [router] = useState(() => createBrowserRouter([{ path: '*', element: <AppRoutes /> }]));
   return (
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <ApiProvider client={client}>
-          <BrowserRouter>
-            <AppRoutes />
-          </BrowserRouter>
+          <RouterProvider router={router} />
         </ApiProvider>
       </QueryClientProvider>
     </ThemeProvider>

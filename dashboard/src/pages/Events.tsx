@@ -1,3 +1,4 @@
+import { useListState } from '../lib/useListState';
 import {
   Activity,
   Archive,
@@ -28,7 +29,7 @@ import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { exportEventTrail, jsonLineParts } from '../api/eventExport';
 import { fetchEventTail, useApi, useEventTail, usePlans } from '../api/hooks';
-import { useLiveEvents } from '../api/live';
+import { useLiveEvents, useLiveStatus } from '../api/live';
 import type { Event } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
@@ -159,7 +160,9 @@ function stamp(): string {
 /** Audit trail plus the live stream: history first, streamed events appended at the top. */
 export default function Events() {
   usePageTitle('Events');
+  const streamStatus = useLiveStatus();
   const searchId = useId();
+  const listState = useListState('events');
   // the plan filter lives in the address like Overview's (SDD §16): its history comes from the API
   const [params, setParams] = useSearchParams();
   const planId = params.get('plan') ?? '';
@@ -167,14 +170,26 @@ export default function Events() {
   const plans = usePlans();
   const [live, setLive] = useState<Item[]>([]);
   const [held, setHeld] = useState<Item[]>([]);
-  const [paused, setPaused] = useState(false);
+  const [paused, setPaused] = listState.field('paused', false);
   const [received, setReceived] = useState(0);
   // only pausing and resuming are announced: a region that read every event out would flood a screen reader (SDD §16)
   const [announcement, setAnnouncement] = useState('');
-  const [showProgress, setShowProgress] = useState(false);
-  const [category, setCategory] = useState('all');
-  const [query, setQuery] = useState('');
-  const [limit, setLimit] = useState(PAGE);
+  const [showProgress, setShowProgress] = listState.field('showProgress', false);
+  const [category, setCategory] = listState.field('category', 'all');
+  const [query, setQuery] = listState.field('query', '');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filtersActive = query !== '' || category !== 'all' || planId !== '' || showProgress;
+  const clearFilters = () => {
+    setQuery('');
+    setCategory('all');
+    setShowProgress(false);
+    const next = new URLSearchParams(params);
+    next.delete('plan');
+    setParams(next, { replace: true });
+    setLimit(PAGE);
+    searchRef.current?.focus();
+  };
+  const [limit, setLimit] = listState.field('limit', PAGE);
   const counter = useRef(0);
   const listRef = useRef<HTMLOListElement>(null);
 
@@ -203,7 +218,7 @@ export default function Events() {
 
   const historyItems = useMemo(() => (history.data ?? []).map((event) => itemOf(`seq-${event.seq}`, event)), [history.data]);
   // pages before the loaded history (SDD §12 `before`), for the plan they were read for; a full page may have more
-  const [older, setOlder] = useState<{ planId: string | null; items: Item[]; more: boolean }>({ planId: null, items: [], more: true });
+  const [older, setOlder] = listState.field<{ planId: string | null; items: Item[]; more: boolean }>('older', { planId: null, items: [], more: true });
   const olderItems = older.planId === planId ? older.items : NO_ITEMS;
   const items = useMemo(() => {
     const merged = new Map<string, Item>();
@@ -259,6 +274,7 @@ export default function Events() {
     setOlderError(null);
     try {
       const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
+      const restoreFocus = document.activeElement === moreRef.current;
       const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
       // the history it was read below stays loaded too: when the newest history is read again, its window moves up
       // and would otherwise leave a gap between it and these pages
@@ -267,7 +283,7 @@ export default function Events() {
       setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
       // the start of the trail removes the button: focus moves to the list, never to the page (SDD §16)
       requestAnimationFrame(() => {
-        if (!moreRef.current) listRef.current?.focus();
+        if (restoreFocus && !moreRef.current && document.activeElement === document.body) (listRef.current ?? searchRef.current)?.focus();
       });
     } catch (error) {
       setOlderError(error);
@@ -321,6 +337,8 @@ export default function Events() {
   // Pause stops everything that updates on its own — the list and this count — until Resume (WCAG 2.2.2, SDD §16)
   const statusText = paused
     ? 'Paused · new events wait until you resume'
+    : streamStatus !== 'open'
+      ? `${streamStatus === 'connecting' ? 'Connecting' : streamStatus === 'reconnecting' ? 'Reconnecting' : streamStatus === 'unauthorized' ? 'Signed out' : 'Offline'} · showing last loaded events`
     : received === 0
       ? 'Live · waiting for new events'
       : `Live · ${received} new event${received === 1 ? '' : 's'} since you opened this page`;
@@ -362,6 +380,7 @@ export default function Events() {
             Search events
           </label>
           <input
+            ref={searchRef}
             id={searchId}
             type="search"
             className="input"
@@ -405,6 +424,7 @@ export default function Events() {
           <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => setShowProgress(e.target.checked)} />
           Show progress updates
         </label>
+        {filtersActive && <Button size="lg" onClick={clearFilters}>Clear filters</Button>}
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">

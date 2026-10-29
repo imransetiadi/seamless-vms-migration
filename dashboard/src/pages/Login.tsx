@@ -35,6 +35,7 @@ export default function Login() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (pending) return;
     if (!token.trim()) {
       setError('Paste your API token to sign in.');
       inputRef.current?.focus();
@@ -106,6 +107,7 @@ export default function Login() {
                   autoCapitalize="off"
                   className="input font-mono"
                   value={token}
+                  readOnly={pending}
                   onChange={(e) => setToken(e.target.value)}
                   aria-invalid={error ? true : undefined}
                   // the field says why the session ended too: a note shown on load is not reliably announced

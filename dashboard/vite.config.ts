@@ -11,7 +11,18 @@ const apiProxy = {
 };
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), {
+    name: 'route-chunk-manifest',
+    generateBundle(_options, bundle) {
+      const routes: Record<string, string> = {};
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk' || !output.facadeModuleId) continue;
+        const name = output.facadeModuleId.match(/\/src\/pages\/([^/]+)\.tsx$/)?.[1];
+        if (name) routes[name] = output.fileName;
+      }
+      this.emitFile({ type: 'asset', fileName: 'route-chunks.json', source: JSON.stringify(routes) });
+    },
+  }],
   server: {
     port: 5173,
     proxy: apiProxy,

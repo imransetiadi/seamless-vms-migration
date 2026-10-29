@@ -110,7 +110,7 @@ test('light theme switches the token values', async ({ page }) => {
   await page.locator('aside').getByRole('button', { name: /^(light|dark) theme$/i }).click();
   await expect
     .poll(async () => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
-    .toBe('rgb(248, 250, 252)');
+    .toBe('rgb(232, 237, 243)');
 });
 
 test('the theme chosen stays after a reload, light and dark (QASuite UI-07)', async ({ page }) => {
@@ -121,10 +121,10 @@ test('the theme chosen stays after a reload, light and dark (QASuite UI-07)', as
   // dark is the default (SDD §16)
   await expect(toggle).toHaveText(/^light theme$/i);
   await toggle.click();
-  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await expect.poll(background).toBe('rgb(232, 237, 243)');
   await page.reload();
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
-  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await expect.poll(background).toBe('rgb(232, 237, 243)');
   await expect(toggle).toHaveText(/^dark theme$/i);
   // and back: the dark choice stays too
   await toggle.click();

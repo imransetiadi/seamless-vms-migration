@@ -1,3 +1,4 @@
+import { useDraftGuard } from '../lib/useDraftGuard';
 import { CircleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from 'react';
 import { usePlans, useProviders, useSavePolicy } from '../api/hooks';
@@ -152,6 +153,8 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
     if (open) resetSave();
   }, [open, resetSave]);
 
+  const { close, guard } = useDraftGuard(open && JSON.stringify(form) !== JSON.stringify(formOf(policy, defaultThreshold)), save.isPending, onClose);
+
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
   const sources = (providers.data ?? []).filter((p) => p.role === 'source');
   const scopeItems =
@@ -189,7 +192,8 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
   };
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy={titleId} dismissible={!save.isPending} initialFocusRef={nameRef} returnFocusRef={returnFocusRef}>
+    <Modal open={open} onClose={close} labelledBy={titleId} dismissible={!save.isPending} initialFocusRef={nameRef} returnFocusRef={returnFocusRef}>
+      {guard}
       <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
@@ -357,7 +361,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
-          <Button size="lg" onClick={onClose} disabledReason={save.isPending ? 'Wait for the request to finish.' : null}>
+          <Button size="lg" onClick={close} disabledReason={save.isPending ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button size="lg" type="submit" variant="primary" loading={save.isPending}>

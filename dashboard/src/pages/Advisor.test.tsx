@@ -57,6 +57,13 @@ function addRecommendations(server: MockServer, m: MockServer['migrations'][numb
 }
 
 describe('Advisor page', () => {
+  it('offers section shortcuts to incident search and notes', async () => {
+    renderWithApp(<Advisor />, { route: '/advisor' });
+    const nav = screen.getByRole('navigation', { name: 'Advisor sections' });
+    expect(within(nav).getByRole('link', { name: 'Similar incidents' })).toHaveAttribute('href', '#similar-incidents');
+    expect(await screen.findByRole('region', { name: 'Similar incidents' })).toHaveAttribute('id', 'similar-incidents');
+    expect(document.querySelectorAll('#advisor-data')).toHaveLength(1);
+  });
   it('says the advisor notes could not be loaded instead of claiming there are none', async () => {
     renderWithApp(<Advisor />, { server: serverWithoutNotes() });
 

@@ -1,10 +1,52 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { Route, Routes, useNavigate } from 'react-router-dom';
+import { useEffect } from 'react';
+import { Link, Route, Routes, useNavigate } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LiveContext, LiveEventHub } from '../api/live';
+import { useHashLanding } from '../lib/useHashLanding';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { Layout } from './Layout';
+
+function FragmentPage() {
+  useHashLanding(true);
+  return <h1 id="résumé" tabIndex={-1}>Destination</h1>;
+}
+
+describe('Layout fragment navigation', () => {
+  for (const hash of ['#%', '#%E0%A4%A', '#missing', '#r%C3%A9sum%C3%A9']) {
+    it(`keeps the page usable and focuses the available target for ${hash}`, async () => {
+      const user = userEvent.setup({ delay: null });
+      renderWithApp(
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<Link to={`/next${hash}`}>Open destination</Link>} />
+            <Route path="/next" element={<FragmentPage />} />
+          </Route>
+        </Routes>,
+      );
+      await user.click(screen.getByRole('link', { name: 'Open destination' }));
+      const heading = screen.getByRole('heading', { name: 'Destination' });
+      expect(hash === '#r%C3%A9sum%C3%A9' ? heading : screen.getByRole('main')).toHaveFocus();
+      expect(screen.getByRole('navigation', { name: 'Primary' })).toBeInTheDocument();
+    });
+  }
+
+  it('keeps shell navigation usable with a malformed fragment on a page without a landing hook', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/" element={<Link to="/next#%">Open destination</Link>} />
+          <Route path="/next" element={<h1>Destination</h1>} />
+        </Route>
+      </Routes>,
+    );
+    await user.click(screen.getByRole('link', { name: 'Open destination' }));
+    expect(screen.getByRole('heading', { name: 'Destination' })).toBeInTheDocument();
+    expect(screen.getByRole('main')).toHaveFocus();
+  });
+});
 
 describe('Layout health notice', () => {
   // the session footer with its details is the full sidebar's (SDD §16); the rail shows live, theme and sign out
@@ -229,7 +271,8 @@ describe('Layout phone navigation (SDD §16 focus)', () => {
     const user = userEvent.setup({ delay: null });
     let go: (to: string) => void = () => {};
     function Page() {
-      go = useNavigate();
+      const navigate = useNavigate();
+      useEffect(() => { go = navigate; }, [navigate]);
       return <p>Overview page</p>;
     }
     renderWithApp(

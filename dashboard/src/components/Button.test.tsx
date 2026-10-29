@@ -7,6 +7,33 @@ import { Button } from './Button';
 describe('Button', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('focuses a pointer trigger before opening its dialog on browsers that omit native focus', () => {
+    let trigger: Element | null = null;
+    render(<Button onClick={() => { trigger = document.activeElement; }}>Open</Button>);
+    const button = screen.getByRole('button', { name: 'Open' });
+    // a pointer click carries its click count in detail; a keyboard or implicit-submission click carries 0
+    fireEvent.click(button, { detail: 1 });
+    expect(trigger).toBe(button);
+  });
+
+  it('leaves the focus in the field when Enter submits its form (implicit submission clicks the button)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());
+    render(
+      <form onSubmit={onSubmit}>
+        <label>
+          Token
+          <input name="token" />
+        </label>
+        <Button type="submit">Sign in</Button>
+      </form>,
+    );
+    const field = screen.getByLabelText('Token');
+    await user.type(field, 'abc{Enter}');
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(field).toHaveFocus();
+  });
+
   it('says why a soft-disabled action is unavailable when it is tapped or clicked, not only on hover', async () => {
     const user = userEvent.setup({ delay: null });
     const onClick = vi.fn();

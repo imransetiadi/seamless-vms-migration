@@ -1,5 +1,6 @@
+import { useListState } from '../lib/useListState';
 import { ClipboardPlus, HardDrive, Info, Server, TriangleAlert } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useInventory, useMigrationSummaries, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
@@ -335,12 +336,13 @@ export default function Inventory() {
   const providers = useProviders();
   const inventory = useInventory(providerId);
   const role = useRole();
-  const [selected, setSelected] = useState<{ providerId: string; ids: Set<string> }>({ providerId: '', ids: new Set() });
+  const listState = useListState('inventory-selection');
+  const [selected, setSelected] = listState.field<{ providerId: string; ids: Set<string> }>('selection', { providerId: '', ids: new Set() });
   const provider = providers.data?.find((p) => p.id === providerId);
   // planning starts from a source; viewers see the action unavailable, with the reason (SDD §16)
   const isSource = provider?.role === 'source';
   const canPlan = hasRole(role, 'operator') && isSource;
-  const selection = selected.providerId === providerId ? selected.ids : new Set<string>();
+  const selection = new Set(selected.providerId === providerId ? [...selected.ids].filter(id => !Array.isArray(inventory.data) || inventory.data.some(vm => vm.source_id === id)) : []);
   // which plans hold each VM of a source (SDD §5.4, §16): unknown, never free, while the plans or migrations fail
   const plans = usePlans();
   const migrations = useMigrationSummaries();
@@ -395,7 +397,7 @@ export default function Inventory() {
         <EmptyState icon={Server} title={`Provider ${providerId} does not exist`} description="Pick another provider above." />
       )}
       {(providers.isPending || (inventory.isPending && provider)) && <LoadingBlock label="Reading inventory…" rows={6} />}
-      {inventory.error && (
+      {inventory.error && (!providers.data || provider) && (
         <ErrorBanner error={inventory.error} title={`Cannot read the inventory of ${provider ? providerLabel(provider) : providerId}`} onRetry={() => void inventory.refetch()} />
       )}
       {data && provider && !isDestinationInventory(data) && (
@@ -420,8 +422,9 @@ export default function Inventory() {
               </div>
             )}
             <VmTable
+              persistenceKey={`inventory:${providerId}:${wanted ?? ''}`}
               // a link to one VM by its source id (`?vm=`, SDD §16) opens the table searching for its name
-              key={wanted ?? ''}
+              key={`${providerId}:${wanted ?? ''}`}
               initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}

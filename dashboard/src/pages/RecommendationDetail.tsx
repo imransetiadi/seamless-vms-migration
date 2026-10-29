@@ -1,7 +1,10 @@
 import { History, ShieldAlert, ShieldCheck } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { useEventTail, useMigration, useRecommendation, useRecommendations, useSnapshot } from '../api/hooks';
+import { fetchEventTail, useApi, useEventTail, useMigration, useRecommendation, useRecommendations, useSnapshot } from '../api/hooks';
+import { ApiError } from '../api/client';
+import { Button } from '../components/Button';
+import { EmptyState } from '../components/EmptyState';
 import { useRole } from '../api/session';
 import type { AdvisorRecommendation, Event } from '../api/types';
 import { DeploymentBadge } from '../components/DeploymentBadge';
@@ -85,13 +88,38 @@ function DetailsTab({ rec }: { rec: AdvisorRecommendation }) {
 function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
   const scope = rec.migration_id ? { migration_id: rec.migration_id } : rec.plan_id ? { plan_id: rec.plan_id } : {};
   const events = useEventTail({ ...scope, audit: true }, 1000);
+  const api = useApi();
+  const [older, setOlder] = useState<{ events: Event[]; more: boolean } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const region = useRef<HTMLDivElement>(null);
+  const merged = new Map<number, Event>();
+  for (const e of [...(older?.events ?? []), ...(events.data ?? [])]) merged.set(e.seq, e);
+  const loaded = [...merged.values()].sort((a, b) => a.seq - b.seq);
+  const more = older ? older.more : (events.data?.length ?? 0) >= 1000;
+  const loadOlder = async () => {
+    if (!loaded.length || loading) return;
+    setLoading(true); setError(null);
+    try {
+      const page = await fetchEventTail(api, { ...scope, audit: true, before: loaded[0]!.seq }, 1000);
+      const restore = document.activeElement === button.current;
+      setOlder({ events: [...page, ...loaded], more: page.length >= 1000 });
+      requestAnimationFrame(() => {
+        if (restore && !button.current && document.activeElement === document.body) region.current?.focus();
+      });
+    } catch (e) { setError(e); }
+    finally { setLoading(false); }
+  };
   if (rec.legacy) return <p className="text-sm text-muted-foreground">Written before the audit trail existed: this entry has no audit events.</p>;
   if (events.isPending) return <LoadingBlock rows={2} />;
   if (events.error) return <ErrorBanner error={events.error} title="The audit trail could not be loaded" onRetry={() => void events.refetch()} />;
-  const mine = events.data.filter((e) => e.data.target_id === rec.id);
-  if (mine.length === 0) return <p className="text-sm text-muted-foreground">No audit events for this recommendation yet.</p>;
+  const mine = loaded.filter((e) => e.data.target_id === rec.id);
   return (
-    <ScrollRegion label="Audit events of this recommendation" className="rounded-md border border-border">
+    <div ref={region} role="region" aria-label="Loaded recommendation audit history" tabIndex={-1} className="flex flex-col gap-3">
+      <p className="text-sm text-muted-foreground">{more ? 'Showing a loaded window of the audit trail; older events may exist.' : 'All available audit events loaded.'}</p>
+      {mine.length === 0 && <p className="text-sm text-muted-foreground">{more ? 'No audit events for this recommendation in the loaded window.' : 'No audit events for this recommendation in the available trail.'}</p>}
+      {mine.length > 0 && <ScrollRegion label="Audit events of this recommendation" className="rounded-md border border-border">
       <table className="data-table">
         <caption className="sr-only">Audit events of this recommendation, oldest first</caption>
         <thead>
@@ -117,7 +145,10 @@ function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
           ))}
         </tbody>
       </table>
-    </ScrollRegion>
+    </ScrollRegion>}
+      {more && <Button ref={button} disabledReason={loading ? 'Loading older audit events…' : null} onClick={() => void loadOlder()}>Load older audit events</Button>}
+      {error !== null && <ErrorBanner error={error} title="Older audit events could not be loaded" onRetry={() => void loadOlder()} />}
+    </div>
   );
 }
 
@@ -202,7 +233,9 @@ export default function RecommendationDetail() {
     return (
       <>
         <PageHeader title="Recommendation" breadcrumbs={[{ label: 'Advisor', to: '/advisor' }, { label: recId ?? '' }]} />
-        <ErrorBanner error={rec.error} title="This recommendation could not be loaded" onRetry={() => void rec.refetch()} />
+        {rec.error instanceof ApiError && rec.error.status === 404
+          ? <EmptyState icon={History} title="This recommendation does not exist" action={<Link to="/advisor" className="underline">Back to recommendations</Link>} />
+          : <ErrorBanner error={rec.error} title="This recommendation could not be loaded" onRetry={() => void rec.refetch()} />}
       </>
     );
   }
@@ -269,7 +302,7 @@ export default function RecommendationDetail() {
             label="Recommendation records"
             tabs={[
               { id: 'details', label: 'Details', content: <DetailsTab rec={r} /> },
-              { id: 'audit', label: 'Audit', content: <AuditTab rec={r} /> },
+              { id: 'audit', label: 'Audit', content: <AuditTab key={r.id} rec={r} /> },
               { id: 'input', label: 'Input', content: <InputTab rec={r} /> },
             ]}
           />
