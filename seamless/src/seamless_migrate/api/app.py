@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,6 +56,7 @@ from . import (
     routes_users,
 )
 from .deps import ApiError, Services, validation_message
+from .relay import RelayMiddleware
 
 log = logging.getLogger(__name__)
 API_PREFIX = "/api/v1"
@@ -401,7 +403,8 @@ def create_app(
     """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks). With a
     fenced store - the server's own - the replica's leadership does (SDD §8, §15): its elector's
     first try comes before the server serves, the hooks and the orchestrator run at each takeover
-    and stop at each deposition, and the stop releases the lease."""
+    and stop at each deposition, and the stop releases the lease; while the replica follows, it
+    relays the API to the leader (SDD §12, plan task HA4)."""
     svc = build_services(settings, store, orchestrator, sse_heartbeat_s)
     # SDD §8.7: the notifier runs beside the orchestrator, in the server's process alone
     svc.notifier = Notifier(svc.store, svc.bus, settings, senders_for(settings))
@@ -421,12 +424,22 @@ def create_app(
                 await svc.notifier.stop()
                 await svc.orchestrator.stop()
             return
-        svc.leadership = await _leadership(svc, holder, hooks)
-        await svc.leadership.start()
+        # the relay's client (SDD §12): plain HTTP to the leader's address, never through a proxy
+        # the environment names, no redirect followed, a connection per relayed stream
+        svc.relay_client = httpx.AsyncClient(
+            trust_env=False,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=10),
+        )
         try:
-            yield
+            svc.leadership = await _leadership(svc, holder, hooks)
+            await svc.leadership.start()
+            try:
+                yield
+            finally:
+                await svc.leadership.stop()
         finally:
-            await svc.leadership.stop()
+            await svc.relay_client.aclose()
 
     app = FastAPI(
         title="Seamless Migrate",
@@ -442,6 +455,9 @@ def create_app(
     _install_error_handlers(app)
     # innermost: the compressed response still gets the security headers (SDD §12)
     app.add_middleware(GZipExceptEventStream, stream_path=f"{API_PREFIX}/events/stream")
+    # a follower's relay to the leader (SDD §12, §25.6): outside the compressor, so the leader's
+    # answer passes back as it came, and inside the body limit, so a body over it is never relayed
+    app.add_middleware(RelayMiddleware, services=svc)
     # added before the security headers middleware, which therefore wraps it: a 413 carries the
     # R-05 headers too
     app.add_middleware(BodyLimitMiddleware)

@@ -17,16 +17,19 @@ PLATFORM
   kubernetes | openshift   the cluster manifests (deploy/kubernetes, deploy/openshift), through kubectl or oc
 
 ACTION
-  up                 deploy or update everything, then wait until it runs
+  up                 deploy or update everything, then wait until it runs - on a cluster with the
+                     overlay's replicas: 1, or 2 with the HA component (SDD §25.7)
   down               stop everything; the data stays (volumes, or PVCs and Secrets)
   stop               stop the control plane alone; PostgreSQL keeps running
-  start              start the control plane again (PostgreSQL first, back to one replica)
+  start              start the control plane again (PostgreSQL first, back to one replica) - on a
+                     cluster with the overlay's replicas
   restart            restart the control plane from its current configuration - after a change
-  scale 0|1          the control plane's replicas: 0 stops it, 1 starts it; more is refused - the
-                     orchestrator is a singleton (SDD §17, D2)
+  scale 0|1|2        the control plane's replicas: 0 stops it, 1 starts one; 2 runs two on a
+                     cluster, on two nodes, one of which leads - only with a ReadWriteMany
+                     seamless-data (SDD §25.7); docker and podman run one
   capacity           scale the one control plane up or down: --max-migrations N, --max-cutovers N,
                      and on a cluster --cpu C, --memory M (its limits); then a restart
-  status             what runs, and the API's health
+  status             what runs, and the API's health - on a cluster with --url, the leading pod
   logs               follow the control plane's log
   resume PLAN_ID...  start again the plans a --drain paused (needs --token-file)
 
@@ -155,11 +158,15 @@ if [ -n "$URL" ]; then
   case $URL in http://* | https://*) URL=${URL%/} ;; *) refuse "--url must start with http:// or https://" ;; esac
 fi
 if [ "$ACTION" = scale ]; then
-  [ "$NARGS" = 1 ] || refuse "scale takes one count, 0 or 1"
-  case ${ARGS[0]} in
-    0 | 1) ;;
-    *[!0-9]* | '') refuse "scale takes 0 or 1, not '${ARGS[0]}'" ;;
-    *) refuse "scale takes 0 or 1: Seamless Migrate runs a single control plane - its orchestrator is a singleton (SDD §17, D2), and a second replica would run two orchestrators against one database. To scale up, give the one control plane more capacity: $PLATFORM capacity --max-migrations N (docs/Operations.md)" ;;
+  # one control plane on the single host; one or two replicas on a cluster, of which the lease's leader runs the
+  # orchestrator (SDD §17.2, §25.7)
+  if [ "$KIND" = host ]; then counts='0 or 1'; else counts='0, 1 or 2'; fi
+  [ "$NARGS" = 1 ] || refuse "scale takes one count, $counts"
+  case $KIND:${ARGS[0]} in
+    host:0 | host:1 | cluster:0 | cluster:1 | cluster:2) ;;
+    *:*[!0-9]* | *:) refuse "scale takes $counts, not '${ARGS[0]}'" ;;
+    host:*) refuse "scale takes 0 or 1 on $PLATFORM: the single host runs one control plane - a second container on the same host fails with it (SDD §17.2, §25.7). To scale up, give it more capacity: $PLATFORM capacity --max-migrations N (docs/Operations.md)" ;;
+    *) refuse "scale takes 0, 1 or 2 on $PLATFORM: two replicas on two nodes, of which the lease's leader runs the orchestrator while the other relays to it (SDD §17.2, §25.7) - a third adds no capacity. To scale up, give the control plane more capacity: $PLATFORM capacity --max-migrations N (docs/Operations.md)" ;;
   esac
 elif [ "$ACTION" = resume ]; then
   [ "$NARGS" -ge 1 ] || refuse "resume takes the plans to start again: resume --token-file FILE PLAN_ID..."
@@ -450,6 +457,67 @@ postgres_others() {
     "$PROG" "$n" "$kept" >&2
 }
 rollout() { kube rollout status "$1" "--timeout=${TIMEOUT}s"; }
+# The overlay's count, which a cluster's up and start restore (SDD §17.2, §25.7): the HA component's replicas field when
+# the overlay - or, for Kubernetes, the deploy/openshift it builds - lists the component under its components:, else 1.
+# Read from the files, never from the cluster, where an earlier down left 0; refused unless 1 or 2.
+HA_COMPONENT=deploy/openshift/ha
+REPLICAS=1
+lists_ha() {
+  [ -f "$1" ] && awk '
+    /^components:[ \t]*(#.*)?$/ { listed = 1; next }
+    listed && /^[^ \t#-]/ { listed = 0 }
+    listed && /^[ \t]*-[ \t]*([^ \t#]*\/)?ha\/?[ \t]*(#.*)?$/ { found = 1 }
+    END { exit !found }' "$1"
+}
+overlay_replicas() {
+  local count=''
+  lists_ha "$ROOT/$OVERLAY/kustomization.yaml" ||
+    { [ "$OVERLAY" != deploy/openshift ] && lists_ha "$ROOT/deploy/openshift/kustomization.yaml"; } || return 0
+  [ ! -f "$ROOT/$HA_COMPONENT/kustomization.yaml" ] || count=$(awk '
+    /^[ \t]*(-[ \t]*)?count:/ { sub(/^[ \t]*(-[ \t]*)?count:[ \t]*/, ""); sub(/[ \t]*(#.*)?$/, ""); print }' \
+    "$ROOT/$HA_COMPONENT/kustomization.yaml")
+  case $count in
+    1 | 2) REPLICAS=$count ;;
+    *) check_failed "the HA component's replicas, the count up and start restore, must be 1 or 2 in" \
+      "$HA_COMPONENT/kustomization.yaml, not '$count': nothing was changed" ;;
+  esac
+}
+# Two replicas share seamless-data from two nodes - the new leader reads the run directories the old one wrote -, so a
+# count of 2 takes a ReadWriteMany claim, read from its spec: a class that binds at the first consumer leaves a new
+# claim unbound until a pod uses it (SDD §17.2, §25.7). Refused, naming why, while nothing changed. up asks before its
+# apply, which could not change a claim's access modes, and a claim not there yet is the one its apply creates.
+data_volume_shared() {
+  local modes first=()
+  [ "${1-}" != before_apply ] || first=(--ignore-not-found)
+  if [ "$DRY" = 1 ]; then
+    kube get pvc/seamless-data ${first[@]+"${first[@]}"} -o 'jsonpath={.spec.accessModes[*]}'
+    say "# refused unless seamless-data's claim is ReadWriteMany${first[*]:+ - or not there yet}"
+    return
+  fi
+  modes=$("$KUBE" -n "$NS" get pvc/seamless-data ${first[@]+"${first[@]}"} -o 'jsonpath={.spec.accessModes[*]}') ||
+    check_failed "cannot read pvc/seamless-data in namespace $NS, whose access modes two replicas need: nothing was" \
+      "changed"
+  [ -n "$modes" ] || [ ${#first[@]} -eq 0 ] || return 0 # a first up: the apply creates it as the overlay asks
+  case " $modes " in
+    *" ReadWriteMany "*) ;;
+    *) check_failed "two replicas share seamless-data from two nodes - the new leader reads the run directories" \
+      "the old one wrote (SDD §17.2, §25.7) -, which takes a ReadWriteMany claim, and it is ${modes// /, }: move" \
+      "/data to a ReadWriteMany claim first - a claim's access modes never change -, with the HA component, which" \
+      "asks for one (docs/Operations.md); nothing was changed" ;;
+  esac
+}
+# The leading pod, named by /health's leader (SDD §12, §17.2, §25.6): its holder is the leader's host name - a pod's
+# name - and 8 hex digits of its process, null while no replica leads; an API from before the lease names no leader.
+leading_pod() {
+  local leader holder
+  leader=$(printf '%s' "$1" | tr -d '\n' | sed -n 's/.*"leader"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p')
+  holder=$(printf '%s' "$leader" | sed -n 's/.*"holder"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$holder" ]; then
+    say "leading pod: ${holder%-*}"
+  elif [ "$(printf '%s' "$leader" | sed -n 's/.*"leading"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/p')" = false ]; then
+    say "no replica leads: migrations wait until one takes over"
+  fi
+}
 control_plane_to() {
   kube scale deployment/seamless "--replicas=$1"
   if [ "$1" = 0 ]; then wait_gone seamless; else rollout deployment/seamless; fi
@@ -472,23 +540,24 @@ postgres_one_before_apply() {
   if is_count "$replicas" && [ "$replicas" -gt 1 ]; then kube scale statefulset/seamless-postgres --replicas=1; fi
   postgres_others_gone
 }
+# PostgreSQL first, then the control plane to the count given - the overlay's for start, scale's own (SDD §17.2).
 cluster_start() {
-  local replicas=0
-  if [ "$DRY" = 1 ]; then
-    say "# when PostgreSQL is not at 1 replica:"
-  else
+  local replicas=0 count=$1
+  if [ "$DRY" != 1 ]; then
     # a namespace without it and a read that failed are refusals, told apart (SDD §17.2, review RV44A-08)
     replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres --ignore-not-found -o 'jsonpath={.spec.replicas}') ||
       check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
     [ -n "$replicas" ] || check_failed "no StatefulSet seamless-postgres in namespace $NS: run up first"
     is_count "$replicas" || die "seamless-postgres reports '$replicas' replicas"
   fi
+  [ "$count" != 2 ] || data_volume_shared
+  [ "$DRY" != 1 ] || say "# when PostgreSQL is not at 1 replica:"
   if [ "$replicas" != 1 ]; then
     kube scale statefulset/seamless-postgres --replicas=1
     rollout statefulset/seamless-postgres
   fi
   postgres_others_gone # rollout status does not wait for a scale-down
-  control_plane_to 1
+  control_plane_to "$count"
 }
 # A cluster's capacity: the ConfigMap's settings, and one new pod template - a restart annotation, as rollout restart
 # writes it, and the limits - so the pod restarts once and reads the settings as it starts, also when the limits stay
@@ -711,13 +780,15 @@ cluster() {
   need "$KUBE" "install it and log in to the cluster"
   case $ACTION in
     up)
+      overlay_replicas
+      [ "$REPLICAS" != 2 ] || data_volume_shared before_apply
       postgres_one_before_apply
       kube apply -k "$ROOT/$OVERLAY"
-      # an apply restores no replica count an earlier down set (SDD §17.2)
+      # an apply restores no replica count an earlier down set: the overlay's, read from its files (SDD §17.2)
       kube scale statefulset/seamless-postgres --replicas=1
       rollout statefulset/seamless-postgres
       postgres_others_gone # rollout status does not wait for a scale-down
-      control_plane_to 1
+      control_plane_to "$REPLICAS"
       say "after a change to the ConfigMap or a Secret alone, run: scripts/seamless-ctl.sh $PLATFORM restart"
       ;;
     down)
@@ -726,7 +797,10 @@ cluster() {
       wait_gone seamless-postgres
       ;;
     stop) control_plane_to 0 ;;
-    start) cluster_start ;;
+    start)
+      overlay_replicas
+      cluster_start "$REPLICAS"
+      ;;
     restart)
       # a control plane stopped at 0 replicas starts, as the single host's restart creates and starts it (SDD §17.2,
       # review RV38B-04)
@@ -738,14 +812,18 @@ cluster() {
         rollout deployment/seamless
       fi
       ;;
-    scale) if [ "${ARGS[0]}" = 0 ]; then control_plane_to 0; else cluster_start; fi ;;
+    scale) if [ "${ARGS[0]}" = 0 ]; then control_plane_to 0; else cluster_start "${ARGS[0]}"; fi ;;
     capacity) cluster_capacity ;;
     status)
       kube get deployment/seamless statefulset/seamless-postgres
       kube get pods -l 'app.kubernetes.io/name in (seamless,seamless-postgres)'
-      if [ -n "$API" ]; then
-        run curl -fsS --max-time 10 "$API/api/v1/health" || die "the API does not answer at $API"
-        say ""
+      if [ -n "$API" ] && [ "$DRY" = 1 ]; then
+        run curl -fsS --max-time 10 "$API/api/v1/health"
+        say "# then the leading pod, named by the health's leader"
+      elif [ -n "$API" ]; then
+        health=$(curl -fsS --max-time 10 "$API/api/v1/health") || die "the API does not answer at $API"
+        say "$health"
+        leading_pod "$health"
       fi
       ;;
     logs) kube logs deployment/seamless -f --tail=200 ;;

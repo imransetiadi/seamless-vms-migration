@@ -1,5 +1,5 @@
-# Seamless Migrate on OpenShift 4.16+ (SDD 17). Single-replica control plane, PostgreSQL 16 StatefulSet,
-# edge-TLS Route, default-deny NetworkPolicies.
+# Seamless Migrate on OpenShift 4.16+ (SDD 17). One control plane replica - two with the HA component below -,
+# PostgreSQL 16 StatefulSet, edge-TLS Route, default-deny NetworkPolicies.
 #
 # Deploy:
 #   1. Build and push the image from the repository root:
@@ -34,6 +34,12 @@ resources:
   - service.yaml
   - route.yaml
   - networkpolicy.yaml
+
+# Two replicas on two nodes (SDD 17, 25.7; a Technology Preview): uncomment the two lines below - only with a
+# ReadWriteMany storage class, once /data moved to the new claim with the control plane stopped (docs/Operations.md).
+# ha/kustomization.yaml says what the component sets; scripts/seamless-ctl.sh up and start restore its two replicas.
+# components:
+#   - ha
 
 # metadata labels only: selectors are immutable, so they must not be rewritten
 labels:

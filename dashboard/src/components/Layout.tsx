@@ -24,6 +24,7 @@ import { Link, Outlet, useLocation } from 'react-router-dom';
 import { useHealth, useMe, useStats } from '../api/hooks';
 import { useLiveSnapshot, type LiveStatus } from '../api/live';
 import { useSignOut } from '../api/session';
+import type { Health } from '../api/types';
 import { cn } from '../lib/cn';
 import { hashTarget, keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
@@ -220,9 +221,29 @@ function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: Nav
   );
 }
 
+/** Whether no replica leads the orchestrator (SDD §12, §25.6): the replica that answered does not lead and names none. */
+function noReplicaLeads(h: Health): boolean {
+  return h.leader !== undefined && !h.leader.leading && h.leader.holder === null;
+}
+
 /**
- * Shown above every page while GET /health is degraded or unreachable (SDD §12). The live
- * region is always mounted so screen readers announce the text when it appears.
+ * What ails the leader's orchestrator loop, whichever replica answered GET /health (SDD §12, §16): the leading replica
+ * is named when another one answered.
+ */
+function loopTrouble(h: Health): string {
+  const { running, last_tick_age_s: age } = h.orchestrator;
+  const loop =
+    h.leader && !h.leader.leading && h.leader.holder !== null
+      ? `the orchestrator loop of the leading replica ${h.leader.holder}`
+      : 'the orchestrator loop';
+  if (!running) return `${loop} is not running`;
+  return age === null ? `${loop} is unhealthy before its first tick` : `${loop} is unhealthy (last tick ${Math.round(age)} s ago)`;
+}
+
+/**
+ * Shown above every page while GET /health is degraded or unreachable, while the leader's orchestrator is unhealthy -
+ * whichever replica answered - and while no replica leads (SDD §12, §16). The live region is always mounted so screen
+ * readers announce the text when it appears.
  */
 function HealthNotice() {
   const health = useHealth();
@@ -231,22 +252,20 @@ function HealthNotice() {
   if (health.isError) {
     tone = 'warning';
     text = 'The control plane is not answering health checks; the data below may be stale.';
-  } else if (health.data && health.data.status === 'degraded') {
+  } else if (health.data) {
     const h = health.data;
+    const nobody = noReplicaLeads(h);
     const reasons: string[] = [];
     if (h.db !== 'ok') reasons.push('the database is unreachable');
-    if (h.orchestrator && !h.orchestrator.healthy) {
-      const age = h.orchestrator.last_tick_age_s;
-      reasons.push(
-        !h.orchestrator.running
-          ? 'the orchestrator loop is not running'
-          : age === null
-            ? 'the orchestrator loop is unhealthy before its first tick'
-            : `the orchestrator loop is unhealthy (last tick ${Math.round(age)} s ago)`,
-      );
+    // while no replica leads, no orchestrator runs anywhere: the notice below says so instead
+    if (!nobody && h.orchestrator && !h.orchestrator.healthy) reasons.push(loopTrouble(h));
+    if (reasons.length || h.status === 'degraded') {
+      tone = 'danger';
+      text = `Control plane degraded: ${reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is resolved.`;
+    } else if (nobody) {
+      tone = 'warning';
+      text = 'No replica leads the orchestrator: migrations wait until one takes over.';
     }
-    tone = 'danger';
-    text = `Control plane degraded: ${reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is resolved.`;
   }
   return (
     <p
@@ -359,6 +378,18 @@ function SessionFooter() {
             : health.data.orchestrator.running
               ? 'stalled'
               : 'stopped'}
+        </p>
+      )}
+      {health.data?.leader && (health.data.leader.holder !== null || !health.data.leader.leading) && (
+        // the orchestrator above is the leader's, whichever replica answered (SDD §12, §16, §25.6)
+        <p
+          className={cn(
+            'px-1 text-xs wrap-anywhere',
+            health.data.leader.holder === null ? 'text-status-warning' : 'text-muted-foreground',
+          )}
+          data-testid="orchestrator-leader"
+        >
+          {health.data.leader.holder === null ? 'No replica leads' : `Leading replica ${health.data.leader.holder}`}
         </p>
       )}
       {health.data?.version && (

@@ -3461,7 +3461,11 @@ strategy ineligible):
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
-  `dst_caps["admin"]` truthy, and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
+  `dst_caps["admin"]` truthy - for a plan with a `destination_project`, `admin` among the roles of that project's entry
+  of the destination's check report (`dst_caps["projects"]`, §10; roles not read count as none) instead of
+  `dst_caps["admin"]`: that project's credential manages the volumes and creates the server, and the provider's own
+  acts in no part of the destination half (§7.3, §27.5, §27.6), so the reason names the project (plan task TC6) -,
+  and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
   it (step 3's `delete_on_termination` update goes to the source server; the destination never receives it, §21.4);
   for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
@@ -3498,7 +3502,9 @@ source=None, destination=None) -> list[Finding]` — `all_vms` are the plan's se
 names, cumulative quotas), `source`/`destination` the providers (conversion-host check). Where a finding's message
 means the destination cloud it names the destination provider (`destination.name`, "the destination" when
 `run_preflight` has none); its remediation, fixed by the catalog, says "the destination" (§1 naming, plan T6).
-Finding catalog (code — severity — condition):
+Validation also gives it both providers' check reports as its checks just read them (`src_caps`, `dst_caps`), its
+clock (`now`) and the keys of its VMs' keypairs (`keypair_fingerprints`, below) for the credential rows (plan task
+TC6). Finding catalog (code — severity — condition):
 
 | Code | Severity | Condition |
 |---|---|---|
@@ -3523,7 +3529,11 @@ Finding catalog (code — severity — condition):
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume). The free quota is the limit less what is in use, so each VM counts what a cutover will still create (review PL-02): all of it with no migration yet or one in `pending`, `validating`, `blocked`, `ready`, `failed` or `rolled_back` (it runs, or runs again, from `ready`) - but one of these that holds the destination volumes an earlier attempt created, which the next attempt uses again (a failed or rolled-back warm attempt, or one a Retry put back in `ready`; its workload record's destination volumes - an unreadable record counts as holding them -, and where no record tells - the demo, the VMware kit - recorded passes of a `warm` migration (its rollback keeps them for every later attempt), or passes a `vmware_warm` one recorded since the kit last released its copies (a pass that started once the attempt after its last `cutover` entered `precopy`, every pass when no `cutover` ran, none when its last attempt ran one) - the strategy being the one of the attempt whose copies remain: while the migration waits for its next attempt (`pending`, `validating`, `blocked`, `ready`), the retried attempt's, whatever a validation or `PUT …/strategy` chose since (the VMware kit keeps no record, so a `vmware_warm` migration switched to `vmware_cold` still holds the kit's copies, review RV40-06) -: the kit's rollback deletes its copies after a cutover, or marks them `cutover`, and a later attempt's first copy cut off - no copy completed - is deleted too, while the copies an attempt with no cutover completed stay, marked, and the next attempt's first run syncs them by CBT - cut off, it keeps them (§7.2, reviews RV40-05, RV41B-02) -; a `cold`, `vmware_cold` or `storage_handover` rollback keeps no copy), counts its server alone (reviews RV38A-01, RV39-02); its server alone (cores, ram, instances) in `precopy`, `syncing`, `awaiting_cutover` or `cutover` (its destination volumes exist or are being created); nothing in `verifying`, `completed`, `finalized`, `rolling_back` or `cancelled` (what it holds is in use, or being released). A VM's cores and ram are those of the destination flavor its server is created with - a GPU VM's GPU flavor (§22.4), a VMware VM's included; else the mapped one, else the same-named or automatically matched one (`MAP_FLAVOR_AUTO`) -, and its own for a flavor pre-staging creates with the source's size, for a VMware VM without a GPU flavor (the migration kit chooses the flavor, §7.2) and when no destination flavor resolves (review PL-01) |
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
-| `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
+| `DST_KEYPAIR_KEY_MISMATCH` | blocker | an OpenStack VM's `key_name` names a keypair that both the source credential's user and the destination credential's user hold (both inventories list it, §10), and their keys differ: validation reads each public key with the plan's credential on its side (`keypair_public_key`, §10; §27.5's inventory row) and compares their SHA256 fingerprints as `ssh-keygen -l` prints them - the key's type and its key, never its comment. Keypairs belong to users (§27.6): the server is created as the destination credential's user and would boot with that user's key of the name, not the source's - a key name two tenants use is one keypair for two project credentials of one user. The message names the key name and both fingerprints with their providers; a key validation could not read, or one that is no OpenSSH public key (an x509 certificate), is not judged (plan task TC6) |
+| `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge). Its remediation names `plan.mappings.projects` and the plan's `destination_project`, the project where a plan with one lands its VMs (§27.4, §27.6, plan task TC6) |
+| `PROJECT_CREDENTIAL_EXPIRING` | warning | a project credential the plan uses - its `source_project`'s on the source provider, its `destination_project`'s on the destination (§27.4) - expires, by the `expires_at` of its entry of that provider's check report as validation's check just read it (`projects`, §10), within 7 days of the validation or before the plan's `cutover_window` ends (owner decision 9, §27.7). One finding per credential: the message names the provider, the plan's side, the project (its name and id), the expiry and which of the two holds. A credential that never expires (`expires_at` null) is not judged, nor are the providers' own credentials, whose check reads no expiry; one that has expired is refused before any finding (§8, plan task TC6) |
+| `PROJECT_CREDENTIAL_UNRESTRICTED` | warning | a project credential the plan uses is an unrestricted application credential (its entry's `restricted` false, §10): it may create other application credentials and trusts (§27.8). One finding per credential, naming the provider, the plan's side and the project; `restricted` null is not judged (plan task TC6) |
+| `PROJECT_CREDENTIAL_ROLE_MISSING` | blocker | a project credential the plan uses lacks, among the roles of its entry (`roles`, §10), `member` - a token lists the roles its roles imply, so `manager` and `admin` carry it (`TODO(LAB): confirm` that, and the legacy profile, whose rules take any role on the project) -, or, for a plan that maps Octavia pools (`network_cutover.lb_pools`), `load-balancer_member`, which the member helper acts with on both sides (§8.5, §27.5). One finding per credential, naming the provider, the plan's side, the project, each role it lacks and the roles its token holds; roles not read are not judged (plan task TC6) |
 | `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - the source's compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead (§9.2) |
 | `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or the detected range contradicts its declared `release` (`declared_outside_range`, §10.1; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
 | `DST_DNS_INTEGRATION_MISSING` | warning | an OpenStack VM's NIC is published in DNS by Neutron's DNS integration at the source (`Nic.dns_name` and `Nic.dns_domain`, §4.2), and the destination lacks it: its Neutron lists no `dns-integration` extension, or its Designate holds no zone of that domain for the destination credential (`DestinationInventory.dns`, §10; a domain is compared lower case with its trailing dot) - the migrated port is not published (§23.5). A destination whose extensions could not be read is not judged, nor its zones when Designate could not be read |
@@ -3531,7 +3541,7 @@ Finding catalog (code — severity — condition):
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | a VM's NIC goes to a RHOSO network name (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name, §7.2) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A VMware NIC's IPv4 guest addresses (the migration kit sends only those, with one subnet per NIC, §7.2) must all be host addresses of one subnet of its resolved network. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
-| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` and `policy_profile` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
+| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` of the plan's destination credential - for a plan with a `destination_project` that project's entry of the destination's check report (`projects`, §10), else the provider's own `roles` (plan task TC6) - and the destination's `policy_profile`, as validation's check reports them; when no `roles` are reported, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails, and the project whose credential it judges for a plan with a destination project |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `NET_PREFIX_SPLIT` | warning | the source or the destination provider declares `announces_tenant_networks` (§4.2, §23.6), and the plan's waves put the VMs of one source network into more than one wave: while one wave is cut over and the next is not, the network's prefix has an origin in each cloud, and its tenant routes cannot be correct. The message names the network, its waves by name and the declaring provider; nothing is judged before the waves are planned |
 | `NET_LB_POOL_SPLIT` | warning | the VM is a member of an Octavia pool of the source (a membership as `SRC_VM_LB_MEMBER` reads it, of a pool the plan maps too: the member helper moves each member with its own VM's cutover, §8.5), and the plan's waves put the pool's members among the plan's VMs into more than one wave: while one wave is cut over and the next is not, the pool's members are in both clouds, and its load balancer reaches only those not yet cut over (§23.7). A member that is no VM of the plan, or a VM of the plan in no wave, is not counted. The message names each such pool with its load balancer, its waves by name in their order and the source provider; nothing is judged before the waves are planned |
@@ -3539,7 +3549,7 @@ Finding catalog (code — severity — condition):
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | the plan's `network_cutover.floating_ips` is `"auto"` (under `"keep_address"` the move of §8.3 keeps the address, and `DST_FIP_ADDRESS_UNAVAILABLE` judges it) and an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
 | `NET_DNS_TTL_LONG` | warning | the plan names a DNS target for the VM (`network_cutover.dns_targets`, §4.2) whose record validation read (§8.4, §10: Designate's recordset with the destination provider's credential, or a TSIG-signed query to the RFC 2136 server) and its TTL is longer than the plan's `downtime_slo_s`: after the swap, clients may reach the old address for up to that TTL. The message names the record, its TTL and the SLO; a record that cannot be read is not judged |
-| `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the token lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
+| `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the credential that reserves it (§8.3) lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`) -: for a plan with a `destination_project`, the credential §8.3's reservation names (`credentials.reservation`, §27.6): its project credential when that one's roles may choose the address, else the destination provider's own, which reserves for the project and so needs `admin` whatever the profile (plan task TC6); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
 | `VM_PCI_PASSTHROUGH` | blocker | the VM has a passthrough device - an entry of kind `passthrough` in its `gpus` (§22.2): an OpenStack flavor's `pci_passthrough:alias`, a VMware `VirtualPCIPassthrough` device that is no vGPU (plan task G2) - and no GPU mapping applies to it, as for `VM_VGPU`; for a VMware device without ids, the message says that no mapping can name it (§22.4, plan task G4) |
 | `VM_VGPU` | blocker | the VM has a vGPU - an entry of kind `vgpu` in its `gpus` (§22.2): an OpenStack flavor's `resources:VGPU`, bare or in its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08), or a custom resource class its source declares a profile for (§22.3); a VMware vGPU device (plan task G2) - and no GPU mapping applies to it (§22.4): no mapping names it (the message names the GPU key or the flavor to map), its mapping's flavor asks for no GPU (the message names the mapping and says the server would lose its GPU), or its GPUs' keys map to different flavors (plan task G4) |
 | `MAP_GPU_FLAVOR` | info; **warning** when the GPU flavor gives fewer vCPUs, less RAM or a smaller local root disk than the VM | a GPU mapping applies (§22.4): the message names the VM's GPUs, the GPU flavor with its size and GPU requests, and that GPU migration is a Technology Preview (§22.1) |
@@ -3592,6 +3602,17 @@ pairs, floating IPs and DNS names (§4.2, §10) - and the destination's floating
 reads the plan's waves and the providers' `announces_tenant_networks`, and `NET_LB_POOL_SPLIT` (§23.7) the plan's waves
 and the source's `lb_members` for each VM of the plan. None of them blocks: each warns of what the migration does not
 carry or its waves split, and its remediation says what the operator does about it.
+
+The credential rows (plan task TC6, §27.7) judge the plan's project credentials as validation's checks just read them
+(§8, §10): the entry of its `source_project` in the source's check report and of its `destination_project` in the
+destination's (`projects`: `roles`, `restricted`, `expires_at`), with validation's clock. A side whose project is
+null - the provider's own credential, 0.4.0's rule - is not judged, and a plan whose project credential is missing,
+failed its check or has expired never reaches them (400, §8). Each such finding is about one credential and its
+message names the project, which a findings list shows (§16). The role halves of `NET_PORT_NOT_PERMITTED` and
+`DST_FIP_ADDRESS_UNAVAILABLE`, and the handover's eligibility (§9.2), read the plan's destination credential's roles
+from the same entry. `DST_KEYPAIR_KEY_MISMATCH` reads `keypair_fingerprints`: for each key name of the plan's
+OpenStack VMs that both inventories list, the fingerprints of the source's and the destination's keys as validation
+read them - null for one it could not read, which is not judged.
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -4418,7 +4439,8 @@ JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP
 `bad_request`), 401 (no/invalid token), 403 (role), 404, 405 (`method_not_allowed`), 409 (invalid
 transition / conflict), 413 (`payload_too_large`, below), 422 (schema), 429 (`too_many_requests`, the
 auth lockout of §15.1), 500 (`internal_error`, message never carries internals), 502
-(`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
+(`provider_error`, the redacted provider message), 503 (`/ready` while degraded; `no_leader` with `Retry-After: 2`,
+a follower's answer while no replica leads or the leader does not answer, below). Every response,
 including error responses written by the server-error handler and the answers to CORS preflights (with
 `SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
 `bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
@@ -4455,8 +4477,8 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
-| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool},"leader":{"leading":bool,"holder":str\|null,"epoch":int\|null,"since":datetime\|null}}` — `status` and `db` judge the replica that answers (plan task HA4): `degraded` when the database is unreachable or, on the replica that leads (§8), the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed, and on a follower when its campaign is dead (no try of the lease for max(5 × the retry period, 30 s), §8, §11); probes use it; `orchestrator`: the leader's, whichever replica answers (below); `leader` (§25.6): `leading`, whether this replica leads, and the lease's `holder`, `epoch` and `acquired_at` (`since`) while the lease is valid as this replica reads the row (§11), each null while no replica leads or the row cannot be read - a leader that cannot read it names its own holder and epoch, `since` null -; a server whose store holds no lease (a test's) leads alone: `leading` true, the rest null; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
+| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness): it judges the replica that answers, so both replicas are ready while one leads (§25.6) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
@@ -4544,6 +4566,41 @@ Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are 
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
 disabled (Security.md R-04). Every response carries the security headers of Security.md R-05.
 
+**The followers** (§25.6, plan task HA4). A server replica that does not lead (§8) answers `/api/v1/health`,
+`/api/v1/ready` and `/api/v1/metrics`, the API documents and the dashboard's files itself, and relays every other
+request whose path is `/api/v1` or lies under it - the event stream too - to the lease's `address` as it reads the
+row at the request (§11), over plain HTTP (§25.9), once the body limit above passed: a body over it is refused by the
+follower and never relayed.
+* *What it sends:* the method, the path as the caller sent it and its query, the body, and of the caller's headers
+  `Authorization`, `Content-Type` and `Accept-Encoding` alone - no cookie, no hop-by-hop header, no other -, with
+  `X-Forwarded-For` extended by the caller's address as the follower reads it (its own lockout's, §13.1) and the
+  marker `X-Seamless-Relayed: 1`. The leader authenticates, authorizes, audits and answers the request as a direct
+  one (§13.1); the follower checks no token of it and passes the answer back as it came - its status, its headers
+  but the hop-by-hop ones, `Date` and `Server`, and its body as it flows.
+* *The marker:* a replica that does not lead answers a request marked `X-Seamless-Relayed` that it would relay with
+  503 `no_leader` and never relays it again (the lease was taken meanwhile); the leader serves a marked request as any
+  other, so a marker a client sets itself gains nothing.
+* *Its bounds:* the relay connects within the retry period, 2 s (§11); it reads the event stream without a bound and
+  ends it when the leader's end of it ends - the client reconnects with `?since=` and gets what it missed from the
+  next leader, the ephemeral events of the gap lost as across a restart (§4.3) -, and gives every other request 300 s
+  from its sending to the last byte of its answer. An answer cut off midway ends where it was cut.
+* *503 `no_leader`*, with `Retry-After: 2`: while no replica leads - the row is missing or expired, or names this
+  replica, deposed before its lease lapsed -; when the leader does not answer - no connection, an error before its
+  answer, or no answer within the 300 s -; and with authentication off, which binds a loopback address alone (§13.1):
+  the leader's refusal of another site's page reads the caller's `Host` and `Origin`, which a relay does not carry,
+  so a follower then relays nothing. A failed relay is logged with its method and path, never a header, the query or
+  the body.
+* *The leader's orchestrator on every replica:* the leader writes its orchestrator's object into the lease row's
+  `health` (§11) with each renewal and, each retry period its tick loop is unhealthy and it renews nothing (§8), alone;
+  a takeover clears it. `/health` reports the leader's own object on the leader, and on a follower the one the row
+  holds: the leader's as of its last write; one before its start (`running` false, `last_tick_age_s` null, `ticks` 0,
+  `healthy` true) until a new leader's first write; and while no replica leads, or the row cannot be read, one that
+  does not run (`running` and `healthy` false, `last_tick_age_s` null, `ticks` 0). A follower's `status`, `db` and
+  `/ready` judge the follower alone, so both replicas are ready while one leads, and the dashboard reads the leader's
+  orchestrator whichever replica answered (§16).
+
+A server whose store holds no lease (a test's) leads alone and relays nothing.
+
 ```text
 ValidationReport { plan_id: str, ok: bool,
                    migrations: [{ migration_id, vm_name, strategy, phase, findings: Finding[],
@@ -4615,6 +4672,11 @@ the principal's name (`unauthenticated` without one), `message` `METHOD path: re
 `{path, method, reason, required_role, client}` - the path as the client sent it, percent-encoded, so a NUL reads
 `%00` and the record is written on PostgreSQL too (§11, review ST-03) -, never the token; at most 30 per client
 address and minute are recorded.
+A follower (§12, plan task HA4) checks no token of a request it relays: the leader authenticates, refuses and
+records it with the caller's address the follower appended to `X-Forwarded-For` - uvicorn reads it there when
+`FORWARDED_ALLOW_IPS` lists the replicas' addresses beside the router's (§25.9) -, so the leader's lockout and its
+`auth.denied` count the caller, never the follower. A follower records `auth.denied`, and counts failures in its
+own lockout, only for what it answers itself: `/metrics` and the API documents.
 
 Admins can add people from Dashboard **Users** (`POST /users`). Names are 1-128 ASCII letters,
 digits, dots, underscores, `@` or hyphens, starting with a letter or digit; surrounding whitespace
@@ -5209,6 +5271,12 @@ cutoff after now (a negative or non-finite `--older-than-days`, a later `--befor
 whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
+`status` prints first the orchestrator's leader as the lease's row names it (§11, §25.8; plan task HA5), whether the
+lease still holds judged on the database's clock, never the CLI's: `leader: {holder} (epoch {epoch})`; once the
+lease expired - its server released it or stopped renewing it, and no other took it since -
+`leader: none (the lease of {holder} at epoch {epoch} expired)`; and `leader: none (no server took the lease)` before
+any did. Its table of the migrations follows, one plan's with `--plan`. The line is a read alone: the CLI takes,
+renews and releases no lease (§25.6).
 
 A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
 errors the API answers with a status (§12); refused arguments — `estimate`'s knobs, `events prune`'s cutoff or a
@@ -5308,6 +5376,15 @@ is no origin a browser sends (review RV31-03).
   "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
   menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
   holding the full sidebar's groups and session; without motion when `prefers-reduced-motion` asks.
+* The orchestrator and its leader (§12, §25.6, plan task HA4): the session's orchestrator line reads `/health`'s
+  `orchestrator` - the leader's, whichever replica answered - as running with its last tick's age, starting, stalled
+  or stopped, and under it the leading replica (`leader.holder`), or "No replica leads" while none does (`holder`
+  null on a replica that does not lead). The notice above every page (a polite live region, empty while all is
+  well) says what keeps the migrations from advancing: the control plane not answering its health checks; a
+  degraded health, naming the database when it is unreachable; the leader's orchestrator loop not running or
+  unhealthy, with its last tick's age, whichever replica answered - naming the leading replica when the one that
+  answered does not lead -; and, while no replica leads, that migrations wait until one takes over. The offline
+  mock answers with one replica that leads.
 * Destination wording (§1 naming, plan T6): the dashboard names RHOSO 18.0 and community OpenStack as destinations
   where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
@@ -5335,6 +5412,14 @@ is no origin a browser sends (review RV31-03).
   `EXTENT_TRACKING_MISSED` (§28.9) - carries a "Technology Preview" badge as the GPU elements do, its detail
   "Technology Preview, validated in simulation: changed-extent tracking has not yet run on the lab's Ceph
   clusters." (§28.11), until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (plan task CE13).
+* The credential findings (§27.7, from 0.5.0, plan task TC6): the dashboard's finding catalog holds
+  `PROJECT_CREDENTIAL_EXPIRING`, `PROJECT_CREDENTIAL_UNRESTRICTED`, `PROJECT_CREDENTIAL_ROLE_MISSING` and
+  `DST_KEYPAIR_KEY_MISMATCH` as the API's (severity, strategies, remediation; the shared `finding_catalog.json`). A
+  credential finding is about one project, which its message names with its provider: a plan's findings list groups
+  each of the three `PROJECT_CREDENTIAL_*` codes by its message, so each entry names its project above its VMs - two
+  projects' findings of one code are two entries, never one whose projects only its VMs' details name -, and a
+  migration's list shows each message. The offline mock's pre-flight gives none of the four: its providers hold no
+  project credential (plan tasks TC8, TC9).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -6108,11 +6193,12 @@ is no origin a browser sends (review RV31-03).
   §17.1). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
-  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
+  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica, 2 with the HA component below,
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `shareProcessNamespace`
   — the pod's pause process is PID 1 and reaps what Ansible leaves behind, the ssh `ControlPersist` masters,
   as `init: true` does in Compose; `seamless serve` would leave them as zombies — liveness
-  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only;
+  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only - and,
+  with the HA component, from the other replica on the API port alone -;
   egress to cloud APIs - the OpenStack services the control plane calls on their community and RHOSP 17.1 public
   ports, Placement (§22.3), Heat, Octavia (§10, §8.5) and Designate (§8.4) among them, RHOSO 18.0's on 443 -,
   vCenter, conversion hosts, Jev, agentmemory, an RFC 2136 DNS target's server on TCP 53 (§8.4), a webhook hook's
@@ -6129,15 +6215,53 @@ is no origin a browser sends (review RV31-03).
   6443 egress rules except the cluster's pod and service networks instead of OpenShift's (kubeadm/kind
   defaults `10.244.0.0/16`, `10.96.0.0/12`, and `169.254.0.0/16` — adjust per cluster; OpenShift's
   ranges are ordinary private addresses there); PostgreSQL from `quay.io/sclorg/postgresql-16-c9s`
-  pinned by digest (the image interface of `registry.redhat.io/rhel9/postgresql-16`).
+  pinned by digest (the image interface of `registry.redhat.io/rhel9/postgresql-16`); the namespace
+  `seamless-migrate` also on what the overlay adds itself - the Ingress and the HA component's objects -, as
+  `deploy/openshift` sets it on its own, so an `apply -k` without `-n` puts them beside the rest (plan task HA6).
   kustomize silently ignores a patch whose target matches nothing, so CI renders the overlay and asserts
   each patch's result.
 * Dashboard-entered credentials (`SEAMLESS_SECRET_STORE=kubernetes`, §13.3): the `seamless`
   ServiceAccount gets a namespaced Role (`secrets`: get, create, update, delete) and its token is
   mounted; the API answers 503 for the credential routes when the store cannot reach the API server.
-* Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
-  a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
-  existing database through the `seamless-db` Secret).
+* **One replica, or two with the HA component** (§25.7, plan task HA6). The base runs one replica, which runs on any
+  cluster; whichever runs it, the lease elects the one replica that runs the orchestrator (§8, §11). The HA component
+  is the kustomize component `deploy/openshift/ha`, which the OpenShift overlay includes, and which the Kubernetes
+  overlay includes through `deploy/kubernetes/ha` - the same component with that overlay's pod network -, each by
+  the two `components:` lines its kustomization carries commented. It sets:
+  * `replicas: 2` - its `replicas` field, the count `seamless-ctl.sh` reads (§17.2) - with a required pod
+    anti-affinity on `kubernetes.io/hostname`: the replicas run on two nodes, and during a drain the evicted one waits
+    for a node without the other, which leads meanwhile;
+  * `strategy: Recreate`, kept: a rollout ends the old pods before it starts new ones, so one version runs at a time
+    and an upgrade stays an outage of the control plane, which `--drain` keeps cutovers out of (§17.2);
+  * the PodDisruptionBudget `seamless`, `maxUnavailable: 1` and `unhealthyPodEvictionPolicy: AlwaysAllow` (stable
+    since Kubernetes 1.31; `TODO(LAB): confirm` on NFR-10's 1.28): a drain evicts one replica at a time, and a
+    replica that is not ready never blocks it;
+  * `seamless-data` ReadWriteMany: the new leader reads the run directories the old one wrote (§25.1). Its class is
+    the cluster's - a `storageClassName` the component carries commented, a CephFS class of OpenShift Data Foundation
+    on OpenShift (`TODO(LAB): confirm` the class and its encryption in transit, §25.9). A claim's access modes never
+    change, so an installation moves `/data` to a new claim once, with the control plane stopped (Operations.md);
+  * the NetworkPolicy `seamless-allow-relay`: ingress from and egress to the control plane's own pods on the API
+    port, TCP 8080, alone - the relay of §25.6 - and nothing else between the replicas. No Kubernetes RBAC is
+    added: the lease is the database's;
+  * uvicorn's `FORWARDED_ALLOW_IPS`: the cluster's pod network, where the replicas are - and, on the default
+    networks, the router's or ingress controller's hop -, so the leader's lockout and audit count the caller, never
+    the follower (§13.1, §25.9): OpenShift's default `10.128.0.0/14`, and in `deploy/kubernetes/ha` the Kubernetes
+    overlay's `10.244.0.0/16`, each adjusted with the NetworkPolicies' ranges. It relies on the NetworkPolicies,
+    which admit only the router and the other replica to the API port.
+
+  CI renders both overlays with the component enabled as an installation enables it, validates them with
+  kubeconform as without it, and asserts what each of its patches must produce.
+* **PostgreSQL** (§25.7). The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an existing
+  database through the `seamless-db` Secret), one pod: two control plane nodes help only with a database that
+  outlives a node, and while its node is down no replica leads. Its server starts with `tcp_keepalives_idle` 10,
+  `tcp_keepalives_interval` 5 and `tcp_keepalives_count` 6 - a client that vanished is dropped within 40 s, and with
+  it its session locks, a cut-off leader's VM-claim lock among them (§5.4) - and `idle_in_transaction_session_timeout`
+  10 s, under which the application role runs: a leader cut off inside a write holds its key-share lock no longer
+  (§11, §25.4). They are the image's `run-postgresql` arguments, which it hands to `postgres` as `-c` options, so
+  they hold for whichever role the control plane connects as - the image's owner role, or an application role of
+  Security.md §9.4 -; `pg_dump` and `pg_restore` lift the timeout for their own sessions. A database of one's own
+  needs them set: the keepalives on its server, the timeout for the application role (`ALTER ROLE … SET
+  idle_in_transaction_session_timeout = '10s'`) - `TODO(LAB): confirm` which ones a managed service lets one change.
 * Backups (optional, `deploy/openshift/backup/`): a CronJob runs `pg_dump -Fc` nightly from the database's own
   image into the `seamless-backups` PVC under the restricted security context, with its own NetworkPolicies
   (egress to PostgreSQL, ingress from the backup pods), keeping `BACKUP_KEEP_DAYS` days; `restore-job.yaml` and
@@ -6224,25 +6348,37 @@ CI (QASuite §14.5) proves the Linux path:
 `scripts/seamless-ctl.sh PLATFORM ACTION [options]` runs a deployment's lifecycle the same way on every platform:
 `docker` and `podman` drive the single-host stack of §17.1 through its Make targets (`SEAMLESS_ENGINE`), and
 `kubernetes` and `openshift` drive the manifests of §17 through `kubectl` or `oc` in one namespace (`--namespace`,
-default `seamless-migrate`). It never runs a second orchestrator and never deletes data - removing the volumes stays
-`make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its PVCs stays a manual act.
+default `seamless-migrate`). It never runs a second orchestrator - one control plane on the single host, and on a
+cluster one or two replicas, of which the lease's leader alone runs the orchestrator (§17, §25) - and never deletes
+data - removing the volumes stays `make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its
+PVCs stays a manual act.
 
 | Action | `docker`, `podman` | `kubernetes`, `openshift` |
 |---|---|---|
-| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | PostgreSQL scaled out of band brought back to one replica first, its extra pods awaited gone as `start` awaits them - before the apply, which may roll the control plane's pod at once (a new image in the overlay) onto every database (reviews RV42A-02, RV43A-01); a namespace without the StatefulSet yet - a first `up`, which the read answers as not found - has none, and any other failure of that read is refused (2) before the apply (review RV44A-04) -, then `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
+| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | PostgreSQL scaled out of band brought back to one replica first, its extra pods awaited gone as `start` awaits them - before the apply, which may roll the control plane's pod at once (a new image in the overlay) onto every database (reviews RV42A-02, RV43A-01); a namespace without the StatefulSet yet - a first `up`, which the read answers as not found - has none, and any other failure of that read is refused (2) before the apply (review RV44A-04) -; with the HA component, a `seamless-data` that exists and is not ReadWriteMany refused (2) the same way, since a claim's access modes never change and the apply could not make it one (§17); then `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL scaled to one replica and the control plane to the overlay's count, 1 or 2 with the HA component (below) - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
 | `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its running pod gone - a pod that failed or succeeded (one evicted) is not waited for: the scale-down never deletes it (review RV38B-03) -, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
 | `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its running pod gone |
-| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to one, both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, both with 2 before anything changed (review RV44A-08) |
+| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to the overlay's count (below), both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, and so is a count of 2 while `seamless-data` is not ReadWriteMany (below), all with 2 before anything changed (review RV44A-08) |
 | `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited; a control plane at 0 replicas (`stop`) is scaled to one instead, as the single host's restart creates and starts it (review RV38B-04) |
-| `scale N` | `N` 0 is `stop`, 1 is `start` | the same |
+| `scale N` | `N` 0 is `stop`, 1 is `start` | `N` 0 is `stop`; 1 and 2 are `start` with that count instead of the overlay's, 2 only while `seamless-data` is ReadWriteMany (below) |
 | `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | `--cpu` and `--memory` first checked by a server-side dry run of the Deployment's patch (a limit below the requests changes nothing, review RV38B-02), then the settings patched into the ConfigMap `seamless-config`, then one patch of the pod template - the limits and a restart annotation, so the pod restarts once and reads the settings even when the limits stay as they are (review RV38B-01) -, awaited. When that patch fails, or its rollout does - a LimitRange or a quota refusing the new pod's limits, which the Deployment's dry run cannot see (admission judges the pod) -, the settings the ConfigMap held are put back and the template rolled back (`rollout undo`, after the put-back so the pod it starts reads the settings as they were, awaited by the Deployment becoming `Available`: its `Progressing` condition keeps a passed deadline after an undo, review RV42A-07) - a put-back that fails still has the template rolled back, its failure named with what the settings then need: put back by hand, and after an undo done a restart once the undo's pod is available - that pod read the new ones (reviews RV42A-03, RV43A-03) -; after an undo that failed, put back first, as the pod of the rollback by hand reads them, and no restart (review RV44A-07) -, so the control plane runs again as it was, and the script exits 1 naming what failed and anything it could not put back, never advising a second undo: an undo done whose pod is not `Available` within `--timeout` is named as such - the template is back, and its pod's refusal shows in the ReplicaSet's events -, and only an undo that failed names the revision to roll back to (reviews RV41A-06, RV41A-07, RV43A-02); the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
-| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given |
+| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given, then the leading pod: the host name of the health's `leader.holder` (§12) - the holder without the 8 hex digits of its process, and a pod's host name is its name -, or that no replica leads while `holder` is null on a replica that does not lead |
 | `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
 
-* **Scale.** `scale` takes 0 or 1 and refuses any other count: the orchestrator is a singleton (§17, D2), and a
-  second replica would run two orchestrators against one database. Scaling up is capacity - concurrency slots and
-  CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
-  while the conversion hosts move the data (Performance.md).
+* **Scale.** On the single host `scale` takes 0 or 1: it runs one control plane, since two containers on one host
+  fail with it (§25.7). On a cluster it takes 0, 1 or 2, and 2 only while `seamless-data` is ReadWriteMany - its
+  claim's `spec.accessModes` -, since the two replicas run on two nodes and the new leader reads the run directories
+  the old one wrote (§17, §25.7); a claim that is not is refused, naming why, before anything changed. Any other count
+  is refused. Two replicas run one orchestrator, the lease's leader's, and the other relays the API to it (§25.6): a
+  second replica adds availability, not capacity. Scaling up is capacity - concurrency slots and CPU and memory for
+  the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -, while the conversion
+  hosts move the data (Performance.md).
+* **The overlay's count**, which a cluster's `up` and `start` restore, is read from the overlay's files, never from
+  the cluster - an earlier `down` left 0 there -: the count of `deploy/openshift/ha`'s `replicas` field when the
+  overlay's kustomization lists the HA component under `components:` (`deploy/kubernetes`'s, or that of the
+  `deploy/openshift` it builds), else 1 (§17). A count it cannot read, or one other than 1 or 2, is refused before
+  anything changed. `restart` - a rollout ends both replicas, and a control plane at 0 replicas starts with one -,
+  `capacity`, `--drain` and `resume` are unchanged: a drain's calls reach the leader through the relay.
 * **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
   without `SEAMLESS_DEMO` in their environment or in `.env` - whether `.env` sets it is read as Compose reads it
   (below, review RV41A-04) - they read it from the running or stopped container, so a demo stack comes back a demo
@@ -6316,6 +6452,12 @@ ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is 
 their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6), and
 `seamless_notifications_total{kind,outcome}` counter — the notification messages recorded as `sent` or `failed` per
 channel kind since the server started (§8.7, §24.7; plan task NT5), so a failing channel can be alerted on.
+Two gauges tell the orchestrator's leadership (§8, §11, §25.8; plan task HA5): `seamless_leader` — 1 while this
+replica leads, that is while it holds the orchestrator's lease and its renew deadline has not passed (§8), else 0 —
+and `seamless_leader_epoch` — the epoch in the lease's row as this replica reads it at each scrape, 0 while nobody
+took the lease: its increases are the changes of leader. Neither carries a label, so no replica's host name leaves
+through them. Each replica answers `/metrics` with the same store figures, and `seamless_leader` tells which one
+drives.
 
 ---
 
@@ -7993,7 +8135,7 @@ acting.
    Layer 1 is binding in §11 since plan task HA2 - the epoch read under a key-share lock at the start of each write,
    the takeover's `FOR UPDATE`, the renewal that changes no key column, `Fenced`, `auth.denied` aside, the refusals
    logged with both epochs, the CLI's store unfenced -, and the deposition on a `Fenced` write in §8 and §11 since plan
-   task HA3, but for the application role's `idle_in_transaction_session_timeout` (HA6).
+   task HA3; the application role's `idle_in_transaction_session_timeout` is binding in §17 since plan task HA6.
 2. **Actions on the clouds start only while the lease holds.** Before a step's attempt, a hook, a floating IP move, a
    DNS swap or an Octavia member change (§8, §8.2–§8.5), the orchestrator checks its deadline and reads the epoch in
    the lease row. A pause between this check and the action defeats it (Kleppmann); layer 3 and the margin cover that.
@@ -8077,6 +8219,10 @@ at each takeover are binding in §8 and §10 since plan task HA3.
 * **The CLI** is unchanged: no lease, no tick, and its validations' cleanups in its own process (§15). `seamless
   status` names the leader and its epoch (HA5).
 
+The relay, its marker header `X-Seamless-Relayed` and 503 `no_leader`, `/health`'s `leader`, the leader's
+orchestrator in the lease row and on every replica, `/ready` judging the replica that answers and the dashboard's
+orchestrator indicator are binding in §12, §13.1 and §16 since plan task HA4.
+
 ### 25.7 Deployment
 
 * **OpenShift and Kubernetes: an HA component**, a kustomize component that both overlays may include; the base stays
@@ -8111,6 +8257,9 @@ at each takeover are binding in §8 and §10 since plan task HA3.
   unchanged: a rollout ends both replicas, and a drain's calls reach the leader through the relay. `docker` and
   `podman` keep `scale` 0 or 1.
 
+The HA component, the PostgreSQL settings and `seamless-ctl.sh`'s cluster `scale` of 0, 1 or 2, the count `up` and
+`start` restore and `status`'s leading pod are binding in §17 and §17.2 since plan task HA6.
+
 ### 25.8 Observability
 
 Proposed; each enters §4.3, §12 or §18 with its task, since tests read those tables (HA3–HA5):
@@ -8125,7 +8274,11 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
   both epochs.
 
 The events, with their data's names (`previous_holder`, `previous_epoch`, `resumes`), are binding in §4.3 and §11
-since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8).
+since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8);
+`/health`'s `leader` is binding in §12 since plan task HA4.
+The gauges are binding in §18 and the leader line of `seamless status` in §15 since plan task HA5: each scrape reads
+the epoch in the lease's row, 0 before any lease; neither gauge carries a label; and `status` names no leader for a
+lease that expired by the database's clock.
 
 ### 25.9 Security
 
@@ -8206,9 +8359,9 @@ The owner took each default as written on 2026-10-23 (D2):
 | PRD: FR-27's priority and acceptance criteria, the 0.2.0 row as delivered, a 0.5.0 row; D2 decided | PRD, §20 | HA1 |
 | the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
-| the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
-| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
-| the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
+| the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 (binding) | HA4 |
+| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
+| the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 (binding) | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
 
@@ -8674,7 +8827,10 @@ and `project`, in §10 and §21.5 since that task; plan task TC4's `VMRef.projec
 the plan's `source_project` and `destination_project` with their edit rules in §4.2, §10 and §12 since that task; plan
 task TC5's selection of §27.5 and §27.6 - validation's reads and refusals, the pre-staging with its flavor access, the
 executors, the helpers, no fallback and the registry's fingerprint - in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since
-that task. The
+that task; plan task TC6's findings of §27.7 - `PROJECT_CREDENTIAL_EXPIRING`, `PROJECT_CREDENTIAL_UNRESTRICTED`,
+`PROJECT_CREDENTIAL_ROLE_MISSING` and `DST_KEYPAIR_KEY_MISMATCH` -, the role halves of `NET_PORT_NOT_PERMITTED` and
+`DST_FIP_ADDRESS_UNAVAILABLE`, the handover's eligibility reason, `DST_PROJECT_MISSING`'s remediation and the
+findings lists in §9.2, §9.3 and §16 since that task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -8779,7 +8935,7 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
 
 Binding in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since plan task TC5, but the executors' sign-in before a step
 (below: "a step whose credential cannot sign in fails before it changes anything"), which comes with plan task TC7
-(§7.1), and the storage handover's `admin` and the findings' role halves, which come with plan task TC6 (§9.2, §9.3).
+(§7.1); the storage handover's `admin` and the findings' role halves are binding in §9.2 and §9.3 since plan task TC6.
 
 A plan's **source** and **destination credentials** are the project credentials its `source_project` and
 `destination_project` name, else the providers' own. The provider's own credential acts in its own project, and in
@@ -8832,8 +8988,8 @@ another only where a service lets an admin act by id or on the project's behalf.
   * two project credentials of one user share its keypairs: a key name two tenants use is one key there, and the
     second tenant's VM would get the first tenant's public key wherever its guest takes keys again on a new instance
     id (`TODO(LAB): confirm` per image). A VM whose key name's destination keypair has another fingerprint than its
-    source keypair is a blocker (proposed DST_KEYPAIR_KEY_MISMATCH), and Operations.md asks for a user per project
-    credential (owner decision 3).
+    source keypair is a blocker (`DST_KEYPAIR_KEY_MISMATCH`, §9.3, since plan task TC6), and Operations.md asks for a
+    user per project credential (owner decision 3).
 * **The storage handover** manages the volumes and creates the server with the destination credential (§7.3), so into a
   project that credential is the project's, with `admin`, since Cinder's manage is an admin's call. Its source half
   acts by id with the source provider's admin: the stop, `delete_on_termination`, the deletion and the unmanage
@@ -8858,7 +9014,8 @@ another only where a service lets an admin act by id or on the project's behalf.
   neither the provider's check nor another project's.
 * **Validation** refuses (400) a plan whose project credential is missing, failed or expired, naming the provider and
   the project, before any finding.
-* **Findings** (proposed; each enters §9.3 with TC6, with its catalog entry, its tests and the mock):
+* **Findings** (binding in §9.3 since plan task TC6, each with its catalog entry, its tests and the dashboard's
+  catalog, §16):
   * PROJECT_CREDENTIAL_EXPIRING, warning: a credential the plan uses expires within 7 days, or before the plan's
     `cutover_window` ends (owner decision 9);
   * PROJECT_CREDENTIAL_UNRESTRICTED, warning: an application credential the plan uses may create other application

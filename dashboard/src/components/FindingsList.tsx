@@ -93,7 +93,7 @@ export const FindingGroupsList = memo(function FindingGroupsList({
   return (
     <ul className="-my-2 divide-y divide-border">
       {groups.map((g) => (
-        <li key={`${g.severity}-${g.code}`} className="flex flex-col gap-1 py-2.5 sm:flex-row sm:gap-3">
+        <li key={g.key} className="flex flex-col gap-1 py-2.5 sm:flex-row sm:gap-3">
           <div className="shrink-0 sm:w-24">
             <SeverityBadge severity={g.severity} />
           </div>

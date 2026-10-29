@@ -96,6 +96,37 @@ def test_postgres_gets_a_writable_home_under_its_read_only_root():
         assert mounts.get(scratch) in empty
 
 
+def test_the_bundled_postgresql_drops_a_vanished_client_within_a_minute():
+    """SDD §17, §25.4, §25.7 (plan task HA6): a control plane cut off from the database loses its
+    session locks - a leader's VM-claim lock (§5.4) - within about a minute, not after the
+    operating system's two hours: the StatefulSet's server starts with keepalives of 10 s idle,
+    then 6 probes 5 s apart (40 s), and ends a transaction the application role left idle after
+    10 s. They are the arguments of the image's own start script, which hands them to postgres as
+    -c options, so they hold for whichever role the control plane connects as."""
+    docs = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "postgres-statefulset.yaml").read_text()
+    )
+    (sts,) = [d for d in docs if d and d.get("kind") == "StatefulSet"]
+    (container,) = [
+        c for c in sts["spec"]["template"]["spec"]["containers"] if c["name"] == "postgres"
+    ]
+    assert "command" not in container  # the image's entrypoint runs its start script
+    args = container.get("args", [])
+    assert args[:1] == ["run-postgresql"], args
+    assert len(args) % 2 == 1 and args[1::2] == ["-c"] * (len(args) // 2), args
+    settings = dict(arg.split("=", 1) for arg in args[2::2])
+    assert settings == {
+        "tcp_keepalives_idle": "10",
+        "tcp_keepalives_interval": "5",
+        "tcp_keepalives_count": "6",
+        "idle_in_transaction_session_timeout": "10s",
+    }
+    idle, interval, count = (
+        int(settings[f"tcp_keepalives_{k}"]) for k in ("idle", "interval", "count")
+    )
+    assert idle + interval * count <= 60
+
+
 def test_security_md_describes_the_api_token_the_deployment_mounts():
     """Security.md's secrets rules and hardening table say what deployment.yaml does with the
     control plane's Kubernetes API token: mounted for the dashboard's Secret store (R-15)."""
@@ -199,6 +230,155 @@ def test_the_route_tells_browsers_to_keep_to_https():
     age = re.search(r"max-age=(\d+)", hsts)
     assert age and int(age.group(1)) >= 31536000, hsts
     assert route["spec"]["tls"]["insecureEdgeTerminationPolicy"] == "Redirect"
+
+
+# --- the HA component (SDD §17, §25.7, plan task HA6) ---
+
+HA = ROOT / "deploy" / "openshift" / "ha"
+#: the Kubernetes overlay's: the same component with that overlay's pod network
+HA_KUBERNETES = ROOT / "deploy" / "kubernetes" / "ha"
+#: an overlay's two commented lines, and the same lines as an installation enables the component
+HA_COMMENTED = "# components:\n#   - ha\n"
+HA_ENABLED = "components:\n  - ha\n"
+OPENSHIFT_PODS = "10.128.0.0/14"  # OpenShift's default pod network
+VANILLA_PODS = "10.244.0.0/16"  # the kubeadm/kind default the Kubernetes overlay assumes
+
+
+def _component(path: Path) -> dict:
+    component = yaml.safe_load((path / "kustomization.yaml").read_text())
+    assert component["kind"] == "Component", path
+    return component
+
+
+def _component_patch(path: Path, kind: str, name: str):
+    """The one patch the component at ``path`` applies to ``kind``/``name``: a strategic merge
+    patch as its object, a JSON patch as its operations."""
+    (patch,) = [
+        p["patch"]
+        for p in _component(path).get("patches", [])
+        if p.get("target", {}).get("kind") == kind and p["target"].get("name") == name
+    ]
+    return yaml.safe_load(patch)
+
+
+def _component_object(kind: str) -> dict:
+    """The one object of ``kind`` among the HA component's resources."""
+    (found,) = [
+        doc
+        for name in _component(HA)["resources"]
+        for doc in yaml.safe_load_all((HA / name).read_text())
+        if doc and doc["kind"] == kind
+    ]
+    return found
+
+
+def _trusted_proxies(path: Path) -> str:
+    """The FORWARDED_ALLOW_IPS the component at ``path`` gives the control plane."""
+    patch = _component_patch(path, "Deployment", "seamless")
+    (container,) = patch["spec"]["template"]["spec"]["containers"]
+    (env,) = [e for e in container["env"] if e["name"] == "FORWARDED_ALLOW_IPS"]
+    return env["value"]
+
+
+def test_the_ha_component_runs_two_replicas_on_two_nodes():
+    """SDD §17, §25.7: the base runs one replica, on any cluster. Each overlay includes the HA
+    component by two commented components: lines - the Kubernetes overlay through
+    deploy/kubernetes/ha, which includes deploy/openshift/ha -, and the component runs two
+    replicas - its replicas field, the count seamless-ctl.sh reads (§17.2) - that a required
+    anti-affinity on the host name keeps on two nodes: a drain's evicted replica waits for a node
+    without the other, which leads meanwhile."""
+    deployment = _deployment()
+    assert deployment["spec"]["replicas"] == 1
+    for overlay in ("openshift", "kubernetes"):
+        text = (ROOT / "deploy" / overlay / "kustomization.yaml").read_text()
+        assert "components" not in yaml.safe_load(text), overlay
+        assert HA_COMMENTED in text, overlay
+        assert yaml.safe_load(text.replace(HA_COMMENTED, HA_ENABLED))["components"] == ["ha"]
+    assert _component(HA_KUBERNETES)["components"] == ["../../openshift/ha"]
+    assert _component(HA)["replicas"] == [{"name": "seamless", "count": 2}]
+    spec = _component_patch(HA, "Deployment", "seamless")["spec"]["template"]["spec"]
+    anti = spec["affinity"]["podAntiAffinity"]
+    assert list(anti) == ["requiredDuringSchedulingIgnoredDuringExecution"]
+    (term,) = anti["requiredDuringSchedulingIgnoredDuringExecution"]
+    assert term == {
+        "labelSelector": deployment["spec"]["selector"],
+        "topologyKey": "kubernetes.io/hostname",
+    }
+
+
+def test_the_ha_component_keeps_recreate_and_a_disruption_budget_of_one():
+    """SDD §17, §25.7 (owner decision 6): Recreate, the base's and the component's, ends a
+    rollout's old pods before it starts new ones, so one version runs at a time; the budget lets a
+    drain evict one replica at a time, and a replica that is not ready never blocks it."""
+    deployment = _deployment()
+    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+    patch = _component_patch(HA, "Deployment", "seamless")
+    assert patch["spec"]["strategy"] == {"type": "Recreate"}
+    budget = _component_object("PodDisruptionBudget")
+    assert budget["apiVersion"] == "policy/v1"
+    assert budget["metadata"]["name"] == "seamless"
+    assert budget["spec"] == {
+        "maxUnavailable": 1,
+        "unhealthyPodEvictionPolicy": "AlwaysAllow",
+        "selector": deployment["spec"]["selector"],
+    }
+
+
+def test_the_ha_component_asks_for_a_readwritemany_data_volume():
+    """SDD §17, §25.7 (owner decision 5): the new leader reads the run directories the old one
+    wrote, from another node - the component asks for the claim the Deployment mounts as
+    ReadWriteMany, while the base keeps ReadWriteOnce, which every cluster serves."""
+    (pvc,) = [d for d in yaml.safe_load_all((ROOT / "deploy/openshift/pvc.yaml").read_text()) if d]
+    assert pvc["metadata"]["name"] == "seamless-data"
+    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
+    volumes = _deployment()["spec"]["template"]["spec"]["volumes"]
+    claims = {
+        v["persistentVolumeClaim"]["claimName"] for v in volumes if "persistentVolumeClaim" in v
+    }
+    assert claims == {"seamless-data"}
+    ops = _component_patch(HA, "PersistentVolumeClaim", "seamless-data")
+    assert ops == [{"op": "replace", "path": "/spec/accessModes", "value": ["ReadWriteMany"]}]
+
+
+def test_the_replicas_reach_each_other_on_the_api_port_alone():
+    """SDD §17, §25.6, §25.9: a follower relays to the leader's pod on its API port. The
+    component's NetworkPolicy lets the control plane's pods reach each other there, in and out,
+    and no policy lets them reach each other otherwise: the external egress keeps the pod network
+    out. The leader takes the caller from the follower's X-Forwarded-For: FORWARDED_ALLOW_IPS is
+    that pod network, OpenShift's and, through deploy/kubernetes/ha, the Kubernetes overlay's."""
+    deployment = _deployment()
+    pods = deployment["spec"]["selector"]
+    (container,) = deployment["spec"]["template"]["spec"]["containers"]
+    (http,) = [p for p in container["ports"] if p["name"] == "http"]
+    config = yaml.safe_load((ROOT / "deploy" / "openshift" / "configmap.yaml").read_text())
+    assert str(http["containerPort"]) == config["data"]["SEAMLESS_PORT"]
+    api_port = [{"protocol": "TCP", "port": http["containerPort"]}]
+    relay = _component_object("NetworkPolicy")
+    assert relay["metadata"]["name"] == "seamless-allow-relay"
+    assert relay["spec"]["podSelector"] == pods
+    assert sorted(relay["spec"]["policyTypes"]) == ["Egress", "Ingress"]
+    assert relay["spec"]["ingress"] == [{"from": [{"podSelector": pods}], "ports": api_port}]
+    assert relay["spec"]["egress"] == [{"to": [{"podSelector": pods}], "ports": api_port}]
+    base = [
+        p
+        for p in yaml.safe_load_all((ROOT / "deploy/openshift/networkpolicy.yaml").read_text())
+        if p
+    ]
+    between = [
+        policy["metadata"]["name"]
+        for policy in [*base, relay]
+        if policy["spec"]["podSelector"] == pods
+        for rule in policy["spec"].get("ingress", []) + policy["spec"].get("egress", [])
+        for peer in rule.get("from", []) + rule.get("to", [])
+        if peer.get("podSelector") == pods
+    ]
+    assert between == ["seamless-allow-relay", "seamless-allow-relay"]
+    (external,) = [p for p in base if p["metadata"]["name"] == "seamless-allow-egress-external"]
+    assert OPENSHIFT_PODS in external["spec"]["egress"][0]["to"][0]["ipBlock"]["except"]
+    vanilla = _value(_ops("seamless-allow-egress-external"), "/spec/egress/0/to/0/ipBlock/except")
+    assert VANILLA_PODS in vanilla
+    assert _trusted_proxies(HA) == OPENSHIFT_PODS
+    assert _trusted_proxies(HA_KUBERNETES) == VANILLA_PODS
 
 
 def _compose_files(**make_vars: str) -> list[str]:

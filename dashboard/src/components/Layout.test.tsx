@@ -143,6 +143,57 @@ describe('Layout health notice', () => {
     renderWithApp(<Layout />, { route: '/', path: '/', server });
     expect(await screen.findByText(/the orchestrator loop is not running/i)).toBeInTheDocument();
   });
+
+  it("names the leader's stalled orchestrator when a follower answers the health", async () => {
+    // a follower answers: it is fine itself (status ok), while the leader's orchestrator stalls (SDD §12, §25.6)
+    const server = createTestServer();
+    server.health = {
+      ...server.health,
+      status: 'ok',
+      leader: { leading: false, holder: 'seamless-a-1f2e3d4c', epoch: 3, since: '2026-10-08T11:00:00Z' },
+      orchestrator: { running: true, last_tick_age_s: 42.4, ticks: 10, healthy: false },
+    };
+    renderWithApp(<Layout />, { route: '/', path: '/', server });
+    expect(await screen.findByTestId('orchestrator-status')).toHaveTextContent(/orchestrator stalled/i);
+    expect(screen.getByTestId('orchestrator-leader')).toHaveTextContent('Leading replica seamless-a-1f2e3d4c');
+    expect(await screen.findByTestId('health-notice')).toHaveTextContent(
+      /control plane degraded: the orchestrator loop of the leading replica seamless-a-1f2e3d4c is unhealthy \(last tick 42 s ago\)\. migrations do not advance/i,
+    );
+  });
+
+  it('says that migrations wait while no replica leads', async () => {
+    const server = createTestServer();
+    server.health = {
+      ...server.health,
+      status: 'ok',
+      leader: { leading: false, holder: null, epoch: null, since: null },
+      orchestrator: { running: false, last_tick_age_s: null, ticks: 0, healthy: false },
+    };
+    renderWithApp(<Layout />, { route: '/', path: '/', server });
+    const notice = await screen.findByTestId('health-notice');
+    await waitFor(() => expect(notice).toHaveTextContent('No replica leads the orchestrator: migrations wait until one takes over.'));
+    expect(notice).not.toHaveTextContent(/degraded|not running/i);
+    expect(screen.getByTestId('orchestrator-leader')).toHaveTextContent('No replica leads');
+  });
+
+  it('names the leading replica in the session footer', async () => {
+    const server = createTestServer();
+    const holder = server.health.leader.holder;
+    expect(holder).toEqual(expect.any(String));
+    const view = renderWithApp(<Layout />, { route: '/', path: '/', server });
+    expect(await screen.findByTestId('orchestrator-leader')).toHaveTextContent(`Leading replica ${holder}`);
+    expect(screen.getByTestId('orchestrator-status')).toHaveTextContent(/orchestrator running/i);
+    expect(screen.queryByText(/no replica leads/i)).not.toBeInTheDocument();
+    view.unmount();
+
+    // a server without a lease leads alone and names no holder (SDD §12): nothing to name, nothing amiss
+    const alone = createTestServer();
+    alone.health = { ...alone.health, leader: { leading: true, holder: null, epoch: null, since: null } };
+    renderWithApp(<Layout />, { route: '/', path: '/', server: alone });
+    expect(await screen.findByTestId('orchestrator-status')).toHaveTextContent(/orchestrator running/i);
+    expect(screen.queryByTestId('orchestrator-leader')).not.toBeInTheDocument();
+    expect(screen.getByTestId('health-notice')).toBeEmptyDOMElement();
+  });
 });
 
 describe('Layout navigation (SDD §16)', () => {

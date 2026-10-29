@@ -651,6 +651,55 @@ def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):
     assert "web-01" in status and "ready" in status
 
 
+def test_status_names_the_leader_and_its_epoch(env, any_store, capsys, monkeypatch):
+    """SDD §15, §25.8 (plan task HA5): `seamless status` names the orchestrator's leader and its
+    epoch above its table, as the lease's row holds them, whether the lease holds judged on the
+    database's clock - SQLite's, and PostgreSQL's with SEAMLESS_TEST_PG_URL: none before any
+    server took the lease; none, naming the last holder and epoch, once the lease expired; the
+    next holder and epoch after a takeover; with --plan too. A read alone: the CLI sends no write
+    to the lease's row, which stays as it was."""
+    import sqlalchemy as sa
+
+    from seamless_migrate.lease import Lease
+
+    store = any_store
+    monkeypatch.setenv("SEAMLESS_DB_URL", store.url)
+    sent: list[str] = []
+    opened = cli._store
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        sent.append(statement)
+
+    def recorded(settings):  # the CLI's own store, its statements recorded
+        cli_store = opened(settings)
+        sa.event.listen(cli_store.engine, "before_cursor_execute", record)
+        return cli_store
+
+    monkeypatch.setattr(cli, "_store", recorded)
+
+    def status(*args: str) -> list[str]:
+        assert cli.main(["status", *args]) == 0
+        return capsys.readouterr().out.splitlines()
+
+    assert status()[0] == "leader: none (no server took the lease)"
+    a = Lease(store.engine, "seamless-a", "192.0.2.10:8080", 30.0)
+    assert a.campaign() == 1
+    held = a.read()
+    lines = status()
+    assert lines[0] == "leader: seamless-a (epoch 1)"
+    assert lines[1].split()[:2] == ["VM", "PLAN"], "the table follows"
+    assert a.read() == held, "the CLI renewed nothing"
+    assert a.release(1)
+    released = a.read()
+    assert status()[0] == "leader: none (the lease of seamless-a at epoch 1 expired)"
+    assert a.read() == released, "the CLI took nothing"
+    assert Lease(store.engine, "seamless-b", "192.0.2.11:8080", 30.0).campaign() == 2
+    assert status("--plan", "plan-00000000")[0] == "leader: seamless-b (epoch 2)"
+    assert any("leases" in statement for statement in sent), "the CLI read the lease's row"
+    changes = re.compile(r"\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+    assert [s for s in sent if "leases" in s and changes.match(s)] == []
+
+
 def test_estimate_table(env, capsys):
     path = env / "vms.yaml"
     path.write_text(

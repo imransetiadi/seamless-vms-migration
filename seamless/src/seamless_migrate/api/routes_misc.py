@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import PlainTextResponse
+from pydantic import ValidationError
 
 from .. import __version__
 from ..ai.payloads import console_allowed, data_sent
 from ..ai.recommendations import LEGACY_PREFIX, legacy_by_id, listing
 from ..domain.enums import DecisionType, Role
 from ..domain.models import AdvisorRecommendation, AdvisorSnapshot, Migration, Plan, VMRef
+from ..lease import LeaseRow
 from ..metrics import advisor_calls, render_metrics
 from ..security.auth import Principal
 from ..stats import Stats, compute_stats
@@ -27,13 +31,22 @@ from .schemas import (
     Health,
     Hit,
     JevStatus,
+    LeaderHealth,
     MemoryStatus,
+    OrchestratorHealth,
     RecommendationPage,
     SimilarIncidentsRequest,
     SimilarIncidentsResponse,
 )
 
 router = APIRouter(tags=["misc"])
+log = logging.getLogger(__name__)
+
+#: a follower's report of the leader's orchestrator before the leader wrote it after its takeover:
+#: one before its start - and while no replica leads, or the row cannot be read: one that does not
+#: run (SDD §12)
+BEFORE_START = {"running": False, "last_tick_age_s": None, "ticks": 0, "healthy": True}
+NONE_RUNS = {"running": False, "last_tick_age_s": None, "ticks": 0, "healthy": False}
 
 
 @router.post("/demo/vms/{source_id}/power", response_model=VMRef)
@@ -67,18 +80,69 @@ async def ready(request: Request, response: Response) -> Health:
 
 
 async def _health(request: Request) -> Health:
+    """The health of the replica that answers (SDD §12, §25.6): ``status`` and ``db`` judge it -
+    the leader by its tick loop, a follower by its campaign -, ``orchestrator`` is the leader's and
+    ``leader`` names the lease's holder. A server whose store holds no lease leads alone."""
     svc = services(request)
     db_ok = await asyncio.to_thread(svc.store.ping)
-    orchestrator = svc.orchestrator.health()
+    leadership = svc.leadership
+    if leadership is None:
+        orchestrator = svc.orchestrator.health()
+        leader = LeaderHealth(leading=True)
+        alive = bool(orchestrator["healthy"])
+    else:
+        leading = leadership.leads()
+        row = await _lease_row(leadership)
+        leader = _leader(row, leading, leadership)
+        if leading:
+            orchestrator = svc.orchestrator.health()
+            alive = bool(orchestrator["healthy"])
+        else:
+            orchestrator = _reported(row)
+            alive = leadership.campaigning()
     return Health(
-        status="ok" if db_ok and orchestrator["healthy"] else "degraded",
+        status="ok" if db_ok and alive else "degraded",
         version=__version__,
         demo=svc.settings.demo,
         demo_speed=svc.settings.demo_speed if svc.settings.demo else None,
         auth_disabled=svc.settings.auth_disabled,
         db="ok" if db_ok else "error",
         orchestrator=orchestrator,
+        leader=leader,
     )
+
+
+async def _lease_row(leadership: Any) -> LeaseRow | None:
+    """The lease row as the store reads it now, None when it cannot be read (SDD §12)."""
+    try:
+        return await asyncio.to_thread(leadership.row)
+    except Exception:  # noqa: BLE001 - the health answers whatever the database says
+        log.debug("the lease row could not be read", exc_info=True)
+        return None
+
+
+def _leader(row: LeaseRow | None, leading: bool, leadership: Any) -> LeaderHealth:
+    """/health's leader (SDD §12): the valid lease's holder, epoch and acquisition; a leader that
+    cannot read the row names itself and its epoch; nobody while no replica leads."""
+    if row is not None and not row.expired:
+        return LeaderHealth(
+            leading=leading, holder=row.holder, epoch=row.epoch, since=row.acquired_at
+        )
+    if leading:
+        return LeaderHealth(leading=True, holder=leadership.holder, epoch=leadership.epoch)
+    return LeaderHealth(leading=False)
+
+
+def _reported(row: LeaseRow | None) -> dict[str, Any]:
+    """The leader's orchestrator as the lease row holds it, which a follower reports (SDD §12)."""
+    if row is None or row.expired:
+        return dict(NONE_RUNS)
+    if row.health is None:
+        return dict(BEFORE_START)
+    try:
+        return OrchestratorHealth.model_validate(row.health).model_dump()
+    except ValidationError:  # written by no version of this one: as if none were written
+        return dict(BEFORE_START)
 
 
 @router.get("/me", response_model=CurrentUser)
@@ -234,11 +298,16 @@ async def similar_incidents(
 async def metrics(request: Request, _: Principal | None = Depends(metrics_access)) -> str:
     svc = services(request)
     migrations = await svc.all_documents("migration", Migration)
+    # SDD §18, §25.8: whether this replica leads - a server's leadership says so by §8's rule; the
+    # API on a store a test hands it holds no lease -, and the lease's epoch as this scrape reads it
+    leading = svc.leadership is not None and svc.leadership.leads()
     text = render_metrics(
         migrations,
         svc.orchestrator.step_stats,
         advisor_calls(svc.jev),
         svc.orchestrator.tick_stats,
         svc.notifier.counts if svc.notifier is not None else None,
+        leading=leading,
+        lease_epoch=await svc.db.lease_epoch(),
     )
     return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")

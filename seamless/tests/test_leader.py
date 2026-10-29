@@ -265,10 +265,10 @@ async def test_the_watchdog_deposes_a_leader_whose_renewal_hangs(cluster, any_st
     entered, hang = threading.Event(), threading.Event()
     renew = a.elector.lease.renew
 
-    def hanging(epoch: int) -> bool:
+    def hanging(epoch: int, **kwargs: Any) -> bool:
         entered.set()
         hang.wait(30)
-        return renew(epoch)
+        return renew(epoch, **kwargs)
 
     monkeypatch.setattr(a.elector.lease, "renew", hanging)
     try:

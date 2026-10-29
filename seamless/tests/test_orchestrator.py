@@ -4750,6 +4750,71 @@ async def test_the_gpu_capacity_of_a_plan_with_projects_is_read_with_the_provide
     assert registry.used("gpu_capacity") == []
 
 
+async def test_a_validation_judges_its_project_credentials_and_its_vms_keypair_keys(
+    tmp_path, store
+):
+    """SDD §8, §9.3, §27.6, §27.7 (plan task TC6): validation gives the pre-flight both check
+    reports as its checks just read them and its own clock - a project credential that expires
+    within 7 days of it warns once per side -, and reads the public key of each key name its VMs
+    boot with that both inventories list, with the plan's credential on each side, and no other:
+    a destination keypair of that name with another key blocks the VM, the same key under another
+    comment does not. A plan that names no project reads the keys with the providers' own
+    credentials and judges no project credential."""
+    vms = [vm(1, key_name="deploy"), vm(2, key_name="ops")]
+    h, plan, registry, t = _tenant_plan(tmp_path, store, vms, expires_at=_ago(-10 * 86400))
+    h.source.vms["vm-1"] = _tenant_vm(1, t.a, "tenant-a", key_name="deploy")
+    h.source.vms["vm-2"] = _tenant_vm(2, t.a, "tenant-a", key_name="ops")
+    for double, key, listed in (
+        (h.source, public_key(1, "tenant-a@ops"), ["deploy"]),
+        (h.destination, public_key(2, "tenant-c@ops"), ["deploy", "ops"]),
+    ):
+        double.keypairs = {"deploy": key, "ops": public_key(3)}
+        read = double.inventory
+
+        async def listing(read=read, listed=listed):
+            inventory = await read()
+            inventory.keypairs = list(listed)
+            return inventory
+
+        double.inventory = listing
+    # the credentials expire in 10 days, 6 days after validation's clock
+    h.clock.advance(4 * 86400)
+
+    async def findings():
+        report = await h.orch.validate_plan(plan.id, "alice")
+        return {item.vm_name: item for item in report.migrations}
+
+    items = await findings()
+    deploy = items["web-01"]
+    codes = [f.code for f in deploy.findings]
+    assert codes.count("PROJECT_CREDENTIAL_EXPIRING") == 2
+    assert "DST_KEYPAIR_KEY_MISMATCH" in codes and deploy.phase == P.blocked
+    [mismatch] = [f for f in deploy.findings if f.code == "DST_KEYPAIR_KEY_MISMATCH"]
+    assert fingerprint(1) in mismatch.message and fingerprint(2) in mismatch.message
+    # a key name the source's user lacks is never read
+    assert "DST_KEYPAIR_KEY_MISMATCH" not in [f.code for f in items["web-02"].findings]
+    assert registry.used("keypair_public_key") == [
+        of_project(SRC_PROVIDER, t.a),
+        of_project(DST_PROVIDER, t.c),
+    ]
+    # the same key under another comment
+    h.destination.keypairs["deploy"] = public_key(1, "copied")
+    items = await findings()
+    assert "DST_KEYPAIR_KEY_MISMATCH" not in [f.code for f in items["web-01"].findings]
+
+    # a plan that names no project: the providers' own credentials read the keys
+    registry.calls.clear()
+    h.destination.keypairs["deploy"] = public_key(2)
+    stored = await h.plan(plan.id)
+    store.put(
+        "plan", stored.model_copy(update={"source_project": None, "destination_project": None})
+    )
+    codes = [f.code for f in (await findings())["web-01"].findings]
+    assert "DST_KEYPAIR_KEY_MISMATCH" in codes
+    assert not [code for code in codes if code.startswith("PROJECT_CREDENTIAL")]
+    assert registry.used("keypair_public_key") == [own(SRC_PROVIDER), own(DST_PROVIDER)]
+
+
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
     """A provider deleted while its check ran is not re-inserted by the check's write."""
     h, plan = await setup(tmp_path, store, [vm(1)])
