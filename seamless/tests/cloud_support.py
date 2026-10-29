@@ -63,8 +63,16 @@ class InProcessCloud:
     ``floatingips`` (filtered by the
     query's ``project_id`` and ``port_id``, as Neutron filters them) and ``extensions`` what
     Neutron's answer, and Cinder's volume types none, as a destination's reads them (plan task
-    N2b). ``connect`` is what OpenStackProvider
-    takes as ``connect_fn``."""
+    N2b). ``project`` is the project the clouds.yaml credential's token is scoped to (``{id, name,
+    domain: {id, name}}``). ``app_credentials`` are Keystone's application credentials by id
+    (``{secret, user_id, project, roles, unrestricted, expires_at}``, plan task TC3): each signs in
+    to its project as its user - a wrong secret or an unknown id answers 401 -, its token naming it
+    restricted unless ``unrestricted``, and its record answers its user's GET of it
+    (``users/{user_id}/application_credentials/{id}``), or ``record`` (a status) instead; ``hold``
+    (a ``threading.Event``) keeps its sign-in unanswered until it is set. ``sign_ins`` records who
+    each sign-in came with - the clouds.yaml user's name or an application credential's id - and
+    ``records_read`` each record read. ``connect`` is what OpenStackProvider takes as
+    ``connect_fn``, a project's connection too (``project_id``)."""
 
     root: Path
     compute: str = "2.96"
@@ -91,6 +99,16 @@ class InProcessCloud:
     keypairs: list[dict[str, Any]] = field(default_factory=list)
     floatingips: list[dict[str, Any]] = field(default_factory=list)
     extensions: list[dict[str, Any]] = field(default_factory=list)
+    project: dict[str, Any] = field(
+        default_factory=lambda: {
+            "id": "p1",
+            "name": "finance",
+            "domain": {"id": "default", "name": "D"},
+        }
+    )
+    app_credentials: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sign_ins: list[str] = field(default_factory=list)
+    records_read: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         pytest.importorskip("requests")
@@ -106,9 +124,11 @@ class InProcessCloud:
             "    region_name: RegionOne\n",
             encoding="utf-8",
         )
-        self.settings = Settings(clouds_yaml=clouds)
+        # a project credential's secret is read from the secrets directory (SDD §13.3, §27.4)
+        self.settings = Settings(clouds_yaml=clouds, secrets_dir=self.root / "secrets")
 
-    def _routes(self) -> dict[tuple[str, str], tuple[int, Any, dict[str, str]]]:
+    def _urls(self) -> dict[str, str]:
+        """The catalog's endpoints by service type."""
         urls = {**CATALOG, **self.catalog}
         if self.placement is not None:
             urls["placement"] = self.placement_url
@@ -118,36 +138,48 @@ class InProcessCloud:
             urls["load-balancer"] = OCTAVIA_URL
         if self.designate is not None:
             urls["dns"] = DESIGNATE_URL
-        token = {
-            "token": {
-                "methods": ["password"],
-                "expires_at": "2099-01-01T00:00:00.000000Z",
-                "user": {"id": "u1", "name": "svc", "domain": {"id": "default", "name": "D"}},
-                "project": {
-                    "id": "p1",
-                    "name": "finance",
-                    "domain": {"id": "default", "name": "D"},
-                },
-                "roles": [{"id": f"r{i}", "name": name} for i, name in enumerate(self.roles)],
-                "catalog": [
-                    {
-                        "type": kind,
-                        "id": kind,
-                        "name": kind,
-                        "endpoints": [
-                            {
-                                "id": kind,
-                                "interface": "public",
-                                "region": "RegionOne",
-                                "region_id": "RegionOne",
-                                "url": url,
-                            }
-                        ],
-                    }
-                    for kind, url in urls.items()
-                ],
-            }
+        return urls
+
+    def _token(
+        self,
+        project: dict[str, Any],
+        user_id: str,
+        roles: Any,
+        application_credential: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A Keystone token scoped to ``project`` for ``user_id`` with ``roles``, with the
+        catalog; one an application credential signed in with names it (``id``, ``name``,
+        ``restricted``), as Keystone's token does."""
+        token: dict[str, Any] = {
+            "methods": ["application_credential" if application_credential else "password"],
+            "expires_at": "2099-01-01T00:00:00.000000Z",
+            "user": {"id": user_id, "name": user_id, "domain": {"id": "default", "name": "D"}},
+            "project": project,
+            "roles": [{"id": f"r{i}", "name": name} for i, name in enumerate(roles)],
+            "catalog": [
+                {
+                    "type": kind,
+                    "id": kind,
+                    "name": kind,
+                    "endpoints": [
+                        {
+                            "id": kind,
+                            "interface": "public",
+                            "region": "RegionOne",
+                            "region_id": "RegionOne",
+                            "url": url,
+                        }
+                    ],
+                }
+                for kind, url in self._urls().items()
+            ],
         }
+        if application_credential is not None:
+            token["application_credential"] = application_credential
+        return {"token": token}
+
+    def _routes(self) -> dict[tuple[str, str], tuple[int, Any, dict[str, str]]]:
+        urls = self._urls()
         identity = {
             "id": "v3.14",
             "status": "stable",
@@ -165,7 +197,6 @@ class InProcessCloud:
         auth = self.auth_url.rstrip("/")
         routes: dict[tuple[str, str], tuple[int, Any, dict[str, str]]] = {
             ("GET", auth): (200, {"version": identity}, {}),
-            ("POST", auth + "/auth/tokens"): (201, token, {"X-Subject-Token": "t"}),
             ("GET", compute_url): (200, {"version": compute}, {}),
             ("GET", compute_url.rsplit("/", 1)[0]): (300, {"versions": [compute]}, {}),
             ("GET", image): (
@@ -217,14 +248,17 @@ class InProcessCloud:
                 routes[("GET", url)] = (200, document, {})
         return routes
 
-    def connect(self, provider: Any, _settings: Any) -> Any:
-        """providers.openstack.connect over this cloud: the same Connection production builds."""
+    def connect(self, provider: Any, _settings: Any, project_id: str | None = None) -> Any:
+        """providers.openstack.connect over this cloud: the same Connection production builds - with
+        the provider's credential for the project ``project_id`` when one is given (SDD §27.4)."""
         import requests
 
         from seamless_migrate.providers.openstack import connect
 
         routes, seen = self._routes(), self.seen
         answers = (
+            self._sign_in_answer,
+            self._record_answer,
             self._servers_answer,
             self._flavors_answer,
             self._placement_answer,
@@ -256,10 +290,78 @@ class InProcessCloud:
             def close(self):
                 pass
 
-        conn = connect(provider, self.settings)
+        conn = (
+            connect(provider, self.settings)
+            if project_id is None
+            else connect(provider, self.settings, project_id=project_id)
+        )
         for scheme in ("http://", "https://"):
             conn.session.session.mount(scheme, Transport())
         return conn
+
+    def _sign_in_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Keystone's answer to a sign-in at the clouds.yaml entry's auth URL, recorded in
+        ``sign_ins`` by who it came with: the password's user is scoped to ``project``; an
+        application credential signs in to its own project as its user, 401 for a wrong secret or
+        an unknown id (SDD §27.7, plan task TC3). None for any other request."""
+        if request.method != "POST" or request.url.rstrip("/") != (
+            self.auth_url.rstrip("/") + "/auth/tokens"
+        ):
+            return None
+        identity = json.loads(request.body)["auth"]["identity"]
+        if "application_credential" not in identity["methods"]:
+            self.sign_ins.append(identity["password"]["user"]["name"])
+            return 201, self._token(self.project, "u1", self.roles), {"X-Subject-Token": "t"}
+        given = identity["application_credential"]
+        self.sign_ins.append(given["id"])
+        known = self.app_credentials.get(given["id"])
+        if known is not None and known.get("hold") is not None:
+            known["hold"].wait(30)
+        if known is None or known["secret"] != given["secret"]:
+            refusal = {"code": 401, "title": "Unauthorized", "message": "authentication required"}
+            return 401, {"error": refusal}, {}
+        application_credential = {
+            "id": given["id"],
+            "name": f"seamless-{known['project']['name']}",
+            "restricted": not known.get("unrestricted", False),
+        }
+        token = self._token(
+            known["project"], known["user_id"], known["roles"], application_credential
+        )
+        return 201, token, {"X-Subject-Token": f"t-{len(self.sign_ins)}"}
+
+    def _record_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Keystone's answer to a user's GET of an application credential's record (``users/
+        {user_id}/application_credentials/{id}``): its record without its secret, 404 for another
+        user's or an unknown one, ``record``'s status instead when it has one; None for any other
+        request (plan task TC3)."""
+        identity = self._urls()["identity"].rstrip("/") + "/users/"
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        if request.method != "GET" or not url.startswith(identity):
+            return None
+        found = re.fullmatch(r"([^/]+)/application_credentials/([^/]+)", url[len(identity) :])
+        if found is None:
+            return None
+        user_id, credential_id = (urllib.parse.unquote(part) for part in found.groups())
+        self.records_read.append(credential_id)
+        known = self.app_credentials.get(credential_id)
+        if known is None or known["user_id"] != user_id:
+            return 404, {"error": {"code": 404, "title": "Not Found"}}, {}
+        if known.get("record") is not None:
+            return known["record"], {"error": {"code": known["record"]}}, {}
+        record = {
+            "id": credential_id,
+            "name": f"seamless-{known['project']['name']}",
+            "description": None,
+            "project_id": known["project"]["id"],
+            "roles": [{"id": f"r{i}", "name": name} for i, name in enumerate(known["roles"])],
+            "unrestricted": known.get("unrestricted", False),
+            "expires_at": known.get("expires_at"),
+            "access_rules": [],
+            "links": {"self": url},
+        }
+        return 200, {"application_credential": record}, {}
 
     def _flavors_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Nova's answer to a list of the flavors with their details, None for any other request."""

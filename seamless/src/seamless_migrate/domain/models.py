@@ -70,6 +70,12 @@ def to_utc(value: datetime) -> datetime:
 UTCDateTime = Annotated[datetime, AfterValidator(to_utc)]
 
 
+def utc_text(value: datetime) -> str:
+    """``value`` in UTC as the API writes a time, ISO 8601 with ``Z`` - a time a report holds as
+    text, such as a project check's (SDD §10)."""
+    return to_utc(value).isoformat().replace("+00:00", "Z")
+
+
 def new_plan_id() -> str:
     return f"plan-{secrets.token_hex(4)}"
 
