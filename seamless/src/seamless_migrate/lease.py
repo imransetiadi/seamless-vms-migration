@@ -94,6 +94,39 @@ class LeaseRow:
     expired: bool
 
 
+def _expired() -> Any:
+    """The lease is expired once the database's clock reaches its expiry (SDD §11)."""
+    return leases.c.expires_at <= db_now()
+
+
+def read_lease(engine: Engine, name: str = ORCHESTRATOR_LEASE) -> LeaseRow | None:
+    """The lease's row as it is now, whether it expired judged on the database's clock, or None
+    while nobody ever took the lease (SDD §11): a read alone, which locks nothing - a replica's
+    and ``seamless status``'s, which takes no lease (§15)."""
+    query = sa.select(
+        leases.c.holder,
+        leases.c.address,
+        leases.c.epoch,
+        leases.c.acquired_at,
+        leases.c.renewed_at,
+        leases.c.expires_at,
+        _expired().label("expired"),
+    ).where(leases.c.name == name)
+    with engine.connect() as conn:
+        row = conn.execute(query).first()
+    if row is None:
+        return None
+    return LeaseRow(
+        holder=row.holder,
+        address=row.address,
+        epoch=int(row.epoch),
+        acquired_at=_aware(row.acquired_at),
+        renewed_at=_aware(row.renewed_at),
+        expires_at=_aware(row.expires_at),
+        expired=bool(row.expired),
+    )
+
+
 def new_holder(host: str | None = None) -> str:
     """A replica's holder: its host name and 8 random hex digits, new at each process start (SDD
     §11)."""
@@ -172,36 +205,14 @@ class Lease:
         self.name = name
 
     def _expired(self) -> Any:
-        """The lease is expired once the database's clock reaches its expiry (SDD §11)."""
-        return leases.c.expires_at <= db_now()
+        return _expired()
 
     def _later(self) -> Any:
         return db_later(sa.literal(self.lease_s, sa.Float()))
 
     def read(self) -> LeaseRow | None:
-        """The row as it is now, or None while nobody ever took the lease."""
-        query = sa.select(
-            leases.c.holder,
-            leases.c.address,
-            leases.c.epoch,
-            leases.c.acquired_at,
-            leases.c.renewed_at,
-            leases.c.expires_at,
-            self._expired().label("expired"),
-        ).where(leases.c.name == self.name)
-        with self.engine.connect() as conn:
-            row = conn.execute(query).first()
-        if row is None:
-            return None
-        return LeaseRow(
-            holder=row.holder,
-            address=row.address,
-            epoch=int(row.epoch),
-            acquired_at=_aware(row.acquired_at),
-            renewed_at=_aware(row.renewed_at),
-            expires_at=_aware(row.expires_at),
-            expired=bool(row.expired),
-        )
+        """The row as it is now, or None while nobody ever took the lease (:func:`read_lease`)."""
+        return read_lease(self.engine, self.name)
 
     def campaign(self, record: Callable[[sa.Connection, Taken], None] | None = None) -> int | None:
         """One try for the lease: the epoch this replica took, else None (SDD §11). With no row it
@@ -371,4 +382,13 @@ class Lease:
             raw.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
 
 
-__all__ = ["RETRY_S", "Lease", "LeaseRow", "Taken", "lease_engine", "new_holder", "replica_address"]
+__all__ = [
+    "RETRY_S",
+    "Lease",
+    "LeaseRow",
+    "Taken",
+    "lease_engine",
+    "new_holder",
+    "read_lease",
+    "replica_address",
+]
