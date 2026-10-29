@@ -12,7 +12,6 @@ import '@fontsource/fira-code/latin-600.css';
 import '@fontsource/fira-sans/latin-400.css';
 import '@fontsource/fira-sans/latin-500.css';
 import '@fontsource/fira-sans/latin-600.css';
-import '@fontsource/fira-sans/latin-700.css';
 import './index.css';
 
 async function bootstrap() {

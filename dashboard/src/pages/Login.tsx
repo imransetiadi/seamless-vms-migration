@@ -66,9 +66,9 @@ export default function Login() {
       </div>
       <main id="main" className="flex flex-1 items-start justify-center px-4 pb-16 pt-6 sm:items-center">
         <div className="card w-full max-w-md p-6">
-          <div className="mb-5 flex items-center gap-3">
-            <BrandMark className="size-9" />
-            <div>
+          <div className="mb-5 flex flex-wrap items-center gap-4 border-b border-border pb-5">
+            <BrandMark className="size-12 drop-shadow-sm" />
+            <div className="min-w-0 grow basis-40 wrap-anywhere">
               <p className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</p>
               <p className="text-xs text-muted-foreground">VM migrations to {DESTINATIONS}</p>
             </div>

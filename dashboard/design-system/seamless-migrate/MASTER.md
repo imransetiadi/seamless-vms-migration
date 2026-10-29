@@ -36,8 +36,26 @@ for cards, forms and navigation, including modals.
 
 Fira Sans is the body font; Fira Code is for headings, identifiers and tabular numbers. Fonts are
 bundled locally through `@fontsource` imports in `src/main.tsx`; no external font requests.
+`src/main.tsx` imports `@fontsource/fira-code` (Latin 400/500/600) and `@fontsource/fira-sans` (Latin 400/500/600);
+the CSP allows fonts from the control plane only.
 Typical body text is `text-sm`; input text is 16px on mobile to avoid automatic input zoom.
 Use `num` for tabular numbers, with units and an explicit unknown state.
+
+Typography scale (root-relative; browser default root is 16 px):
+
+| Role | Size / weight | Line height |
+| --- | --- | --- |
+| Body and controls | 1rem inputs below 640px; 0.875rem inputs from 640px and dense copy, 400/500 | 1.5 |
+| Hints, dates, chart labels and rail navigation | At least 0.75rem, 400/500 | 1.5; compact navigation labels may use 1.25 |
+| Page heading | 1.25rem mobile / 1.5rem desktop, Fira Code 600 | Default heading rhythm |
+| Panel heading | 0.875rem, Fira Code 600 | 1.5 |
+| Metrics and timers | 1.25–2.25rem, Fira Code 600 with tabular numerals | 1–1.25 for numeric display |
+
+Use `rem` instead of fixed-pixel font sizes. Preserve text at 200% root size and with user text-spacing overrides;
+labels and values wrap when space runs out. Charts retain a readable minimum width in a named keyboard-scrollable
+region, with the existing data-table alternative. Font faces use `font-display: swap` and system fallbacks.
+No 700-weight copy is used, so its unused font import is omitted. These sizes are a dashboard convention, not a
+claim that WCAG prescribes a minimum font size.
 
 ## Layout and controls
 
@@ -49,15 +67,46 @@ names need `min-w-0` and `wrap-anywhere`. `card` provides intrinsic shrinkage an
 
 - `Button` and `buttonClassName` define variants and sizes. Use `lg` (44px) for primary actions.
   Pending actions retain focus and prevent duplicate submission. Unavailable actions expose a reason.
+  Use `Button` or `buttonClassName` for links with button styling. Primary actions use the accent token;
+  secondary actions use the card surface and border. Danger actions keep their own tone and confirmation.
+  Targets are at least 44px below 640px; compact desktop buttons use 32/36px, primary actions remain 44px.
+  Labels wrap, focus remains visible, and hover/pressed states never move the layout.
 - `TextField`, `SelectField`, and `TextAreaField` associate labels, hints, errors and required state.
   Use native constraints or the existing `noValidate` form error summary, with focus on invalid input.
+  Inputs retain their semantic boundary/focus colours, visible labels and mobile 44px height.
 - `Modal` owns focus containment, Escape, background inertness and trigger focus restoration.
   Keep form headers/actions separate from a shrinking scrollable body. Dirty forms require discard
-  confirmation; pending requests must not silently discard entered data.
+  confirmation; pending requests must not silently discard entered data. Use the existing `Modal` and
+  `ConfirmDialog` components: dialog actions stay below the scrolling body; surfaces use theme tokens,
+  including the soft light palette. Do not replace validation, focus trapping or error recovery with
+  visual-only alternatives.
 - `ScrollRegion` labels tables without focusable content and permits keyboard scrolling.
 - `ErrorBanner` supports retry for transient failure. A missing entity needs navigation recovery.
 - `EmptyState` distinguishes no data from filters with no matches. List views preserve filters and
   sort when returning from details. Dialog-only selectors keep their state local.
+
+## Cards and page headers
+
+Use `.card`: 12px radius, semantic card/border/text tokens and a quiet shadow. Static cards do not lift on
+hover or show a pointer cursor. `Panel` uses a subtle tinted header and 16px padding. `PageHeader` groups
+title, description, context and actions in one card, with 12px mobile / 20px wider padding. Long descriptions
+use a readable measure. Metric strips keep shared rules rather than eight separate floating cards.
+
+## Brand
+
+Keep the SDD §16 continuous S and fixed brand colours in every asset. The shell mark is 32px with 12px
+clear space before its wordmark; sign-in uses a 48px mark with 16px clear space. Preserve SVG proportions,
+decorative semantics and unique gradient IDs. Sign-in branding wraps rather than squeezing the wordmark
+when text is enlarged. Refine presentation without introducing another logo.
+
+## Page pattern: operations landing
+
+- **Primary task:** Monitor VM migration state and reach the next human action. Keep loading, failed and stale data explicit.
+- **CTA Placement:** Page task in the header; object actions beside their context. Overview links to Plans after its plan summary.
+- **Section Order:** Scope and context > Key metrics > Downtime now > Approvals and attention > History/charts > Plan progress.
+- **Columns:** Overview uses an operational 3:2 split from 1024px, one column below; DOM order keeps clocks before action queues.
+- **Hero card:** Downtime now has a neutral information accent, without implying healthy status. VM status always keeps its own icon and label.
+- **First screen:** Preserve the first clock and SLO at 390×844. Shorten repeated explanatory copy before shrinking font or hiding metrics.
 
 ## Feedback and data safety
 

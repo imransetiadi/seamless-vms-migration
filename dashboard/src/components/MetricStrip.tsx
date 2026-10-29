@@ -40,7 +40,7 @@ export function MetricStrip({ metrics, label, busy = false, className }: { metri
     <section
       aria-label={label}
       aria-busy={busy || undefined}
-      className={cn('grid gap-px overflow-hidden rounded-lg border border-border bg-card', COLUMNS[metrics.length] ?? COLUMNS[6], className)}
+      className={cn('grid gap-px overflow-hidden rounded-xl border border-border bg-card', COLUMNS[metrics.length] ?? COLUMNS[6], className)}
     >
       {metrics.map((metric, index) => (
         <div
@@ -49,7 +49,7 @@ export function MetricStrip({ metrics, label, busy = false, className }: { metri
           aria-label={metric.label}
           // tighter on a phone, so the live panels below start on the first screen; every figure and hint stays
           className={cn(
-            'flex min-w-0 flex-col gap-0.5 bg-card px-3 py-2 outline-1 outline-border sm:px-4 sm:py-3',
+            'flex min-w-0 flex-col wrap-anywhere gap-0.5 bg-card px-3 py-1 outline-1 outline-border sm:px-4 sm:py-3',
             index === metrics.length - 1 && LAST_SPAN[metrics.length],
           )}
         >

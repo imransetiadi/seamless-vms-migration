@@ -54,8 +54,8 @@ function ServiceCard({
         ? { tone: 'neutral' as const, icon: CircleSlash, label: 'Off' }
         : { tone: 'danger' as const, icon: CircleX, label: 'Unavailable' };
   return (
-    <section aria-label={title} className="card flex flex-col gap-3 p-4">
-      <div className="flex items-start justify-between gap-2">
+    <section aria-label={title} className="card flex min-w-0 flex-col wrap-anywhere gap-3 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
         <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
           <Icon aria-hidden className="size-5 text-muted-foreground" />
           {title}

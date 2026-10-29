@@ -20,6 +20,7 @@ import { useElementWidth } from '../lib/useElementWidth';
 import { useChartColors } from '../theme/useChartColors';
 import { ChartDataTable, ChartTooltipBody } from './ChartParts';
 import { EmptyState } from './EmptyState';
+import { ScrollRegion } from './ScrollRegion';
 import { TechPreviewBadge } from './TechPreviewBadge';
 
 export interface SyncPassChartProps {
@@ -76,8 +77,8 @@ function convergedText(
 }
 
 const byteTick = (v: number) => (v === 0 ? '0' : formatBytes(v).replace('.0 ', ' '));
-/** Chart width beside the plot: the y axis (64 px) and the right margin (12 px). */
-const PLOT_INSET = 76;
+/** Chart width beside the plot: the y axis (96 px) and the right margin (12 px). */
+const PLOT_INSET = 108;
 /** Room a bar needs for its value label ("35.6 MiB" at 12 px) before labels run into each other. */
 const LABEL_SLOT_MIN = 60;
 
@@ -217,7 +218,7 @@ export function SyncPassChart({
         const x = Number(props.x ?? 0) + Number(props.width ?? 0) / 2;
         const y = Number(props.y ?? 0) - 6;
         return (
-          <text x={x} y={y} textAnchor="middle" fill={colors.foreground} fontSize={12}>
+          <text x={x} y={y} textAnchor="middle" fill={colors.foreground} fontSize="0.75rem">
             {formatBytes(row.changed)}
           </text>
         );
@@ -231,40 +232,42 @@ export function SyncPassChart({
       {data.length === 0 ? (
         <p className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">Delta passes appear here after the first full copy.</p>
       ) : !drawable ? null : (
-        <div ref={measureRef} className="h-56 w-full min-w-0 overflow-hidden">
-          <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 224 }}>
-            <BarChart data={data} margin={{ top: 22, right: 12, bottom: 0, left: 0 }} accessibilityLayer title="Bytes changed per pass" desc={summary}>
-              <CartesianGrid vertical={false} stroke={colors.grid} strokeWidth={1} />
-              <XAxis dataKey="label" tick={{ fill: colors.axis, fontSize: 12 }} axisLine={{ stroke: colors.grid }} tickLine={false} />
-              <YAxis
-                ticks={ticks}
-                domain={[0, ticks.at(-1) ?? 'auto']}
-                tickFormatter={byteTick}
-                tick={{ fill: colors.axis, fontSize: 12 }}
-                axisLine={false}
-                tickLine={false}
-                width={64}
-              />
-              <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
-              {showThreshold && (
-                <ReferenceLine
-                  y={thresholdBytes}
-                  stroke={colors.reference}
-                  strokeDasharray="4 4"
-                  strokeWidth={1.5}
-                  ifOverflow="extendDomain"
-                  label={{ value: `Threshold ${byteTick(thresholdBytes)}`, position: 'insideTopRight', fill: colors.axis, fontSize: 12 }}
+        <ScrollRegion label="Sync passes chart">
+          <div ref={measureRef} className="h-56 min-w-96">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 224 }}>
+              <BarChart data={data} margin={{ top: 22, right: 12, bottom: 0, left: 0 }} accessibilityLayer title="Bytes changed per pass" desc={summary}>
+                <CartesianGrid vertical={false} stroke={colors.grid} strokeWidth={1} />
+                <XAxis padding={{ left: 48, right: 48 }} height={48} dataKey="label" tick={{ fill: colors.axis, fontSize: '0.75rem' }} axisLine={{ stroke: colors.grid }} tickLine={false} />
+                <YAxis
+                  ticks={ticks}
+                  domain={[0, ticks.at(-1) ?? 'auto']}
+                  tickFormatter={byteTick}
+                  tick={{ fill: colors.axis, fontSize: '0.75rem' }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={96}
                 />
-              )}
-              <Bar dataKey="delta" name="Delta pass" stackId="pass" fill={colors.series1} barSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false}>
-                {!narrow && !crowded && valueLabel(false)}
-              </Bar>
-              <Bar dataKey="finalSync" name="Final sync" stackId="pass" fill={colors.series2} barSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false}>
-                {!narrow && !crowded && valueLabel(true)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+                <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
+                {showThreshold && (
+                  <ReferenceLine
+                    y={thresholdBytes}
+                    stroke={colors.reference}
+                    strokeDasharray="4 4"
+                    strokeWidth={1.5}
+                    ifOverflow="extendDomain"
+                    label={{ value: `Threshold ${byteTick(thresholdBytes)}`, position: 'insideTopRight', fill: colors.axis, fontSize: '0.75rem' }}
+                  />
+                )}
+                <Bar dataKey="delta" name="Delta pass" stackId="pass" fill={colors.series1} barSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false}>
+                  {!narrow && !crowded && valueLabel(false)}
+                </Bar>
+                <Bar dataKey="finalSync" name="Final sync" stackId="pass" fill={colors.series2} barSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false}>
+                  {!narrow && !crowded && valueLabel(true)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </ScrollRegion>
       )}
       {drawable && hasFinal && (
         <ul aria-label="Legend" className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">

@@ -45,6 +45,9 @@
   --color-chart-reference: rgb(var(--chart-reference));
   --color-chart-grid: rgb(var(--chart-grid));
 
+  --text-xs--line-height: 1.5;
+  --text-sm--line-height: 1.5;
+
   --font-sans:
     'Fira Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji',
     'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
@@ -79,7 +82,7 @@
 }
 
 @utility card {
-  @apply min-w-0 wrap-anywhere rounded-lg border border-border bg-card text-card-foreground;
+  @apply min-w-0 wrap-anywhere rounded-xl border border-border bg-card text-card-foreground shadow-xs;
 }
 
 @utility num {
@@ -120,7 +123,7 @@
 }
 
 @utility data-table {
-  @apply w-full border-collapse text-left text-sm;
+  @apply w-full border-collapse wrap-normal text-left text-sm;
 
   & thead th {
     @apply whitespace-nowrap border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground;

@@ -22,6 +22,7 @@ import { useElementWidth } from '../lib/useElementWidth';
 import { useChartColors } from '../theme/useChartColors';
 import { ChartDataTable, ChartTooltipBody } from './ChartParts';
 import { EmptyState } from './EmptyState';
+import { ScrollRegion } from './ScrollRegion';
 
 export interface DowntimeSloChartProps {
   /** Average actual downtime per strategy (Stats.downtime_by_strategy). */
@@ -97,54 +98,58 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
           </li>
         </ul>
       )}
-      <div ref={measureRef} className="w-full min-w-0 overflow-hidden" style={{ height: data.length * 44 + 56 }}>
-        <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 200 }}>
-          <BarChart
-            data={data}
-            layout="vertical"
-            margin={{ top: 18, right: narrow ? 12 : 120, bottom: 0, left: 0 }}
-            accessibilityLayer
-            title="Average downtime per strategy"
-            desc={summary}
-          >
-            <CartesianGrid horizontal={false} stroke={colors.grid} strokeWidth={1} />
-            <XAxis
-              type="number"
-              domain={[0, ticks.at(-1) ?? 'auto']}
-              ticks={ticks}
-              tickFormatter={formatDurationTick}
-              tick={{ fill: colors.axis, fontSize: 12 }}
-              axisLine={{ stroke: colors.grid }}
-              tickLine={false}
-            />
-            <YAxis
-              type="category"
-              dataKey="label"
-              width={narrow ? 96 : 124}
-              tick={{ fill: colors.axis, fontSize: 12 }}
-              axisLine={false}
-              tickLine={false}
-            />
-            <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
-            {sloS !== null && (
-              <ReferenceLine
-                x={sloS}
-                stroke={colors.reference}
-                strokeDasharray="4 4"
-                strokeWidth={1.5}
-                ifOverflow="extendDomain"
-                label={{ value: `${sloLabel} ${formatDuration(sloS)}`, position: 'top', fill: colors.axis, fontSize: 12 }}
+      <ScrollRegion label="Downtime chart">
+        <div ref={measureRef} className="min-w-96" style={{ height: `${data.length * 2.75 + 3.5}rem` }}>
+          <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 200 }}>
+            <BarChart
+              data={data}
+              layout="vertical"
+              margin={{ top: 32, right: narrow ? 12 : 120, bottom: 0, left: 0 }}
+              accessibilityLayer
+              title="Average downtime per strategy"
+              desc={summary}
+            >
+              <CartesianGrid horizontal={false} stroke={colors.grid} strokeWidth={1} />
+              <XAxis
+                padding={{ left: 48, right: 48 }}
+                height={48}
+                type="number"
+                domain={[0, ticks.at(-1) ?? 'auto']}
+                ticks={ticks}
+                tickFormatter={formatDurationTick}
+                tick={{ fill: colors.axis, fontSize: '0.75rem' }}
+                axisLine={{ stroke: colors.grid }}
+                tickLine={false}
               />
-            )}
-            <Bar dataKey="downtime" name="Average downtime" barSize={20} radius={[0, 4, 4, 0]} isAnimationActive={false}>
-              {data.map((d) => (
-                <Cell key={d.strategy} fill={d.over ? colors.danger : colors.series1} />
-              ))}
-              {!narrow && <LabelList dataKey="text" position="right" fill={colors.foreground} fontSize={12} />}
-            </Bar>
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
+              <YAxis
+                type="category"
+                dataKey="label"
+                width={narrow ? 96 : 124}
+                tick={{ fill: colors.axis, fontSize: '0.75rem' }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
+              {sloS !== null && (
+                <ReferenceLine
+                  x={sloS}
+                  stroke={colors.reference}
+                  strokeDasharray="4 4"
+                  strokeWidth={1.5}
+                  ifOverflow="extendDomain"
+                  label={narrow ? undefined : { value: `${sloLabel} ${formatDuration(sloS)}`, position: 'top', fill: colors.axis, fontSize: '0.75rem' }}
+                />
+              )}
+              <Bar dataKey="downtime" name="Average downtime" barSize={20} radius={[0, 4, 4, 0]} isAnimationActive={false}>
+                {data.map((d) => (
+                  <Cell key={d.strategy} fill={d.over ? colors.danger : colors.series1} />
+                ))}
+                {!narrow && <LabelList dataKey="text" position="right" fill={colors.foreground} fontSize="0.75rem" />}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </ScrollRegion>
       <ChartDataTable
         caption="Average downtime per strategy"
         columns={['Strategy', 'Average downtime', 'SLO', 'Status']}

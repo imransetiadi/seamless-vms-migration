@@ -43,7 +43,7 @@ export function LiveIndicator({
         compact
           ? 'min-h-11 min-w-11 justify-center'
           : stacked
-            ? 'min-h-11 w-full flex-col justify-center gap-1 text-center text-[11px] leading-tight'
+            ? 'min-h-11 w-full flex-col justify-center gap-1 text-center text-xs leading-tight'
             : 'min-h-6 gap-1.5 whitespace-nowrap text-xs',
         TONE_CLASSES[meta.tone].text,
         className,

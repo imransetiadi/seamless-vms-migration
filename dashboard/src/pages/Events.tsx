@@ -115,7 +115,7 @@ const EventRow = memo(function EventRow({ event, planName }: { event: Event; pla
     <li className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
       <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
         {formatTime(event.ts)}
-        <span className="block text-[11px]">{formatDateTime(event.ts).slice(0, 10)}</span>
+        <span className="block text-xs">{formatDateTime(event.ts).slice(0, 10)}</span>
       </time>
       <span className={cn('inline-flex min-w-0 items-start gap-1.5 text-xs', TONE_CLASSES[meta.tone].text)}>
         <meta.icon aria-hidden className="mt-0.5 size-3.5 shrink-0" />

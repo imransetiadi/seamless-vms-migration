@@ -237,12 +237,12 @@ function ProgressPanel({ m }: { m: Migration }) {
   return (
     <Panel title="Progress" description={meta.description}>
       <div className="flex flex-col gap-3">
-        <div className="flex items-baseline justify-between gap-2">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
           <span className="num text-3xl font-semibold text-foreground">{formatPct(m.progress_pct)}</span>
           <PhaseBadge phase={m.phase} />
         </div>
         <ProgressBar value={m.progress_pct} label={`${m.vm.name} ${meta.label} progress`} tone={active ? 'progress' : meta.tone} />
-        <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-1 wrap-anywhere text-sm">
           {/* two figures, never one over the other: every pass counts, so a warm migration transfers
               more than its disk holds (SDD §4.2, §16) */}
           <dt id={transferredId} className="text-muted-foreground">
@@ -512,7 +512,7 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const guest = guestOsOf(vm);
   const vmware = m.strategy === 'vmware_cold' || m.strategy === 'vmware_warm';
   return (
-    <div className="flex flex-col gap-3 text-sm">
+    <div className="flex min-w-0 flex-col wrap-anywhere gap-3 text-sm">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
         <dt className="text-muted-foreground">Source id</dt>
         <dd className="min-w-0">
