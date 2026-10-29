@@ -2846,7 +2846,13 @@ Placement allocation:
     SIGKILL to the process group of every playbook the replica runs, from the deposing thread (§7.1); logs its reason;
     and schedules on the event loop the stop of the notifier and the orchestrator (`stop()`: the tasks are cancelled,
     nothing new starts). The replica then follows, and campaigns again once that stop ended: it may lead again. It
-    releases nothing: its lease lapses.
+    releases nothing: its lease lapses. Its own lapsed lease - the term it was deposed from, which still names it - it
+    takes only once the lease has been expired for a pause of three retry periods (6 s) by the database's clock (§11;
+    the owner's decision of 2026-10-29): its tries run in step with its last renewal and usually read the expiry before
+    a follower's, so without the pause a replica whose tick loop keeps stalling could keep the lease. A follower,
+    trying every retry period, takes the lease first; a lone replica takes it again at its first try after the pause -
+    within the lease, the pause and one retry period of its last renewal -, then starts its orchestrator (§25.5). A
+    lease another replica took meanwhile it campaigns for as any follower does.
   * *The takeover*, on the event loop and in order with the stops: the start hooks - in demo mode the seed, with its
     restore of the fake clouds (§10) -, then `start()`, then the notifier (§8.7). `start()` begins as a new process
     would: it forgets what its process knew of an earlier term - the assessments pre-stagings covered, the GPU reads'
@@ -4278,7 +4284,11 @@ expired once `now()` reaches `expires_at`.
 * *Campaign.* A replica reads the row. When there is none it inserts it with epoch 1 (`ON CONFLICT DO NOTHING`: of
   two at once, one takes it). When it reads the lease expired it locks the row `FOR UPDATE` and, in the same
   transaction, takes it where it is still expired: `epoch + 1`, its `holder` and `address`, `acquired_at` and
-  `renewed_at` `now()`, `expires_at` `now()` plus the lease (`SEAMLESS_LEADER_LEASE_S`, §15.1). A `lock_timeout` of
+  `renewed_at` `now()`, `expires_at` `now()` plus the lease (`SEAMLESS_LEADER_LEASE_S`, §15.1). A lease whose
+  `holder` is the replica's own - the term it was deposed from (§8): a replica that stops releases its lease and
+  campaigns no more, and each process start is a new holder - it reads and takes as expired only where `expires_at`
+  is at least the pause, three retry periods (6 s), before `now()` (the owner's decision of 2026-10-29): the other
+  replicas, each trying every retry period, take it first. A `lock_timeout` of
   the retry period (2 s; on SQLite the wait for its write lock) keeps a candidate from queueing behind the row - a try
   that times out takes nothing -, and a valid lease is never locked. A server's elector (§8, plan task HA3) writes
   `leader.acquired` (§4.3) in the transaction that takes the lease: its `cause` is `first` for the insert, `released`
@@ -5159,8 +5169,9 @@ The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `
 `serve` runs the orchestrator's elector (§8, §11; plan task HA3): it tries the lease once before it serves, and a
 server that takes it runs the demo seed and starts its orchestrator and its notifier first; one that finds the lease
 held serves at once as a follower - no seed, no orchestrator, every write but `auth.denied` refused - and tries again
-every 2 s. The leader renews its lease every 2 s and is deposed by its renew deadline; its stop releases the lease
-once its orchestrator stopped. Its store checks the lease's epoch in every write (§11). On SQLite, `serve` first
+every 2 s. The leader renews its lease every 2 s and is deposed by its renew deadline; a deposed server takes its
+own lapsed lease again only once it has been expired for 6 s (§8, §11); its stop releases the lease once its
+orchestrator stopped. Its store checks the lease's epoch in every write (§11). On SQLite, `serve` first
 takes an exclusive `flock` on `{database}.server.lock` and exits 1 (`error: another server runs against this
 database`) while another server holds it: SQLite in WAL mode serves one host's processes, so it never has a second
 replica (§25.3). The other commands open the store without a lease and check none: their writes are a person's
@@ -7955,6 +7966,12 @@ that answer reads themselves (decision 4); the run directories' state in the dat
   30 s), fewer than three failed ticks in a row). A leader whose loop hangs lets its lease go.
 * **Release.** A leader that stops (SIGTERM, an eviction, a rollout) stops its orchestrator as today (§8), then sets
   `expires_at = now()` and writes `leader.released` in one transaction. A follower takes over at its next try.
+* **A deposed replica's pause** (owner decision 11, 2026-10-29). A deposed replica's tries run in step with its last
+  renewal, so it usually read its lapsed lease expired before a follower's try did and took it again: a replica whose
+  tick loop keeps stalling could keep the lease from a healthy follower. It takes its own lapsed lease only once the
+  lease has been expired for three retry periods (6 s) by the database's clock. A follower, trying every retry period,
+  reads the lease expired two or three times before - one try that fails leaves it another -, and a lone replica
+  takes its lease again after the pause (§25.5).
 * **Why a row** (owner decision 2):
   * *A session advisory lock on a dedicated connection*, as the VM-claim lock (§5.4), gives no number to fence writes
     with. It lives until PostgreSQL sees its session end: a client that vanished silently keeps it for the server's
@@ -7975,6 +7992,7 @@ and SQLite's server lock are binding in §11, §15.1 and §15 since plan task HA
 its start and releases it after its orchestrator stopped. The thread and its connection, the renewals' schedule, the
 deadline, the watchdog, the renewals only while the tick loop is healthy and the release with `leader.released` are
 binding in §8, §11 and §15 since plan task HA3, which replaced HA2's single take at `serve`'s start by the elector.
+The deposed replica's pause is binding in §8, §11 and §15 since the owner's decision of 2026-10-29.
 
 ### 25.4 Fencing
 
@@ -8040,6 +8058,9 @@ than the margin: the database host's clock must slew, never step.
 * **Recovery time** (owner decision 3): about 35 s from a leader's loss to a leader driving the migrations again
   (lease 30 s, retry 2 s, about 3 s to start), against about 12 minutes on a lost node today. Each step that was
   running then starts again, and a playbook takes seconds to reach its first task (`TODO(LAB): confirm` both).
+  A replica deposed - its tick loop stalled, or its start failed - with no follower to take over, as a SQLite server
+  never has one, waits its pause (§25.3) and takes its lease again within the lease, the pause and one retry period
+  of its last renewal: about 41 s until it drives again (lease 30 s, pause 6 s, retry 2 s, about 3 s to start).
 * **Effect on downtime.** A VM whose source is stopped stays down for the recovery time plus the work its step does
   again: a final delta pass starts over, and a destination server already created is found by its record or its name
   (§7.2). A migration before its stop loses time only.
@@ -8177,7 +8198,7 @@ lease that expired by the database's clock.
 
 ### 25.11 Owner decisions
 
-The owner took each default as written on 2026-10-23 (D2):
+The owner took each default as written on 2026-10-23 (D2), and decided the eleventh on 2026-10-29:
 
 1. **The release: 0.5.0, as a Technology Preview** until LAB-HA01–LAB-HA05 pass. PRD §9 put HA in 0.2.0 and no
    release delivered it; 0.4.0 is at its release candidate, and HA needs nothing it still changes. Only real nodes can
@@ -8210,6 +8231,10 @@ The owner took each default as written on 2026-10-23 (D2):
    20 s cancels even a single replica's steps (§25.5).
 10. **The database's part.** The manifests set the bundled PostgreSQL's keepalive and idle-transaction settings
     (§25.7); a database that outlives a node, from an operator or a managed service, is the deployment's.
+11. **A deposed replica gives the other replicas the first chance** (2026-10-29, seen with plan task HA4): it takes
+    its own lapsed lease only once the lease has been expired for three retry periods (6 s) by the database's clock,
+    so a healthy follower takes the lease first and a replica whose tick loop keeps stalling cannot keep it; a lone
+    replica takes its lease again after the pause (§8, §11, §25.3, §25.5).
 
 ### 25.12 Contract changes (each binding from its plan task)
 
@@ -8220,6 +8245,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 (binding) | HA4 |
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
+| a deposed replica's pause before its own lapsed lease (decision 11) | §8, §11, §15 (binding) | the owner, 2026-10-29 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
