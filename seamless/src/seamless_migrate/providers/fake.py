@@ -1071,8 +1071,9 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
     def _floating(self) -> dict[str, str | None]:  # type: ignore[override]
         return self._cloud.floating
 
-    async def reserve_floating_ip(self, address: str) -> None:
-        """SDD §8.3: the demo's external network takes any address; one a port holds is refused."""
+    async def reserve_floating_ip(self, address: str, project_id: str | None = None) -> None:
+        """SDD §8.3: the demo's external network takes any address; one a port holds is refused.
+        The demo has one project: an admin's reservation for another lands there too (§27.6)."""
         if self._cloud.floating.get(address) is not None:
             raise ProviderError(f"floating IP {address} is held by a port of the project")
         self._cloud.floating[address] = None

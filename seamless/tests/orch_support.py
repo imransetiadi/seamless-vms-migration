@@ -23,7 +23,7 @@ from seamless_migrate.executors.base import StepName, StepResult
 from seamless_migrate.executors.simulated import SimulatedExecutor
 from seamless_migrate.orchestrator import Orchestrator
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory
-from seamless_migrate.providers.base import VMNotFound
+from seamless_migrate.providers.base import ProviderError, VMNotFound
 from seamless_migrate.store import Store
 
 
@@ -131,7 +131,12 @@ class StaticRegistry:
         self.source = source
         self.destination = destination
 
-    def get(self, provider: Provider) -> Any:
+    def get(self, provider: Provider, project_id: str | None = None) -> Any:
+        """The side's double, whatever the credential (SDD §10): a project credential the provider
+        holds reaches it too - tests/credential_support.py's registry tells them apart -, one it
+        does not hold is a provider error, never its own credential (§27.5)."""
+        if project_id is not None and project_id not in provider.project_credentials:
+            raise ProviderError(f"{provider.id}: it holds no credential for project {project_id}")
         return self.destination if provider.role == ProviderRole.destination else self.source
 
 

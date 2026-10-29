@@ -49,8 +49,9 @@ class FipCloud:
         if what.split(" ")[0] in self.refuse:
             raise ProviderError(f"{self.name}: Neutron refused {what}")
 
-    async def reserve_floating_ip(self, address):
-        self._call(f"reserve {address}")
+    async def reserve_floating_ip(self, address, project_id=None):
+        # an admin's reservation for another project names it (SDD §8.3, §27.6)
+        self._call(f"reserve {address}" + (f" for {project_id}" if project_id else ""))
         if self.fips.get(address) is not None:
             raise ProviderError(f"{address} is held by port {self.fips[address]}")
         self.fips[address] = None
@@ -240,6 +241,103 @@ async def test_prestaging_reserves_the_address_detached(tmp_path, store):
         assert _fip_actions(h, mid) == [("reserve", "failed")]
     finally:
         refused_store.dispose()
+
+
+async def test_a_reservation_for_a_member_project_is_made_by_the_providers_admin(tmp_path, store):
+    """SDD §8.3, §27.5, §27.6 (plan task TC5): Neutron lets admin - or the project's manager under
+    secure-RBAC - choose a floating IP's address, so for a plan whose destination project
+    credential holds member alone the destination provider's own credential, its admin, reserves
+    the address for that project (project_id), at the pre-staging and again at the move; the
+    move's other calls are the plan's credentials'. A project credential that may choose the
+    address reserves it itself."""
+    from seamless_migrate.credentials import reservation
+    from tests.credential_support import of_project, own, with_projects
+    from tests.orch_support import DST_PROVIDER, SRC_PROVIDER
+
+    h, plan, source, destination, log = await fip_setup(tmp_path, store)
+    registry, t = with_projects(h, plan)
+    await run_plan(h, t.plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert m.fip_moves[0].state == "moved"
+    assert log.count(f"destination:reserve 203.0.113.10 for {t.destination}") == 2
+    assert registry.used("reserve_floating_ip") == [own(DST_PROVIDER)] * 2
+    src = of_project(SRC_PROVIDER, t.source)
+    dst = of_project(DST_PROVIDER, t.destination)
+    assert set(registry.used("floating_ip_port")) == {src}
+    assert set(registry.used("disassociate_floating_ip")) == {src}
+    assert set(registry.used("server_port")) == set(registry.used("associate_floating_ip")) == {dst}
+
+    # who reserves, by the project credential's roles as the last check read them (§8.3)
+    checked = store.get("provider", DST_PROVIDER.id, type(DST_PROVIDER))
+    project = t.destination
+
+    def reading(roles, profile=None):
+        entry = {**checked.capabilities["projects"][project], "roles": roles}
+        caps = {**checked.capabilities, "projects": {project: entry}}
+        if profile is not None:
+            caps["policy_profile"] = profile
+        return checked.model_copy(update={"capabilities": caps})
+
+    assert reservation(t.plan, reading(["member"])) == (None, project)
+    assert reservation(t.plan, reading(["admin", "member"])) == (project, None)
+    assert reservation(t.plan, reading(["manager"], "secure_rbac")) == (project, None)
+    assert reservation(t.plan, reading(["manager"], "legacy")) == (None, project)
+    unread = checked.model_copy(update={"capabilities": {}})
+    assert reservation(t.plan, unread) == (None, project)
+    failed = {**checked.capabilities["projects"][project], "status": "error", "roles": ["admin"]}
+    erred = {**checked.capabilities, "projects": {project: failed}}
+    assert reservation(t.plan, checked.model_copy(update={"capabilities": erred})) == (
+        None,
+        project,
+    )
+    assert reservation(plan, checked) == (None, None)  # no destination project: 0.4.0's
+
+    # the OpenStack provider: the admin's reservation looks the project's floating IP up and creates
+    # it for that project (Neutron's project_id)
+    from types import SimpleNamespace
+
+    from seamless_migrate.config import Settings
+    from seamless_migrate.providers.openstack import OpenStackProvider
+
+    asked: list[tuple[str, dict]] = []
+
+    class Neutron:
+        def ips(self, **query):
+            asked.append(("ips", query))
+            return []
+
+        def networks(self, **query):
+            return [SimpleNamespace(id="net-public")]
+
+        def subnets(self, **query):
+            return [SimpleNamespace(cidr="203.0.113.0/24")]
+
+        def create_ip(self, **body):
+            asked.append(("create_ip", body))
+
+    conn = SimpleNamespace(network=Neutron(), current_project_id="admin-project", close=lambda: 0)
+    admin = OpenStackProvider(DST_PROVIDER, Settings(), connect_fn=lambda *a, **kw: conn)
+    await admin.reserve_floating_ip("203.0.113.10", project_id=project)
+    assert asked == [
+        ("ips", {"floating_ip_address": "203.0.113.10", "project_id": project}),
+        (
+            "create_ip",
+            {
+                "floating_network_id": "net-public",
+                "floating_ip_address": "203.0.113.10",
+                "project_id": project,
+            },
+        ),
+    ]
+    asked.clear()
+    await admin.reserve_floating_ip("203.0.113.10")  # its own project's, as before
+    assert asked[0] == (
+        "ips",
+        {"floating_ip_address": "203.0.113.10", "project_id": "admin-project"},
+    )
+    assert "project_id" not in asked[1][1]
 
 
 async def test_the_cutover_moves_the_address_after_the_stop(tmp_path, store):

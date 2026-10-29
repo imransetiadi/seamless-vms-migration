@@ -47,6 +47,14 @@ from .ai.redaction import redact, redact_cut
 from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
 from .conversion_key import resolve as resolve_conversion_key
+from .credentials import (
+    Step,
+    credential_project,
+    for_step,
+    implementation,
+    reservation,
+    verification_view,
+)
 from .dns_swap import (
     DnsSwapError,
     backend_for,
@@ -108,6 +116,7 @@ from .domain.models import (
     new_recommendation_id,
     next_pass_number,
     repeated_vm_ids,
+    to_utc,
     utc_text,
     utcnow,
 )
@@ -196,8 +205,9 @@ class _HostKeyBook:
 
     async def pin_from_console(self, provider: Provider) -> Provider:
         """The provider once its conversion host, without a pin, was pinned from its console by
-        the provider check's path (§10, §26.8); as stored when nothing was pinned."""
-        return await self._orchestrator._pin_from_console(provider.id)
+        the provider check's path (§10, §26.8); as stored when nothing was pinned. The host is
+        looked up where the run reaches it: with the plan's credential (§7.2, §27.5)."""
+        return await self._orchestrator._pin_from_console(provider.id, self.plan_id)
 
     async def pin_injected(
         self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
@@ -813,6 +823,34 @@ def _projects_report(
     return report
 
 
+def _foreign_vms(plan: Plan, source: Provider, vms: Iterable[VMRef]) -> str | None:
+    """Why validation refuses a plan whose VMs are not all of its source project (SDD §27.5 "One
+    project pair per plan", owner decision 7, plan task TC5): its source_project, else the source
+    provider's own project as its check names it; each project named with its VM count. A VM whose
+    project is not known (project_id null: VMware, or recorded before) and a source whose check
+    names no project of its own are not judged."""
+    expected = plan.source_project or source.own_project_id
+    if expected is None or source.kind == ProviderKind.vmware:
+        return None
+    counts: Counter[str] = Counter()
+    names: dict[str, str | None] = {}
+    for vm in vms:
+        if vm.project_id is not None:
+            counts[vm.project_id] += 1
+            names.setdefault(vm.project_id, vm.project)
+    if set(counts) <= {expected}:
+        return None
+    listed = ", ".join(
+        f"{pid}{f' ({names[pid]})' if names[pid] and names[pid] != pid else ''}: {n} VM(s)"
+        for pid, n in sorted(counts.items())
+    )
+    whose = "its source project" if plan.source_project else "its source provider's own project"
+    return (
+        f"the plan's VMs are not all of {whose} {expected}: {listed}; a plan moves the VMs of one "
+        "project - plan the others with their own (SDD §27.5)"
+    )
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -1107,7 +1145,8 @@ class Orchestrator:
         async with self._lock(f"provider:{provider_id}"):
             # versioned write: a provider deleted or edited while the check ran is not re-inserted
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
-            impl = self.providers.get(provider)
+            # the check acts with the provider's own credential (SDD §27.5's first row)
+            impl = for_step(self.providers, Step.CHECK, provider, None)
             pinned: Event | None = None
             update: dict[str, Any]
             try:
@@ -1244,17 +1283,23 @@ class Orchestrator:
         the plan's pre-staging (SDD §7.2 "Conversion host keys")."""
         return _HostKeyBook(self, plan_id, migration_id)
 
-    async def _pin_from_console(self, provider_id: str) -> Provider:
+    async def _pin_from_console(self, provider_id: str, plan_id: str | None = None) -> Provider:
         """A run's pin of a conversion host without one (SDD §7.2, §26.8): the provider check's
         path (§10) - the host's whole console read once, what the parser keeps pinned with
         conversion_host.key_pinned in one transaction -, under the provider's lock as a check
-        holds it; the provider as stored when it was pinned meanwhile or nothing was pinned."""
+        holds it; the provider as stored when it was pinned meanwhile or nothing was pinned. The
+        host of the run of ``plan_id`` is looked up with the plan's credential, in its project
+        when it names one there (§7.2, §27.5)."""
+        plan: Plan | None = None
+        if plan_id is not None:
+            with contextlib.suppress(NotFound):
+                plan = await self._plan(plan_id)
         async with self._lock(f"provider:{provider_id}"):
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
             if provider.conversion_host_pin is not None:
                 return provider
             pinning, pinned = await self._pin_conversion_host(
-                provider, self.providers.get(provider), "system"
+                provider, for_step(self.providers, Step.PRESTAGE, provider, plan), "system"
             )
             if pinned is None:
                 return provider
@@ -1308,6 +1353,62 @@ class Orchestrator:
         if checked.status != "ok":
             raise BadRequest(f"provider {provider.id} check failed: {checked.status_message}")
         return {**checked.capabilities, "conversion_host": checked.conversion_host is not None}
+
+    def _project_refusal(self, provider: Provider, project: str | None) -> str | None:
+        """Why validation refuses the plan's ``project`` on ``provider``'s side (SDD §8, §27.5,
+        §27.7, plan task TC5), as the check just left the provider: no credential for it, its
+        check's entry not ok, its expiry past, or an existing conversion host on that side, which
+        serves the provider's own project alone. None for a side that names no project. It names
+        the provider and the project, never the credential."""
+        if project is None:
+            return None
+        where = f"provider {provider.label}"
+        if project not in provider.project_credentials:
+            return (
+                f"{where} holds no credential for project {project}: an admin writes its "
+                "application credential, or the plan names another project (SDD §27.5)"
+            )
+        report = provider.capabilities.get("projects")
+        entry = report.get(project) if isinstance(report, dict) else None
+        if not isinstance(entry, dict) or entry.get("status") != "ok":
+            why = entry.get("message") if isinstance(entry, dict) else None
+            return f"{where}: the credential of project {project} failed its check" + (
+                f": {why}" if why else ""
+            )
+        expires = entry.get("expires_at")
+        if expires is not None:
+            try:
+                expiry = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+            except ValueError:
+                return (
+                    f"{where}: the credential of project {project} holds an expiry that is no time"
+                )
+            if to_utc(expiry) <= self._now():
+                return (
+                    f"{where}: the credential of project {project} expired at {expires}; an admin "
+                    "writes a new one"
+                )
+        host = provider.conversion_host
+        if host is not None and not host.manage:
+            return (
+                f"{where} has an existing conversion host, which serves its own project alone: "
+                f"a plan cannot name project {project} on that side (SDD §27.5)"
+            )
+        return None
+
+    async def _destination_view(self, destination: Provider, impl: Any, plan: Plan) -> Any:
+        """The destination's inventory as validation judges it (SDD §8, §22.3, §27.5): read by
+        ``impl``, the plan's destination credential - and, for a plan with a destination project,
+        its GPU capacity read again with the destination provider's own credential over the GPU
+        flavors that credential lists: Placement refuses a member's token."""
+        inventory = await impl.inventory()
+        if credential_project(Step.INVENTORY, ProviderRole.destination, plan) is None:
+            return inventory  # the provider's own inventory read Placement itself
+        requests = [g for f in getattr(inventory, "gpu_flavors", None) or [] for g in f["gpus"]]
+        if not requests:
+            return inventory
+        placement = for_step(self.providers, Step.GPU, destination, plan)
+        return replace(inventory, gpu_capacity=await placement.gpu_capacity(requests))
 
     async def _vms(self, plan: Plan, impl: Any, existing: Mapping[str, Migration]) -> list[VMRef]:
         """The plan's VMs as a validation and the wave planner read them (SDD §5.4): from the source
@@ -1391,8 +1492,6 @@ class Orchestrator:
             raise BadRequest("; ".join(problems))
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
-        src_impl = self.providers.get(source)
-        dst_impl = self.providers.get(destination)
         # the plan's projects, by id (SDD §4.2, §10, plan task TC4): each side's check signs in
         # with the plan's project credential there alone
         src_caps = await self._caps(source, actor, plan.source_project)
@@ -1405,9 +1504,21 @@ class Orchestrator:
                 await self._provider(plan.destination_provider_id, ProviderRole.destination),
             )
         }
+        # SDD §8, §27.5 (plan task TC5): a project credential missing, failed or expired, and a
+        # project on an existing conversion host's side, refused before anything is read
+        for provider, project in (
+            (as_checked[source.id], plan.source_project),
+            (as_checked[destination.id], plan.destination_project),
+        ):
+            refusal = self._project_refusal(provider, project)
+            if refusal is not None:
+                raise BadRequest(refusal)
+        # the plan's credentials read its VMs and inventories; Placement, the provider's own (§27.5)
+        src_impl = for_step(self.providers, Step.INVENTORY, source, plan)
+        dst_impl = for_step(self.providers, Step.INVENTORY, destination, plan)
         try:
             src_inv = await src_impl.inventory()
-            dst_inv = await dst_impl.inventory()
+            dst_inv = await self._destination_view(destination, dst_impl, plan)
         except ProviderError as exc:
             raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
         listed = await self.db.list("migration", Migration, plan_id=plan.id)
@@ -1416,6 +1527,10 @@ class Orchestrator:
             raise NotAllowed(twice)
         existing = _by_vm(listed)
         vms = await self._vms(plan, src_impl, existing)
+        # one project pair per plan (SDD §27.5, owner decision 7), before any finding
+        foreign = _foreign_vms(plan, as_checked[source.id], vms)
+        if foreign is not None:
+            raise BadRequest(foreign)
         # what a cutover of each VM will still create - its server alone when an earlier attempt
         # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
         shares: dict[str, QuotaShare] = {}
@@ -1477,15 +1592,20 @@ class Orchestrator:
         items: list[ValidationItem] = []
         # a memory outage is met once per validation: the search is not repeated for every VM
         memory_up = True
-        # the TTL of each DNS target's record, for NET_DNS_TTL_LONG (SDD §8.4, §9.3)
-        ttls = await record_ttls(plan, vms, dst_impl, self.settings)
+        # the TTL of each DNS target's record, for NET_DNS_TTL_LONG (SDD §8.4, §9.3), with the
+        # plan's destination credential (§27.5)
+        dns = for_step(self.providers, Step.DNS, destination, plan)
+        ttls = await record_ttls(plan, vms, dns, self.settings)
         # the plan's post_create hooks run inside the downtime: their timeouts (SDD §9.1)
         hooks_s = await self._post_create_hooks_s(plan)
-        # each mapped pair of Octavia pools, for MAP_LB_POOL_INCOMPATIBLE (SDD §8.5, §9.3)
+        # each mapped pair of Octavia pools, for MAP_LB_POOL_INCOMPATIBLE (SDD §8.5, §9.3), each
+        # read with the plan's credential on its side (§27.5)
+        src_lb = for_step(self.providers, Step.NETWORK, source, plan)
+        dst_lb = for_step(self.providers, Step.NETWORK, destination, plan)
         lb_pairs = {
             source_pool: PoolPair(
-                source=await _read_pool(src_impl, source_pool),
-                destination=await _read_pool(dst_impl, pool),
+                source=await _read_pool(src_lb, source_pool),
+                destination=await _read_pool(dst_lb, pool),
             )
             for source_pool, pool in plan.network_cutover.lb_pools.items()
         }
@@ -1963,7 +2083,10 @@ class Orchestrator:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
         existing = _by_vm(await self.db.list("migration", Migration, plan_id=plan.id))
-        vms = await self._vms(plan, self.providers.get(source), existing)
+        # the VMs as validation reads them: the plan's source credential (SDD §8, §27.5)
+        vms = await self._vms(
+            plan, for_step(self.providers, Step.INVENTORY, source, plan), existing
+        )
         if self.advisor is not None:
             # the destination by kind and series: its provider's name never leaves for Jev
             # (SDD §13.4, audit AD-09); one gone meanwhile has no name to leave
@@ -2693,7 +2816,7 @@ class Orchestrator:
                 # redacted and cut like any reason a skipped VM reports (SDD §8.1)
                 raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
             # SDD §8.3: the source's allocation of each moved floating IP is released
-            await self._release_floating_ips(m, source)
+            await self._release_floating_ips(m, plan, source)
             # SDD §8.2: on_finalize after the step; a failure is recorded, the VM finalized
             await self._run_hooks(m, "on_finalize", keep_going=True)
             m.checkpoint = "finalized"
@@ -2780,9 +2903,10 @@ class Orchestrator:
         return {"finalized": [m.id for m in finalized], "skipped": skipped}
 
     async def source_client(self, plan: Plan) -> Any:
-        """The client of the plan's source provider (the source watch, the demo controls)."""
+        """The client of the plan's source provider (the source watch, the demo controls), with
+        the plan's source credential (SDD §8.1, §27.5)."""
         provider = await self.db.get("provider", plan.source_provider_id, Provider)
-        return self.providers.get(provider)
+        return for_step(self.providers, Step.MIGRATION, provider, plan)
 
     async def demo_power(self, source_id: str, *, on: bool) -> VMRef:
         """Power a fake source VM on or off (demo mode, SDD §8.1); NotFound for an unknown VM."""
@@ -2826,7 +2950,7 @@ class Orchestrator:
             log.warning("the source watch failed", exc_info=True)
 
     async def _watch_sources_once(self) -> None:
-        clients: dict[str, Any] = {}
+        clients: dict[tuple[str, str | None], Any] = {}
         # each plan read once per pass, a plan that is gone too: a plan of 1,000 VMs is ~22 KB,
         # and in demo the watch runs every few seconds
         plans: dict[str, Plan | None] = {}
@@ -2842,9 +2966,12 @@ class Orchestrator:
                 plan = plans[m.plan_id]
                 if plan is None:
                     continue
-                if plan.source_provider_id not in clients:
-                    clients[plan.source_provider_id] = await self.source_client(plan)
-                vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)
+                # one client per provider and credential: plans of one source may name
+                # different projects (SDD §8.1, §27.5)
+                key = (plan.source_provider_id, plan.source_project)
+                if key not in clients:
+                    clients[key] = await self.source_client(plan)
+                vm = await clients[key].get_vm(m.vm.source_id)
             except VMNotFound:
                 # SDD §8.1 (the owner's choice, 2026-10-14): the cloud says the VM is gone - a
                 # finalize deleted it, a handover rebuilt it, or someone deleted the source after
@@ -3043,7 +3170,8 @@ class Orchestrator:
             read = _GpuRead(room=True)  # no GPU flavor of its plan: nothing to read for it
             if flavor is not None:
                 others = await self._cutovers_without_server(destination.id, mid)
-                client = self.providers.get(destination)
+                # Placement's read, with the destination provider's own credential (SDD §27.5)
+                client = for_step(self.providers, Step.GPU, destination, plan)
                 read = await self._gpu_capacity_read(client, flavor, others, destination.label)
                 read = replace(read, begun=begun)
             # when the destination answered: one read may take minutes (§8.1)
@@ -3910,8 +4038,13 @@ class Orchestrator:
                     # only the plan's flavors RHOSO lacks (a destination flavor is shared by every
                     # project and never pre-staged over) and the keypairs the destination user
                     # lacks and the source user owns (SDD §7.2)
-                    src_inv = await self.providers.get(source).inventory()
-                    dst_inv = await self.providers.get(destination).inventory()
+                    # read with the plan's credentials (SDD §7.2, §27.5)
+                    src_inv = await for_step(
+                        self.providers, Step.INVENTORY, source, plan
+                    ).inventory()
+                    dst_inv = await for_step(
+                        self.providers, Step.INVENTORY, destination, plan
+                    ).inventory()
                     if "flavors" in plan.prestage_resources and "prestage_flavors" in params:
                         kwargs["prestage_flavors"] = sorted(
                             {
@@ -3933,7 +4066,11 @@ class Orchestrator:
                     # hold, name the sides to re-key, or refuse before any playbook runs (SDD
                     # §7.2 "Conversion key", issue #112)
                     kwargs["rekey_conversion_hosts"] = await resolve_conversion_key(
-                        self.settings, source, destination, self.providers.get
+                        self.settings,
+                        source,
+                        destination,
+                        # the keypair of the user of the plan's credential on each side (§27.5)
+                        lambda provider: for_step(self.providers, Step.PRESTAGE, provider, plan),
                     )
                 if "host_keys" in params:
                     # what the pre-staging pins and refuses of its conversion hosts (SDD §7.2)
@@ -3941,7 +4078,7 @@ class Orchestrator:
                 await executor.prestage(plan, source, destination, **kwargs)
             # SDD §8.3: a keep_address plan reserves its floating IPs' addresses at the destination
             if plan.network_cutover.floating_ips == "keep_address":
-                await self._reserve_floating_ips(migs, destination)
+                await self._reserve_floating_ips(migs, plan, destination)
             # what it read when it began: a migration assessed meanwhile waits for the next one
             self._prestage_done.setdefault(plan.id, set()).update(_assessment(m) for m in migs)
             self._prestage_retry_at.pop(plan.id, None)
@@ -4543,7 +4680,14 @@ class Orchestrator:
             return
         plan = await self._plan(m.plan_id)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-        verifier = self._verifier_factory(self.providers.get(destination))
+        try:
+            # the plan's destination credential; its allocation read, Placement's, the
+            # destination provider's own (SDD §7.5, §22.8, §27.5)
+            view = verification_view(self.providers, destination, plan)
+        except ProviderError as exc:
+            await self._fail(m.id, P.verifying, "verify", exc)
+            return
+        verifier = self._verifier_factory(view)
         try:
             result: VerificationResult | None = await self._run_step(
                 m, "verify", runner=verifier.verify
@@ -4834,14 +4978,27 @@ class Orchestrator:
             },
         )
 
-    async def _reserve_floating_ips(self, migs: list[Migration], destination: Provider) -> None:
+    async def _reserve(self, plan: Plan, destination: Provider, address: str) -> None:
+        """One keep-address reservation (SDD §8.3, §27.5, §27.6): the plan's destination credential
+        when it may choose an address, else the destination provider's own - its admin - for the
+        plan's destination project (``project_id``); a plan without a destination project, the
+        provider's own as before."""
+        acting, for_project = reservation(plan, destination)
+        dst = implementation(self.providers, destination, acting)
+        if for_project is None:
+            await dst.reserve_floating_ip(address)
+        else:
+            await dst.reserve_floating_ip(address, project_id=for_project)
+
+    async def _reserve_floating_ips(
+        self, migs: list[Migration], plan: Plan, destination: Provider
+    ) -> None:
         """The keep-address move's reservations with a plan's pre-staging (SDD §8.3): a failure
         fails the pre-staging, before any source stops."""
-        dst = self.providers.get(destination)
         for m in migs:
             for address in _floating_addresses(m.vm):
                 try:
-                    await dst.reserve_floating_ip(address)
+                    await self._reserve(plan, destination, address)
                 except Exception as exc:
                     await self._fip_action(m, address, "reserve", exc)
                     raise
@@ -4871,11 +5028,16 @@ class Orchestrator:
             return None
         source = await self.db.get("provider", plan.source_provider_id, Provider)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-        src, dst = self.providers.get(source), self.providers.get(destination)
+        try:
+            # the plan's credentials (SDD §8.3, §27.5)
+            src = for_step(self.providers, Step.NETWORK, source, plan)
+            dst = for_step(self.providers, Step.NETWORK, destination, plan)
+        except ProviderError as exc:
+            return exc
         for nic in m.vm.nics:
             for address in dict.fromkeys(_address(a) for a in nic.floating_ips):
                 try:
-                    if await self._move_one(m, plan, nic, address, src, dst, destination.label):
+                    if await self._move_one(m, plan, nic, address, src, dst, destination):
                         await self._fip_action(m, address, "move")
                 except Exception as exc:
                     await self._fip_action(m, address, "move", exc)
@@ -4883,7 +5045,7 @@ class Orchestrator:
         return None
 
     async def _move_one(
-        self, m: Migration, plan: Plan, nic: Nic, address: str, src: Any, dst: Any, where: str
+        self, m: Migration, plan: Plan, nic: Nic, address: str, src: Any, dst: Any, at: Provider
     ) -> bool:
         """One floating IP's move from where its journal left it (SDD §8.3); False when it had
         moved already."""
@@ -4903,11 +5065,11 @@ class Orchestrator:
         if entry.state == "releasing":
             await src.disassociate_floating_ip(address)
             entry = await self._journal(m.id, address, state="released")
-        await dst.reserve_floating_ip(address)
+        await self._reserve(plan, at, address)
         server = (await self.db.get("migration", m.id, Migration)).destination_server_id
         port_id = await dst.server_port(str(server), entry.fixed_ip)
         if port_id is None:
-            raise ProviderError(f"server {server} in {where} has no port with {entry.fixed_ip}")
+            raise ProviderError(f"server {server} in {at.label} has no port with {entry.fixed_ip}")
         await dst.associate_floating_ip(address, port_id)
         await self._journal(m.id, address, state="moved")
         return True
@@ -4923,7 +5085,11 @@ class Orchestrator:
         plan = await self._plan(m.plan_id)
         source = await self.db.get("provider", plan.source_provider_id, Provider)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-        src, dst = self.providers.get(source), self.providers.get(destination)
+        try:
+            src = for_step(self.providers, Step.NETWORK, source, plan)
+            dst = for_step(self.providers, Step.NETWORK, destination, plan)
+        except ProviderError as exc:
+            return exc  # the rollback fails before the source starts, as a call's failure does
         for entry in pending:
             try:
                 await dst.disassociate_floating_ip(entry.address)
@@ -4937,13 +5103,19 @@ class Orchestrator:
             await self._fip_action(m, entry.address, "return")
         return None
 
-    async def _release_floating_ips(self, m: Migration, source: Provider) -> None:
+    async def _release_floating_ips(self, m: Migration, plan: Plan, source: Provider) -> None:
         """SDD §8.3: a finalize deletes the source's floating IP of each moved address - its
-        allocation; a failure is recorded and the migration finalized. ``m`` is the finalize's,
-        saved with its transition."""
+        allocation -, with the plan's source credential (§27.5); a failure is recorded and the
+        migration finalized. ``m`` is the finalize's, saved with its transition."""
         if not any(e.state == "moved" for e in m.fip_moves):
             return
-        src = self.providers.get(source)
+        try:
+            src = for_step(self.providers, Step.NETWORK, source, plan)
+        except ProviderError as exc:
+            for entry in m.fip_moves:
+                if entry.state == "moved":
+                    await self._fip_action(m, entry.address, "release", exc)
+            return
         for i, entry in enumerate(m.fip_moves):
             if entry.state != "moved":
                 continue
@@ -4995,9 +5167,10 @@ class Orchestrator:
         if swap is not None and swap.state not in ("swapping", "reverted"):
             return None
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-        dst = self.providers.get(destination)
         name = record_name(target)
         try:
+            # the plan's destination credential (SDD §8.4, §27.5)
+            dst = for_step(self.providers, Step.DNS, destination, plan)
             if swap is None or swap.state == "reverted":
                 server = None
                 if any(nic.floating_ips for nic in cur.vm.nics):
@@ -5050,7 +5223,8 @@ class Orchestrator:
             return None
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         try:
-            backend = backend_for(target, self.providers.get(destination), self.settings)
+            dst = for_step(self.providers, Step.DNS, destination, plan)
+            backend = backend_for(target, dst, self.settings)
             outcome, held = await backend.replace(swap.name, swap.rdtype, swap.new, swap.old)
         except Exception as exc:
             failure = DnsSwapError(describe(exc))
@@ -5119,10 +5293,13 @@ class Orchestrator:
         return entry
 
     async def _lb_clouds(self, m: Migration) -> tuple[Plan, Any, Any]:
+        """The plan, and its source's and destination's clouds as the member helper reaches them:
+        each with the plan's credential on its side (SDD §8.5, §27.5)."""
         plan = await self._plan(m.plan_id)
         source = await self.db.get("provider", plan.source_provider_id, Provider)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-        return plan, self.providers.get(source), self.providers.get(destination)
+        src = for_step(self.providers, Step.NETWORK, source, plan)
+        return plan, src, for_step(self.providers, Step.NETWORK, destination, plan)
 
     async def _drain_lb_members(self, m: Migration) -> BaseException | None:
         """SDD §8.5: at pre_stop, each member of a mapped source pool whose address is one of the
@@ -5133,7 +5310,10 @@ class Orchestrator:
         addresses = vm_addresses(m.vm)
         if not plan.network_cutover.lb_pools or not addresses:
             return None
-        _, src, _ = await self._lb_clouds(m)
+        try:
+            _, src, _ = await self._lb_clouds(m)
+        except ProviderError as exc:
+            return exc  # the drain fails at pre_stop, the source still running
         if getattr(src, "pool_members", None) is None:
             return None  # a VMware source has no Octavia pool
         for source_pool, pool in plan.network_cutover.lb_pools.items():
@@ -5187,7 +5367,10 @@ class Orchestrator:
         pending = [e for e in cur.lb_moves if e.state in ("drained", "joining")]
         if not pending:
             return None
-        plan, _, dst = await self._lb_clouds(m)
+        try:
+            plan, _, dst = await self._lb_clouds(m)
+        except ProviderError as exc:
+            return exc
         for entry in pending:
             try:
                 address = join_address(cur, plan, entry.address)
@@ -5225,7 +5408,12 @@ class Orchestrator:
         pending = [e for e in cur.lb_moves if e.state != "restored"]
         if not pending:
             return
-        plan, src, dst = await self._lb_clouds(m)
+        try:
+            plan, src, dst = await self._lb_clouds(m)
+        except ProviderError as exc:
+            for entry in pending:  # recorded, and the rollback goes on (§8.5)
+                await self._lb_action(m, entry, "restore", exc)
+            return
         for entry in pending:
             try:
                 gone = {entry.member} if entry.member else set()
