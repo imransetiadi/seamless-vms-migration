@@ -110,10 +110,16 @@ class DestinationProvider(Protocol):
         """Set the given metadata keys on the volume and keep its other keys (Cinder's merge),
         within the call's bound: the mark of a VMware kit copy that completed (§7.2)."""
 
-    async def reserve_floating_ip(self, address: str) -> None:
+    async def reserve_floating_ip(self, address: str, project_id: str | None = None) -> None:
         """The keep-address move's reservation (SDD §8.3, §10): a floating IP of the address the
         project holds detached is kept, else one is created detached on the external network one
-        of whose subnets holds it; a provider error when none does or Neutron refuses it."""
+        of whose subnets holds it; a provider error when none does or Neutron refuses it. With
+        ``project_id``, the provider's admin reserves for that project (§27.6, plan task TC5)."""
+
+    async def grant_flavor_access(self, name: str, project_id: str) -> bool:
+        """The private flavor of the name made usable by the project - access it holds already is
+        no error -, True; a public one left as it is, False; none of the name, or two, a provider
+        error (SDD §7.2, §10, §27.5, plan task TC5)."""
 
     async def server_port(self, server_id: str, address: str) -> str | None:
         """The id of the server's port with the fixed address, None when it has none (§8.3)."""

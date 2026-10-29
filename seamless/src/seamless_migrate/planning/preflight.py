@@ -2660,7 +2660,7 @@ def _port_findings(
 
 
 #: the roles Neutron's create_floatingip:floating_ip_address takes, by policy profile (SDD §9.3)
-_FIP_ADDRESS_ROLES = {"secure_rbac": ("admin", "manager")}
+FIP_ADDRESS_ROLES = {"secure_rbac": ("admin", "manager")}
 
 
 def _fip_keep_findings(
@@ -2693,7 +2693,7 @@ def _fip_keep_findings(
             reasons.append(f"{address} is held by a port of its project")
     extras: list[str] = []
     roles = (dst_caps or {}).get("roles")
-    allowed = _FIP_ADDRESS_ROLES.get(policy_profile_of(dst_caps, destination), ("admin",))
+    allowed = FIP_ADDRESS_ROLES.get(policy_profile_of(dst_caps, destination), ("admin",))
     if roles is not None and not set(roles) & set(allowed) and set(mine) - detached:
         extras.append(
             "the credential's token has no role that may choose a floating IP's address "

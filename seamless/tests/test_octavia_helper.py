@@ -277,6 +277,37 @@ async def test_a_rollback_removes_the_member_and_re_enables_the_source(tmp_path,
     assert lb_actions(h, mid)[-1] == ("restore", "succeeded")
 
 
+#: the member helper's calls of a cloud (SDD §8.5, §10)
+LB_CALLS = {"lb_pool", "pool_members", "set_pool_member", "add_pool_member", "delete_pool_member"}
+
+
+async def test_the_member_helper_acts_with_each_sides_project_credential(tmp_path, store):
+    """SDD §8.5, §27.5 (plan task TC5): a plan with projects reads, drains and re-enables its
+    source pool's member with the plan's source credential, and reads its destination pool, joins
+    it and removes its member with the plan's destination credential - validation's reads of the
+    pair too -; no call of the helper is made with a provider's own credential."""
+    from tests.credential_support import of_project, own, with_projects
+    from tests.orch_support import DST_PROVIDER, SRC_PROVIDER
+
+    h, plan, source, destination, log = await lb_setup(tmp_path, store)
+    registry, t = with_projects(h, plan)
+    await run_plan(h, t.plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.completed)
+    await h.orch.rollback(mid, "alice", "the application team asked for it")
+    m = await h.wait_phase(mid, P.rolled_back)
+    await h.orch.stop()
+    assert [move.state for move in m.lb_moves] == ["restored"]
+    src = of_project(SRC_PROVIDER, t.source)
+    dst = of_project(DST_PROVIDER, t.destination)
+    assert {"lb_pool", "pool_members", "set_pool_member"} <= registry.methods(src)
+    assert {"lb_pool", "add_pool_member", "delete_pool_member"} <= registry.methods(dst)
+    assert set(registry.used("set_pool_member")) == {src}
+    assert not LB_CALLS & (
+        registry.methods(own(SRC_PROVIDER)) | registry.methods(own(DST_PROVIDER))
+    )
+
+
 async def test_a_restore_that_fails_is_recorded_and_the_rollback_goes_on(tmp_path, store):
     """SDD §8.5: the source must run again: a restore's failure is recorded, the entry keeps its
     state for the operator, and the rollback's step runs."""

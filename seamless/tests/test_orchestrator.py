@@ -5,6 +5,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -79,6 +80,13 @@ from seamless_migrate.planning.estimator import (
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.security.secret_store import project_secret_name
 from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue
+from tests.credential_support import (
+    CredentialRegistry,
+    of_project,
+    own,
+    project_credentials,
+    tenant_project,
+)
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory, tool_result
@@ -4328,20 +4336,31 @@ def _project_credentials(provider_id: str, *project_ids: str) -> dict[str, Proje
     }
 
 
-def _signs_in(impl, calls: list[str], names: dict[str, str]) -> None:
+def _signs_in(
+    impl,
+    calls: list[str],
+    names: dict[str, str],
+    *,
+    expires_at: str | None = None,
+    refused: Collection[str] = (),
+    roles: Sequence[str] = ("member", "reader"),
+) -> None:
     """``impl`` signs in with a project credential as a project of ``names`` (SDD §10 "The check
-    of project credentials"), recording the project each sign-in came with in ``calls``."""
+    of project credentials"), recording the project each sign-in came with in ``calls``: each
+    credential with ``roles``, expiring at ``expires_at``; Keystone refuses those of ``refused``."""
 
     async def check_project(project_id: str) -> dict:
         calls.append(project_id)
+        if project_id in refused:
+            raise ProviderError("the sign-in failed: HTTP 401")
         return {
             "project_id": project_id,
             "project_name": names[project_id],
             "domain": "Default",
             "user_id": f"user-{names[project_id]}",
-            "roles": ["member", "reader"],
+            "roles": list(roles),
             "restricted": True,
-            "expires_at": None,
+            "expires_at": expires_at,
         }
 
     impl.check_project = check_project
@@ -4414,11 +4433,16 @@ async def test_a_validation_checks_the_plans_project_credentials_alone(tmp_path,
     assert destination.capabilities["projects"][tenant_c]["project_name"] == "tenant-c"
 
     # a plan that names no project: no project credential signs in, the entries stay; nor does
-    # a project its provider holds no credential for (validation refuses it with plan task TC5)
+    # a project its provider holds no credential for, which validation then refuses (plan task
+    # TC5, §8)
     unheld = {"destination_project": secrets.token_hex(16)}
     for projects in ({}, unheld):
         store.put("plan", plan.model_copy(update=projects))
-        await h.orch.validate_plan(plan.id, "alice")
+        if projects:
+            with pytest.raises(BadRequest, match="holds no credential for project"):
+                await h.orch.validate_plan(plan.id, "alice")
+        else:
+            await h.orch.validate_plan(plan.id, "alice")
         assert (source_calls, destination_calls) == ([tenant_a], [tenant_c])
     kept = store.get("provider", SRC_PROVIDER.id, Provider).capabilities["projects"]
     assert kept == source.capabilities["projects"]
@@ -4429,6 +4453,301 @@ async def test_a_validation_checks_the_plans_project_credentials_alone(tmp_path,
     # a manual check signs in with each of the provider's project credentials
     await h.orch.check_provider(SRC_PROVIDER.id, "bob")
     assert source_calls == [tenant_a, *sorted((tenant_a, tenant_b))]
+
+
+# -- the selection: one function gives each step its credential (SDD §8, §27.5, plan task TC5) --
+
+
+def _tenant_plan(tmp_path, store, vms, plan_kw=None, **sign_in):
+    """A plan of ``vms`` whose source_project and destination_project name a tenant project of
+    each side (SDD §4.2, §27.5, plan task TC5): each provider holds the credentials of two made-up
+    tenant projects - tenant-a and tenant-b at the source, tenant-c and tenant-d at the
+    destination -, each signs in with them as ``sign_in`` says (``_signs_in``), and every provider
+    call goes through a registry that records the credential it came with. The plan names tenant-a
+    and tenant-c unless ``plan_kw`` says otherwise."""
+    tenants = SimpleNamespace(**{name: tenant_project() for name in "abcd"})
+    h = build_harness(tmp_path, store, vms)
+    for provider, first, second in (
+        (SRC_PROVIDER, tenants.a, tenants.b),
+        (DST_PROVIDER, tenants.c, tenants.d),
+    ):
+        credentials = project_credentials(provider.id, first, second)
+        store.put("provider", provider.model_copy(update={"project_credentials": credentials}))
+    _signs_in(h.source, [], {tenants.a: "tenant-a", tenants.b: "tenant-b"}, **sign_in)
+    _signs_in(h.destination, [], {tenants.c: "tenant-c", tenants.d: "tenant-d"}, **sign_in)
+    registry = CredentialRegistry(h.source, h.destination)
+    h.orch.providers = registry
+    data = {"source_project": tenants.a, "destination_project": tenants.c, **(plan_kw or {})}
+    plan = plan_for(vms, **data)
+    store.put("plan", plan)
+    return h, plan, registry, tenants
+
+
+#: what a provider check calls with the provider's own credential: its check, its project
+#: credentials' sign-ins and its conversion host's pin (SDD §10, §27.5's first row)
+CHECK_CALLS = {"check", "check_project", "find_server", "console_log"}
+
+
+def _tenant_vm(i: int, project_id: str, project: str, **kw):
+    """An OpenStack VM of the Keystone project ``project_id`` (SDD §4.2 VMRef.project_id)."""
+    return vm(i, project=project, project_id=project_id, **kw)
+
+
+async def test_validation_reads_the_plans_vms_and_inventories_with_its_project_credentials(
+    tmp_path, store
+):
+    """SDD §8, §27.5 (plan task TC5): a validation of a plan with projects checks each provider
+    with its own credential - and the plan's project credential there (§10) -, then reads the
+    plan's VMs, both inventories, its mapped Octavia pools and its DNS targets' records with the
+    plan's project credentials, never with the providers' own; a plan that names no project reads
+    them with the providers' own credentials, as 0.4.0 did."""
+    from seamless_migrate.domain.models import DnsTarget
+
+    vms = [vm(1), vm(2)]
+    designate = DnsTarget(kind="designate", zone="example.com.", record="web-01")
+    cutover = {"lb_pools": {"src-pool": "dst-pool"}, "dns_targets": {"vm-1": designate}}
+    h, plan, registry, t = _tenant_plan(tmp_path, store, vms, {"network_cutover": cutover})
+    for i in (1, 2):
+        h.source.vms[f"vm-{i}"] = _tenant_vm(i, t.a, "tenant-a")
+
+    async def lb_pool(pool_id):
+        return {"id": pool_id, "protocol": "HTTP", "lb_algorithm": "ROUND_ROBIN", "listeners": []}
+
+    async def dns_recordset(zone, name, rdtype):
+        return {"zone_id": "z-1", "id": "rs-1", "records": ["10.0.0.1"], "ttl": 60}
+
+    h.source.lb_pool = h.destination.lb_pool = lb_pool
+    h.destination.dns_recordset = dns_recordset
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert len(report.migrations) == 2
+    src, dst = of_project(SRC_PROVIDER, t.a), of_project(DST_PROVIDER, t.c)
+    assert registry.used("get_vm") == [src, src]
+    assert registry.used("inventory") == [src, dst]
+    assert registry.used("lb_pool") == [src, dst]
+    assert registry.used("dns_recordset") == [dst]
+    # the providers' own credentials made the checks alone (§27.5's first row)
+    assert registry.methods(own(SRC_PROVIDER)) == {"check", "check_project"}
+    assert registry.methods(own(DST_PROVIDER)) <= CHECK_CALLS
+
+    # the same plan naming no project: the providers' own credentials, as before
+    registry.calls.clear()
+    stored = await h.plan(plan.id)
+    store.put(
+        "plan", stored.model_copy(update={"source_project": None, "destination_project": None})
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    assert registry.used("get_vm") == [own(SRC_PROVIDER)] * 2
+    assert registry.used("inventory") == [own(SRC_PROVIDER), own(DST_PROVIDER)]
+    assert registry.used("lb_pool") == [own(SRC_PROVIDER), own(DST_PROVIDER)]
+    assert registry.used("dns_recordset") == [own(DST_PROVIDER)]
+    assert not [c for c, _ in registry.calls if "/" in c], "no project credential was used"
+
+
+async def test_a_plan_whose_project_credential_is_missing_failed_or_expired_is_refused(
+    tmp_path, store
+):
+    """SDD §8, §27.5, §27.7 (plan task TC5): validation refuses (400) a plan whose project
+    credential is missing - its provider holds none for the project -, failed its check, or has
+    expired by its check's expires_at, naming the provider and the project: after the checks,
+    before it reads anything and before any finding, so no migration is written. Nothing of a
+    credential reaches the refusal."""
+    vms = [vm(1)]
+    h, plan, registry, t = _tenant_plan(tmp_path, store, vms)
+    unheld = tenant_project()
+    store.put("plan", plan.model_copy(update={"destination_project": unheld}))
+    with pytest.raises(BadRequest) as missing:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert DST_PROVIDER.label in str(missing.value) and unheld in str(missing.value)
+    assert "holds no credential for project" in str(missing.value)
+
+    store.put("plan", plan)
+    _signs_in(h.source, [], {t.a: "tenant-a", t.b: "tenant-b"}, refused={t.a})
+    with pytest.raises(BadRequest) as failed:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert SRC_PROVIDER.label in str(failed.value) and t.a in str(failed.value)
+    assert "failed its check" in str(failed.value) and "HTTP 401" in str(failed.value)
+
+    _signs_in(h.source, [], {t.a: "tenant-a", t.b: "tenant-b"})
+    _signs_in(h.destination, [], {t.c: "tenant-c", t.d: "tenant-d"}, expires_at=_ago(60))
+    with pytest.raises(BadRequest) as expired:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert DST_PROVIDER.label in str(expired.value) and t.c in str(expired.value)
+    assert "expired" in str(expired.value)
+
+    # nothing was read before the refusals, no finding was written
+    assert registry.used("get_vm") == registry.used("inventory") == []
+    assert await h.migrations(plan.id) == []
+    for refusal in (missing, failed, expired):
+        assert "secret" not in str(refusal.value).lower()
+    # a credential that expires later is no refusal
+    _signs_in(h.destination, [], {t.c: "tenant-c", t.d: "tenant-d"}, expires_at=_ago(-3600))
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert [item.vm_name for item in report.migrations] == ["web-01"]
+
+
+def _ago(seconds: float) -> str:
+    """The time ``seconds`` ago (a negative number: from now), as a project check writes it."""
+    from seamless_migrate.domain.models import utc_text
+
+    return utc_text(utcnow() - timedelta(seconds=seconds))
+
+
+async def test_a_failing_project_credential_is_never_replaced_by_the_providers(tmp_path, store):
+    """SDD §27.5 "No fallback" (owner decision 6, plan task TC5): a project credential that fails
+    is never replaced by the provider's own, which would act as admin or in another project. A
+    validation whose destination project credential fails its check is refused without a read by
+    the destination provider's own credential; a project credential that stops signing in after
+    the validation fails the step that needs it - the verification here -, and no call of that
+    step is made with the provider's own credential instead."""
+    vms = [vm(1)]
+    h, plan, registry, t = _tenant_plan(
+        tmp_path, store, vms, {"default_strategy": Strategy.cold}, refused=set()
+    )
+    _signs_in(h.destination, [], {t.c: "tenant-c", t.d: "tenant-d"}, refused={t.c})
+    with pytest.raises(BadRequest, match="failed its check"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert registry.methods(own(DST_PROVIDER)) <= CHECK_CALLS
+    assert registry.used("inventory") == []
+
+    _signs_in(h.destination, [], {t.c: "tenant-c", t.d: "tenant-d"})
+    await h.orch.validate_plan(plan.id, "alice")
+    registry.revoked.add(t.c)  # the tenant's credential is revoked in Keystone meanwhile
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.rolled_back, P.failed)
+    await h.orch.stop()
+    assert "HTTP 401" in (m.error or "")
+    assert "get_server" in registry.methods(of_project(DST_PROVIDER, t.c))
+    assert "get_server" not in registry.methods(own(DST_PROVIDER))
+
+    # a credential gone from its provider after the validation (written around the API, which
+    # refuses it while a plan needs it): the verification fails, never with the provider's own
+    gone_store = Store(f"sqlite:///{tmp_path / 'gone.db'}")
+    gone_store.create_schema()
+    try:
+        h, plan, registry, t = _tenant_plan(
+            tmp_path / "gone", gone_store, [vm(1)], {"default_strategy": Strategy.cold}
+        )
+        await h.orch.validate_plan(plan.id, "alice")
+        held = gone_store.get("provider", DST_PROVIDER.id, Provider)
+        gone_store.put("provider", held.model_copy(update={"project_credentials": {}}))
+        await h.orch.start_plan(plan.id, "alice")
+        await h.orch.start()
+        mid = (await h.by_vm(plan.id, "vm-1")).id
+        m = await h.wait_phase(mid, P.rolled_back, P.failed)
+        await h.orch.stop()
+        assert "holds no credential for project" in (m.error or "")
+        assert "get_server" not in registry.methods(own(DST_PROVIDER))
+    finally:
+        gone_store.dispose()
+
+
+async def test_a_plan_whose_vms_are_not_all_of_its_source_project_is_refused(tmp_path, store):
+    """SDD §27.5 "One project pair per plan" (owner decision 7, plan task TC5): validation refuses
+    (400) a plan whose VMs are not all of its source project - the source provider's own project,
+    as its check names it, when source_project is null -, naming each project with its VM count,
+    before any finding. A VM whose project is not known (recorded before) is not judged."""
+    other = tenant_project()
+    vms = [vm(1), vm(2), vm(3)]
+    h, plan, _, t = _tenant_plan(tmp_path, store, vms)
+    h.source.vms["vm-1"] = _tenant_vm(1, t.a, "tenant-a")
+    h.source.vms["vm-2"] = _tenant_vm(2, t.a, "tenant-a")
+    h.source.vms["vm-3"] = _tenant_vm(3, other, "tenant-b")
+    with pytest.raises(BadRequest) as refused:
+        await h.orch.validate_plan(plan.id, "alice")
+    text = str(refused.value)
+    assert f"{t.a} (tenant-a): 2 VM(s)" in text and f"{other} (tenant-b): 1 VM(s)" in text
+    assert "source project" in text
+    assert await h.migrations(plan.id) == []
+
+    # a plan that names no source project: its source provider's own project, as checked
+    own_project = {"id": t.a, "name": "tenant-a", "domain": "Default"}
+    checked = h.source.check
+
+    async def check():
+        return {**(await checked()), "project": own_project}
+
+    h.source.check = check
+    store.put("plan", plan.model_copy(update={"source_project": None}))
+    with pytest.raises(BadRequest, match=f"{other} \\(tenant-b\\): 1 VM\\(s\\)"):
+        await h.orch.validate_plan(plan.id, "alice")
+    # all of one project: validated; a VM whose project is not known is not judged
+    h.source.vms["vm-3"] = vm(3)  # project_id null: recorded before plan task TC4
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert len(report.migrations) == 3
+
+
+async def test_a_plan_with_a_project_on_an_existing_conversion_host_is_refused(tmp_path, store):
+    """SDD §27.5 "Conversion hosts" (plan task TC5): an existing conversion host (manage false)
+    serves its provider's own project alone, so validation refuses (400) a plan that names a
+    project on that side, naming the provider; a project on the other side, whose host the deploy
+    manages, is no refusal, nor is a plan that names none."""
+    vms = [vm(1)]
+    h, plan, _, t = _tenant_plan(tmp_path, store, vms)
+    existing = ConversionHostConfig(name="conv-src", manage=False, address="192.0.2.20")
+    source = store.get("provider", SRC_PROVIDER.id, Provider)
+    store.put("provider", source.model_copy(update={"conversion_host": existing}))
+    with pytest.raises(BadRequest) as refused:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert SRC_PROVIDER.label in str(refused.value) and t.a in str(refused.value)
+    assert "existing conversion host" in str(refused.value)
+    assert await h.migrations(plan.id) == []
+    for projects in (
+        {"source_project": None},
+        {"source_project": None, "destination_project": None},
+    ):
+        store.put("plan", plan.model_copy(update=projects))
+        report = await h.orch.validate_plan(plan.id, "alice")
+        assert [item.vm_name for item in report.migrations] == ["web-01"]
+
+
+async def test_the_gpu_capacity_of_a_plan_with_projects_is_read_with_the_providers_credential(
+    tmp_path, store
+):
+    """SDD §8, §22.3, §27.5 (plan task TC5): Placement refuses a member's token, so a validation
+    of a plan with a destination project reads its inventory with the project credential - whose
+    GPU capacity is Placement's refusal - and the capacity of the GPU flavors that credential lists
+    again with the destination provider's own credential: the pre-flight judges the provider's
+    read (no DST_GPU_CAPACITY_UNKNOWN), and no other read is the provider's."""
+    from seamless_migrate.domain.models import Mappings
+    from seamless_migrate.planning.preflight import GpuCapacity
+
+    refusal = GpuCapacity(status="unknown", reason="forbidden", detail="HTTP 403 policy")
+
+    class MemberView(GateDestination):
+        """The destination as a member's token reads it: its flavors, Placement's refusal."""
+
+        async def inventory(self):
+            inv = await super().inventory()
+            inv.gpu_capacity = refusal
+            return inv
+
+        async def gpu_capacity(self, requests):
+            return refusal
+
+    vms = [gate_vm(1)]
+    mappings = Mappings(flavors={"g1.vgpu": GATE_FLAVOR})
+    h, plan, registry, t = _tenant_plan(tmp_path, store, vms, {"mappings": mappings})
+    provider_view = GateDestination(free=GATE_ROOM)
+    _signs_in(provider_view, [], {t.c: "tenant-c", t.d: "tenant-d"})
+    registry.destination = provider_view
+    registry.by_credential[of_project(DST_PROVIDER, t.c)] = MemberView(free=GATE_ROOM)
+    report = await h.orch.validate_plan(plan.id, "alice")
+    [item] = report.migrations
+    assert "DST_GPU_CAPACITY_UNKNOWN" not in [f.code for f in item.findings]
+    assert item.phase == P.ready, [f.code for f in item.findings]
+    assert registry.used("gpu_capacity") == [own(DST_PROVIDER)]
+    assert len(provider_view.reads) == 1
+    assert registry.used("inventory") == [
+        of_project(SRC_PROVIDER, t.a),
+        of_project(DST_PROVIDER, t.c),
+    ]
+    # without a destination project the provider's own inventory holds the capacity: no read again
+    registry.calls.clear()
+    store.put("plan", plan.model_copy(update={"source_project": None, "destination_project": None}))
+    await h.orch.validate_plan(plan.id, "alice")
+    assert registry.used("gpu_capacity") == []
 
 
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):

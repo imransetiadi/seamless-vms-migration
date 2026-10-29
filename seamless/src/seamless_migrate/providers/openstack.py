@@ -792,8 +792,12 @@ class OpenStackProvider:
         await self._run(self._set_volume_metadata, volume_id, metadata)
 
     # the keep-address move of floating IPs (SDD §8.3, §10, plan task N6a)
-    async def reserve_floating_ip(self, address: str) -> None:
-        await self._run(self._reserve_floating_ip, address)
+    async def reserve_floating_ip(self, address: str, project_id: str | None = None) -> None:
+        await self._run(self._reserve_floating_ip, address, project_id)
+
+    # a pre-staged private flavor made usable by a plan's destination project (SDD §7.2, §27.5)
+    async def grant_flavor_access(self, name: str, project_id: str) -> bool:
+        return await self._run(self._grant_flavor_access, name, project_id)
 
     async def server_port(self, server_id: str, address: str) -> str | None:
         return await self._run(self._server_port, server_id, address)
@@ -1480,20 +1484,23 @@ class OpenStackProvider:
                 )
             time.sleep(2)
 
-    def _project_fip(self, conn: Any, address: str) -> Any:
-        """The credential's project's floating IP of the address, None when it holds none."""
-        project = _attr(conn, "current_project_id", default=None)
+    def _project_fip(self, conn: Any, address: str, project_id: str | None = None) -> Any:
+        """The floating IP of the address the credential's project holds - or ``project_id``,
+        for an admin acting for it (SDD §8.3, §27.6) -, None when it holds none."""
+        project = project_id or _attr(conn, "current_project_id", default=None)
         canonical = _canonical_ip(address)
         for fip in conn.network.ips(floating_ip_address=canonical, project_id=project):
             if _canonical_ip(str(_attr(fip, "floating_ip_address"))) == canonical:
                 return fip
         return None
 
-    def _reserve_floating_ip(self, address: str) -> None:
+    def _reserve_floating_ip(self, address: str, project_id: str | None = None) -> None:
         """SDD §8.3: keep the project's detached floating IP of the address, else create one on
-        the external network one of whose subnets holds it."""
+        the external network one of whose subnets holds it - with ``project_id``, the admin's
+        reservation for that project: looked up and created there (§27.6, plan task TC5)."""
         conn = self._connection()
-        held = self._project_fip(conn, address)
+        held = self._project_fip(conn, address, project_id)
+        owner = {"project_id": project_id} if project_id is not None else {}
         if held is not None:
             if _attr(held, "port_id"):
                 raise ProviderError(
@@ -1508,11 +1515,34 @@ class OpenStackProvider:
                         conn.network.create_ip(
                             floating_network_id=_attr(network, "id"),
                             floating_ip_address=str(ip),
+                            **owner,
                         )
                         return
         raise ProviderError(
             f"{self.provider.id}: {address} lies in no subnet of an external network"
         )
+
+    def _grant_flavor_access(self, name: str, project_id: str) -> bool:
+        """SDD §7.2, §10, §27.5: the private flavor of the name (``is_public`` false) made usable
+        by the project - Nova's addTenantAccess, an admin's call; access the project holds
+        already (409) is no error -, True; a public flavor is left as it is, False. None of the
+        name, or two, is a provider error."""
+        conn = self._connection()
+        # an admin's list holds the private flavors too (openstacksdk sends is_public=None)
+        named = [f for f in conn.compute.flavors(details=True) if _attr(f, "name") == name]
+        if len(named) != 1:
+            many = "more than one flavor" if named else "no flavor"
+            raise ProviderError(f"{self.provider.id}: {many} named {name!r}")
+        flavor = named[0]
+        if _attr(flavor, "is_public", default=True):
+            return False
+        import openstack.exceptions
+
+        try:
+            conn.compute.flavor_add_tenant_access(flavor, project_id)
+        except openstack.exceptions.ConflictException:
+            pass  # the project has access already
+        return True
 
     def _server_port(self, server_id: str, address: str) -> str | None:
         canonical = _canonical_ip(address)

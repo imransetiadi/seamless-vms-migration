@@ -27,7 +27,8 @@ from typing import Any, TypeVar
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
-from ..domain.enums import Strategy
+from ..credentials import Step, credential_project, for_step
+from ..domain.enums import ProviderRole, Strategy
 from ..domain.models import Mappings, Plan, Provider, VMRef, utcnow
 from ..planning.gpu import vm_gpus
 from ..planning.ipam import address_refusal, requested_ips
@@ -452,16 +453,18 @@ class HandoverExecutor:
     def __init__(
         self,
         settings: Settings,
-        conn_factory: Callable[[Provider], Any] | None = None,
+        conn_factory: Callable[..., Any] | None = None,
         *,
         poll_s: float = 2.0,
         wait_s: int = 900,
         providers: Any = None,
     ) -> None:
         self.settings = settings
+        #: (provider) for its own credential, (provider, project_id) for a project's (SDD §27.5)
         self._conn_factory = conn_factory or self._default_conn
-        #: per provider id: the fingerprint a connection was built for, and the connection
-        self._conns: dict[str, tuple[str, Any]] = {}
+        #: per provider id and project (None: its own credential): the fingerprint a connection
+        #: was built for, and the connection
+        self._conns: dict[tuple[str, str | None], tuple[str, Any]] = {}
         self._conns_lock = asyncio.Lock()
         self.poll_s = poll_s
         self.wait_s = wait_s
@@ -475,10 +478,12 @@ class HandoverExecutor:
             self._providers = ProviderRegistry(self.settings)
         return self._providers
 
-    def _default_conn(self, provider: Provider) -> Any:
+    def _default_conn(self, provider: Provider, project_id: str | None = None) -> Any:
         from ..providers.openstack import connect
 
-        return connect(provider, self.settings)
+        if project_id is None:
+            return connect(provider, self.settings)
+        return connect(provider, self.settings, project_id=project_id)
 
     def supports(self, strategy: Strategy) -> bool:
         return Strategy(strategy) == Strategy.storage_handover
@@ -489,21 +494,47 @@ class HandoverExecutor:
     def run_dir(self, ctx: StepContext) -> Path:
         return run_dir(self.settings, ctx.plan.id, ctx.migration.id)
 
-    async def _conn(self, provider: Provider) -> Any:
-        """The provider's connection, built again once how it is reached changed - a credential
-        rotated while a plan runs (SDD §13.3) - as the provider registry does (audit EX-14)."""
-        fingerprint = connection_fingerprint(provider, self.settings)
+    async def _conn(self, provider: Provider, project_id: str | None = None) -> Any:
+        """The provider's connection - with its credential for the Keystone project
+        ``project_id`` when one is given (SDD §7.3, §27.5), never its own instead: a project it
+        holds no credential for is a permanent failure -, built again once how it is reached
+        changed - a credential rotated while a plan runs (SDD §13.3) - as the provider registry
+        does (audit EX-14)."""
+        if project_id is not None and project_id not in provider.project_credentials:
+            raise PermanentStepError(
+                f"credentials unavailable: {provider.id} holds no credential for project "
+                f"{project_id}"
+            )
+        fingerprint = connection_fingerprint(provider, self.settings, project_id)
+        key = (provider.id, project_id)
         async with self._conns_lock:
-            cached = self._conns.get(provider.id)
+            cached = self._conns.get(key)
             if cached is not None and cached[0] == fingerprint:
                 return cached[1]
-            conn = await _in_thread(self._conn_factory, provider)
-            self._conns[provider.id] = (fingerprint, conn)
+            if project_id is None:
+                conn = await _in_thread(self._conn_factory, provider)
+            else:
+                conn = await _in_thread(self._conn_factory, provider, project_id)
+            self._conns[key] = (fingerprint, conn)
         close = getattr(cached[1], "close", None) if cached is not None else None
         if callable(close):
             with contextlib.suppress(Exception):
                 close()  # the replaced connection must not keep its session
         return conn
+
+    @staticmethod
+    def _project(plan: Plan | None, side: ProviderRole) -> str | None:
+        """The project whose credential the handover acts with on ``side`` (SDD §7.3, §27.5): the
+        source half by id with the source provider's own, the destination half with the plan's
+        destination credential."""
+        return credential_project(Step.HANDOVER, side, plan)
+
+    async def _halves(
+        self, source: Provider, destination: Provider, plan: Plan | None
+    ) -> tuple[Any, Any]:
+        """The source's and the destination's connections, each with its half's credential."""
+        src = await self._conn(source, self._project(plan, ProviderRole.source))
+        return src, await self._conn(destination, self._project(plan, ProviderRole.destination))
 
     async def _call(self, what: str, fn: Callable[[], T]) -> T:
         try:
@@ -798,8 +829,7 @@ class HandoverExecutor:
         """Read-only handover check of one server (SDD §7.3 step 0): per volume its driver
         family, source pool, destination host and manage reference, and every problem that would
         refuse the handover. Changes nothing; the lab runs it before a real cutover."""
-        src = await self._conn(source)
-        dst = await self._conn(destination)
+        src, dst = await self._halves(source, destination, plan)
         return await self._call(
             "check the handover readiness",
             lambda: self._readiness(
@@ -827,7 +857,10 @@ class HandoverExecutor:
             return None
         where = ctx.destination.label
         try:
-            inventory = await self.providers.get(ctx.destination).inventory()
+            # the plan's destination credential (SDD §7.3, §27.5)
+            inventory = await for_step(
+                self.providers, Step.HANDOVER, ctx.destination, ctx.plan
+            ).inventory()
         except ProviderError as exc:
             raise TransientStepError(
                 f"could not read the flavors of {where} for the GPU flavor of {vm.name}: {exc}"
@@ -1392,8 +1425,7 @@ class HandoverExecutor:
                 f"a rollback attempt recreated the source server {recreated}, which runs: roll "
                 "back to finish it"
             )
-        src = await self._conn(ctx.source)
-        dst = await self._conn(ctx.destination)
+        src, dst = await self._halves(ctx.source, ctx.destination, ctx.plan)
         # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
         # (SDD §7.2)
         mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
@@ -1686,7 +1718,8 @@ class HandoverExecutor:
     async def _rollback(self, ctx: StepContext) -> StepResult:
         rdir = self.run_dir(ctx)
         journal = await _in_thread(_Journal, rdir / JOURNAL_FILE)
-        src = await self._conn(ctx.source)
+        # the source half by id with the source provider's own credential (SDD §7.3, §27.5)
+        src = await self._conn(ctx.source, self._project(ctx.plan, ProviderRole.source))
         server_id = ctx.migration.vm.source_id
         definition_path = rdir / DEFINITION_FILE
         if not journal.data["order"]:
@@ -1706,7 +1739,7 @@ class HandoverExecutor:
             await _in_thread(journal.archive, "rolled-back")
             return StepResult(details={"source_running": True})
 
-        dst = await self._conn(ctx.destination)
+        dst = await self._conn(ctx.destination, self._project(ctx.plan, ProviderRole.destination))
         definition = await _in_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
