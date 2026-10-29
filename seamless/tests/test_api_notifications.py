@@ -600,9 +600,13 @@ def test_a_notify_secret_name_is_refused_for_a_provider_a_hook_and_a_dns_target(
 def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     """SDD §8.7, §12, §24.3 (plan task NT5): an admin's test sends a fixed message through the
     channel at once and answers its outcome; it is recorded as a delivery with the trigger test;
-    a disabled channel answers 409, a kind without a sender yet (the webhook's, plan task NT8)
-    fails with no_sender."""
+    a disabled channel answers 409; a webhook channel sends through the webhook sender (plan
+    task NT8) - no_secret while its signing key is unwritten, and a signed POST to its URL once it
+    is - and a kind without a sender (removed for one call) fails with no_sender."""
+    import httpx
+
     from seamless_migrate.notify.notifier import SendResult
+    from seamless_migrate.notify.webhook import WebhookSender
 
     class Scripted:
         def __init__(self):
@@ -614,9 +618,26 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
             return self.results.pop(0)
 
     sender = Scripted()
-    api.client.app.state.services.notifier.senders["slack"] = sender
+    services = api.client.app.state.services
+    services.notifier.senders["slack"] = sender
+    received = []
+
+    def receiver(request):
+        received.append(request)
+        return httpx.Response(200)
+
+    services.notifier.senders["webhook"] = WebhookSender(
+        services.settings, transport=httpx.MockTransport(receiver)
+    )
     register(api, SLACK)
-    register(api, WEBHOOK)  # the webhook sender comes with plan task NT8: no sender yet
+    register(api, WEBHOOK)
+    register(api, {"name": "sms", "kind": "webhook", "url": "https://sms.example.org/in"})
+    del services.notifier.senders["webhook"]  # for one call: a kind without a sender
+    no_sender = api.post(f"{CHANNELS}/sms/test")
+    assert no_sender.json() == {"outcome": "failed", "reason": "no_sender"}
+    services.notifier.senders["webhook"] = WebhookSender(
+        services.settings, transport=httpx.MockTransport(receiver)
+    )
     for role in OTHERS:
         assert api.post(f"{CHANNELS}/ops-slack/test", role=role).status_code == 403
     assert api.post(f"{CHANNELS}/nope/test").status_code == 404
@@ -626,19 +647,36 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     sent = api.post(f"{CHANNELS}/ops-slack/test")
     assert sent.json() == {"outcome": "sent", "reason": None}
     assert len(sender.keys) == 2 and all(k.startswith("ops-slack_test_") for k in sender.keys)
-    no_sender = api.post(f"{CHANNELS}/cmdb/test")
-    assert no_sender.json() == {"outcome": "failed", "reason": "no_sender"}
+    no_secret = api.post(f"{CHANNELS}/cmdb/test")
+    assert no_secret.json() == {"outcome": "failed", "reason": "no_secret"}
+    assert received == []  # nothing is sent without the key
+    assert (
+        put(api, "/notifications/channels/cmdb/secret", {"signing_key": SIGNING_KEY}).status_code
+        == 200
+    )
+    delivered = api.post(f"{CHANNELS}/cmdb/test")
+    assert delivered.json() == {"outcome": "sent", "reason": None}
+    [request] = received
+    assert str(request.url) == WEBHOOK["url"]
+    assert request.headers["webhook-id"].startswith("cmdb_test_")
+    assert request.headers["webhook-signature"].startswith("v1,")
+    assert SIGNING_KEY not in request.headers["webhook-signature"]
+    assert json.loads(request.read())["type"] == "test"
     assert patch(api, "/notifications/channels/ops-slack", {"enabled": False}).status_code == 200
     refused = api.post(f"{CHANNELS}/ops-slack/test")
     assert refused.status_code == 409 and "disabled" in message(refused)
     recorded = events(api, ("notification.",))
     assert [(e.kind, e.data["channel"], e.data["trigger"], e.data["reason"]) for e in recorded] == [
+        ("notification.failed", "sms", "test", "no_sender"),
         ("notification.failed", "ops-slack", "test", "invalid_payload"),
         ("notification.sent", "ops-slack", "test", None),
-        ("notification.failed", "cmdb", "test", "no_sender"),
+        ("notification.failed", "cmdb", "test", "no_secret"),
+        ("notification.sent", "cmdb", "test", None),
     ]
     assert all(e.data["tries"] == 1 and e.data["event_seq"] is None for e in recorded)
     assert api.store.list("notification_cursor", NotificationCursor) == []
     metrics = api.get("/api/v1/metrics", role=Role.admin).text
     assert 'seamless_notifications_total{kind="slack",outcome="sent"} 1' in metrics
     assert 'seamless_notifications_total{kind="slack",outcome="failed"} 1' in metrics
+    assert 'seamless_notifications_total{kind="webhook",outcome="sent"} 1' in metrics
+    assert 'seamless_notifications_total{kind="webhook",outcome="failed"} 2' in metrics

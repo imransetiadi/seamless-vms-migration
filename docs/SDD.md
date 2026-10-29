@@ -3124,6 +3124,17 @@ route waits for it.
   with `https://hooks.slack.com/services/`, is `failed` with `no_secret`, and nothing is sent. The URL reaches no
   event, no log line, no exception message and no API answer: a reason is a status, one word of Slack's or an error's
   class, and the answer's body is never kept.
+* **The webhook sender** (plan task NT8; §24.3, §24.5, §24.6): `httpx`'s asynchronous client with 15 s for the
+  request and no redirect followed POSTs §24.5's Standard Webhooks document (`webhook_document`, §8.6) to the
+  channel's `url` with `Content-Type: application/json` and the three headers: `webhook-id` the message's key,
+  `webhook-timestamp` the try's time in Unix seconds, `webhook-signature` the prefix `v1,` and the base64 HMAC-SHA256
+  of `<id>.<timestamp>.<body>` over the exact bytes sent, keyed with the bytes the secret's `signing_key` encodes
+  after `whsec_`. Each try takes a new timestamp and a new signature with the same `webhook-id`, so a receiver that
+  refuses an old timestamp still takes a retry, and one that keeps the ids it saw drops the copy (§24.6). A 2xx is
+  `sent`; 408, 429 and 5xx, a timeout, a connection or TLS error are `retry`, with the answer's `Retry-After`; 410 and
+  any other 4xx are `failed` with the status as the reason; a 3xx is `failed` with the reason `redirect`; a missing
+  or malformed `signing_key` is `failed` with the reason `no_secret`, and nothing is sent. The key never leaves the
+  control plane: only the signature travels, and no request, event, log line or reason carries it (§13.3).
 * **Retries, pacing, expiry** (§24.6): 5 tries with 10, 20, 40 and 80 s before the second to the fifth, each ±20 %,
   a `Retry-After` of up to 300 s honoured; one message a second per channel; a message whose event is more than an
   hour old when its turn comes is not sent, and a run of expired messages is one `notification.failed` with the
@@ -4317,7 +4328,9 @@ starting with `notify-` belong to the notification channels (`notify-{name}`, §
 `PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`, a hook's `secret`
 or a DNS target's `tsig_secret` that folds to one is refused (422), so writing a channel's secret never replaces theirs,
 and a channel never reads theirs. `SEAMLESS_SMTP_SECRET` names the secret whose `username` and `password` the email sender
-authenticates to the relay with (§15.1, §24.3); it is read each time a message is sent. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+authenticates to the relay with (§15.1, §24.3); it is read each time a message is sent. A webhook channel's `signing_key`
+never leaves the control plane: the webhook sender (§8.7) sends the HMAC signature it computes with the key, and the key
+itself reaches no request, event, log line or reason. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
@@ -7008,7 +7021,9 @@ channel or plan, the `notify-` names, a Slack secret's URL) is the routes' (NT3)
 The routes above with their roles and refusals, `NotificationChannelView` (§4.2), the `notify-` names (§13.3), the roles
 (§13.2) and the `channel.*` events (§4.3) are binding in those sections since plan task NT3; the test route since NT5
 (§8.7). The SMTP relay, its variables and an email channel's refusal while the relay is unset are binding in §8.7,
-§13.3 and §15.1 since plan task NT6, with the NetworkPolicy's egress in §17.
+§13.3 and §15.1 since plan task NT6, with the NetworkPolicy's egress in §17. The webhook kind's Standard Webhooks
+signature and headers, and the rule that the signing key never travels, are binding in §8.7 and §13.3 since plan task
+NT8.
 
 ### 24.4 Subscriptions and roles
 
@@ -7136,7 +7151,8 @@ Two event data additions close the gap of §24.1 (plan task NT4; binding in §4.
   * the downtime, the estimate and the SLO, in seconds.
 
 The topics, the triggers, the messages and the formats above are binding in §8.6 since plan task NT4, and
-`SEAMLESS_PUBLIC_URL` in §15.1. The sender that POSTs the Slack format is binding in §8.7 since plan task NT7.
+`SEAMLESS_PUBLIC_URL` in §15.1. The sender that POSTs the Slack format is binding in §8.7 since plan task NT7. The webhook document as the body the webhook sender signs and POSTs is binding in §8.7
+and §13.3 since plan task NT8.
 
 ### 24.6 Delivery
 
@@ -7195,7 +7211,9 @@ The topics, the triggers, the messages and the formats above are binding in §8.
 
 The notifier above is binding in §8.7 since plan task NT5, with its test route in §12 and its metric in §18. The Slack
 sender's outcome classes - the retry classes, Slack's final answers, the 3xx and the missing secret -, its 15 s timeout
-and its `Retry-After` are binding in §8.7 since plan task NT7.
+and its `Retry-After` are binding in §8.7 since plan task NT7. A
+webhook's delivery - the 15 s request, no redirect followed, its retry classes with `Retry-After`, 410 final and a new
+timestamp and signature for each try under the same `webhook-id` - is binding in §8.7 and §13.3 since plan task NT8.
 
 ### 24.7 Audit events
 
