@@ -38,6 +38,24 @@ spec:
           # pin by digest for production, e.g. via the images: section of kustomization.yaml
           image: registry.redhat.io/rhel9/postgresql-16
           imagePullPolicy: IfNotPresent
+          # The image's own start script, which hands what follows it to postgres (SDD 17, 25.7): a client that
+          # vanished is dropped within 40 s - 10 s idle, then 6 probes 5 s apart -, and with it its session locks, a
+          # cut-off control plane's VM-claim lock among them (SDD 5.4), instead of after the kernel's two hours;
+          # a transaction left idle ends after 10 s, so a leader cut off inside a write holds its lock no longer
+          # (SDD 25.4). On the server, they hold for whichever role the control plane connects as; pg_dump and
+          # pg_restore lift the timeout for their own sessions. A database of your own needs them set: the
+          # keepalives on its server, the timeout for the application role (ALTER ROLE ... SET
+          # idle_in_transaction_session_timeout = '10s').
+          args:
+            - run-postgresql
+            - -c
+            - tcp_keepalives_idle=10
+            - -c
+            - tcp_keepalives_interval=5
+            - -c
+            - tcp_keepalives_count=6
+            - -c
+            - idle_in_transaction_session_timeout=10s
           ports:
             - name: postgres
               containerPort: 5432

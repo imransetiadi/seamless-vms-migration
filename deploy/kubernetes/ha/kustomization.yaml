@@ -1,0 +1,29 @@
+# The HA component on Kubernetes (SDD 17, 25.7): deploy/openshift/ha - read it for what it sets - with this overlay's
+# pod network for FORWARDED_ALLOW_IPS, as ../kustomization.yaml puts it into the NetworkPolicies' except ranges.
+# Enable it with the two commented components: lines of ../kustomization.yaml - there, not in deploy/openshift, whose
+# component would bring OpenShift's pod network.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+components:
+  - ../../openshift/ha
+
+patches:
+  # ADJUST with ../kustomization.yaml's pod network (k3s: 10.42.0.0/16), and add the ingress controller's addresses
+  # when its hop comes from outside it (comma-separated; never "*")
+  - target:
+      kind: Deployment
+      name: seamless
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: seamless
+      spec:
+        template:
+          spec:
+            containers:
+              - name: seamless
+                env:
+                  - name: FORWARDED_ALLOW_IPS
+                    value: 10.244.0.0/16
