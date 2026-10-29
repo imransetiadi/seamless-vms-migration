@@ -203,6 +203,8 @@ class Settings(BaseModel):
     memory_secret: str | None = Field(default=None, repr=False)
     memory_project: str = "seamless-migrate"
     memory_redact_names: bool = False
+    #: the address people reach the dashboard at: a notification's link (SDD §8.6, §24.5)
+    public_url: str | None = None
     dashboard_dir: Path | None = None
     metrics_public: bool = False
     log_level: str = "INFO"
@@ -284,6 +286,7 @@ class Settings(BaseModel):
             "MEMORY_URL": "memory_url",
             "MEMORY_SECRET": "memory_secret",
             "MEMORY_PROJECT": "memory_project",
+            "PUBLIC_URL": "public_url",
             "LOG_LEVEL": "log_level",
         }
         for env_name, field in text_fields.items():

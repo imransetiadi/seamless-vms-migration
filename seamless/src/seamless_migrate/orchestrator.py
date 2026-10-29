@@ -4069,7 +4069,7 @@ class Orchestrator:
                 v,
                 "migration.downtime_ended",
                 f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
-                {"actual_downtime_s": m.actual_downtime_s},
+                {"actual_downtime_s": m.actual_downtime_s, "cause": "source_started"},
             )
 
     async def _run_step(
@@ -4477,7 +4477,7 @@ class Orchestrator:
                         "migration.downtime_ended",
                         f"{cur.vm.name}: verified after {cur.actual_downtime_s:.0f} s of downtime",
                         migration=cur,
-                        data={"actual_downtime_s": cur.actual_downtime_s},
+                        data={"actual_downtime_s": cur.actual_downtime_s, "cause": "verified"},
                     )
                 if cur.data_issues:
                     await self._emit(
@@ -4566,7 +4566,7 @@ class Orchestrator:
                     v,
                     "migration.downtime_ended",
                     f"{cur.vm.name}: source running again after {cur.actual_downtime_s:.0f} s",
-                    {"actual_downtime_s": cur.actual_downtime_s},
+                    {"actual_downtime_s": cur.actual_downtime_s, "cause": "source_started"},
                 )
             else:
                 v = await self._save(cur, v)
@@ -5156,7 +5156,12 @@ class Orchestrator:
                 _add_model_s(cur, exc.details)
             plan = await self._plan(cur.plan_id)
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = [
-                (P.failed, f"{step} failed: {message[:200]}", data)
+                # SDD §4.3, §24.5: whether the downtime clock was open at the failure
+                (
+                    P.failed,
+                    f"{step} failed: {message[:200]}",
+                    {**(data or {}), "source_stopped": fsm.source_stopped(cur)},
+                )
             ]
             rollback = (
                 expected != P.rolling_back
