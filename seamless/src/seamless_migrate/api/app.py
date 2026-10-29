@@ -32,6 +32,7 @@ from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
 from ..executors.router import ExecutorRouter
+from ..notify.notifier import Notifier, senders_for
 from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
 from ..providers.registry import ProviderRegistry
@@ -373,6 +374,8 @@ def create_app(
 ) -> FastAPI:
     """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks)."""
     svc = build_services(settings, store, orchestrator, sse_heartbeat_s)
+    # SDD §8.7: the notifier runs beside the orchestrator, in the server's process alone
+    svc.notifier = Notifier(svc.store, svc.bus, settings, senders_for(settings))
     hooks = list(on_startup or [])
 
     @asynccontextmanager
@@ -380,9 +383,11 @@ def create_app(
         for hook in hooks:
             await hook(svc)
         await svc.orchestrator.start()
+        await svc.notifier.start()
         try:
             yield
         finally:
+            await svc.notifier.stop()
             await svc.orchestrator.stop()
 
     app = FastAPI(

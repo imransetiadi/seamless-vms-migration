@@ -79,6 +79,8 @@ def test_kind_catalog_matches_sdd():
         "channel.deleted",
         "subscription.created",
         "subscription.deleted",
+        "notification.sent",
+        "notification.failed",
         "auth.denied",
         "user.created",
         "events.pruned",

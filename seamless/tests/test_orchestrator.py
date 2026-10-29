@@ -12815,3 +12815,38 @@ async def test_a_miss_puts_the_disks_scan_back_into_the_estimate(tmp_path, store
     assert m.estimate.downtime_parts["copy_s"] == pytest.approx(
         30 + 200 * 2**30 / m.observed_scan_bps, rel=0.05
     )
+
+
+async def test_a_channel_that_never_answers_delays_no_migration(tmp_path, store):
+    """SDD §8.7, §24.6 (plan task NT5): the notifier is never in a migration's path - with a
+    channel whose sender never answers, the migrations finish as they would without it, and
+    nothing of the channel is recorded meanwhile."""
+    from seamless_migrate.domain.models import NotificationChannel, NotificationSubscription
+    from seamless_migrate.notify.notifier import Notifier, Timing
+
+    class Hanging:
+        async def send(self, channel, message, key, secret):
+            await asyncio.Event().wait()
+
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    store.put("notification_channel", NotificationChannel(name="ops-slack", kind="slack"))
+    store.put(
+        "notification_subscription",
+        NotificationSubscription(channel="ops-slack", plan_id=plan.id, created_by="op"),
+    )
+    notifier = Notifier(
+        h.store, h.bus, h.orch.settings, {"slack": Hanging()}, timing=Timing(tick_s=0.02)
+    )
+    await notifier.start()
+    try:
+        await run_plan(h, plan)
+        m = await h.by_vm(plan.id, "vm-1")
+        done = await h.wait_phase(m.id, P.completed)
+        await h.wait_plan(plan.id, PlanStatus.completed)
+    finally:
+        await notifier.stop()
+        await h.orch.stop()
+    assert done.downtime_started_at and done.downtime_ended_at
+    assert not [
+        e for e in h.store.events(since_seq=0, limit=1000) if e.kind.startswith("notification.")
+    ]

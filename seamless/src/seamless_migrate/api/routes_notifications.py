@@ -300,6 +300,19 @@ async def set_channel_secret(
     return await _view(request, channel, principal)
 
 
+@router.post("/notifications/channels/{name}/test")
+async def test_channel(
+    name: str, request: Request, _: Principal = Depends(require_role(Role.admin))
+) -> dict[str, Any]:
+    """One try of a fixed message through the channel's sender (SDD §8.7, §12, §24.3), recorded
+    as a delivery with the trigger test; 409 for a disabled channel."""
+    svc = services(request)
+    channel = await svc.db.get("notification_channel", name, NotificationChannel)  # 404
+    if not channel.enabled:
+        raise ApiError(409, "conflict", f"channel {name} is disabled: enable it first")
+    return await svc.notifier.send_test(channel)
+
+
 # -------------------------------------------------------------------- the subscriptions (§24.4)
 
 

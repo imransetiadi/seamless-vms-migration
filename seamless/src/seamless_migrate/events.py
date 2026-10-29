@@ -88,6 +88,9 @@ PERSISTED_KINDS = frozenset(
         "channel.deleted",
         "subscription.created",
         "subscription.deleted",
+        # each message's outcome, once per message (SDD §4.3, §8.7, §24.7)
+        "notification.sent",
+        "notification.failed",
         "auth.denied",
         "user.created",
         "events.pruned",

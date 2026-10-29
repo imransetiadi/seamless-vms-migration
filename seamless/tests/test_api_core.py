@@ -347,6 +347,7 @@ ROUTES = [
         Role.admin,
         {"url": "https://hooks.slack.com/services/T000/B000/matrix"},
     ),
+    ("POST", "/api/v1/notifications/channels/nope-1/test", Role.admin, None),
     ("GET", "/api/v1/notifications/subscriptions", Role.viewer, None),
     (
         "POST",
