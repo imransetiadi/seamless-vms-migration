@@ -1245,3 +1245,76 @@ def test_a_deletion_and_its_events_are_one_write(any_store: Store, refuse_write)
     assert written.seq is not None and [e.message for e in any_store.events()] == ["deleted"]
     with pytest.raises(NotFound):
         any_store.delete_with_events("plan", plan.id, version, [event])
+
+
+def test_notification_channels_subscriptions_and_cursors_round_trip(any_store: Store):
+    """SDD §11, §24.3 (plan task NT2): the document kinds notification_channel (its id its name),
+    notification_subscription and notification_cursor (its id the channel's name) are stored and
+    read back as given, listed by their top-level fields, and deleted one by one."""
+    from seamless_migrate.domain.models import (
+        NotificationChannel,
+        NotificationCursor,
+        NotificationSubscription,
+    )
+    from seamless_migrate.store import KINDS
+
+    assert {"notification_channel", "notification_subscription", "notification_cursor"} <= set(
+        KINDS
+    )
+    email = NotificationChannel(
+        name="app-owners", kind="email", recipients=["owners@example.com"], description="owners"
+    )
+    hook = NotificationChannel(name="cmdb", kind="webhook", url="https://cmdb.example.com/h")
+    slack = NotificationChannel(name="ops-slack", kind="slack", enabled=False, redact_names=True)
+    for channel in (email, hook, slack):
+        assert any_store.put("notification_channel", channel) == 1
+    assert any_store.get("notification_channel", "app-owners", NotificationChannel) == email
+    assert any_store.get("notification_channel", "ops-slack", NotificationChannel) == slack
+    listed = any_store.list("notification_channel", NotificationChannel)
+    assert {c.name for c in listed} == {"app-owners", "cmdb", "ops-slack"}
+    assert [
+        c.name for c in any_store.list("notification_channel", NotificationChannel, enabled=False)
+    ] == ["ops-slack"]
+
+    every = NotificationSubscription(channel="app-owners", plan_id=None, created_by="admin")
+    one = NotificationSubscription(
+        channel="cmdb", plan_id="plan-0000abcd", topics=["progress"], created_by="operator"
+    )
+    for sub in (every, one):
+        any_store.put("notification_subscription", sub)
+    assert any_store.get("notification_subscription", every.id, NotificationSubscription) == every
+    by_plan = any_store.list(
+        "notification_subscription", NotificationSubscription, plan_id="plan-0000abcd"
+    )
+    assert by_plan == [one]
+    by_channel = any_store.list(
+        "notification_subscription", NotificationSubscription, channel="app-owners"
+    )
+    assert by_channel == [every]
+
+    at = datetime(2026, 10, 29, 10, 0, 5, tzinfo=UTC)
+    fresh = NotificationCursor(channel="cmdb", seq=0)
+    moved = NotificationCursor(
+        channel="app-owners",
+        seq=42,
+        last_outcome="failed",
+        last_outcome_at=at,
+        last_reason="503",
+        failures_in_a_row=3,
+    )
+    for cursor in (fresh, moved):
+        any_store.put("notification_cursor", cursor)
+    assert any_store.get("notification_cursor", "app-owners", NotificationCursor) == moved
+    assert any_store.get("notification_cursor", "cmdb", NotificationCursor) == fresh
+    # the cursor moves with a versioned write, as a migration does
+    moved.seq, moved.last_outcome = 43, "sent"
+    assert any_store.put("notification_cursor", moved, expected_version=1) == 2
+    assert any_store.get("notification_cursor", "app-owners", NotificationCursor).seq == 43
+
+    any_store.delete("notification_cursor", "cmdb")
+    any_store.delete("notification_subscription", one.id)
+    any_store.delete("notification_channel", "cmdb")
+    with pytest.raises(NotFound):
+        any_store.get("notification_channel", "cmdb", NotificationChannel)
+    assert len(any_store.list("notification_channel", NotificationChannel)) == 2
+    assert any_store.get("notification_channel", "app-owners", NotificationChannel) == email

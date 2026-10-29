@@ -34,6 +34,7 @@ from ..security.host_keys import declared_key_problems
 from .enums import (
     DecisionStatus,
     DecisionType,
+    NotifyTopic,
     Phase,
     PlanStatus,
     ProviderKind,
@@ -850,6 +851,125 @@ def _https_url(url: str) -> None:
 
 #: the pre-flight codes a plan may acknowledge for a VM (SDD §4.2, §9.3): a blocker it then reports
 #: as a warning that says so - an autoscaling group's member (owner decision 9)
+#: a channel's secret is named after it, and the admin never chooses the name (SDD §24.3)
+NOTIFY_SECRET_PREFIX = "notify-"
+MAX_RECIPIENTS = 50
+#: RFC 5321's limit on a forward path, which the addr-spec fits in
+MAX_ADDR_SPEC = 254
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_DOT_ATOM = rf"{_ATEXT}(?:\.{_ATEXT})*"
+#: an RFC 5322 addr-spec in its dot-atom form: no quoted local part, no domain literal
+_ADDR_SPEC = re.compile(rf"{_DOT_ATOM}@{_DOT_ATOM}")
+DEFAULT_NOTIFY_TOPICS = (NotifyTopic.approval, NotifyTopic.downtime, NotifyTopic.problem)
+
+
+def new_subscription_id() -> str:
+    return f"sub-{secrets.token_hex(4)}"
+
+
+class NotificationChannel(_Model):
+    """A channel of the catalog an admin keeps (SDD §4.2, §24.3, plan task NT2): one email
+    audience through the installation's relay, one Slack incoming webhook, or one signed
+    webhook receiver. Its secret is ``notify-{name}`` (§13.3): a Slack webhook's URL (key
+    ``url``) or a webhook's signing key - neither is a field of the document."""
+
+    name: str = Field(pattern=HOOK_NAME)
+    kind: Literal["email", "slack", "webhook"]
+    description: str | None = None
+    #: email: 1-50 addresses, each an addr-spec of at most 254 characters (required); else none
+    recipients: list[str] = Field(default_factory=list)
+    #: webhook: an https:// URL without user information (required); else none
+    url: str | None = None
+    #: its messages name the VM, the plan and the wave by their ids (§24.11 decision 8)
+    redact_names: bool = False
+    #: false: its cursor follows the events and it sends nothing (§24.6)
+    enabled: bool = True
+    #: server-owned
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_at: UTCDateTime = Field(default_factory=utcnow)
+
+    @property
+    def id(self) -> str:
+        """The store's key: the channel's name (SDD §11)."""
+        return self.name
+
+    @property
+    def secret_name(self) -> str:
+        """The secret the channel reads (SDD §13.3, §24.3), never chosen by the admin."""
+        return f"{NOTIFY_SECRET_PREFIX}{self.name}"
+
+    @model_validator(mode="after")
+    def _kind_fields(self) -> NotificationChannel:
+        if self.kind == "email":
+            if not 1 <= len(self.recipients) <= MAX_RECIPIENTS:
+                raise ValueError(f"recipients: an email channel needs 1-{MAX_RECIPIENTS} addresses")
+            for address in self.recipients:
+                if len(address) > MAX_ADDR_SPEC or not _ADDR_SPEC.fullmatch(address):
+                    raise ValueError(
+                        "recipients: each an address, local-part@domain, of at most "
+                        f"{MAX_ADDR_SPEC} characters"
+                    )
+            if self.url is not None:
+                raise ValueError("url: an email channel takes none")
+            return self
+        if self.recipients:
+            raise ValueError(f"recipients: a {self.kind} channel takes none")
+        if self.kind == "webhook":
+            if self.url is None:
+                raise ValueError("url: a webhook channel needs it")
+            _https_url(self.url)
+        elif self.url is not None:
+            raise ValueError(
+                "url: a slack channel takes none - the webhook's URL is its secret "
+                f"({NOTIFY_SECRET_PREFIX}{self.name}, key url)"
+            )
+        return self
+
+
+class NotificationSubscription(_Model):
+    """A channel subscribed to a plan, or to every plan, for its topics (SDD §4.2, §24.4, plan
+    task NT2): not a field of the plan, so adding or removing one leaves the plan as it is."""
+
+    id: str = Field(default_factory=new_subscription_id)
+    #: a channel's name
+    channel: str = Field(pattern=HOOK_NAME)
+    #: null: every plan (admin)
+    plan_id: str | None
+    #: at least one, each once; approval, downtime and problem unless the subscriber says otherwise
+    topics: list[NotifyTopic] = Field(
+        default_factory=lambda: list(DEFAULT_NOTIFY_TOPICS), min_length=1
+    )
+    #: server-owned
+    created_by: str
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+
+    @field_validator("topics")
+    @classmethod
+    def _each_once(cls, topics: list[NotifyTopic]) -> list[NotifyTopic]:
+        twice = sorted(str(topic) for topic, n in Counter(topics).items() if n > 1)
+        if twice:
+            raise ValueError(f"topics: {', '.join(twice)} more than once")
+        return topics
+
+
+class NotificationCursor(_Model):
+    """A channel's place in the events and its delivery state (SDD §4.2, §24.3, §24.6, plan task
+    NT2): the seq of the last event it handled, and the last message's outcome."""
+
+    channel: str = Field(pattern=HOOK_NAME)
+    #: the last event the channel handled; 0 before any
+    seq: int = Field(ge=0)
+    last_outcome: Literal["sent", "failed"] | None = None
+    last_outcome_at: UTCDateTime | None = None
+    last_reason: str | None = None
+    failures_in_a_row: int = Field(default=0, ge=0)
+
+    @property
+    def id(self) -> str:
+        """The store's key: the channel's name (SDD §11)."""
+        return self.channel
+
+
 ACKNOWLEDGEABLE_FINDINGS = frozenset({"SRC_VM_AUTOSCALED"})
 
 
