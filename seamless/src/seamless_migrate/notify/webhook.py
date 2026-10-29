@@ -43,6 +43,13 @@ def signing_key_bytes(secret: Mapping[str, str] | None) -> bytes | None:
     return raw or None
 
 
+def webhook_body(message: Message) -> bytes:
+    """The body the sender signs and POSTs (SDD §8.7, §24.5): the Standard Webhooks document as
+    compact JSON in UTF-8 - the bytes the signature covers, and what the demo's recording sender
+    renders (§7.4)."""
+    return json.dumps(webhook_document(message), separators=(",", ":")).encode("utf-8")
+
+
 def sign(key: bytes, msg_id: str, timestamp: str, body: bytes) -> str:
     """Standard Webhooks' signature: ``v1,`` and the base64 HMAC-SHA256 of
     ``<id>.<timestamp>.<body>`` (SDD §24.3)."""
@@ -94,7 +101,7 @@ class WebhookSender:
         signing_key = signing_key_bytes(secret)
         if signing_key is None:
             return SendResult("failed", "no_secret")
-        body = json.dumps(webhook_document(message), separators=(",", ":")).encode("utf-8")
+        body = webhook_body(message)
         now = self._now()
         timestamp = str(int(now.timestamp()))
         headers = {

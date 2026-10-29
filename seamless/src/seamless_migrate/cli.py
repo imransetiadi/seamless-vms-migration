@@ -196,10 +196,12 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
 
 def build_app(settings: Settings) -> Any:
     from .api.app import create_app
-    from .demo import seed_demo
+    from .demo import demo_server_settings, seed_demo
 
     hooks = []
     if settings.demo:
+        # the demo's relay of fakes while the environment names none (SDD §7.4, §15.1)
+        settings = demo_server_settings(settings)
 
         async def seed(services: Any) -> None:
             await seed_demo(services.store, services.settings, services.orchestrator)

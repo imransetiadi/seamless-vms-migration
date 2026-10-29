@@ -49,6 +49,9 @@ class SendResult:
 
 
 class Sender(Protocol):
+    """A channel kind's sender (SDD §8.7). One that needs no secret - the demo's recording sender
+    (§7.4) - says so with ``reads_secret = False``: the notifier then reads none for it."""
+
     async def send(
         self,
         channel: NotificationChannel,
@@ -315,9 +318,12 @@ class Notifier:
     def _expired(self, event: Event) -> bool:
         return (self._now() - event.ts).total_seconds() > self.timing.expiry_s
 
-    async def _secret(self, channel: NotificationChannel) -> Mapping[str, str] | None:
-        """The channel's secret, read each time a message is sent (§24.3)."""
-        if channel.kind == "email":
+    async def _secret(
+        self, channel: NotificationChannel, sender: Sender
+    ) -> Mapping[str, str] | None:
+        """The channel's secret, read each time a message is sent (§24.3); none for an email
+        channel, and none for a sender that needs none - the demo's recording senders (§7.4)."""
+        if channel.kind == "email" or not getattr(sender, "reads_secret", True):
             return None
         try:
             return await asyncio.to_thread(secret_store(self.settings).read, channel.secret_name)
@@ -336,7 +342,7 @@ class Notifier:
         result = SendResult("failed", "not_tried")
         for attempt in range(self.timing.tries):
             tries += 1
-            secret = await self._secret(channel)
+            secret = await self._secret(channel, sender)
             try:
                 result = await sender.send(channel, message, key, secret)
             except asyncio.CancelledError:
@@ -479,7 +485,8 @@ class Notifier:
             result = SendResult("failed", "no_sender")
         else:
             try:
-                result = await sender.send(channel, message, key, await self._secret(channel))
+                secret = await self._secret(channel, sender)
+                result = await sender.send(channel, message, key, secret)
             except Exception as exc:
                 result = SendResult("failed", type(exc).__name__)
         outcome = self._outcome_event(
@@ -501,8 +508,17 @@ class Notifier:
 
 def senders_for(settings: Settings) -> dict[str, Sender]:
     """The senders the server runs with (SDD §8.7): the email sender (plan task NT6), the Slack
-    sender (NT7) and the webhook sender (NT8)."""
-    from .email import EmailSender  # the senders import SendResult from here
+    sender (NT7) and the webhook sender (NT8) - in demo mode a recording sender for every kind
+    instead, which renders the message and sends nothing (§7.4, plan task NT10)."""
+    if settings.demo:
+        from .recording import RecordingSender  # the senders import SendResult from here
+
+        return {
+            "email": RecordingSender("email", settings),
+            "slack": RecordingSender("slack", settings),
+            "webhook": RecordingSender("webhook", settings),
+        }
+    from .email import EmailSender
     from .slack import SlackSender
     from .webhook import WebhookSender
 
