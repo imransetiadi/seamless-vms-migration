@@ -98,6 +98,11 @@ _FLAVORS = {
 DEMO_DNS_DOMAIN = "example.com."
 #: the Designate zones the demo destination holds
 DEMO_DNS_ZONES = ("internal.example.org.",)
+#: the projects the demo clouds' provider credentials are scoped to, as their checks name them
+#: (SDD §10 "The check of project credentials", §27.7): the source's is its VMs' project, the
+#: destination's owns its own networks (network_details)
+DEMO_SOURCE_PROJECT = {"id": "project-finance", "name": "finance", "domain": "Default"}
+DEMO_DESTINATION_PROJECT = {"id": "project-demo", "name": "demo", "domain": "Default"}
 
 # the demo's network cut-over (SDD §10, §23.9, plan task N11)
 #: the source's Heat stack: web-01 a server resource, the Tomcat pair its autoscaling group's
@@ -586,6 +591,7 @@ class FakeSourceProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         return {
             "admin": True,
             "roles": ["admin", "member", "reader"],
+            "project": dict(DEMO_SOURCE_PROJECT),
             "compute_microversion": "2.88",
             "block_storage_microversion": "3.64",  # Wallaby (RHOSP 17.1)
             "ovn": True,
@@ -830,6 +836,7 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         return {
             "admin": True,
             "roles": ["admin", "member", "reader"],
+            "project": dict(DEMO_DESTINATION_PROJECT),
             "compute_microversion": compute,
             "block_storage_microversion": block_storage,
             "ovn": True,
@@ -884,7 +891,7 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
                     "id": f"net-{name}",
                     "name": name,
                     "mtu": mtu,
-                    "project_id": "project-demo" if own else "project-admin",
+                    "project_id": DEMO_DESTINATION_PROJECT["id"] if own else "project-admin",
                     "own": own,
                     "shared": not own,
                     "external": False,
