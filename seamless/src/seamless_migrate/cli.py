@@ -596,8 +596,23 @@ def cmd_estimate(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _leader_line(store: Any) -> str:
+    """The orchestrator's leader as the lease's row names it, whether the lease holds judged on the
+    database's clock (SDD §15, §25.8): a read alone - the CLI takes, renews and releases no
+    lease."""
+    from .lease import read_lease
+
+    row = read_lease(store.engine)
+    if row is None:
+        return "leader: none (no server took the lease)"
+    if row.expired:
+        return f"leader: none (the lease of {row.holder} at epoch {row.epoch} expired)"
+    return f"leader: {row.holder} (epoch {row.epoch})"
+
+
 def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
     store = _store(settings)
+    print(_leader_line(store))
     filters = {"plan_id": args.plan} if args.plan else {}
     migrations = store.list("migration", Migration, **filters)
     plans = {p.id: p.name for p in store.list("plan", Plan)}
