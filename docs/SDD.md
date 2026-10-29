@@ -1888,7 +1888,16 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
   `{data_dir}/conversion/ssh.key`, and the link key the plan's (below, "Conversion key").
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
-  `clouds.yaml` os-migrate writes into the data dir.
+  `clouds.yaml` os-migrate writes into the data dir. It holds the run's two credentials alone, those §8's selection
+  names for its step (`credentials`, §27.5, plan task TC5): a plan's source and destination credentials - the
+  project credentials its `source_project` and `destination_project` name (§13.3's project entry, `auth_type`
+  `v3applicationcredential`), the provider's own on a side whose project is null - for each run of a `cold` or `warm`
+  migration and its pre-staging, but the flavor import's (below); a VMware run's `dst_cloud` is the destination
+  provider's own (§27.9). So a plan that names no project runs as before, and a run of a plan with projects holds no
+  provider's credential but the flavor import's. The executor's own calls of a run - the destination server's
+  lookups, its inventory, its volumes, the conversion hosts' lookups (below), a finalize's deletion of the source -
+  act with the same credentials. A project credential the plan names that cannot be read is a permanent failure
+  before any playbook, never replaced by the provider's own (§27.5).
 * The Ceph files (§28.4, plan task CE7): a warm plan that tracks extents (`extent_tracking`) whose source declares
   `ceph` and holds its key (`provider-{id}.ceph`, §13.3) gets, beside `secrets.yml` and deleted with it, the run's
   `ceph.conf` (the fsid and `mon_host`) and `ceph.keyring` (`[client.<client>]`, the key), both 0600, named to the
@@ -2280,6 +2289,17 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
   destination flavors up when it pre-stages. `keypairs` is scoped the same way: only the `key_name`s of the plan's
   VMs that the source credential owns and the destination credential lacks (`os_migrate_keypairs_filter`); with
   none, its playbooks are skipped.
+  A plan with projects (§27.5, plan task TC5) is pre-staged as its projects: its resources, the conversion key's
+  keypair reads (below) and its conversion hosts, which the deploy finds by name and creates in the plan's projects
+  with their credentials (§27.6: they count against those projects' quotas) - and the orchestrator reads the
+  inventories that scope `flavors` and `keypairs` with the plan's credentials too. The flavor pair alone mixes
+  credentials: the export runs as the plan's projects, as the rest of the pre-staging, and `import_flavors.yml` runs
+  on its own, in its place among the plan's resources, with the plan's source credential and the destination
+  provider's own (creating a flavor is an admin's call), so the provider's credential reaches that run's files alone
+  (§27.8); then each pre-staged flavor the import left private (`is_public` false) is given access for the plan's
+  destination project (`grant_flavor_access`, §10), with the destination provider's own credential - os-migrate's
+  import gives none, and the project could use no private flavor without it. A public flavor, and the flavors of a
+  plan without a destination project, are left as they are.
 * **Conversion key** (issue #112). The managed conversion hosts are per provider - found by name - and the
   `os_migrate_conv` keypair belongs to the credential's user (the collection's default name, which the executor never
   changes), so a plan meets the hosts and the keypair an earlier plan of the same credentials made. Every OpenStack
@@ -2333,7 +2353,11 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     a VMware kit run (pre-copy, sync, cutover) the destination's host of the inventory's `conversion_host` group, under
     `conversion_host`. A host without declared keys is looked up as the provider check finds it (§10): by its name
     (`conversion_host.name`, else its side's alias), else by its address. A lookup that fails fails the run as
-    transient, a rollback's excepted, which logs it.
+    transient, a rollback's excepted, which logs it. A plan with a project on a side looks its host up there with the
+    plan's credential, where the deploy created it (above, §27.5); a provider holds one pin (§4.2), so the hosts of
+    two projects of one provider replace each other's pin as each project's pre-staging creates its own, and a run
+    that meets the other's pin is refused ("conversion host replaced", below) - pins per project wait for an owner
+    decision (`TODO(OWNER)`, plan task TC5).
   * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
     `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
     resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
@@ -2403,7 +2427,13 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
-Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`). A call that fails is retried
+Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`), one per provider and credential,
+built again as the registry's are (§10, §13.3). Its credentials are §8's selection's (§27.5, §27.6, plan task TC5):
+the source half - the reads of the source server and its volumes, the stop, `delete_on_termination`, the deletion,
+the unmanage and, on rollback, the source's restore - acts by id with the source provider's own credential, whatever
+the plan's `source_project`; the destination half - step 0's reads, the manage, the ports, the server and, on
+rollback, their deletion and unmanage - with the plan's destination credential, its `destination_project`'s (which
+Cinder's manage needs with `admin`, §9.2), else the provider's own. A call that fails is retried
 (`TransientStepError`, §7.1, §8) when its answer is HTTP 502, 503 or 504 — openstacksdk's `HttpException`, keystoneauth's
 HTTP errors, or a raw call's status — or keystoneauth reports a retriable connection failure (`ConnectTimeout`:
 "Request to … timed out"; `ConnectFailure`: "Unable to establish connection to …"). The error is read together with
@@ -2874,6 +2904,35 @@ Placement allocation:
   is recorded (the same event, without a status) and the tick pre-stages it again after 60 s (PR #58 review). A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
   a late failure must not turn an edited draft into a `failed` plan that `start_plan` accepts unvalidated.
+* **Credentials** (§27.5, §27.6, plan task TC5). One function gives each step its credential:
+  `credentials.credential_project(step, side, plan)` reads §27.5's table (`credentials.Step`, one member per row but
+  the floating IP reservation's, which `credentials.reservation` answers, §8.3) and
+  the plan's `source_project` and `destination_project`, and answers the Keystone project whose credential the step
+  acts with on that side - the plan's project there for the work inside a project -, or null for the provider's own:
+  the check, Placement's GPU capacity and allocations, the flavor import, the handover's source half, the migration
+  kit's. The registry hands its implementation (`ProviderRegistry.get(provider, project_id)`, §10); no executor,
+  helper or route picks a credential on its own - the inventory's `project` query asks
+  `credentials.inventory_project` (§12) -, and a plan whose projects are null acts with the providers' own
+  credentials as before. A project credential the plan names that is missing, cannot sign in or has expired fails
+  what needs it and is never replaced by the provider's own (§27.5).
+  * **Validation** checks each provider with the plan's project credential on its side (§10) and then refuses (400),
+    before it reads anything and before any finding, a plan whose project credential is missing (the provider holds
+    none for the project), failed its check (the check report's `projects` entry is not `ok`) or has expired (its
+    `expires_at` is past), naming the provider and the project; and a plan that names a project on a side whose
+    conversion host is an existing one (`conversion_host.manage` false), which serves its provider's own project
+    alone. It reads the plan's VMs, both inventories, its DNS targets' records (§8.4) and its mapped Octavia pools
+    (§8.5) with the plan's credentials, and a destination's GPU capacity with the provider's own: a `member`
+    credential's inventory reads Placement's refusal, so for a plan with a destination project the GPU flavors that
+    credential lists are read for capacity again with the provider's own (`gpu_capacity`, §10, §22.3), and the
+    pre-flight judges that read. It then refuses (400) a plan whose VMs are not all of its source project - the
+    source provider's own project, as its check names it (`project`, §10), when `source_project` is null -, naming
+    each project with its VM count; a VM whose project is not known (`project_id` null) and a source whose check
+    names no project of its own are not judged, nor is a VMware source.
+  * **The steps.** The wave planner reads the VMs as validation does. The pre-staging (§7.2), a migration's runs
+    (§7.2, §7.3), its verification (§7.5), its cancel's cleanup, its finalize, the source watch (§8.1) and the
+    helpers (§8.3-§8.5) act with the plan's credentials; the verification's allocation read (§22.8) and the cutover
+    gate's GPU reads (§22.7) are Placement's, with the destination provider's own; the keep-address reservation is
+    §8.3's.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
   migration after **every** state change, emits events, and records `checkpoint` (last completed
   step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed — and a `cancelled`
@@ -2969,7 +3028,8 @@ dashboard keeps Rollback unavailable with that reason, and the migration's next 
 for a deletion stays within that bound.
 
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
-in demo mode ÷ `demo_speed`) the source watch asks its source provider for the source VM (`get_vm`). The tick only
+in demo mode ÷ `demo_speed`) the source watch asks its source provider for the source VM (`get_vm`), with the plan's
+source credential (§8, §27.5, plan task TC5: its `source_project`'s, else the provider's own). The tick only
 starts the watch, as a task of its own, one at a time, and never waits for it: a slow or hanging source provider
 (one call may take minutes) delays the next watch, never the cutover gates, the passes or the tick's heartbeat
 (`/ready`, §12); stopping the orchestrator cancels it. Seen `running`, the
@@ -3044,10 +3104,20 @@ A plan whose `network_cutover.floating_ips` is `"keep_address"` keeps each float
 of an OpenStack VM, whatever its strategy: the control plane moves it, and the cold and warm imports leave floating IPs
 alone (`floating_ip_mode: skip`, §7.2). A VMware VM has none. Each step is a `migration.action`, data `{"action":
 "floating_ip", "address", "step": "reserve"|"move"|"return"|"release", "outcome": "succeeded"|"failed", "detail"}`.
+The move, the return and the release act with the plan's credentials (§8, §27.5, plan task TC5: its projects', else
+the providers' own) - a floating IP the provider's admin reserved for the project is the project's, which moves and
+releases it.
 
 * **The reservation** comes with the plan's pre-staging (§8): for each floating IP of a VM it pre-stages, the
   destination reserves the address (`reserve_floating_ip`, §10) - one the project holds detached is kept. A reservation
   that fails fails the pre-staging (§8), before any source stops; `DST_FIP_ADDRESS_UNAVAILABLE` (§9.3) says why first.
+  Who reserves (`credentials.reservation`, §27.5, §27.6): the plan's destination credential when it may choose an
+  address - the roles of its project credential, as the destination's last check read them (`projects`, §10), hold
+  one `DST_FIP_ADDRESS_UNAVAILABLE` counts for the destination's policy profile (`admin`; `admin` or `manager` under
+  `secure_rbac`) -, and for a `member` project credential (roles without one, or not read) the destination provider's
+  own credential, its admin, for the plan's destination project (`project_id`): the floating IP is created in, and its
+  detached one looked up in, that project. A plan without a destination project reserves with the provider's own
+  credential, as before. The move's reservation again (below) is made the same way.
 * **The move**, in `verifying`, after the cutover step created the server and before the `post_create` hooks (§8.2) -
   the source stopped, the clock open: for each floating IP, its `FipMove` (§4.2) is saved as `releasing` with the port
   the source's floating IP is on (`floating_ip_port`), the source's is disassociated (`released`), the destination
@@ -3083,7 +3153,9 @@ never overwritten. Each swap is a `migration.action`, data `{"action": "dns", "n
   exists and the clock is open. The `DnsSwap` (§4.2) is saved as `swapping` before the first request, so a restart
   resumes the same swap. One `swapped`, `unchanged` or `conflict` is not made again - by a restart or a retry -; a
   retry after a rollback (`reverted`) makes it anew.
-* **Designate** (`kind: designate`), with the destination provider's credential (§10: `dns_recordset`,
+* **Designate** (`kind: designate`), with the plan's destination credential - its `destination_project`'s, whose
+  project's zones it sees, else the destination provider's own (§8, §27.5, plan task TC5) - for the swap, the revert
+  and validation's read of the TTL alike (§10: `dns_recordset`,
   `update_dns_recordset`): the recordset of the name and type in the zone must hold exactly the old address; its
   records become the new one, its TTL unchanged. Designate writes asynchronously, so the swap reads the recordset every
   2 s until it is `ACTIVE`, for at most 60 s; `ERROR`, or no `ACTIVE` in that time, fails it.
@@ -3116,6 +3188,10 @@ destination load balancer that the operator or a runbook created - never Seamles
 mapped pool: a member of the pool (§10: `pool_members`) whose address is one of the VM's fixed IPs. Each step is a
 `migration.action`, data `{"action": "lb_member", "pool", "address", "port", "step": "drain"|"join"|"restore",
 "outcome": "succeeded"|"failed", "detail"}`, `pool` the source pool's id. A VMware source has no Octavia pool.
+Each side acts with the plan's credential there (§8, §27.5, plan task TC5): the source pool's reads, its drain and the
+restore's re-enable with the source credential, the destination pool's reads, the join and the restore's deletion
+with the destination credential - each its project's, else the provider's own -; validation reads each pool of a pair
+the same way.
 
 * **The drain**, in `cutover` at `pre_stop` (§8.2), before the point's hooks, while the source runs: each such member's
   `LbMove` (§4.2) is saved as `draining`, its `admin_state_up` set to false (`set_pool_member`), and it is `drained`
@@ -3642,10 +3718,17 @@ class DestinationProvider(Protocol):
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None
         # sets the given metadata keys on the volume and keeps its other keys (Cinder's merge), within the call's
         # bound (§8.1): the mark of a VMware kit copy that completed (§7.2, review RV30-01)
-    async def reserve_floating_ip(self, address: str) -> None
+    async def reserve_floating_ip(self, address: str, project_id: str | None = None) -> None
         # the keep-address move's reservation (§8.3): a floating IP of that address the credential's project holds
         # detached is kept; else one is created with it, detached, on the external network one of whose subnets holds
-        # the address - a provider error when none does, or when Neutron refuses it (another project holds it)
+        # the address - a provider error when none does, or when Neutron refuses it (another project holds it). With
+        # project_id, the provider's admin reserves for that project: the one it holds is looked up there, and the new
+        # one created for it (Neutron's project_id) (§8.3, §27.6, plan task TC5)
+    async def grant_flavor_access(self, name: str, project_id: str) -> bool
+        # the private flavor of that name (`is_public` false) made usable by the project - Nova's addTenantAccess,
+        # one the project has already is no error -; a public flavor is left as it is (false); none of the name, or
+        # two, is a provider error. A pre-staging's flavor import for a plan's destination project (§7.2, §27.5,
+        # plan task TC5); the admin's call, made with the destination provider's own credential
     async def server_port(self, server_id: str, address: str) -> str | None
         # the id of the server's port with the fixed address, None when it has none (§8.3)
     async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None
@@ -3783,13 +3866,22 @@ quotas; and a community OpenStack destination, `hibiscus-dc3` - kind `openstack`
 `release` `2026.2` - that shares that inventory and whose check reports 2026.2's maxima, compute 2.104 and block
 storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 and the secure-RBAC profile, §10.1).
 `providers.registry.build(provider, settings)` returns the right implementation (fake when `settings.demo`; a fake
-destination is given its provider and reports by its kind). `ProviderRegistry.for_project(provider, project_id)`
-returns one that acts with the provider's credential for that Keystone project (§13.3, §27.4, plan task TC4): an
-`OpenStackProvider` on a connection of its own, built for the call and never cached - each read signs in afresh,
-with the credential as an admin last wrote it -, which its caller closes after its read (the inventory's `project`
-query, §12). Which step acts with which credential, and caching them, is plan task TC5's (§27.5). The demo's fakes
-cannot sign in with a project credential until plan task TC9 gives them tenant projects (§27.10), nor can a VMware
-provider, which holds none: a provider error. The demo seeds two running plans, both to `rhoso18`:
+destination is given its provider and reports by its kind). `ProviderRegistry.get(provider)` caches one implementation
+per provider under its connection fingerprint - its document without its state, each project credential's
+`updated_at` with it, and the mounted `clouds.yaml`'s change marker -, built again, the replaced one closed, once the
+fingerprint changed (§13.3). `ProviderRegistry.get(provider, project_id)` is the steps' implementation that acts with
+the provider's credential for that Keystone project (§8's selection, §27.5, plan task TC5): an `OpenStackProvider` of
+that project, cached per provider and project under a fingerprint that holds how the provider is reached - its
+document without its state and its project credentials, and the change marker - and that project credential's own
+entry, its `updated_at` among them, so a credential an admin wrote again signs in at the next step and the replaced
+connection is closed; a project the provider holds no credential for is a provider error naming the provider and the
+project, never its own credential. `ProviderRegistry.for_project(provider, project_id)` returns one that acts with the
+provider's credential for that Keystone project (§13.3, §27.4, plan task TC4): an `OpenStackProvider` on a connection
+of its own, built for the call and never cached - each read signs in afresh, with the credential as an admin last
+wrote it -, which its caller closes after its read (the inventory's `project` query, §12). `forget(provider_id)` drops
+and closes a provider's implementations, its projects' too. The demo's fakes cannot sign in with a project credential
+until plan task TC9 gives them tenant projects (§27.10), nor can a VMware provider, which holds none: a provider
+error. The demo seeds two running plans, both to `rhoso18`:
 the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and maps `g1.vgpu` to `g1.a100-4c` (`mappings.flavors`), so `gpu-ml-01` migrates; the VMware
@@ -3984,8 +4076,9 @@ answered - the provider check (`POST /providers/{id}/check`) signs in with each 
 order of their project ids: the bound ends a call's wait, not its thread (below), so a Keystone that never answers
 pins one worker thread at a time. A validation's check (§8) signs in with the plan's project credentials alone - its
 `source_project` on its source provider, its `destination_project` on its destination (§4.2, plan task TC4), none for
-a plan that names none; a project the provider holds no credential for has nothing to sign in with (validation's
-refusal of it comes with plan task TC5, §27.5).
+a plan that names none; a project the provider holds no credential for has nothing to sign in with, and validation
+refuses the plan (400, §8, plan task TC5), as it refuses one whose project's entry the check left `error` or whose
+credential has expired.
 * **The sign-in.** `OpenStackProvider.check_project` opens a connection of its own with the project's entry (§13.3:
   the provider credential's auth URL, else its endpoint) and closes it after the call, so each check signs in afresh:
   one `POST /v3/auth/tokens`, a request keystoneauth never logs - the token's body it writes at DEBUG names the
@@ -5099,6 +5192,12 @@ cutoff after now (a negative or non-finite `--older-than-days`, a later `--befor
 whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
+`status` prints first the orchestrator's leader as the lease's row names it (§11, §25.8; plan task HA5), whether the
+lease still holds judged on the database's clock, never the CLI's: `leader: {holder} (epoch {epoch})`; once the
+lease expired - its server released it or stopped renewing it, and no other took it since -
+`leader: none (the lease of {holder} at epoch {epoch} expired)`; and `leader: none (no server took the lease)` before
+any did. Its table of the migrations follows, one plan's with `--plan`. The line is a read alone: the CLI takes,
+renews and releases no lease (§25.6).
 
 A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
 errors the API answers with a status (§12); refused arguments — `estimate`'s knobs, `events prune`'s cutoff or a
@@ -6215,6 +6314,12 @@ ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is 
 their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6), and
 `seamless_notifications_total{kind,outcome}` counter — the notification messages recorded as `sent` or `failed` per
 channel kind since the server started (§8.7, §24.7; plan task NT5), so a failing channel can be alerted on.
+Two gauges tell the orchestrator's leadership (§8, §11, §25.8; plan task HA5): `seamless_leader` — 1 while this
+replica leads, that is while it holds the orchestrator's lease and its renew deadline has not passed (§8), else 0 —
+and `seamless_leader_epoch` — the epoch in the lease's row as this replica reads it at each scrape, 0 while nobody
+took the lease: its increases are the changes of leader. Neither carries a label, so no replica's host name leaves
+through them. Each replica answers `/metrics` with the same store figures, and `seamless_leader` tells which one
+drives.
 
 ---
 
@@ -8030,6 +8135,9 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
 The events, with their data's names (`previous_holder`, `previous_epoch`, `resumes`), are binding in §4.3 and §11
 since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8);
 `/health`'s `leader` is binding in §12 since plan task HA4.
+The gauges are binding in §18 and the leader line of `seamless status` in §15 since plan task HA5: each scrape reads
+the epoch in the lease's row, 0 before any lease; neither gauge carries a label; and `status` names no leader for a
+lease that expired by the database's clock.
 
 ### 25.9 Security
 
@@ -8111,7 +8219,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 (binding) | HA4 |
-| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
+| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
@@ -8477,7 +8585,10 @@ The proposed fields, routes, check keys, findings and gate rule stay out of the 
 without code quotes. Plan task TC2's provider field, routes, secret name and deletion rules are binding in §4.2, §4.3,
 §12 and §13.3 since that task; plan task TC3's check of each project credential, with the check report keys `projects`
 and `project`, in §10 and §21.5 since that task; plan task TC4's `VMRef.project_id`, the inventory's `project` query and
-the plan's `source_project` and `destination_project` with their edit rules in §4.2, §10 and §12 since that task. The
+the plan's `source_project` and `destination_project` with their edit rules in §4.2, §10 and §12 since that task; plan
+task TC5's selection of §27.5 and §27.6 - validation's reads and refusals, the pre-staging with its flavor access, the
+executors, the helpers, no fallback and the registry's fingerprint - in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since
+that task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -8579,6 +8690,10 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
   holds a credential for; without the query, its own credential as today.
 
 ### 27.5 Which credential each step uses
+
+Binding in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since plan task TC5, but the executors' sign-in before a step
+(below: "a step whose credential cannot sign in fails before it changes anything"), which comes with plan task TC7
+(§7.1), and the storage handover's `admin` and the findings' role halves, which come with plan task TC6 (§9.2, §9.3).
 
 A plan's **source** and **destination credentials** are the project credentials its `source_project` and
 `destination_project` name, else the providers' own. The provider's own credential acts in its own project, and in
@@ -8772,7 +8887,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | `Provider.project_credentials` and `ProjectCredential`; the two routes; the secret's name and its 409s; the deletion rules; `provider.credentials_updated`'s `project_id` and `deleted` | §4.2, §4.3, §12, §13.3 (binding) | TC2 |
 | the check of each project credential: the report keys `projects` and `project` | §10, §21.5 (binding) | TC3 |
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 (binding) | TC4 |
-| the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 | TC5 |
+| the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 (binding) | TC5 |
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure | §5.4, §7.1 | TC7 |
 | the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 | TC8 |

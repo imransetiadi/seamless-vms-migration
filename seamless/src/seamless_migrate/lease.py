@@ -98,9 +98,16 @@ class LeaseRow:
     health: dict[str, Any] | None = None
 
 
+def _expired() -> Any:
+    """The lease is expired once the database's clock reaches its expiry (SDD §11)."""
+    return leases.c.expires_at <= db_now()
+
+
 def read_lease(engine: Engine, name: str = ORCHESTRATOR_LEASE) -> LeaseRow | None:
-    """The row as it is now on ``engine``, or None while nobody ever took the lease: the elector's
-    read on its own engine, a replica's health and relay on the store's (SDD §11, §12)."""
+    """The row as it is now on ``engine``, whether it expired judged on the database's clock, or
+    None while nobody ever took the lease (SDD §11, §12): a read alone, which locks nothing - the
+    elector's on its own engine, a replica's health and relay on the store's, and ``seamless
+    status``'s, which takes no lease (§15)."""
     query = sa.select(
         leases.c.holder,
         leases.c.address,
@@ -108,7 +115,7 @@ def read_lease(engine: Engine, name: str = ORCHESTRATOR_LEASE) -> LeaseRow | Non
         leases.c.acquired_at,
         leases.c.renewed_at,
         leases.c.expires_at,
-        (leases.c.expires_at <= db_now()).label("expired"),
+        _expired().label("expired"),
         leases.c.health,
     ).where(leases.c.name == name)
     with engine.connect() as conn:
@@ -205,14 +212,13 @@ class Lease:
         self.name = name
 
     def _expired(self) -> Any:
-        """The lease is expired once the database's clock reaches its expiry (SDD §11)."""
-        return leases.c.expires_at <= db_now()
+        return _expired()
 
     def _later(self) -> Any:
         return db_later(sa.literal(self.lease_s, sa.Float()))
 
     def read(self) -> LeaseRow | None:
-        """The row as it is now, or None while nobody ever took the lease."""
+        """The row as it is now, or None while nobody ever took the lease (:func:`read_lease`)."""
         return read_lease(self.engine, self.name)
 
     def campaign(self, record: Callable[[sa.Connection, Taken], None] | None = None) -> int | None:

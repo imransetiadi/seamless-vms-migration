@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import ValidationError
 
+from ..credentials import inventory_project
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     BLANK_NAME,
@@ -32,6 +33,7 @@ from ..domain.models import (
 )
 from ..events import emit
 from ..orchestrator import RELEASES_VM, cleanup_pending
+from ..providers.base import ProviderError
 from ..security.auth import Principal
 from ..security.secret_store import (
     SecretStoreError,
@@ -845,18 +847,14 @@ async def provider_inventory(
     if project is not None:
         _check_project_id(project, "project")
     provider = await svc.db.get("provider", provider_id, Provider)
-    if project is None or (
-        project not in provider.project_credentials and project == provider.own_project_id
-    ):
+    try:
+        # the credential the query names, as the one selection reads it (SDD §8, §27.5)
+        reading = None if project is None else inventory_project(provider, project)
+    except ProviderError as exc:
+        raise ApiError(404, "not_found", str(exc)) from None
+    if reading is None:
         return await _inventory_of(provider, svc.providers.get(provider))
-    if project not in provider.project_credentials:
-        raise ApiError(
-            404,
-            "not_found",
-            f"provider {provider_id} holds no credential for project {project}, nor is it the "
-            "project of its own credential, as its last check names it",
-        )
-    scoped = svc.providers.for_project(provider, project)
+    scoped = svc.providers.for_project(provider, reading)
     try:
         return await _inventory_of(provider, scoped)
     finally:

@@ -604,6 +604,73 @@ def test_metrics_format(api, tmp_path):
     public_store.dispose()
 
 
+def test_metrics_say_whether_this_replica_leads_and_the_epoch_it_read(
+    api, any_store, tmp_path, monkeypatch
+):
+    """SDD §18, §25.8 (plan task HA5): two servers on one database - SQLite, and PostgreSQL with
+    SEAMLESS_TEST_PG_URL -, each through the API's lifespan. The one that took the lease says
+    seamless_leader 1 and the follower 0, and both say the epoch in the lease's row as they read
+    it at the scrape - the follower holds none of its own. Once the leader is cut off from its
+    lease - its renewals fail, its renew deadline deposes it, its lease lapses -, the follower
+    takes it over and says 1 and the next epoch, and the deposed replica, still serving, says 0
+    and reads that epoch. Before any lease - the API on a store a test hands it, which takes
+    none - both gauges read 0. Neither carries a label: no replica's holder or address, each a
+    host name, leaves through /metrics."""
+    import contextlib
+    import time
+
+    import sqlalchemy as sa
+
+    from seamless_migrate import lease as lease_module
+
+    texts: list[str] = []
+
+    def gauges(client: TestClient, headers: dict[str, str]) -> tuple[int, int]:
+        text = client.get("/api/v1/metrics", headers=headers).text
+        texts.append(text)
+        assert "# TYPE seamless_leader gauge\n" in text
+        assert "# TYPE seamless_leader_epoch gauge\n" in text
+        samples = re.findall(r"^(seamless_leader\S*) (\S+)$", text, re.MULTILINE)
+        assert [name for name, _ in samples] == ["seamless_leader", "seamless_leader_epoch"]
+        return int(samples[0][1]), int(samples[1][1])
+
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise sa.exc.OperationalError("leases", {}, ConnectionError("the lease is out of reach"))
+
+    assert gauges(api.client, api.h(Role.viewer)) == (0, 0)
+
+    monkeypatch.setattr(lease_module, "RETRY_S", 0.1)  # a try or a renewal every tenth of a second
+    apps, headers = [], []
+    for name in ("a", "b"):
+        settings, tokens = api_settings(tmp_path / name, db_url=any_store.url)
+        # a lease of two seconds, below the variable's bound, which a test may set past (§15.1)
+        apps.append(create_app(settings.model_copy(update={"leader_lease_s": 2.0})))
+        headers.append({"Authorization": f"Bearer {tokens[Role.viewer]}"})
+    try:
+        with contextlib.ExitStack() as servers:
+            a = servers.enter_context(TestClient(apps[0]))
+            b = servers.enter_context(TestClient(apps[1]))
+            assert gauges(a, headers[0]) == (1, 1), "it took the lease before it served"
+            assert gauges(b, headers[1]) == (0, 1), "it follows and reads the leader's epoch"
+            assert apps[1].state.services.store.epoch is None, "a follower holds no epoch"
+            cut_off = apps[0].state.services.leadership.elector.lease
+            monkeypatch.setattr(cut_off, "renew", unreachable)
+            monkeypatch.setattr(cut_off, "campaign", unreachable)
+            deadline = time.monotonic() + 30
+            while gauges(b, headers[1])[0] == 0:
+                assert time.monotonic() < deadline, "the follower never took the lease over"
+                time.sleep(0.05)
+            assert gauges(b, headers[1]) == (1, 2)
+            assert gauges(a, headers[0]) == (0, 2), "deposed, it serves and reads the new epoch"
+            assert apps[0].state.services.store.epoch is None
+    finally:
+        for app in apps:
+            app.state.services.store.dispose()
+    for app in apps:
+        lease = app.state.services.leadership.elector.lease
+        assert [t for t in texts if lease.holder in t or lease.address in t] == []
+
+
 def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     svc = api.client.app.state.services
     assert api.get("/api/v1/stats").status_code == 200
