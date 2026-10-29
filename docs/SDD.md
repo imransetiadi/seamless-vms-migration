@@ -420,6 +420,11 @@ NotificationCursor { channel: str, seq: int,   # the last event the channel hand
                      last_outcome: "sent"|"failed"|null, last_outcome_at: datetime|null,
                      last_reason: str|null, failures_in_a_row: int = 0 }
 
+NotificationChannelView { ...NotificationChannel,   # what the channel routes answer (§12, §24.3, §24.8)
+                          recipient_count: int, url_host: str|null,   # for every role
+                          cursor: NotificationCursor|null }   # null before the channel handled an event (§24.6);
+                                        # a role below admin reads `recipients` as [] and `url` as null
+
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
            bytes_transferred: int = 0, duration_s: float|null,
@@ -613,11 +618,16 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `conversion_host.key_pinned` (§7.2, §10, §26.5), `conversion_host.key_refused` (§7.2, §26.5), `hook.created`,
-`hook.updated`, `hook.deleted` (§23.3), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`hook.updated`, `hook.deleted` (§23.3), `channel.created`, `channel.updated`, `channel.deleted`, `subscription.created`,
+`subscription.deleted` (§24.3, §24.4, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
-`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `plan.cancelled`
+`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. The `channel.*` events
+carry the channel's `name` and `kind`; `channel.updated` the fields it set (`fields`), `secret` among them when the secret
+was written; `channel.deleted` a secret the store could not remove (`secret_left`). The `subscription.*` events carry the
+subscription's `id`, `channel`, `plan_id` (null for every plan) and `topics`. None of them carries a URL, a recipient or
+a secret's value (§24.7). `plan.cancelled`
 carries the reason given and how many migrations it cancelled. `migration.gpu_wait` carries `{"waiting", "pool",
 "needed", "free"}` - the pool, units needed and units free of a `GpuWait` (§4.2) - written with the migration's change in
 one transaction once when its cutover begins to wait for GPU capacity (`waiting` true) and once when a read finds room
@@ -3985,6 +3995,15 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/hooks/{name}` | viewer | — | `Hook` |
 | PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); the merged hook is checked as `POST /hooks` checks one | `Hook`; event `hook.updated` with the fields set |
 | DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. Event `hook.deleted` |
+| GET | `/notifications/channels` | viewer | — | `NotificationChannelView[]` by name (§24.3): each channel with `recipient_count`, `url_host` and its `cursor` (null before it handled an event). Recipients are personal data and a webhook's URL may hold a token (§24.8), so a role below admin reads `recipients` as `[]` and `url` as null |
+| POST | `/notifications/channels` | admin | `NotificationChannel` (the server-owned fields ignored; a field it does not have: 422) | `201 NotificationChannelView`; 409 when the name exists; 422 when the kind's fields are missing or another kind's are set, a recipient is no addr-spec or there are more than 50, or a webhook's URL is not `https://` or holds user information (§4.2); with plan task NT6, 422 for an email channel while the relay is unset. Event `channel.created` |
+| GET | `/notifications/channels/{name}` | viewer | — | `NotificationChannelView`, as the list shows it to the role |
+| PATCH | `/notifications/channels/{name}` | admin | any of `description`, `recipients`, `url`, `redact_names`, `enabled` (`name`, `kind` and the server-owned fields are immutable: 422); the merged channel is checked as `POST` checks one | `NotificationChannelView`; event `channel.updated` with the fields set |
+| DELETE | `/notifications/channels/{name}` | admin | — | `204`; 409 while a subscription names the channel, each named with its plan or "every plan". It deletes the channel's cursor and the secret `notify-{name}` the store manages (`secret_left` in the event when the store could not). Event `channel.deleted` |
+| PUT | `/notifications/channels/{name}/secret` | admin | `{"url"}` for a `slack` channel: a URL beginning with `https://hooks.slack.com/services/`, without user information; `{"signing_key"}` for a `webhook` channel: `whsec_` and the base64 of 24 to 64 bytes (§24.3) | `NotificationChannelView` (write-only: no route returns the value); 422 for an email channel, another key, or a value outside the rule; 503 when the store cannot write the secret (§13.3). The secret is written under `notify-{name}` with the label `seamless.io/channel`. Event `channel.updated` with `"fields": ["secret"]`, never a value |
+| GET | `/notifications/subscriptions` | viewer | query `plan_id`, `channel` (optional, each an exact match) | `NotificationSubscription[]` by id |
+| POST | `/notifications/subscriptions` | operator | `{"channel", "plan_id", "topics"?}` (§24.4); `plan_id` null, every plan, is an admin's: an operator gets 403 and an `auth.denied` naming the admin role, as for an approver-only plan field (§13.1) | `201 NotificationSubscription` with `created_by` the principal; 422 for an unknown channel or plan, a topic §24.5 does not name, no topic, or a topic twice; 409 when the channel already has a subscription to that plan (or to every plan). The check and the write hold the lock `DELETE /notifications/channels/{name}` holds. Adding one leaves the plan's status and `updated_at` as they are. Event `subscription.created` |
+| DELETE | `/notifications/subscriptions/{id}` | operator | — | `204`; an every-plan subscription is an admin's (403 and `auth.denied` for an operator). Event `subscription.deleted` |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), a `network_cutover` whose point names a hook twice or a hook the catalog lacks (checked under the lock of `DELETE /hooks/{name}`, which a plan's creation and edit take as they take `DELETE /providers/{id}`'s - it is the same lock), or whose DNS target lacks what its kind needs or has what it does not take (§4.2), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
@@ -4137,7 +4156,9 @@ storage. Editing roles, rotating tokens and deleting users are not exposed by th
 Ordered roles `viewer < operator < approver < admin`; each route declares its minimum role (§12).
 Every mutating call emits an audit event with `actor = principal.name`. Named permissions map to a minimum
 role: `advisor.policy.manage` and `advisor.approve` → `admin` (§14.6; `approver` is the alternative the owner
-may choose, `TODO(ADV-04): confirm`).
+may choose, `TODO(ADV-04): confirm`). Notification channels (§24.4): the catalog, its secrets and its tests are an
+admin's; an operator subscribes a channel to a plan and removes that subscription; a subscription to every plan is an
+admin's, and an operator who asks for one is refused with 403 and an `auth.denied`, as for an approver-only plan field.
 
 ### 13.3 Secrets
 
@@ -4200,7 +4221,11 @@ field (`credentials_secret`: `provider-{id}`; `ssh_key_secret`: `provider-{id}-s
 endpoint. The name is compared as the readers fold it - a case-insensitive filesystem (a host run on macOS or
 Windows) opens `provider-x` for `Provider-x`, and the variables upper-case the name and turn every other character
 into `_` - lower-cased, with every character other than a letter or digit taken as `-`: a name that folds to one
-starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). Names that fold to one
+starting with `notify-` belong to the notification channels (`notify-{name}`, §24.3), which the store writes through
+`PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`, a hook's `secret`
+or a DNS target's `tsig_secret` that folds to one is refused (422), so writing a channel's secret never replaces theirs,
+and a channel never reads theirs. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
@@ -6876,6 +6901,10 @@ recipients, each an addr-spec in its dot-atom form, a webhook's URL under a webh
 a subscription's topics at least one and each once; what needs the catalog, the plans or the secret store (an unknown
 channel or plan, the `notify-` names, a Slack secret's URL) is the routes' (NT3).
 
+The routes above with their roles and refusals, `NotificationChannelView` (§4.2), the `notify-` names (§13.3), the roles
+(§13.2) and the `channel.*` events (§4.3) are binding in those sections since plan task NT3. The test route follows with
+NT5, and an email channel's refusal while the relay is unset with NT6 (§15.1).
+
 ### 24.4 Subscriptions and roles
 
 A subscription names a channel, a plan or every plan, and its topics. The default topics are `approval`, `downtime`
@@ -6907,6 +6936,8 @@ and `problem` (§24.5, owner decision 7). The roles (§13.2):
     "topics"?}` and emits `subscription.created`. It answers 422 for an unknown channel or plan, or for an empty or
     unknown topic, and 409 when the channel already has a subscription to that plan.
   * `DELETE /notifications/subscriptions/{id}` (operator; admin for an every-plan one) emits `subscription.deleted`.
+
+The routes above, their roles and the `subscription.*` events are binding in §4.3, §12 and §13.2 since plan task NT3.
 
 ### 24.5 Notified events and messages
 

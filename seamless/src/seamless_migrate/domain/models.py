@@ -867,6 +867,15 @@ def new_subscription_id() -> str:
     return f"sub-{secrets.token_hex(4)}"
 
 
+def is_notify_secret_name(name: str | None) -> bool:
+    """Whether a secret name folds to one of the notification channels' (SDD §13.3, §24.3): a
+    provider's, a hook's or a DNS target's secret never does, compared as the readers fold a name
+    (lower-cased, every character other than a letter or digit taken as ``-``; audit AP-04)."""
+    if name is None:
+        return False
+    return re.sub(r"[^a-z0-9]", "-", name.lower()).startswith(NOTIFY_SECRET_PREFIX)
+
+
 class NotificationChannel(_Model):
     """A channel of the catalog an admin keeps (SDD §4.2, §24.3, plan task NT2): one email
     audience through the installation's relay, one Slack incoming webhook, or one signed
@@ -968,6 +977,44 @@ class NotificationCursor(_Model):
     def id(self) -> str:
         """The store's key: the channel's name (SDD §11)."""
         return self.channel
+
+
+class NotificationChannelView(_Model):
+    """What the channel routes answer (SDD §4.2, §12, §24.3, §24.8, plan task NT3): the channel
+    with its recipients' number, its URL's host and its cursor; a role below admin reads the
+    recipients as [] and the URL as null, since recipients are personal data and a webhook's URL
+    may hold a token."""
+
+    name: str
+    kind: Literal["email", "slack", "webhook"]
+    description: str | None = None
+    recipients: list[str] = Field(default_factory=list)
+    url: str | None = None
+    redact_names: bool = False
+    enabled: bool = True
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+    recipient_count: int = 0
+    url_host: str | None = None
+    cursor: NotificationCursor | None = None
+
+
+def channel_view(
+    channel: NotificationChannel, cursor: NotificationCursor | None, full: bool
+) -> NotificationChannelView:
+    """``channel`` as a role reads it (SDD §24.3): in full for an admin, else its recipients'
+    number and its URL's host alone."""
+    from urllib.parse import urlsplit
+
+    host = urlsplit(channel.url).hostname if channel.url else None
+    return NotificationChannelView(
+        **channel.model_dump(exclude={"recipients", "url"}),
+        recipients=list(channel.recipients) if full else [],
+        url=channel.url if full else None,
+        recipient_count=len(channel.recipients),
+        url_host=host,
+        cursor=cursor,
+    )
 
 
 ACKNOWLEDGEABLE_FINDINGS = frozenset({"SRC_VM_AUTOSCALED"})

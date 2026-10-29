@@ -526,6 +526,77 @@ export interface Hook {
 /** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable. */
 export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'secret' | 'timeout_s' | 'revert'>>;
 
+/** What a notification subscription chooses (SDD §4.1, §24.5). */
+export type NotifyTopic = 'approval' | 'downtime' | 'problem' | 'outcome' | 'progress';
+export const NOTIFY_TOPICS: readonly NotifyTopic[] = ['approval', 'downtime', 'problem', 'outcome', 'progress'];
+/** The topics a subscription has unless it says otherwise (SDD §24.4). */
+export const DEFAULT_NOTIFY_TOPICS: readonly NotifyTopic[] = ['approval', 'downtime', 'problem'];
+
+/** A channel of the notification catalog an admin keeps (SDD §4.2, §24.3). Its secret is `notify-{name}`, never a field. */
+export interface NotificationChannel {
+  name: string;
+  kind: 'email' | 'slack' | 'webhook';
+  description: string | null;
+  /** email: 1-50 addresses; else []. */
+  recipients: string[];
+  /** webhook: an https:// URL without user information; else null. */
+  url: string | null;
+  /** Its messages name the VM, the plan and the wave by their ids. */
+  redact_names: boolean;
+  /** false: its cursor follows the events and it sends nothing. */
+  enabled: boolean;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+/** A channel's place in the events and its delivery state (SDD §4.2, §24.6). */
+export interface NotificationCursor {
+  channel: string;
+  seq: number;
+  last_outcome: 'sent' | 'failed' | null;
+  last_outcome_at: Timestamp | null;
+  last_reason: string | null;
+  failures_in_a_row: number;
+}
+
+/** What the channel routes answer (SDD §4.2, §12, §24.3): a role below admin reads `recipients` as [] and `url` as null,
+ * with their number and the URL's host instead. */
+export interface NotificationChannelView extends NotificationChannel {
+  recipient_count: number;
+  url_host: string | null;
+  cursor: NotificationCursor | null;
+}
+
+/** The fields `POST /notifications/channels` takes (SDD §12): the server-owned ones are its. */
+export type NotificationChannelCreate = Pick<NotificationChannel, 'name' | 'kind'> &
+  Partial<Pick<NotificationChannel, 'description' | 'recipients' | 'url' | 'redact_names' | 'enabled'>>;
+
+/** The fields `PATCH /notifications/channels/{name}` takes (SDD §12): its name and kind are immutable. */
+export type NotificationChannelPatch = Partial<
+  Pick<NotificationChannel, 'description' | 'recipients' | 'url' | 'redact_names' | 'enabled'>
+>;
+
+/** `PUT /notifications/channels/{name}/secret` (SDD §12, §24.3): write-only, a Slack webhook's URL or a signing key. */
+export type NotificationChannelSecret = { url: string } | { signing_key: string };
+
+/** A channel subscribed to a plan, or to every plan (`plan_id` null), for its topics (SDD §4.2, §24.4). */
+export interface NotificationSubscription {
+  /** `sub-<8 hex>`. */
+  id: string;
+  channel: string;
+  plan_id: string | null;
+  topics: NotifyTopic[];
+  created_by: string;
+  created_at: Timestamp;
+}
+
+/** The body of `POST /notifications/subscriptions` (SDD §12). */
+export interface NotificationSubscriptionCreate {
+  channel: string;
+  plan_id: string | null;
+  topics?: NotifyTopic[];
+}
+
 export interface Plan {
   /** `plan-<8 hex>`. */
   id: string;
@@ -1050,6 +1121,12 @@ export const PERSISTED_EVENT_KINDS = [
   'hook.created',
   'hook.updated',
   'hook.deleted',
+  // the notification catalog's and the subscriptions' changes (SDD §4.3, §24.3, §24.4, plan task NT3)
+  'channel.created',
+  'channel.updated',
+  'channel.deleted',
+  'subscription.created',
+  'subscription.deleted',
   'auth.denied',
   'user.created',
   'events.pruned',
