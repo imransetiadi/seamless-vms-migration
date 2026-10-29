@@ -4308,14 +4308,6 @@ async def test_a_validation_and_a_manual_check_of_its_provider_both_succeed(tmp_
     assert [type(r).__name__ for r in results] == ["ValidationReport", "Provider"], results
 
 
-class _PlanNamingProjects(Plan):
-    """A plan as plan task TC4 stores one, naming its projects by id (SDD §4.2 with TC4, §27.4):
-    until TC4 adds the fields to Plan, a validation reads plans stored with them through this."""
-
-    source_project: str | None = None
-    destination_project: str | None = None
-
-
 def _project_credentials(provider_id: str, *project_ids: str) -> dict[str, ProjectCredential]:
     """A provider's project credentials for the projects (SDD §4.2, §27.4)."""
     return {
@@ -4345,18 +4337,13 @@ def _signs_in(impl, calls: list[str], names: dict[str, str]) -> None:
     impl.check_project = check_project
 
 
-async def test_a_validation_checks_the_plans_project_credentials_alone(
-    tmp_path, store, monkeypatch
-):
+async def test_a_validation_checks_the_plans_project_credentials_alone(tmp_path, store):
     """SDD §8, §10 "The check of project credentials", §27.7 (plan task TC3): a validation's check
     of each provider signs in with the plan's project credential on that side alone - its
-    source_project on its source provider, its destination_project on its destination, never the
-    providers' other project credentials -, replaces those projects' entries and keeps the others
-    as the last check read them. A plan that names no project signs in with none; a manual check
-    signs in with each."""
-    from seamless_migrate import orchestrator as orchestrator_module
-
-    monkeypatch.setattr(orchestrator_module, "Plan", _PlanNamingProjects)
+    source_project on its source provider, its destination_project on its destination (§4.2, plan
+    task TC4), never the providers' other project credentials -, replaces those projects' entries
+    and keeps the others as the last check read them. A plan that names no project signs in with
+    none; a manual check signs in with each."""
     tenant_a, tenant_b, tenant_c, tenant_d = (secrets.token_hex(16) for _ in range(4))
     h, plan = await setup(tmp_path, store, [vm(1)])
     earlier = {
@@ -4392,7 +4379,7 @@ async def test_a_validation_checks_the_plans_project_credentials_alone(
     _signs_in(h.source, source_calls, {tenant_a: "tenant-a", tenant_b: "tenant-b"})
     _signs_in(h.destination, destination_calls, {tenant_c: "tenant-c", tenant_d: "tenant-d"})
     named = {"source_project": tenant_a, "destination_project": tenant_c}
-    store.put("plan", _PlanNamingProjects.model_validate({**plan.model_dump(), **named}))
+    store.put("plan", plan.model_copy(update=named))
 
     await h.orch.validate_plan(plan.id, "alice")
     assert (source_calls, destination_calls) == ([tenant_a], [tenant_c])
@@ -4420,7 +4407,7 @@ async def test_a_validation_checks_the_plans_project_credentials_alone(
     # a project its provider holds no credential for (validation refuses it with plan task TC5)
     unheld = {"destination_project": secrets.token_hex(16)}
     for projects in ({}, unheld):
-        store.put("plan", _PlanNamingProjects.model_validate({**plan.model_dump(), **projects}))
+        store.put("plan", plan.model_copy(update=projects))
         await h.orch.validate_plan(plan.id, "alice")
         assert (source_calls, destination_calls) == ([tenant_a], [tenant_c])
     kept = store.get("provider", SRC_PROVIDER.id, Provider).capabilities["projects"]

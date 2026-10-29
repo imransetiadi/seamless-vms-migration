@@ -420,6 +420,8 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
         source_id=_stable_id("srv", spec.name),
         name=spec.name,
         project="finance",
+        # the project its source credential's check names as its own (SDD §10, plan task TC4)
+        project_id=DEMO_SOURCE_PROJECT["id"],
         flavor=spec.flavor,
         vcpus=vcpus,
         ram_mb=ram,

@@ -11,12 +11,13 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request, Response
+from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     BLANK_NAME,
+    PROJECT_ID_RULE,
     REQUEST_BODY,
     ConversionHostConfig,
     Migration,
@@ -550,14 +551,11 @@ class _CephAccessGone(Exception):
     """The Ceph access was removed between the key's write and its record."""
 
 
-def _check_project_id(project_id: str) -> None:
-    """A project credential's project id is 1-64 letters, digits, `-` or `_` (SDD §4.2, §12)."""
+def _check_project_id(project_id: str, name: str = "project_id") -> None:
+    """A project credential's project id is 1-64 letters, digits, `-` or `_`, else a 422 naming
+    ``name`` and never quoting the value (SDD §4.2, §12)."""
     if not is_project_id(project_id):
-        raise ApiError(
-            422,
-            "validation_error",
-            "project_id: a Keystone project's id, 1-64 letters, digits, '-' or '_'",
-        )
+        raise ApiError(422, "validation_error", f"{name}: {PROJECT_ID_RULE}")
 
 
 def _without_project_check(capabilities: dict[str, Any], project_id: str) -> dict[str, Any]:
@@ -572,14 +570,9 @@ def _without_project_check(capabilities: dict[str, Any], project_id: str) -> dic
 def _names_project(plan: Plan, provider_id: str, project_id: str) -> bool:
     """Whether ``plan`` acts in the project with the provider's credential for it: its
     ``source_project`` on its source provider, its ``destination_project`` on its destination
-    (SDD §12, §27.4). Plan task TC4 adds the two fields (§4.2): a plan stored without them names
-    no project."""
-    return (
-        plan.source_provider_id == provider_id
-        and getattr(plan, "source_project", None) == project_id
-    ) or (
-        plan.destination_provider_id == provider_id
-        and getattr(plan, "destination_project", None) == project_id
+    (SDD §4.2, §12, §27.4); a plan stored before plan task TC4 names none."""
+    return (plan.source_provider_id == provider_id and plan.source_project == project_id) or (
+        plan.destination_provider_id == provider_id and plan.destination_project == project_id
     )
 
 
@@ -838,11 +831,40 @@ async def check_provider(
 
 @router.get("/providers/{provider_id}/inventory")
 async def provider_inventory(
-    provider_id: str, request: Request, _: Principal = Depends(require_role(Role.viewer))
+    provider_id: str,
+    request: Request,
+    project: str | None = Query(default=None),
+    _: Principal = Depends(require_role(Role.viewer)),
 ) -> Any:
+    """A source's VMs, or a destination's view, read with the provider's own credential; with
+    ``project``, with that project's credential - the project credential the provider holds for
+    it, on a connection of its own closed after the read, else its own credential for the project
+    its last check names as its own -; 404 for any other project, nothing read (SDD §10, §12,
+    §27.4, plan task TC4)."""
     svc = services(request)
+    if project is not None:
+        _check_project_id(project, "project")
     provider = await svc.db.get("provider", provider_id, Provider)
-    impl = svc.providers.get(provider)
+    if project is None or (
+        project not in provider.project_credentials and project == provider.own_project_id
+    ):
+        return await _inventory_of(provider, svc.providers.get(provider))
+    if project not in provider.project_credentials:
+        raise ApiError(
+            404,
+            "not_found",
+            f"provider {provider_id} holds no credential for project {project}, nor is it the "
+            "project of its own credential, as its last check names it",
+        )
+    scoped = svc.providers.for_project(provider, project)
+    try:
+        return await _inventory_of(provider, scoped)
+    finally:
+        scoped.close()
+
+
+async def _inventory_of(provider: Provider, impl: Any) -> Any:
+    """What ``impl`` reads of the provider's inventory, as the route answers it (SDD §12)."""
     if provider.role == ProviderRole.source:
         return [vm.model_dump(mode="json") for vm in await impl.list_vms()]
     return (await impl.inventory()).to_dict()

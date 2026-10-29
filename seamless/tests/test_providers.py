@@ -5265,6 +5265,75 @@ async def test_the_check_reports_an_unrestricted_application_credential(tmp_path
 
 
 # --------------------------------------------------------------------------------------------
+# the VMs' projects and a project's inventory (SDD §4.2, §10, §27.4; plan task TC4)
+
+
+async def test_the_source_inventory_records_each_vms_project_id(tmp_path, monkeypatch):
+    """SDD §4.2, §10, §27.4 (plan task TC4): an OpenStack source's VM carries its server's project
+    - its id as Nova reports it (tenant_id) and its name - whichever credential read it: the
+    provider's own lists its own project's servers, its credential for a project that project's,
+    through the registry's for_project - an implementation built for the read, never cached, which
+    signs in with the project's application credential -, and an admin's get_vm of another
+    project's VM by id (SDD §27.1). A VMware VM carries none; the demo's OpenStack source's VMs
+    carry the project its check names as its own."""
+    import functools
+
+    cloud = InProcessCloud(tmp_path / "cloud", roles=("admin", "member"))
+    tenant_a = _tenant(cloud, "tenant-a")
+    own = cloud.project["id"]
+    cloud.servers = [
+        {"id": "srv-own-1", "name": "web-01"},
+        {"id": "srv-a-1", "name": "ledger-01", "project_id": tenant_a.project_id},
+        {"id": "srv-own-2", "name": "web-02"},
+        {"id": "srv-a-2", "name": "ledger-02", "project_id": tenant_a.project_id},
+    ]
+    monkeypatch.setattr(
+        registry,
+        "OpenStackProvider",
+        functools.partial(OpenStackProvider, connect_fn=cloud.connect),
+    )
+    reg = registry.ProviderRegistry(cloud.settings)
+    provider = _holding(tenant_a)
+
+    own_read = await reg.get(provider).list_vms()
+    assert [(vm.name, vm.project, vm.project_id) for vm in own_read] == [
+        ("web-01", "finance", own),
+        ("web-02", "finance", own),
+    ]
+    # the provider's admin reads another project's VM by id: that VM's project, not its own
+    across = await reg.get(provider).get_vm("srv-a-1")
+    assert (across.name, across.project, across.project_id) == (
+        "ledger-01",
+        "tenant-a",
+        tenant_a.project_id,
+    )
+    assert cloud.sign_ins == ["svc"]
+    scoped = reg.for_project(provider, tenant_a.project_id)
+    assert scoped is not reg.for_project(provider, tenant_a.project_id), "never cached"
+    try:
+        tenant_read = await scoped.list_vms()
+        assert await scoped.get_vm("srv-a-1") == tenant_read[0]
+    finally:
+        scoped.close()
+    assert [(vm.name, vm.project, vm.project_id) for vm in tenant_read] == [
+        ("ledger-01", "tenant-a", tenant_a.project_id),
+        ("ledger-02", "tenant-a", tenant_a.project_id),
+    ]
+    assert cloud.sign_ins == ["svc", tenant_a.credential_id]
+
+    # VMware has no Keystone projects; the demo's OpenStack VMs are of its check's own project
+    [vcenter_vm] = await _vcenter(tmp_path / "vc", [fake_vcenter_vm()]).list_vms()
+    assert vcenter_vm.project_id is None
+    demo = FakeSourceProvider(ProviderKind.openstack)
+    finance = (await demo.check())["project"]["id"]
+    assert {vm.project_id for vm in await demo.list_vms()} == {finance} == {"project-finance"}
+    assert (await demo.get_vm((await demo.list_vms())[0].source_id)).project_id == finance
+    assert {vm.project_id for vm in await FakeSourceProvider(ProviderKind.vmware).list_vms()} == {
+        None
+    }
+
+
+# --------------------------------------------------------------------------------------------
 # the provider check's host key pin (SDD §10 "Host key pins", §26.3, §26.4; plan task ST2)
 
 
