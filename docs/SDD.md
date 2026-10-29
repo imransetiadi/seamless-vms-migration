@@ -2310,6 +2310,16 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
   destination project (`grant_flavor_access`, §10), with the destination provider's own credential - os-migrate's
   import gives none, and the project could use no private flavor without it. A public flavor, and the flavors of a
   plan without a destination project, are left as they are.
+  A host's floating IP (the owner's decision of 2026-10-30, §26.10 decision 14): the configured address
+  (`conversion_host.address`) is the provider's own host's alone (`credentials.host_address`, §10), so the deploy
+  passes it as `os_migrate_{side}_conversion_floating_ip_address` - the role attaches that floating IP to the host
+  it deploys - only on a side where the plan names no project, as before, and never for a project's host. Without
+  it the role takes a floating IP for the host with the credential it deploys with, in that project
+  (`create_fip.yml`, `reuse: true`): one the project holds detached on the host's external network
+  (`conversion_host.external_network`, else the cloud's first external IPv4 network), else a new one there, counted
+  against the project's floating IP quota (§27.6). The runs reach a project's host at the address its server holds,
+  which the collection reads when it finds the host by its name in the project (`conv_host_inventory.yml`; §26.10
+  decision 13). No run of a project's side - its pre-staging's or a migration's - carries the provider's address.
 * **Conversion key** (issue #112). The managed conversion hosts are per provider - found by name - and the
   `os_migrate_conv` keypair belongs to the credential's user (the collection's default name, which the executor never
   changes), so a plan meets the hosts and the keypair an earlier plan of the same credentials made. Every OpenStack
@@ -3548,7 +3558,7 @@ Finding catalog (code — severity — condition):
 | `VMW_SNAPSHOTS_PRESENT` | warning | `snapshot_count > 0` |
 | `VMW_TOOLS_MISSING` | info | `tools_ok is False` |
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
-| `CONV_HOST_KEY_UNKNOWN` | blocker (cold, warm, vmware_*) | while SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is true (§15.1, §26.5), a conversion host the plan needs - the source's and the destination's for an OpenStack source, the destination's alone for a VMware source - has no declared keys (`conversion_host.ssh_host_keys`) and either no pin while Seamless will not create it (`conversion_host.manage` false, or a VMware source's destination host, which the operator brings), or a pin of another server: the validation's provider check reports the host resolving to another server than its pin's, its status message "conversion host replaced: ..." (§10 "Host key pins"), a managed host too. Its runs would be refused before their first playbook (§7.2). The message names each such host by its side, provider and name, and a replaced one by the check's words. A host Seamless manages without a pin is not judged: its pre-staging creates it with an injected key, or a run reads and pins its console (§26.3, §26.8) |
+| `CONV_HOST_KEY_UNKNOWN` | blocker (cold, warm, vmware_*) | while SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is true (§15.1, §26.5), a conversion host the plan needs - the source's and the destination's for an OpenStack source, the destination's alone for a VMware source - has no declared keys (`conversion_host.ssh_host_keys`) and either no pin while Seamless will not create it (`conversion_host.manage` false, or a VMware source's destination host, which the operator brings), or a pin of another server: the validation's provider check reports the host resolving to another server than its pin's, its status message "conversion host replaced: ..." (§10 "Host key pins"), a managed host too. Its runs would be refused before their first playbook (§7.2). The message names each such host by its side, provider and name, and a replaced one by the check's words. A host Seamless manages without a pin is not judged: its pre-staging creates it with an injected key, or a run reads and pins its console (§26.3, §26.8). On a side where the plan names a project the host is that project's, judged by its project credential's pin and the check's report in that project's entry, never by the provider's declared keys (§10, §26.10 decisions 11 and 12). The remediation says what helps on each side: for the provider's own host, its keys declared, read out of band, or, while it has no pin, its console pinned by the provider check, and for one Seamless manages its deletion and a new pre-staging, which creates it with an injected key; for a project's host, which declared keys do not reach, the plan's pre-staging, which creates it in that project and pins it with an injected key once a replaced one is deleted, or, while it has no pin, a run's pin of its console with that project's credential (§26.3, §26.4) |
 | `CONV_HOST_KEYS_UNCHECKED` | warning (cold, warm, vmware_*) | SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is false (§15.1, §26.8) and a conversion host the plan needs is configured: no hop of the data path checks a conversion host's key |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
@@ -4063,7 +4073,8 @@ declared keys and its address are its own host's, the one its own credential rea
 owner's decisions of 2026-10-29 that followed, §26.10 decisions 12 and 13: `credentials.declared_keys(provider,
 project_id)` gives `conversion_host.ssh_host_keys` for None and none for a project, and
 `credentials.host_address(provider, project_id)` `conversion_host.address` for None and none for a project, whose
-host is looked up by its name alone):
+host is looked up by its name alone and deployed with a floating IP of its own project - the deploy's floating IP
+address is that function's too, the owner's decision of 2026-10-30, §7.2, §26.10 decision 14):
 * **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
   of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
   looks the host's server up with its own credential: by its name, `conversion_host.name`, else its side's name as the
@@ -4459,7 +4470,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`, its `conversion_host_pin` kept: a credential written again reaches the same project's host, whose pin belongs to its server (§26.4); that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
 | DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry - its project's conversion host pin with it, so a later credential for the project starts without one (§26.4) - and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
-| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin of another server reported in that project's entry of `projects`, no console of a project's host read, §10) |
+| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin checked against its project's host, looked up by its name alone: a pin of another server, or a host no server of the project bears the name of ("conversion host not found: ..."), reported in that project's entry of `projects`, no console of a project's host read, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
 | POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
 | GET | `/hooks/{name}` | viewer | — | `Hook` |
@@ -8232,7 +8243,9 @@ per project credential, the one rule that selects a step's pin, the check's repo
 the project credential routes' rules for its pin - in §4.2, §7.2, §10 and §12 since it; the owner's decisions of
 2026-10-29 that followed it (§26.10, decisions 12 and 13) - the declared keys and the address the provider's own
 host's alone, a project's host looked up by its name in its project alone and reported not found - in §7.2 and §10
-since them. The facts
+since them; the owner's decision of 2026-10-30 (§26.10, decision 14) - a project's host deployed with a floating IP
+of its own project, never the provider's address - in §7.2 and §10 since it, with the check's not-found report in
+§12 and the finding's remediation for each side in §9.3. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -8369,6 +8382,8 @@ decision 10).
   and a project's host is checked against its project's pin whatever the provider declares; it is looked up by its
   name alone, with its project's credential, in that project - never by the provider's address -, so it never
   resolves to the provider's own host, and one whose name no server of the project bears is not found (§7.2, §10).
+  Nor is that address its floating IP (owner decision 14; binding in §7.2 and §10 since it): its pre-staging deploys
+  it without one, and the role gives it a floating IP of its own project (§7.2).
   A project's host found replaced is refused until it is deleted and a pre-staging creates and pins it again: an
   operator's declared keys do not reach it.
 * **Why per host.** A conversion host serves every plan of the project its credential reaches - its provider's own,
@@ -8604,6 +8619,24 @@ The owner took each default as written on 2026-10-23 (D8):
     not found: a run fails as for a lookup that fails - transient, a rollback's excepted, which logs it -, the plan's
     pre-staging creates it, and the check reports it in the project's entry, as it reports a host found replaced; it
     never resolves to the provider's own host.
+14. **A project's host takes a floating IP of its own project**, decided by the owner on 2026-10-30. The pre-staging
+    passed `conversion_host.address` to every side's deploy as the host's floating IP
+    (`os_migrate_{side}_conversion_floating_ip_address`), a project's side included, so the role asked for the
+    provider's own host's floating IP for the project's host: a `member` project credential finds no floating IP of
+    that address in its project and the deploy fails ("unable to find floating IP"), one that holds `admin` finds it
+    on the provider's own host and fails too ("has been attached to different server") - or, were it detached, takes
+    it from the provider's host (the vendored openstack.cloud 2.6.0 `floating_ip` module; `TODO(LAB): confirm`). The
+    address is the provider's own host's (decision 13), and a project's host is another server, which its project's
+    pre-staging creates. Its deploy now passes no address for a project's side (`credentials.host_address`, §10), and
+    the role takes a floating IP of that project, as it does when no address is given: one the project holds
+    detached on the host's external network, else a new one (`create_fip.yml`, `reuse: true`), counted against the
+    project's quota (§27.6). The provider's own host keeps its configured address, exactly as before, and no field is
+    added: a project's host is reached at the address its server holds, which the runs read when they find it by
+    its name in the project (§7.2). The role's `reuse` is the collection's, unchanged: like the provider's own host
+    deployed without an address, a project's host that holds no floating IP when the role deploys it - a new one, or
+    one created again after its deletion - takes a floating IP its project holds detached on that network when there
+    is one: the tenant's own, or one a keep-address plan reserved (§8.3), whose next reservation then fails, "held by
+    a port of the project" (`TODO(LAB): confirm`).
 
 ### 26.11 Contract changes (each binding from its plan task)
 
@@ -8620,6 +8653,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
 | a pin per project credential (`ProjectCredential.conversion_host_pin`); the one rule that selects a step's pin (`credentials.host_pin`); the check's report of a project's replaced host; the project credential routes' rules for its pin (owner decision 11) | §4.2, §7.2, §10, §12 (binding) | after TC5 |
 | the declared keys and the address the provider's own host's alone (`credentials.declared_keys`, `credentials.host_address`); a project's host looked up by its name in its project alone: a run's failure and the check's report of one not found (owner decisions 12 and 13) | §7.2, §10 (binding) | after TC5 |
+| the configured address the floating IP of the provider's own host alone: a project's host deployed without it, with a floating IP of its own project, and no run of a project's side carrying it (owner decision 14); the check's not-found report in §12; `CONV_HOST_KEY_UNKNOWN`'s remediation for each side | §7.2, §9.3, §10, §12 (binding) | after TC5 |
 
 ## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
@@ -8807,7 +8841,9 @@ another only where a service lets an admin act by id or on the project's behalf.
 * **The keep-address reservation** (§8.3): Neutron lets `admin`, or the project's `manager` under the secure-RBAC
   defaults, choose a floating IP's address. For a `member` project credential the provider's admin creates it for the
   project (`project_id`), and the project's credential associates it (`TODO(LAB): confirm`).
-* **Conversion hosts** count against the plan's projects' quotas, as they count today against the credential's.
+* **Conversion hosts** count against the plan's projects' quotas, as they count today against the credential's - a
+  project's host's floating IP too: the role takes it from that project, never the provider's configured address
+  (§7.2; §26.10 decision 14, the owner's decision of 2026-10-30).
 
 ### 27.7 Checks, findings and the cutover gate
 
