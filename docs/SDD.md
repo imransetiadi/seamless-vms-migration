@@ -619,7 +619,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `conversion_host.key_pinned` (§7.2, §10, §26.5), `conversion_host.key_refused` (§7.2, §26.5), `hook.created`,
 `hook.updated`, `hook.deleted` (§23.3), `channel.created`, `channel.updated`, `channel.deleted`, `subscription.created`,
-`subscription.deleted` (§24.3, §24.4, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
@@ -629,7 +629,11 @@ failure (§24.5, plan task NT4). The `channel.*` events
 carry the channel's `name` and `kind`; `channel.updated` the fields it set (`fields`), `secret` among them when the secret
 was written; `channel.deleted` a secret the store could not remove (`secret_left`). The `subscription.*` events carry the
 subscription's `id`, `channel`, `plan_id` (null for every plan) and `topics`. None of them carries a URL, a recipient or
-a secret's value (§24.7). `plan.cancelled`
+a secret's value (§24.7). `notification.sent` and `notification.failed` are written once per message, never once per
+try: their `plan_id` and `migration_id` are the notified event's, their message the title and the channel, their data
+`{"channel", "kind", "trigger", "event_seq", "key", "tries", "reason", "refused"}` - `reason` an HTTP status, an SMTP
+reply code, the failure's kind or `expired`, `refused` an email's refused recipients - and never the URL, a recipient,
+the body or the answer; a test message carries the trigger `test` (§8.7, §24.7). `plan.cancelled`
 carries the reason given and how many migrations it cancelled. `migration.gpu_wait` carries `{"waiting", "pool",
 "needed", "free"}` - the pool, units needed and units free of a `GpuWait` (§4.2) - written with the migration's change in
 one transaction once when its cutover begins to wait for GPU capacity (`waiting` true) and once when a read finds room
@@ -3079,6 +3083,42 @@ and the tests call alone:
 The orchestrator gives the messages their two facts (§4.3): `migration.downtime_ended` says its `cause`, and a
 `migration.phase` to `failed` whether the source was stopped (`source_stopped`).
 
+### 8.7 The notifier (plan task NT5, §24.6, §24.7)
+
+`seamless_migrate.notify.notifier.Notifier` runs in the server's process beside the orchestrator and starts and stops
+with it in the API's lifespan; the CLI runs none. It is never in a migration's path: no step, gate, transition or
+route waits for it.
+
+* **One task per channel, in `seq` order.** Each tick (`tick_s`, 1 s) the notifier lists the channels and keeps one
+  task per channel. A channel's task reads the store's events after its cursor (`NotificationCursor.seq`), a page at
+  a time, as the bus's catch-up reads the CLI's events (§12): so the events the CLI writes are notified by the server.
+  A new channel's cursor starts at its own `channel.created` event, so it never receives the history; a disabled
+  channel's cursor follows the events and nothing is sent. A channel that fails holds back its own task alone.
+* **Routing.** For each event the channel's subscriptions that match it - the plan's and the every-plan ones - give
+  the union of their topics; `triggers_for` (§8.6) gives the event's triggers, and each trigger whose topic is in
+  the union makes one message (`build_message`, with the channel's `redact_names` and `SEAMLESS_PUBLIC_URL`). So a
+  channel sends an event once, whatever subscriptions match it; `notification.*`, `channel.*` and `subscription.*`
+  fire no trigger and are never notified.
+* **Senders.** A sender per channel kind (`Sender`: `send(channel, message, key, secret) -> SendResult`) answers
+  `sent`, `failed` (final) or `retry` (a timeout, a connection or TLS error, HTTP 408, 429 or 5xx, a temporary SMTP
+  4yz reply), with a reason, an optional `Retry-After` and an email's refused count. The notifier reads the channel's
+  secret (`notify-{name}`, §13.3) each time it sends, so a rotation needs no restart. Plan tasks NT6–NT8 bring the
+  email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`.
+* **Retries, pacing, expiry** (§24.6): 5 tries with 10, 20, 40 and 80 s before the second to the fifth, each ±20 %,
+  a `Retry-After` of up to 300 s honoured; one message a second per channel; a message whose event is more than an
+  hour old when its turn comes is not sent, and a run of expired messages is one `notification.failed` with the
+  reason `expired`, their number (`expired`) and their first and last `seq` (`first_seq`, `last_seq`).
+* **The key and the outcome.** A message's key is `<channel>_<seq>`, with `_2` and so on when one event fires more
+  than one trigger. When the outcome is known, the cursor moves past the event in the store transaction that writes
+  `notification.sent` or `notification.failed` (`put_with_event`, §11), so a restart sends again only a message
+  whose outcome was not written, with the same key. While events match nothing, the cursor is written at most once a
+  minute. `seamless_notifications_total{kind,outcome}` counts the outcomes (§18).
+* **Errors.** An unexpected error of a channel's task is logged and the task starts again from the cursor after a
+  backoff (5 s); the notifier never stops the server or the tick.
+* **The test.** `POST /notifications/channels/{name}/test` (§12, §24.3) sends a fixed message through the channel's
+  sender at once, within the same timeouts and with one try, and records the outcome as a delivery with the trigger
+  `test`; the cursor does not move.
+
 ## 9. Planning
 
 ### 9.1 Estimator (`planning/estimator.py`)
@@ -3876,6 +3916,8 @@ Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `adv
 `advisor_policy` (§14.6), `user` (§13.1), `hook` (§23.3, its id its name), `notification_channel` (§24.3, its id its
 name), `notification_subscription` (§24.4) and `notification_cursor` (§24.6, its id the channel's name).
 
+A notification's outcome and its channel's cursor are one `put_with_event` (§8.7, §24.6).
+
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
 exists already is a `ConflictError`, and an `UPDATE … WHERE version = n` for `n > 0`, where no row updated is a
@@ -4032,6 +4074,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/notifications/subscriptions` | viewer | query `plan_id`, `channel` (optional, each an exact match) | `NotificationSubscription[]` by id |
 | POST | `/notifications/subscriptions` | operator | `{"channel", "plan_id", "topics"?}` (§24.4); `plan_id` null, every plan, is an admin's: an operator gets 403 and an `auth.denied` naming the admin role, as for an approver-only plan field (§13.1) | `201 NotificationSubscription` with `created_by` the principal; 422 for an unknown channel or plan, a topic §24.5 does not name, no topic, or a topic twice; 409 when the channel already has a subscription to that plan (or to every plan). The check and the write hold the lock `DELETE /notifications/channels/{name}` holds. Adding one leaves the plan's status and `updated_at` as they are. Event `subscription.created` |
 | DELETE | `/notifications/subscriptions/{id}` | operator | — | `204`; an every-plan subscription is an admin's (403 and `auth.denied` for an operator). Event `subscription.deleted` |
+| POST | `/notifications/channels/{name}/test` | admin | — | `{"outcome": "sent"|"failed", "reason": str|null}` after one try of a fixed message through the channel's sender, within the timeouts of §24.6 (§8.7); 409 for a disabled channel. Recorded as a delivery with the trigger `test` (`notification.sent` or `notification.failed`) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), a `network_cutover` whose point names a hook twice or a hook the catalog lacks (checked under the lock of `DELETE /hooks/{name}`, which a plan's creation and edit take as they take `DELETE /providers/{id}`'s - it is the same lock), or whose DNS target lacks what its kind needs or has what it does not take (§4.2), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
@@ -5767,7 +5810,9 @@ over half of `tick_s`; QASuite PERF-CP-02), `seamless_cutover_refusals` gauge �
 `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, §7.2), the
 ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is to fix before a cutover —, and
 `seamless_gpu_waits` gauge — the migrations whose cutover waits for GPU capacity (`gpu_wait`, §5.4 rule 5, §22.7),
-their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6).
+their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6), and
+`seamless_notifications_total{kind,outcome}` counter — the notification messages recorded as `sent` or `failed` per
+channel kind since the server started (§8.7, §24.7; plan task NT5), so a failing channel can be alerted on.
 
 ---
 
@@ -7069,8 +7114,10 @@ The topics, the triggers, the messages and the formats above are binding in §8.
   nothing: the server notifies the CLI's events, which it reads from the store (§12).
 * **One cursor per channel, in order.**
   * Each enabled channel has a cursor: the `seq` of the last event it handled (`NotificationCursor`, §24.3).
-  * The notifier reads the events after the cursor through the bus's subscription (§12). It routes each event through
-    the channel's subscriptions and topics, and sends what matches one message at a time, in `seq` order.
+  * The notifier reads the events after the cursor from the store, a page at a time, as the bus's catch-up reads
+    another process's events (§12; amended with plan task NT5: a reader per channel at its own cursor needs no stream).
+    It routes each event through the channel's subscriptions and topics, and sends what matches one message at a
+    time, in `seq` order.
   * A channel that fails holds back its own messages, never another channel's, and never a step.
 * **Never in a migration's path.**
   * No step, gate, transition or route waits for the notifier: it reads events after their transaction committed.
@@ -7115,6 +7162,8 @@ The topics, the triggers, the messages and the formats above are binding in §8.
 * **A partly refused email.** When the relay accepts some recipients and refuses others, the message counts as sent.
   Its event gives the number refused, never their addresses.
 
+The notifier above is binding in §8.7 since plan task NT5, with its test route in §12 and its metric in §18.
+
 ### 24.7 Audit events
 
 These kinds are proposed. Each enters §4.3, `events.py` and the dashboard's `PERSISTED_EVENT_KINDS` together, with
@@ -7137,6 +7186,8 @@ its plan task, since one test reads all three (`test_event_kinds_match_sdd_4_3_a
 Each change to the catalog or to the subscriptions has its event, with the principal as actor (§13.2). Neither the
 notification events nor the catalog's are ever notified. The metric `seamless_notifications_total{kind,outcome}`,
 with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a failing channel can be alerted on.
+
+`notification.sent` and `notification.failed` are binding in §4.3 since plan task NT5.
 
 ### 24.8 Data that leaves the installation
 
