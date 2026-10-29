@@ -1399,10 +1399,12 @@ A Linux host's own Docker Engine, with no Colima (SDD §17.1). These checks run 
 * CI's `deploy-scripts` job (pull requests too) runs `scripts/compose-init.sh` and `make -n seamless-up` /
   `make seamless-colima-up` in RHEL 9 and RHEL 10 (Red Hat's UBI images), Rocky Linux 9, AlmaLinux 9, Fedora 42, Debian 12 and
   Ubuntu 24.04 containers; and CI's `rhel-control-plane` job installs the control plane into a venv of RHEL 9's and
-  RHEL 10's AppStream Python 3.12 in the UBI images, runs `seamless version` and the configuration, model, store and
-  API core tests there (the tools run on RHEL 9 and later, the owner's ask of 2026-10-29). RHEL 9's SQLite 3.34.1
+  RHEL 10's AppStream Python 3.12 in the UBI images, runs `seamless version` and the configuration, model, store,
+  API core and lease tests there (the tools run on RHEL 9 and later, the owner's ask of 2026-10-29). RHEL 9's SQLite 3.34.1
   refuses NaN and Infinity in JSON, so the store test of a document an earlier version kept with one skips itself there
-  (`sqlite_reads_nan_json`); the production store is PostgreSQL (SDD §11).
+  (`sqlite_reads_nan_json`); the production store is PostgreSQL (SDD §11). It has no `RETURNING` either (SQLite 3.35
+  brought it), which the UBI 9 image's SQLite shares: no statement of the lease sends one
+  (`test_the_lease_runs_no_returning_clause`).
   Debian and Ubuntu run without `openssl`, so the init script's `/dev/urandom` fallback runs too.
 * CI's `compose-linux` job (main, nightly, manual) runs `scripts/compose-init.sh`, `make seamless-demo` and the
   §14.6 smoke test on an Ubuntu runner's Docker Engine, with no context variable. With no `dashboard/dist` in the
