@@ -36,6 +36,12 @@ import type {
   UserCreated,
   Migration,
   MigrationAction,
+  NotificationChannelCreate,
+  NotificationChannelPatch,
+  NotificationChannelSecret,
+  NotificationChannelView,
+  NotificationSubscription,
+  NotificationSubscriptionCreate,
   MigrationListQuery,
   MigrationSummary,
   Plan,
@@ -93,7 +99,16 @@ export const queryKeys = {
   advisorNotes: (limit: number) => ['advisor', 'notes', limit] as const,
   policies: ['advisor', 'policies'] as const,
   hooks: ['hooks'] as const,
+  notifications: ['notifications'] as const,
+  notificationChannels: ['notifications', 'channels'] as const,
+  notificationSubscriptions: (query: SubscriptionListQuery = {}) => ['notifications', 'subscriptions', query] as const,
 };
+
+/** The query of GET /notifications/subscriptions (SDD §12): each an exact match. */
+export interface SubscriptionListQuery {
+  plan_id?: string;
+  channel?: string;
+}
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
   if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false;
@@ -453,6 +468,76 @@ export function useUpdateHook() {
 /** DELETE /hooks/{name} (admin, SDD §12): refused while a plan or another hook names it. */
 export function useDeleteHook() {
   return useHookWrite((api, name: string) => api.delete(`/hooks/${enc(name)}`));
+}
+
+/** GET /notifications/channels (viewer): the catalog in name order, each channel as the role reads it (SDD §12, §24.3). */
+export function useNotificationChannels() {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.notificationChannels,
+    queryFn: ({ signal }) => api.get<NotificationChannelView[]>('/notifications/channels', { signal }),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** GET /notifications/subscriptions (viewer), by id (SDD §12, §24.4). */
+export function useNotificationSubscriptions(query: SubscriptionListQuery = {}) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.notificationSubscriptions(query),
+    queryFn: ({ signal }) => api.get<NotificationSubscription[]>('/notifications/subscriptions', { signal, query: { ...query } }),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** A write of the catalog or the subscriptions refreshes both and the event tail: a channel's cursor and events change. */
+function useNotificationWrite<V, T>(write: (api: ApiClient, variables: V) => Promise<T>) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (variables: V) => write(api, variables),
+    retry: false,
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.notifications, ['events', 'tail']]),
+  });
+}
+
+/** POST /notifications/channels (admin, SDD §12). */
+export function useCreateNotificationChannel() {
+  return useNotificationWrite((api, channel: NotificationChannelCreate) => api.post<NotificationChannelView>('/notifications/channels', channel));
+}
+
+/** PATCH /notifications/channels/{name} (admin, SDD §12): its name and kind are immutable; `enabled` enables and disables it. */
+export function useUpdateNotificationChannel() {
+  return useNotificationWrite((api, { name, patch }: { name: string; patch: NotificationChannelPatch }) =>
+    api.patch<NotificationChannelView>(`/notifications/channels/${enc(name)}`, patch),
+  );
+}
+
+/** DELETE /notifications/channels/{name} (admin, SDD §12): refused while a subscription names it. */
+export function useDeleteNotificationChannel() {
+  return useNotificationWrite((api, name: string) => api.delete(`/notifications/channels/${enc(name)}`));
+}
+
+/** PUT /notifications/channels/{name}/secret (admin, write-only, SDD §12, §24.3): no route returns the value. */
+export function useSetNotificationChannelSecret() {
+  return useNotificationWrite((api, { name, secret }: { name: string; secret: NotificationChannelSecret }) =>
+    api.put<NotificationChannelView>(`/notifications/channels/${enc(name)}/secret`, secret),
+  );
+}
+
+/** POST /notifications/channels/{name}/test (admin, SDD §12): one try of a fixed message, its outcome and reason. */
+export function useTestNotificationChannel() {
+  return useNotificationWrite((api, name: string) => api.post<{ outcome: 'sent' | 'failed'; reason: string | null }>(`/notifications/channels/${enc(name)}/test`, {}));
+}
+
+/** POST /notifications/subscriptions (operator; admin for every plan, SDD §12, §24.4). */
+export function useCreateNotificationSubscription() {
+  return useNotificationWrite((api, body: NotificationSubscriptionCreate) => api.post<NotificationSubscription>('/notifications/subscriptions', body));
+}
+
+/** DELETE /notifications/subscriptions/{id} (operator; admin for an every-plan one, SDD §12, §24.4). */
+export function useDeleteNotificationSubscription() {
+  return useNotificationWrite((api, id: string) => api.delete(`/notifications/subscriptions/${enc(id)}`));
 }
 
 /** PATCH /providers/{id} (admin). */

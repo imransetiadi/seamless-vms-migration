@@ -41,6 +41,7 @@ import { ProbeWarnings } from '../components/ProbeWarnings';
 import { PlanStatusBadge } from '../components/StatusBadge';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { Unavailable } from '../components/Unavailable';
+import { PlanNotificationsPanel } from '../components/Subscriptions';
 import { WavesBoard } from '../components/WavesBoard';
 import { DECISION_TYPE_LABELS, thresholdDecimals } from '../lib/advisor';
 import { cn } from '../lib/cn';
@@ -575,6 +576,9 @@ export default function PlanDetail() {
             )}
           </Panel>
         </section>
+
+        {/* the channels that follow this plan (SDD §16, §24.4, plan task NT9): not a field of the plan */}
+        <PlanNotificationsPanel planId={p.id} />
       </div>
 
       <ConfirmDialog

@@ -116,7 +116,8 @@ describe('Layout navigation (SDD §16)', () => {
     // the hook catalog every role reads, after Plans (SDD §16, plan task N12a)
     expect(items(groups[0]!)).toEqual([['Overview', '/'], ['Plans', '/plans'], ['Hooks', '/hooks']]);
     expect(items(groups[1]!)).toEqual([['Providers', '/providers'], ['Inventory', '/inventory']]);
-    expect(items(groups[2]!)).toEqual([['Events', '/events']]);
+    // the notification catalog beside Events (SDD §16, plan task NT9)
+    expect(items(groups[2]!)).toEqual([['Events', '/events'], ['Notifications', '/notifications']]);
     expect(items(groups[3]!)).toEqual([['Recommendations', '/advisor'], ['Policies', '/advisor/policies'], ['Audit trail', '/advisor/audit']]);
     expect(items(groups[4]!)).toEqual([['Users', '/users']]);
     // a recommendation's page belongs to Recommendations

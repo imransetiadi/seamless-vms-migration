@@ -27,6 +27,7 @@ beforeAll(async () => {
     import('./pages/Plans'),
     import('./pages/PlanDetail'),
     import('./pages/AdvisorPolicies'),
+    import('./pages/Notifications'),
   ]);
 }, 30_000);
 
@@ -88,6 +89,22 @@ describe('App shell', () => {
     // and stays there once the shell's navigation effects ran
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(document.activeElement).toBe(card);
+  });
+
+  it('lists Notifications in the Activity group (SDD §16, plan task NT9)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderApp('viewer');
+    await screen.findByRole('heading', { level: 1, name: 'Overview' }, PAGE_TIMEOUT);
+    const nav = screen.getAllByRole('navigation', { name: 'Primary' })[0] as HTMLElement;
+    const activity = within(nav).getByRole('group', { name: 'Activity' });
+    expect(within(activity).getAllByRole('link').map((link) => [link.textContent, link.getAttribute('href')])).toEqual([
+      ['Events', '/events'],
+      ['Notifications', '/notifications'],
+    ]);
+    await user.click(within(activity).getByRole('link', { name: 'Notifications' }));
+    expect(await screen.findByRole('heading', { level: 1, name: 'Notifications' }, PAGE_TIMEOUT)).toBeInTheDocument();
+    expect(within(nav).getByRole('link', { name: 'Notifications' })).toHaveAttribute('aria-current', 'page');
+    await waitFor(() => expect(document.title).toBe('Notifications · Seamless Migrate'));
   });
 
   it('sends an unauthenticated user to the sign-in page', async () => {

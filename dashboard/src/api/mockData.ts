@@ -27,6 +27,9 @@ import type {
   GpuPool,
   Migration,
   Nic,
+  NotificationChannel,
+  NotificationCursor,
+  NotificationSubscription,
   Phase,
   PhaseChange,
   Plan,
@@ -2524,6 +2527,12 @@ export interface Fixtures {
   /** Stored advisor policies (document kind `advisor_policy`, SDD §14.6). */
   policies: AdvisorPolicy[];
   events: Event[];
+  /** The notification catalog, one channel of each kind (document kind `notification_channel`, SDD §24.3, §24.9). */
+  channels: NotificationChannel[];
+  /** Each channel's subscription to a plan or to every plan (document kind `notification_subscription`, SDD §24.4). */
+  subscriptions: NotificationSubscription[];
+  /** Each channel's place in the events and its delivery state (document kind `notification_cursor`, SDD §24.6). */
+  cursors: NotificationCursor[];
 }
 
 export function buildFixtures(now: number): Fixtures {
@@ -2817,5 +2826,25 @@ export function buildFixtures(now: number): Fixtures {
   for (const plan of plans) plan.derived_status = derivePlanStatus(plan, migrations);
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
-  return { providers, inventories, plans, migrations, recommendations, snapshots, policies, events };
+
+  // one notification channel of each kind, each subscribed to a plan or to every plan, with the delivery state its cursor
+  // recorded (SDD §16, §24.9); addresses under example.com, and a Slack channel holds no URL (its secret, SDD §24.3)
+  const channelAt = iso(now - 9 * D * 1000);
+  const channels: NotificationChannel[] = [
+    { name: 'itsm-webhook', kind: 'webhook', description: 'The ITSM receiver, signed', recipients: [], url: 'https://itsm.example.com/hooks/seamless', redact_names: true, enabled: true, created_at: channelAt, updated_at: channelAt },
+    { name: 'ops-mailbox', kind: 'email', description: 'The operations mailbox', recipients: ['ops@example.com', 'migration-team@example.com'], url: null, redact_names: false, enabled: true, created_at: channelAt, updated_at: channelAt },
+    { name: 'ops-slack', kind: 'slack', description: 'Slack #migrations', recipients: [], url: null, redact_names: false, enabled: true, created_at: channelAt, updated_at: channelAt },
+  ];
+  const subscriptions: NotificationSubscription[] = [
+    { id: 'sub-3a7f1c2e', channel: 'ops-mailbox', plan_id: null, topics: ['approval', 'downtime', 'problem'], created_by: 'rina', created_at: channelAt },
+    { id: 'sub-5b2d9e04', channel: 'ops-slack', plan_id: 'plan-4f2a9c1e', topics: ['approval', 'downtime', 'problem'], created_by: 'bayu', created_at: iso(now - 8 * D * 1000) },
+    { id: 'sub-8c1e4f6a', channel: 'itsm-webhook', plan_id: 'plan-2d5c8b93', topics: ['outcome', 'problem'], created_by: 'bayu', created_at: iso(now - 8 * D * 1000) },
+  ];
+  const last = events.length;
+  const cursors: NotificationCursor[] = [
+    { channel: 'itsm-webhook', seq: last, last_outcome: 'failed', last_outcome_at: iso(now - 25 * 60_000), last_reason: 'HTTP 503', failures_in_a_row: 2 },
+    { channel: 'ops-mailbox', seq: last, last_outcome: 'sent', last_outcome_at: iso(now - 20 * 60_000), last_reason: null, failures_in_a_row: 0 },
+    { channel: 'ops-slack', seq: last, last_outcome: 'sent', last_outcome_at: iso(now - 20 * 60_000), last_reason: null, failures_in_a_row: 0 },
+  ];
+  return { providers, inventories, plans, migrations, recommendations, snapshots, policies, events, channels, subscriptions, cursors };
 }

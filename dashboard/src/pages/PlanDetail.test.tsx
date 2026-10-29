@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
-import type { Plan, VMRef } from '../api/types';
+import type { NotificationSubscription, Plan, VMRef } from '../api/types';
 import { createTestClient, createTestServer, formFields, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
@@ -1681,5 +1681,47 @@ describe('PlanDetail', () => {
     await user.type(within(dialog).getByLabelText(/^name/i), ' v2');
     await user.keyboard('{Escape}');
     expect(await screen.findByRole('alertdialog', { name: /discard unsaved plan changes/i })).toBeInTheDocument();
+  });
+
+  it('lets an operator subscribe a channel to the plan with the default topics (SDD §16, §24.4, plan task NT9)', async () => {
+    const user = userEvent.setup();
+    const view = renderPlan('plan-c81d44a0', 'operator');
+    const client = createTestClient(view.server, 'viewer');
+    const before = await client.get<Plan>('/plans/plan-c81d44a0');
+    const panel = await screen.findByRole('region', { name: 'Notifications' });
+    // the every-plan subscription reaches the plan, marked so, with its topics in words
+    const mailbox = await within(panel).findByRole('listitem', { name: 'ops-mailbox' });
+    expect(mailbox).toHaveTextContent('Every plan');
+    expect(mailbox).toHaveTextContent('Approval, Downtime, Problem');
+    expect(within(mailbox).getByRole('button', { name: 'Remove ops-mailbox' })).toHaveAccessibleDescription('An every-plan subscription is removed on the Notifications page by an admin.');
+    // a channel of the catalog, the default topics checked
+    await user.selectOptions(within(panel).getByLabelText('Channel'), 'ops-slack');
+    for (const [topic, checked] of [['Approval', true], ['Downtime', true], ['Problem', true], ['Outcome', false], ['Progress', false]] as const) {
+      expect(within(panel).getByRole('checkbox', { name: topic })).toHaveProperty('checked', checked);
+    }
+    await user.click(within(panel).getByRole('button', { name: 'Add subscription' }));
+    const row = await within(panel).findByRole('listitem', { name: 'ops-slack' });
+    expect(row).toHaveTextContent('Approval, Downtime, Problem');
+    expect(row).not.toHaveTextContent('Every plan');
+    expect(await client.get<NotificationSubscription[]>('/notifications/subscriptions', { query: { plan_id: 'plan-c81d44a0' } })).toEqual([
+      expect.objectContaining({ channel: 'ops-slack', plan_id: 'plan-c81d44a0', topics: ['approval', 'downtime', 'problem'], created_by: 'bayu' }),
+    ]);
+    // the plan's status and updated_at stay as they were (SDD §24.4)
+    expect(await client.get<Plan>('/plans/plan-c81d44a0')).toMatchObject({ status: before.status, updated_at: before.updated_at });
+    // the channel already has a subscription to the plan: the API's refusal is shown
+    await user.selectOptions(within(panel).getByLabelText('Channel'), 'ops-slack');
+    await user.click(within(panel).getByRole('button', { name: 'Add subscription' }));
+    expect(await within(panel).findByRole('alert')).toHaveTextContent(/channel ops-slack already has subscription sub-[0-9a-f]{8} to plan plan-c81d44a0/);
+    // Remove takes the plan's own subscription away
+    await user.click(within(row).getByRole('button', { name: 'Remove ops-slack' }));
+    await waitFor(() => expect(within(panel).queryByRole('listitem', { name: 'ops-slack' })).not.toBeInTheDocument());
+    expect(await client.get<NotificationSubscription[]>('/notifications/subscriptions', { query: { plan_id: 'plan-c81d44a0' } })).toEqual([]);
+    view.unmount();
+
+    // a viewer reads the panel and is told why it cannot add one
+    renderPlan('plan-c81d44a0', 'viewer');
+    const read = await screen.findByRole('region', { name: 'Notifications' });
+    await within(read).findByRole('listitem', { name: 'ops-mailbox' });
+    expect(within(read).getByRole('button', { name: 'Add subscription' })).toHaveAccessibleDescription('Requires the operator role.');
   });
 });
