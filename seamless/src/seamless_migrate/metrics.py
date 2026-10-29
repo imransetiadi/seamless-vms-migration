@@ -29,7 +29,13 @@ def render_metrics(
     advisor_calls: Mapping[tuple[str, str], int],
     tick_stats: Mapping[str, float] | None = None,
     notifications: Mapping[tuple[str, str], int] | None = None,
+    *,
+    leading: bool = False,
+    lease_epoch: int | None = None,
 ) -> str:
+    """The exposition (SDD §18). ``leading``: whether this replica leads the orchestrator;
+    ``lease_epoch``: the epoch in the lease's row as this scrape read it, None while nobody took
+    the lease (§25.8)."""
     migrations = list(migrations)
     lines: list[str] = []
 
@@ -105,6 +111,17 @@ def render_metrics(
             f'seamless_advisor_calls_total{{tool="{_escape(tool)}",outcome="{_escape(outcome)}"}} '
             f"{count}"
         )
+
+    # SDD §18, §25.8: the orchestrator's leadership, without a label - no replica's holder or
+    # address, each a host name, leaves through /metrics
+    family("seamless_leader", "gauge", "1 while this replica leads the orchestrator, else 0.")
+    lines.append(f"seamless_leader {1 if leading else 0}")
+    family(
+        "seamless_leader_epoch",
+        "gauge",
+        "The epoch of the orchestrator's lease as this replica read it; 0 before any lease.",
+    )
+    lines.append(f"seamless_leader_epoch {0 if lease_epoch is None else int(lease_epoch)}")
     return "\n".join(lines) + "\n"
 
 

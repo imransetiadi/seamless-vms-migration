@@ -119,7 +119,7 @@
   "DST_PROJECT_MISSING": {
    "severity": "blocker",
    "strategies": [],
-   "remediation": "Map the VM's project to an existing destination project (plan.mappings.projects)."
+   "remediation": "Map the VM's project to a project the destination lists (plan.mappings.projects): for a plan with a destination project, to the project its destination_project names, where its VMs land - or name in destination_project the project the VMs go to."
   },
   "NET_MTU_SHRINK": {
    "severity": "warning",
@@ -366,6 +366,26 @@
     "warm"
    ],
    "remediation": "Check the Ceph releases of the source's compute nodes and cluster for the fast-diff fixes (Ceph #61616: Pacific 16.2.14, Quincy 17.2.7, Reef 18.1.2); the disk scans in full for the rest of the migration."
+  },
+  "DST_KEYPAIR_KEY_MISMATCH": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Give the destination's migration user the source's key under that name: delete its keypair of that name and pre-stage keypairs, or create it again with the source's public key. A user of its own for each project credential keeps two tenants' keypairs of one name apart (Operations.md)."
+  },
+  "PROJECT_CREDENTIAL_EXPIRING": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Have an admin write a new application credential for the project before this one expires - one that outlives the plan's cutover window, or never expires - (PUT /providers/{id}/projects/{project_id}/credentials), then check the provider: a step that runs after the expiry fails, a rollback included."
+  },
+  "PROJECT_CREDENTIAL_UNRESTRICTED": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Have an admin write a restricted application credential for the project in its place - Keystone creates one restricted unless asked otherwise - and delete the unrestricted one in Keystone: a restricted credential creates no application credential and no trust, so a stolen run directory gives no lasting access."
+  },
+  "PROJECT_CREDENTIAL_ROLE_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Give the credential's user the role on the project in Keystone - member for the plan's steps, load-balancer_member for a plan that maps Octavia pools -, create a new application credential, which holds the roles its user has when it is created, and write it for the project; then check the provider and validate the plan again."
   }
  }
 }

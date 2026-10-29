@@ -1292,7 +1292,19 @@ export interface OrchestratorHealth {
   healthy: boolean;
 }
 
+/**
+ * `/health`'s leader (SDD §12, §25.6): whether the replica that answered leads, and the lease's holder, epoch and
+ * acquisition while one leads - each null while none does (and on a server without a lease, which leads alone).
+ */
+export interface LeaderHealth {
+  leading: boolean;
+  holder: string | null;
+  epoch: number | null;
+  since: string | null;
+}
+
 export interface Health {
+  /** Judges the replica that answered: the leader by its tick loop, a follower by its campaign (SDD §12). */
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
@@ -1301,7 +1313,9 @@ export interface Health {
   /** Authentication is off (SDD §13.1): every request is the anonymous admin, so no token is needed. */
   auth_disabled: boolean;
   db: 'ok' | 'error';
+  /** The leader's orchestrator, whichever replica answered (SDD §12, §25.6). */
   orchestrator: OrchestratorHealth;
+  leader: LeaderHealth;
 }
 
 /** A dashboard user, as `GET /users` lists it (SDD §12). */

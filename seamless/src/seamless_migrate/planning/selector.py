@@ -16,6 +16,7 @@ from ..domain.models import Estimate, Finding, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
 from .gpu import gpu_names, vm_gpus
 from .platforms import parse_microversion
+from .preflight import project_check, project_roles, project_words
 
 #: the compute microversion the handover updates the source server's delete_on_termination with
 #: (SDD §7.3, §21.4; executors.handover.KEEP_MICROVERSION): a source below it cannot hand over
@@ -146,8 +147,7 @@ def eligibility(
         handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps, destination))
         if not src_caps.get("admin"):
             handover.append("admin rights are required on the source cloud")
-        if not dst_caps.get("admin"):
-            handover.append(f"admin rights are required on {destination}")
+        handover.extend(_destination_admin(plan, dst_caps, destination))
         # a gap this strategy alone has is its eligibility reason, never a finding; the update goes
         # to the source server, the destination never receives it (SDD §9.2, §21.4, RV18-07)
         compute = parse_microversion(src_caps.get("compute_microversion"))
@@ -167,6 +167,24 @@ def eligibility(
             for reasons in out.values():
                 reasons.append(f"blocked by finding {finding.code}")
     return out
+
+
+def _destination_admin(plan: Plan, dst_caps: Mapping[str, Any], destination: str) -> list[str]:
+    """Why the credential of the handover's destination half lacks admin (SDD §9.2, §7.3): the
+    provider's own - its check's admin flag - for a plan without a destination project; for a plan
+    with one, that project's credential, which manages the volumes and creates the server while the
+    provider's own acts in no part of that half - admin among the roles its check read, roles not
+    read counting as none (§27.5, §27.6, owner decision 8, plan task TC6)."""
+    project = plan.destination_project
+    if project is None:
+        return [] if dst_caps.get("admin") else [f"admin rights are required on {destination}"]
+    if "admin" in (project_roles(dst_caps, project) or []):
+        return []
+    named = project_words(project, project_check(dst_caps, project))
+    return [
+        f"admin rights are required on {destination} in the credential of project {named}, which "
+        "manages the volumes and creates the server"
+    ]
 
 
 def _ports(nics: Sequence[tuple[str, list[str]]]) -> str:

@@ -277,9 +277,11 @@ def test_the_lease_reads_and_sets_only_the_databases_time(replicas):
 def test_the_lease_runs_no_returning_clause(replicas):
     """SDD §11: the SQLite of RHEL 9 - the UBI 9 image's, 3.34.1 - has no RETURNING (SQLite 3.35
     brought it), and a campaign that sent one stopped `seamless serve` in the image. No statement
-    of a first campaign, a renewal, a takeover or a release has the clause, on either engine."""
+    of a first campaign, a renewal - with the orchestrator's health or without -, a write of the
+    health alone (§12, plan task HA4), a takeover or a release has the clause, on either engine."""
     a, b = lease_of(replicas[0], A), lease_of(replicas[1], B)
     sent: list[str] = []
+    health = {"running": True, "last_tick_age_s": 0.4, "ticks": 3, "healthy": True}
 
     def record(conn, cursor, statement, parameters, context, executemany):
         sent.append(statement)
@@ -290,6 +292,8 @@ def test_the_lease_runs_no_returning_clause(replicas):
         assert a.campaign() == 1
         assert b.campaign() is None
         assert a.renew(1)
+        assert a.renew(1, health=health)
+        assert a.write_health(1, {**health, "healthy": False})
         wait_expired(b)
         assert b.campaign() == 2
         assert b.release(2)

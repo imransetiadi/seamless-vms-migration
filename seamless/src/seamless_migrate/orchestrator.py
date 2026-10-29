@@ -172,6 +172,7 @@ from .planning.preflight import (
     gpu_shortfalls,
     has_blocker,
     keep_detached_volumes,
+    keypair_fingerprint,
     keypair_prestaged,
     qualifying_disks,
     quota_share,
@@ -267,6 +268,37 @@ async def _read_pool(provider: Any, pool_id: str) -> dict[str, Any] | None:
         log.info("an Octavia pool was not read: %s", type(exc).__name__)
         return None
     return found
+
+
+async def _read_key(provider: Any, name: str) -> str | None:
+    """The fingerprint of the credential's user's keypair called ``name`` as validation reads it
+    (SDD §9.3 DST_KEYPAIR_KEY_MISMATCH, §10 ``keypair_public_key``): None when the provider reads
+    no keypair, its user holds none of the name, its key is no OpenSSH public key, or the read
+    fails - its kind logged, never a name."""
+    read = getattr(provider, "keypair_public_key", None)
+    if read is None:
+        return None
+    try:
+        key = await read(name)
+    except Exception as exc:
+        log.info("a keypair's public key was not read: %s", type(exc).__name__)
+        return None
+    return keypair_fingerprint(key)
+
+
+async def _keypair_fingerprints(
+    vms: Iterable[VMRef], src_inv: Any, dst_inv: Any, source: Any, destination: Any
+) -> dict[str, tuple[str | None, str | None]]:
+    """For each key name the plan's VMs boot with that both inventories list - both credentials'
+    users hold a keypair of it -, the fingerprints of the source's and the destination's key,
+    each read with the plan's credential on its side (SDD §9.3, §27.5, §27.6, plan task TC6)."""
+    held = set(getattr(src_inv, "keypairs", None) or []) & set(
+        getattr(dst_inv, "keypairs", None) or []
+    )
+    names = sorted({vm.key_name for vm in vms if vm.key_name and vm.key_name in held})
+    return {
+        name: (await _read_key(source, name), await _read_key(destination, name)) for name in names
+    }
 
 
 #: the points whose hooks a rollback reverts (SDD §8.2)
@@ -1671,6 +1703,10 @@ class Orchestrator:
         foreign = _foreign_vms(plan, as_checked[source.id], vms)
         if foreign is not None:
             raise BadRequest(foreign)
+        # the keys of the keypairs its VMs boot with, with the plan's credentials, and the clock its
+        # project credentials' expiry is judged by (SDD §9.3, §27.6, §27.7, plan task TC6)
+        prints = await _keypair_fingerprints(vms, src_inv, dst_inv, src_impl, dst_impl)
+        judged_at = self._now()
         # what a cutover of each VM will still create - its server alone when an earlier attempt
         # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
         shares: dict[str, QuotaShare] = {}
@@ -1782,6 +1818,11 @@ class Orchestrator:
                 # the conversion hosts' keys, as the checks just found them (SDD §9.3, §26.5)
                 host_key_checking=self.settings.ansible_host_key_checking,
                 checked=as_checked,
+                # the plan's project credentials as the checks just read them, and its VMs' keys
+                # (SDD §9.3, §27.6, §27.7, plan task TC6)
+                src_caps=src_caps,
+                now=judged_at,
+                keypair_fingerprints=prints,
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
