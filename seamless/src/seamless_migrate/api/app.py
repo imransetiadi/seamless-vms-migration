@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -32,6 +33,7 @@ from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
 from ..executors.router import ExecutorRouter
+from ..lease import Lease, new_holder, replica_address, take
 from ..notify.notifier import Notifier, senders_for
 from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
@@ -324,14 +326,16 @@ def build_services(
     orchestrator: Orchestrator | None = None,
     sse_heartbeat_s: float = 15.0,
 ) -> Services:
-    """Wire store, bus, providers, executors, AI integration and the orchestrator."""
+    """Wire store, bus, providers, executors, AI integration and the orchestrator. The store built
+    here, when none is given, is the server's own and fenced (SDD §11): it writes under the lease
+    the lifespan takes; the CLI passes its unfenced one."""
     if orchestrator is not None:
         store = orchestrator.store
         bus = orchestrator.bus
         jev = getattr(orchestrator.advisor, "jev", None)
         memory = getattr(orchestrator.knowledge, "memory", None)
     else:
-        store = store or Store(settings.db_url)
+        store = store or Store(settings.db_url, fenced=True)
         bus = EventBus(store)
         registry = ProviderRegistry(settings)
         jev = JevClient(settings) if settings.jev_mode != "off" else None
@@ -364,6 +368,25 @@ def build_services(
     )
 
 
+async def _take_the_lease(svc: Services, holder: str) -> Lease:
+    """The orchestrator's lease, before the server writes anything: tried every retry period while
+    another server holds it (SDD §11, §15). Its epoch becomes the store's own."""
+    address = await asyncio.to_thread(replica_address, svc.settings.port)
+    lease = Lease(svc.store.engine, holder, address, svc.settings.leader_lease_s)
+    svc.store.epoch = await take(lease)
+    return lease
+
+
+async def _release_the_lease(lease: Lease, store: Store) -> None:
+    """Expire the lease now, so another server takes it at its next try (SDD §11, §15); one that
+    cannot be released lapses on its own."""
+    try:
+        if not await asyncio.to_thread(lease.release, store.epoch):
+            log.warning("the orchestrator lease was no longer this server's at its stop")
+    except Exception:  # noqa: BLE001 - the stop goes on; the lease lapses by itself
+        log.warning("could not release the orchestrator lease; it lapses by itself", exc_info=True)
+
+
 def create_app(
     settings: Settings,
     store: Store | None = None,
@@ -372,23 +395,31 @@ def create_app(
     sse_heartbeat_s: float = 15.0,
     on_startup: list[Hook] | None = None,
 ) -> FastAPI:
-    """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks)."""
+    """Build the API. The lifespan starts the orchestrator (after ``on_startup`` hooks); with a
+    fenced store - the server's own - it first takes the lease, and releases it once the
+    orchestrator stopped (SDD §11, §15)."""
     svc = build_services(settings, store, orchestrator, sse_heartbeat_s)
     # SDD §8.7: the notifier runs beside the orchestrator, in the server's process alone
     svc.notifier = Notifier(svc.store, svc.bus, settings, senders_for(settings))
     hooks = list(on_startup or [])
+    holder = new_holder()  # new at each process start (SDD §11)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        for hook in hooks:
-            await hook(svc)
-        await svc.orchestrator.start()
-        await svc.notifier.start()
+        lease = await _take_the_lease(svc, holder) if svc.store.fenced else None
         try:
-            yield
+            for hook in hooks:
+                await hook(svc)
+            await svc.orchestrator.start()
+            await svc.notifier.start()
+            try:
+                yield
+            finally:
+                await svc.notifier.stop()
+                await svc.orchestrator.stop()
         finally:
-            await svc.notifier.stop()
-            await svc.orchestrator.stop()
+            if lease is not None:
+                await _release_the_lease(lease, svc.store)
 
     app = FastAPI(
         title="Seamless Migrate",

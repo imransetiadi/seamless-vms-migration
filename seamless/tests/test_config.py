@@ -37,6 +37,7 @@ def test_settings_defaults_match_sdd():
     assert s.log_level == "INFO"
     assert s.log_json is False
     assert s.step_timeout_s == 0.0
+    assert s.leader_lease_s == 30.0  # SDD §15.1, §25.3 (plan task HA2)
 
 
 def test_settings_pg_url_from_env(tmp_path):
@@ -177,6 +178,9 @@ def test_a_cors_origin_no_browser_sends_is_refused(origin):
         ("SEAMLESS_DEMO_FAILURE_RATE", "-0.1"),
         ("SEAMLESS_DEMO_FAILURE_RATE", "1.1"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "1.1"),
+        # a renew deadline of two thirds of it, and the retry period of 2 s (SDD §25.3)
+        ("SEAMLESS_LEADER_LEASE_S", "9.9"),
+        ("SEAMLESS_LEADER_LEASE_S", "0"),
         # every page could call the API (Security.md C1-12, audit AP-10)
         ("SEAMLESS_CORS_ORIGINS", "*"),
         ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example,*"),
@@ -219,6 +223,7 @@ def test_settings_refuse_a_value_outside_its_bounds(variable, value):
         ("SEAMLESS_DEMO_FAILURE_RATE", "1"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "0"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "1"),
+        ("SEAMLESS_LEADER_LEASE_S", "10"),
         ("SEAMLESS_CORS_ORIGINS", ""),
         ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example"),
         ("SEAMLESS_CORS_ORIGINS", "http://127.0.0.1:5173,https://[2001:db8::1]:8443"),

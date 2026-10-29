@@ -13,7 +13,8 @@ import hashlib
 import logging
 import math
 import threading
-from collections.abc import AsyncIterator, Collection, Iterable, Sequence
+import time
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -89,6 +90,29 @@ events = sa.Table(
     sqlite_autoincrement=True,
 )
 
+#: the one row of ``leases``: the orchestrator's lease (SDD §11, §25.3)
+ORCHESTRATOR_LEASE = "orchestrator"
+
+#: the lease a server process holds to write (SDD §11, §25.3): its times are the database's alone,
+#: set and compared by ``seamless_migrate.lease``; ``health`` is the leader's (§25.6)
+leases = sa.Table(
+    "leases",
+    metadata,
+    sa.Column("name", sa.String(64), primary_key=True),
+    sa.Column("holder", sa.Text, nullable=False),
+    sa.Column("address", sa.Text, nullable=False),
+    sa.Column("epoch", sa.Integer, nullable=False),
+    sa.Column("acquired_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("renewed_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("health", JSONType, nullable=True),
+)
+
+#: how long a SQLite statement waits for another connection's write lock (SDD §11)
+SQLITE_BUSY_TIMEOUT_MS = 30000
+#: how often create_schema() looks again at the lock another process holds while it creates it
+_SCHEMA_LOCK_POLL_S = 0.05
+
 
 class StoreError(Exception):
     """Base class for store errors."""
@@ -115,6 +139,18 @@ class NotFound(StoreError):
         self.id = id_
 
 
+class Fenced(StoreError):
+    """A server process's write while the lease is at another epoch than the one the process took,
+    or the process took none: nothing of it is written (SDD §11, §25.4)."""
+
+    def __init__(self, what: str, own: int | None, lease: int | None) -> None:
+        super().__init__(
+            f"the fence refused {what}: this process's epoch is {own}, the lease's is {lease}"
+        )
+        self.own = own
+        self.lease = lease
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -124,7 +160,7 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     finally:
         cursor.close()
 
@@ -332,14 +368,35 @@ def _index_names(conn: sa.Connection) -> set[str]:
 
 
 class Store:
-    """Synchronous store; see the module docstring."""
+    """Synchronous store; see the module docstring.
 
-    def __init__(self, url: str) -> None:
+    ``fenced`` is a server process's store (SDD §11, §25.4): each write first reads the lease's
+    epoch under a key-share lock and is refused (:class:`Fenced`) unless it is ``epoch``, the one
+    the process took. The CLI's store is not fenced.
+    """
+
+    def __init__(self, url: str, *, fenced: bool = False) -> None:
         self.url = url
         self.engine = build_engine(url)
+        self.fenced = fenced
+        #: the lease epoch this process took; None until it takes one (SDD §11)
+        self.epoch: int | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
     def create_schema(self) -> None:
+        """Create the tables, and the indexes a table lacks, idempotently - under the cross-process
+        lock ``schema``: two replicas creating them at once would race on PostgreSQL's catalog,
+        where concurrent CREATE TABLE of one name fails; the second waits, then finds the schema
+        complete (SDD §11, §25.10)."""
+        lock = self.cross_process_lock("schema")
+        try:
+            while not lock.try_acquire():
+                time.sleep(_SCHEMA_LOCK_POLL_S)
+            self._create_schema()
+        finally:
+            lock.close()
+
+    def _create_schema(self) -> None:
         metadata.create_all(self.engine, checkfirst=True)
         # create_all skips the indexes of tables that already exist, and expression indexes
         # cannot be reflected: add the missing ones by name. A complete schema takes no DDL -
@@ -363,11 +420,38 @@ class Store:
             log.debug("store ping failed", exc_info=True)
             return False
 
+    @contextlib.contextmanager
+    def _write(self, what: str, *, fence: bool = True) -> Iterator[sa.Connection]:
+        """A write transaction (SDD §11, §25.4). In a server process (``fenced``) its first
+        statement reads the lease's epoch under a key-share lock - after ``BEGIN IMMEDIATE`` on
+        SQLite, which holds the database's write lock -, so a takeover, which locks the row FOR
+        UPDATE, waits for it: a write of the old epoch commits before the takeover or not at all."""
+        with self.engine.begin() as conn:
+            if self.fenced and fence:
+                self._check_the_fence(conn, what)
+            yield conn
+
+    def _check_the_fence(self, conn: sa.Connection, what: str) -> None:
+        """Refuse the write ``what`` - :class:`Fenced`, logged with both epochs, nothing written -
+        unless the lease is at the epoch this process took (SDD §11, §25.8)."""
+        if conn.dialect.name == "sqlite":
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+        lease = conn.execute(
+            sa.select(leases.c.epoch)
+            .where(leases.c.name == ORCHESTRATOR_LEASE)
+            .with_for_update(read=True, key_share=True)
+        ).scalar_one_or_none()
+        if self.epoch is None or lease != self.epoch:
+            refused = Fenced(what, self.epoch, lease)
+            log.warning("%s", refused)
+            raise refused
+
     def truncate_for_tests(self) -> None:
         """Delete every row (test helper; never used by the application)."""
         with self.engine.begin() as conn:
             conn.execute(documents.delete())
             conn.execute(events.delete())
+            conn.execute(leases.delete())
 
     # -- documents ---------------------------------------------------------------------------
     def create_user(self, user: DashboardUser, actor: str) -> Event:
@@ -381,7 +465,7 @@ class Store:
         data = _document_data("user", user.id, user)
         row = _event_row(event)
         try:
-            with self.engine.begin() as conn:
+            with self._write(f"create_user {user.id}") as conn:
                 conn.execute(
                     documents.insert().values(
                         kind="user",
@@ -420,10 +504,11 @@ class Store:
     ) -> int:
         now = _now()
         key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        what = f"put {kind} {doc_id}"
         # a versioned write is one statement; only a refused one reads what it found (SDD §11)
         if expected_version == 0:
             try:
-                with self.engine.begin() as conn:
+                with self._write(what) as conn:
                     conn.execute(
                         documents.insert().values(
                             kind=kind,
@@ -438,7 +523,7 @@ class Store:
                 raise self._refused(kind, doc_id, expected_version) from None
             return 1
         if expected_version is not None:
-            with self.engine.begin() as conn:
+            with self._write(what) as conn:
                 result = conn.execute(
                     documents.update()
                     .where(key & (documents.c.version == expected_version))
@@ -449,7 +534,7 @@ class Store:
             return expected_version + 1
         # unconditional: the next version of whatever is stored (put() retries a race)
         try:
-            with self.engine.begin() as conn:
+            with self._write(what) as conn:
                 row = conn.execute(sa.select(documents.c.version).where(key)).first()
                 if row is None:
                     conn.execute(
@@ -500,8 +585,10 @@ class Store:
         rows = [_event_row(event) for event in appended]
         now = _now()
         moved: tuple[str, str, int] | None = None
+        named = [f"{kind} {doc_id}" for kind, doc_id, *_ in documents_]
+        what = "put_all_with_events " + ", ".join([*named, *(row["kind"] for row in rows)])
         try:
-            with self.engine.begin() as conn:
+            with self._write(what) as conn:
                 for kind, doc_id, data, expected in documents_:
                     moved = (kind, doc_id, expected)
                     if expected == 0:
@@ -680,7 +767,7 @@ class Store:
         key = (documents.c.kind == kind) & (documents.c.id == id_)
         if expected_version is not None:
             key = key & (documents.c.version == expected_version)
-        with self.engine.begin() as conn:
+        with self._write(f"delete {kind} {id_}") as conn:
             result = conn.execute(documents.delete().where(key))
         if result.rowcount == 0 and expected_version is not None:
             with self.engine.connect() as conn:
@@ -707,7 +794,7 @@ class Store:
         rows = [_event_row(event) for event in appended]
         key = (documents.c.kind == kind) & (documents.c.id == id_)
         written: list[Event] = []
-        with self.engine.begin() as conn:
+        with self._write(f"delete {kind} {id_}") as conn:
             result = conn.execute(
                 documents.delete().where(key & (documents.c.version == expected_version))
             )
@@ -727,7 +814,9 @@ class Store:
     def append_event(self, event: Event) -> Event:
         """Append ``event``; return it as written, its seq set (SDD §11)."""
         row = _event_row(event)
-        with self.engine.begin() as conn:
+        # the replica that refuses a request records it, leading or not (SDD §11, §13.1)
+        fence = event.kind != "auth.denied"
+        with self._write(f"append_event {event.kind}", fence=fence) as conn:
             result = conn.execute(events.insert().values(**row))
             seq = int(result.inserted_primary_key[0])
         return Event(seq=seq, **row)
@@ -793,7 +882,7 @@ class Store:
         if before.tzinfo is None:
             before = before.replace(tzinfo=UTC)
         before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
-        with self.engine.begin() as conn:
+        with self._write("prune_events") as conn:
             deleted = int(conn.execute(events.delete().where(events.c.ts < before)).rowcount or 0)
             row = _event_row(
                 Event(
@@ -815,7 +904,7 @@ class Store:
         if before.tzinfo is None:
             before = before.replace(tzinfo=UTC)
         before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
-        with self.engine.begin() as conn:
+        with self._write("delete_events_before") as conn:
             result = conn.execute(events.delete().where(events.c.ts < before))
         return int(result.rowcount or 0)
 
@@ -995,8 +1084,10 @@ class AsyncStore:
 __all__ = [
     "AsyncStore",
     "ConflictError",
+    "Fenced",
     "KINDS",
     "NotFound",
+    "ORCHESTRATOR_LEASE",
     "Store",
     "StoreError",
     "UnstorableValue",

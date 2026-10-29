@@ -649,6 +649,27 @@ def test_serve_refuses_auth_disabled_on_public_bind(env, capsys, monkeypatch):
     assert calls[-1].auth_disabled is False and calls[-1].port == 8080
 
 
+def test_a_second_server_on_one_sqlite_database_exits_with_an_error(env, capsys, monkeypatch):
+    """SDD §15, §25.3: SQLite serves one host's processes, so it never has a second replica - a
+    server takes an exclusive flock on {database}.server.lock, and a second `seamless serve` against
+    the same file exits 1 with one error line, never serving; the first one's end frees it."""
+    second: list[int] = []
+    lock = env / "cli.db.server.lock"
+
+    def first_server(app, settings, reload):
+        assert lock.is_file(), "the running server holds its lock file"
+        second.append(cli.main(["serve", "--port", "8081"]))
+
+    monkeypatch.setattr(cli, "run_server", first_server)
+    assert cli.main(["serve"]) == 0
+    assert second == [1]
+    assert "error: another server runs against this database" in capsys.readouterr().err
+    served = []
+    monkeypatch.setattr(cli, "run_server", lambda app, settings, reload: served.append(settings))
+    assert cli.main(["serve", "--port", "8082"]) == 0
+    assert [s.port for s in served] == [8082]
+
+
 def test_json_logging_covers_uvicorn_loggers(env, capsys, monkeypatch):
     import json as _json
     import logging
