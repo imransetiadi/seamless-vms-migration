@@ -1133,6 +1133,9 @@ export const PERSISTED_EVENT_KINDS = [
   'auth.denied',
   'user.created',
   'events.pruned',
+  // the orchestrator's lease taken and released (SDD §4.3, §8, §25.3, plan task HA3)
+  'leader.acquired',
+  'leader.released',
   // audit events (SDD §14.5)
   'recommendation.created',
   'decision.auto_applied',

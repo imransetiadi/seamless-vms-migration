@@ -15,7 +15,7 @@ export const EVENT_CATEGORIES: Array<{ value: string; label: string; match: (kin
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') || k.startsWith('conversion_host.') },
   // a prune cuts the audit trail itself (SDD §15); a dashboard user created grants access (SDD §13.1); a policy change
   // can weaken an approval gate (SDD §14.5); a hook runs code with the control plane's reach (SDD §23.3); a conversion
-  // host's key decides whom the data path trusts (SDD §26.5)
+  // host's key decides whom the data path trusts (SDD §26.5); the leader is the audit trail's only writer (SDD §25.9)
   {
     value: 'security',
     label: 'Security',
@@ -29,6 +29,7 @@ export const EVENT_CATEGORIES: Array<{ value: string; label: string; match: (kin
       k.startsWith('subscription.') ||
       k.startsWith('notification.') ||
       k.startsWith('conversion_host.') ||
+      k.startsWith('leader.') ||
       k === 'events.pruned',
   },
 ];
