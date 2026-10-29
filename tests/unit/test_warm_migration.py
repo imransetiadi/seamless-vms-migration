@@ -47,7 +47,7 @@ PASS_KEYS = {
     "bytes_changed",
     "bytes_transferred",
     "duration_s",
-"extents",
+    "extents",
 }
 SNAPSHOT_ENTRY_KEYS = {
     "source_id",
@@ -59,7 +59,9 @@ SNAPSHOT_ENTRY_KEYS = {
     "bootable",
     "name",
     "volume_type",
-"name_id", "host", "encrypted",
+    "name_id",
+    "host",
+    "encrypted",
 }
 CREATE_CALLS = ("create_volume_snapshot", "create_volume", "create_server_image", "attach_volume")
 
