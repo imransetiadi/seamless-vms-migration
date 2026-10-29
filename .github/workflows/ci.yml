@@ -301,6 +301,23 @@ jobs:
             echo "OpenShift networks are left in the egress policies"; exit 1
           fi
           grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
+      - name: Render both overlays with the HA component and validate them (SDD §17, §25.7)
+        # enabled as an installation enables it: the two components: lines each overlay carries commented
+        run: |
+          # the base runs one replica, on any cluster: no budget, which would block every drain
+          if grep -q '^kind: PodDisruptionBudget' /tmp/manifests.yaml /tmp/k8s.yaml; then
+            echo "the base overlays carry the HA component's budget"; exit 1
+          fi
+          for overlay in openshift kubernetes; do
+            work=$(mktemp -d) && cp -R deploy "$work/"
+            kustomization="$work/deploy/$overlay/kustomization.yaml"
+            sed -i -e 's/^# components:$/components:/' -e 's/^#   - ha$/  - ha/' "$kustomization"
+            grep -qx '  - ha' "$kustomization"
+            kubectl kustomize "$work/deploy/$overlay" > "/tmp/ha-$overlay.yaml"
+          done
+          kubeconform -strict -summary -skip Route -kubernetes-version 1.30.0 -schema-location default \
+            /tmp/ha-openshift.yaml
+          kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default /tmp/ha-kubernetes.yaml
       - name: Render the optional backup overlay and validate it with the restore job (audit D-06)
         run: |
           kubectl kustomize deploy/openshift/backup > /tmp/backup.yaml
@@ -319,6 +336,34 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
+      - name: What the HA component must produce in both overlays (SDD §17, §25.7)
+        # kustomize ignores a patch whose target matches nothing: assert each of the component's results
+        run: |
+          python -m pip install pyyaml
+          python - <<'PY'
+          import yaml
+
+          for overlay, pod_network in (("openshift", "10.128.0.0/14"), ("kubernetes", "10.244.0.0/16")):
+              docs = [d for d in yaml.safe_load_all(open(f"/tmp/ha-{overlay}.yaml")) if d]
+              found = {(d["kind"], d["metadata"]["name"]): d for d in docs}
+              spaces = {d["metadata"].get("namespace") for d in docs if d["kind"] != "Namespace"}
+              assert spaces == {"seamless-migrate"}, (overlay, spaces)
+              spec = found["Deployment", "seamless"]["spec"]
+              assert spec["replicas"] == 2 and spec["strategy"] == {"type": "Recreate"}, overlay
+              pod = spec["template"]["spec"]
+              (term,) = pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+              assert term["topologyKey"] == "kubernetes.io/hostname", overlay
+              env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
+              assert env["FORWARDED_ALLOW_IPS"] == pod_network, (overlay, env["FORWARDED_ALLOW_IPS"])
+              claim = found["PersistentVolumeClaim", "seamless-data"]["spec"]
+              assert claim["accessModes"] == ["ReadWriteMany"], overlay
+              budget = found["PodDisruptionBudget", "seamless"]["spec"]
+              assert budget["maxUnavailable"] == 1, overlay
+              assert budget["unhealthyPodEvictionPolicy"] == "AlwaysAllow", overlay
+              assert ("NetworkPolicy", "seamless-allow-relay") in found, overlay
+              assert found["StatefulSet", "seamless-postgres"]["spec"]["replicas"] == 1, overlay
+              print(f"{overlay}: every object and patch of the HA component is there")
+          PY
       - name: PostgreSQL under the manifests' security context (read-only root, OpenShift and overlay UIDs)
         run: |
           python -m pip install pyyaml
