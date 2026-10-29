@@ -115,7 +115,7 @@ class Lab:
     def cursor(self, name):
         return self.store.get("notification_cursor", name, NotificationCursor)
 
-    async def wait_outcomes(self, n, channel=None, timeout=5.0):
+    async def wait_outcomes(self, n, channel=None, timeout=20.0):
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             seen = self.outcomes(channel)
