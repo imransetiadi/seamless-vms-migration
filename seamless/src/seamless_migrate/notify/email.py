@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..config import Settings
 from ..domain.models import NotificationChannel
+from ..security.secrets import SecretNotFound, read_secret
 from .messages import Message, email_message
 from .notifier import SendResult
 
@@ -62,6 +63,16 @@ class EmailSender:
         secret: Mapping[str, str] | None,
     ) -> SendResult:
         settings = self.settings
+        # SEAMLESS_SMTP_SECRET, read as §13.3 resolves a secret each time a message is sent (§8.7):
+        # an email channel has no secret of its own, so ``secret`` is not the relay's
+        credentials: Mapping[str, str] | None = None
+        if settings.smtp_secret:
+            try:
+                credentials = read_secret(settings.smtp_secret, settings)
+            except (SecretNotFound, OSError):
+                credentials = None
+            if not credentials or not credentials.get("username"):
+                return SendResult("failed", "no_secret")
         sender = settings.smtp_from or ""
         domain = sender.rpartition("@")[2] or "seamless"
         mail = email_message(
@@ -83,9 +94,9 @@ class EmailSender:
                         return SendResult("failed", "no_starttls")
                     client.starttls(context=self._context())
                     client.ehlo()
-                if secret and secret.get("username"):
+                if credentials:
                     # after TLS alone: the session is encrypted here on both paths
-                    client.login(secret["username"], secret.get("password", ""))
+                    client.login(credentials["username"], credentials.get("password", ""))
                 refused = client.send_message(mail)
                 return SendResult("sent", refused=len(refused))
         except smtplib.SMTPRecipientsRefused as exc:
