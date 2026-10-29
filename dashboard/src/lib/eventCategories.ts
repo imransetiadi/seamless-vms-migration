@@ -24,6 +24,9 @@ export const EVENT_CATEGORIES: Array<{ value: string; label: string; match: (kin
       k.startsWith('user.') ||
       k.startsWith('policy.') ||
       k.startsWith('hook.') ||
+      // a channel and a subscription decide where the installation's data goes (SDD §24.8)
+      k.startsWith('channel.') ||
+      k.startsWith('subscription.') ||
       k.startsWith('conversion_host.') ||
       k === 'events.pruned',
   },
