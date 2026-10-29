@@ -5058,6 +5058,12 @@ cutoff after now (a negative or non-finite `--older-than-days`, a later `--befor
 whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
+`status` prints first the orchestrator's leader as the lease's row names it (§11, §25.8; plan task HA5), whether the
+lease still holds judged on the database's clock, never the CLI's: `leader: {holder} (epoch {epoch})`; once the
+lease expired - its server released it or stopped renewing it, and no other took it since -
+`leader: none (the lease of {holder} at epoch {epoch} expired)`; and `leader: none (no server took the lease)` before
+any did. Its table of the migrations follows, one plan's with `--plan`. The line is a read alone: the CLI takes,
+renews and releases no lease (§25.6).
 
 A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
 errors the API answers with a status (§12); refused arguments — `estimate`'s knobs, `events prune`'s cutoff or a
@@ -6165,6 +6171,12 @@ ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is 
 their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6), and
 `seamless_notifications_total{kind,outcome}` counter — the notification messages recorded as `sent` or `failed` per
 channel kind since the server started (§8.7, §24.7; plan task NT5), so a failing channel can be alerted on.
+Two gauges tell the orchestrator's leadership (§8, §11, §25.8; plan task HA5): `seamless_leader` — 1 while this
+replica leads, that is while it holds the orchestrator's lease and its renew deadline has not passed (§8), else 0 —
+and `seamless_leader_epoch` — the epoch in the lease's row as this replica reads it at each scrape, 0 while nobody
+took the lease: its increases are the changes of leader. Neither carries a label, so no replica's host name leaves
+through them. Each replica answers `/metrics` with the same store figures, and `seamless_leader` tells which one
+drives.
 
 ---
 
@@ -7975,6 +7987,9 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
 
 The events, with their data's names (`previous_holder`, `previous_epoch`, `resumes`), are binding in §4.3 and §11
 since plan task HA3, and so are the logs of the takeovers, the failed renewals and the depositions (§8).
+The gauges are binding in §18 and the leader line of `seamless status` in §15 since plan task HA5: each scrape reads
+the epoch in the lease's row, 0 before any lease; neither gauge carries a label; and `status` names no leader for a
+lease that expired by the database's clock.
 
 ### 25.9 Security
 
@@ -8056,7 +8071,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 (binding; also §11, §15) | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
-| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
+| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
