@@ -81,3 +81,33 @@ test('200% text keeps dashboard actions and status labels inside the viewport', 
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth - innerWidth), { message: path }).toBe(0);
   }
 });
+
+// the label/value lists that gave their labels an auto column: at 320px with 200% text the label took its whole
+// width and left the value a few pixels (the design pass's measurements: 11, 51 and 55 px), as the Ceph summary did
+for (const place of [
+  { name: "the migration page's VM details", path: '/migrations/mig-3c1a0f9e21', label: 'Source id' },
+  { name: "the Advisor's service cards", path: '/advisor', label: null },
+  { name: "the recommendation's summary", path: '/advisor/recommendations/rec-d4e6f8a09001', label: 'VM' },
+]) {
+  test(`${place.name} give each value at least its label's room at 320px with 200% text`, async ({ page }) => {
+    await page.setViewportSize({ width: 320, height: 900 });
+    await signIn(page);
+    await page.goto(place.path);
+    const list = place.label
+      ? page.locator('main dl').filter({ has: page.getByText(place.label, { exact: true }) }).first()
+      : page.locator('main dl').first();
+    await expect(list).toBeVisible();
+    await page.addStyleTag({ content: 'html { font-size: 200%; }' });
+    await page.evaluate(() => document.fonts.ready);
+    await expect.poll(() => page.locator('main h1').evaluate((el) => parseFloat(getComputedStyle(el).fontSize))).toBe(40);
+    const rows = await list.locator('dt').evaluateAll((labels) =>
+      labels.map((label) => ({
+        label: label.textContent,
+        labelWidth: label.getBoundingClientRect().width,
+        valueWidth: label.nextElementSibling!.getBoundingClientRect().width,
+      })),
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row.valueWidth, `${row.label}: ${row.valueWidth}px for the value`).toBeGreaterThanOrEqual(row.labelWidth);
+  });
+}

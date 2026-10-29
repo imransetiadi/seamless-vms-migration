@@ -169,7 +169,7 @@ function InputTab({ rec }: { rec: AdvisorRecommendation }) {
   const matches = recomputed === s.sha256 && s.sha256 === rec.input_snapshot_sha256;
   return (
     <div className="flex flex-col gap-3">
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
         <dt className="text-muted-foreground">SHA-256</dt>
         <dd className="font-mono text-xs break-all text-foreground">{s.sha256}</dd>
         <dt className="text-muted-foreground">Stored</dt>
@@ -263,7 +263,7 @@ export default function RecommendationDetail() {
           {d.reason_text && <p className="mt-0.5 text-xs text-muted-foreground">{d.reason_text}</p>}
           <DetailActions rec={r} />
           {r.legacy && r.legacy_text && <p className="mt-2 border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {r.legacy_text}</p>}
-          <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+          <dl className="mt-3 grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
             <dt className="text-muted-foreground">VM</dt>
             <dd className="text-foreground">
               {r.migration_id ? (
