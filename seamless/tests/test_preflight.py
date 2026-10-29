@@ -3876,6 +3876,8 @@ FIXED_TEXTS = {
     ("planning/preflight.py", "_PORT_ROLE_ADVICE"),
     ("ai/advisor.py", "STRATEGY_DESCRIPTIONS"),
     ("ai/payloads.py", "STRATEGY_REQUEST_FIELDS"),
+    # the notification texts of SDD §24.5: a message never names a provider (§24.8, plan task NT4)
+    ("notify/messages.py", "TEXTS"),
 }
 
 

@@ -10430,7 +10430,7 @@ async def test_a_simulated_rollback_counts_model_seconds(tmp_path, store):
     assert (m.downtime_ended_at - m.downtime_started_at).total_seconds() < 690.0
     events = h.store.events(since_seq=0, limit=1000)
     [ended] = [e for e in events if e.kind == "migration.downtime_ended"]
-    assert ended.data == {"actual_downtime_s": 690.0}
+    assert ended.data == {"actual_downtime_s": 690.0, "cause": "source_started"}
 
 
 async def test_a_rollback_that_interrupts_a_simulated_cutover_counts_its_model_seconds(
@@ -12608,6 +12608,75 @@ async def test_a_restart_in_a_rollback_runs_the_reverts_still_owed(tmp_path, sto
     await restarted.orch.stop()
     assert [r[0] for r in again.runs] == ["dns-back", "undrain-lb"]
     assert back.hook_reverts == []
+
+
+async def test_downtime_ended_names_its_cause(tmp_path, store):
+    """SDD §4.3, §24.5 (plan task NT4): migration.downtime_ended says why the clock closed -
+    `verified` when the verification passed, `source_started` when a rollback started the source
+    again - so a message can say where the VM runs."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.wait_phase(m.id, P.completed)
+    await h.wait_kind("migration.downtime_ended")
+    await h.orch.stop()
+    ended = [
+        e for e in h.store.events(since_seq=0, limit=1000) if e.kind == "migration.downtime_ended"
+    ]
+    assert [e.data["cause"] for e in ended] == ["verified"]
+    assert ended[0].data["actual_downtime_s"] is not None and ended[0].migration_id == m.id
+
+
+async def test_a_failure_records_whether_the_source_is_stopped(tmp_path, store):
+    """SDD §4.3, §24.5 (plan task NT4): a migration.phase to failed carries source_stopped - True
+    when the downtime clock was open at the failure, whose automatic rollback then closes it with
+    the cause source_started; False for a failure before the stop."""
+    settings = make_settings(tmp_path)
+
+    async def failing_after_the_stop(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("dst volume attach failed")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: failing_after_the_stop})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    events = [e for e in h.store.events(since_seq=0, limit=1000) if e.migration_id == m.id]
+    failed = [e for e in events if e.kind == "migration.phase" and e.data.get("to") == "failed"]
+    assert [e.data["source_stopped"] for e in failed] == [True]
+    assert [e.data["cause"] for e in events if e.kind == "migration.downtime_ended"] == [
+        "source_started"
+    ]
+
+    async def failing_before_the_stop(ctx):
+        raise PermanentStepError("conversion host unreachable")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: failing_before_the_stop})
+    h, plan = await setup(
+        tmp_path / "before",
+        store,
+        [vm(2)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-2")).id, P.failed)
+    await h.orch.stop()
+    events = [e for e in h.store.events(since_seq=0, limit=1000) if e.migration_id == m.id]
+    failed = [e for e in events if e.kind == "migration.phase" and e.data.get("to") == "failed"]
+    assert [e.data["source_stopped"] for e in failed] == [False]
+    assert m.downtime_started_at is None
+    assert not [e for e in events if e.kind == "migration.downtime_ended"]
 
 
 # -- extent tracking (SDD §9.1, §28.6; plan task CE8) ----------------------------------------
