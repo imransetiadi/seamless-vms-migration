@@ -465,9 +465,11 @@ own conversion host in that project, with the project's credential, under the pr
 (else `os_migrate_conv_src` or `os_migrate_conv_dst`). Its pin is the project credential's, set from the key its
 pre-staging injects, or from its console by the plan's first run when the host exists without a pin; deleting the
 credential deletes the pin with it. The provider's declared keys do not reach the host, and it is looked up by its
-name in its project alone, never at the provider's address. It takes a floating IP of its own project - one the
-project holds detached on the host's external network, else a new one - and counts against that project's quotas,
-the floating IP's included; the provider's `conversion_host.address` stays its own host's.
+name in its project alone, never at the provider's address. It takes a new floating IP of its own project on the
+host's external network - never one the project holds detached, such as a tenant's own or an address a keep-address
+plan reserved - and counts against that project's quotas, the floating IP's included. The provider's
+`conversion_host.address` stays its own host's; deployed without it, that host still takes a floating IP its
+credential's project holds detached when there is one, else a new one, as upstream's role does.
 
 **A plan blocked by `CONV_HOST_KEY_UNKNOWN`.** The plan needs a host that has neither declared keys nor a pin and
 that Seamless will not create, or whose pin belongs to another server than the one the host resolves to. The message
