@@ -1511,6 +1511,20 @@ is written whole each time with what the playbook run reported so far: it names 
 a server task, and a run that reaches none - or runs in check mode - leaves the file as it finds it. The run pins the
 injected key of a server under `created` alone (§26.4, plan task ST5).
 
+**A host's floating IP** (§7.2; the owner's decisions of 2026-10-30, §26.10 decision 14). With
+`os_migrate_conversion_manage_fip`, role `conversion_host` gives the host a floating IP (`create_fip.yml`): the address
+`os_migrate_conversion_floating_ip_address` names, as upstream, else one the `floating_ip` module takes on the host's
+external network for the host's port on its own network. That second task passes
+`os_migrate_conversion_floating_ip_reuse`, `true` by default, as the module's `reuse`, made a boolean: `true`,
+upstream's, takes a floating IP the credential's project holds detached on that network when there is one, else
+creates one; `false` creates a new one (openstacksdk's `create_floating_ip`), never taking one the project holds
+detached. Either way a host that holds a floating IP on its own network already keeps it and gets none more. The task
+with an address is upstream's, unchanged: `reuse` plays no part there (openstack.cloud 2.6.0).
+`deploy_conversion_hosts.yml` passes each side's `os_migrate_src_conversion_floating_ip_reuse` or
+`os_migrate_dst_conversion_floating_ip_reuse` as it, `true` when unset; a run sets those two alone, since an extra var
+outranks an include's vars and the role's own name would reach both sides. The control plane sets a side's `false`
+for a host in a plan's project alone (§7.2).
+
 ### 6.6 Hardening of existing code (required)
 
 `roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
@@ -2310,16 +2324,20 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
   destination project (`grant_flavor_access`, §10), with the destination provider's own credential - os-migrate's
   import gives none, and the project could use no private flavor without it. A public flavor, and the flavors of a
   plan without a destination project, are left as they are.
-  A host's floating IP (the owner's decision of 2026-10-30, §26.10 decision 14): the configured address
+  A host's floating IP (the owner's decisions of 2026-10-30, §26.10 decision 14): the configured address
   (`conversion_host.address`) is the provider's own host's alone (`credentials.host_address`, §10), so the deploy
   passes it as `os_migrate_{side}_conversion_floating_ip_address` - the role attaches that floating IP to the host
   it deploys - only on a side where the plan names no project, as before, and never for a project's host. Without
-  it the role takes a floating IP for the host with the credential it deploys with, in that project
-  (`create_fip.yml`, `reuse: true`): one the project holds detached on the host's external network
-  (`conversion_host.external_network`, else the cloud's first external IPv4 network), else a new one there, counted
-  against the project's floating IP quota (§27.6). The runs reach a project's host at the address its server holds,
-  which the collection reads when it finds the host by its name in the project (`conv_host_inventory.yml`; §26.10
-  decision 13). No run of a project's side - its pre-staging's or a migration's - carries the provider's address.
+  it the role takes a floating IP for the host with the credential it deploys with, in that project, on the host's
+  external network (`conversion_host.external_network`, else the cloud's first external IPv4 network). For a
+  project's host the deploy also passes `os_migrate_{side}_conversion_floating_ip_reuse: false` (§6.5): the role
+  creates a new floating IP there, counted against the project's floating IP quota (§27.6), and never takes one the
+  project holds detached - the tenant's own, or one a keep-address plan reserved (§8.3). A side where the plan names
+  no project gets no such variable: its provider's own host, deployed without an address, takes a floating IP its
+  credential's project holds detached there, else a new one, as before (`reuse: true`, the collection's default).
+  The runs reach a project's host at the address its server holds, which the collection reads when it finds the
+  host by its name in the project (`conv_host_inventory.yml`; §26.10 decision 13). No run of a project's side - its
+  pre-staging's or a migration's - carries the provider's address.
 * **Conversion key** (issue #112). The managed conversion hosts are per provider - found by name - and the
   `os_migrate_conv` keypair belongs to the credential's user (the collection's default name, which the executor never
   changes), so a plan meets the hosts and the keypair an earlier plan of the same credentials made. Every OpenStack
@@ -4094,8 +4112,8 @@ declared keys and its address are its own host's, the one its own credential rea
 owner's decisions of 2026-10-29 that followed, §26.10 decisions 12 and 13: `credentials.declared_keys(provider,
 project_id)` gives `conversion_host.ssh_host_keys` for None and none for a project, and
 `credentials.host_address(provider, project_id)` `conversion_host.address` for None and none for a project, whose
-host is looked up by its name alone and deployed with a floating IP of its own project - the deploy's floating IP
-address is that function's too, the owner's decision of 2026-10-30, §7.2, §26.10 decision 14):
+host is looked up by its name alone and deployed with a new floating IP of its own project - the deploy's floating IP
+address is that function's too, the owner's decisions of 2026-10-30, §7.2, §26.10 decision 14):
 * **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
   of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
   looks the host's server up with its own credential: by its name, `conversion_host.name`, else its side's name as the
@@ -8781,15 +8799,21 @@ The owner took each default as written on 2026-10-23 (D8):
     it from the provider's host (the vendored openstack.cloud 2.6.0 `floating_ip` module; `TODO(LAB): confirm`). The
     address is the provider's own host's (decision 13), and a project's host is another server, which its project's
     pre-staging creates. Its deploy now passes no address for a project's side (`credentials.host_address`, §10), and
-    the role takes a floating IP of that project, as it does when no address is given: one the project holds
-    detached on the host's external network, else a new one (`create_fip.yml`, `reuse: true`), counted against the
-    project's quota (§27.6). The provider's own host keeps its configured address, exactly as before, and no field is
-    added: a project's host is reached at the address its server holds, which the runs read when they find it by
-    its name in the project (§7.2). The role's `reuse` is the collection's, unchanged: like the provider's own host
-    deployed without an address, a project's host that holds no floating IP when the role deploys it - a new one, or
-    one created again after its deletion - takes a floating IP its project holds detached on that network when there
-    is one: the tenant's own, or one a keep-address plan reserved (§8.3), whose next reservation then fails, "held by
-    a port of the project" (`TODO(LAB): confirm`).
+    the role takes a floating IP of that project - a new one, below -, counted against the project's quota (§27.6).
+    The provider's own host keeps its configured address, exactly as before, and no field is added: a project's host
+    is reached at the address its server holds, which the runs read when they find it by its name in the project
+    (§7.2).
+    * **A new floating IP, never one the project holds detached**, decided by the owner on 2026-10-30, after the
+      change above. Without an address the role's task (`create_fip.yml`) passed upstream's `reuse: true`, so a
+      project's host that held no floating IP when the role deployed it - a new one, or one created again after its
+      deletion - took a floating IP its project held detached on that network when there was one: the tenant's own,
+      or one a keep-address plan reserved (§8.3), whose next reservation would then fail, "held by a port of the
+      project". The collection takes an optional variable, `os_migrate_conversion_floating_ip_reuse` (§6.5), whose
+      default keeps upstream's `reuse: true`, and the deploy passes it `false` for a project's side alone
+      (`os_migrate_{side}_conversion_floating_ip_reuse`, §7.2): the role then creates a new floating IP of the
+      project for a host that holds none. The provider's own host is unchanged: the deploy passes no such variable
+      for it, so without its configured address it takes a floating IP its credential's project holds detached, else
+      a new one, as before.
 
 ### 26.11 Contract changes (each binding from its plan task)
 
@@ -8807,6 +8831,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | a pin per project credential (`ProjectCredential.conversion_host_pin`); the one rule that selects a step's pin (`credentials.host_pin`); the check's report of a project's replaced host; the project credential routes' rules for its pin (owner decision 11) | §4.2, §7.2, §10, §12 (binding) | after TC5 |
 | the declared keys and the address the provider's own host's alone (`credentials.declared_keys`, `credentials.host_address`); a project's host looked up by its name in its project alone: a run's failure and the check's report of one not found (owner decisions 12 and 13) | §7.2, §10 (binding) | after TC5 |
 | the configured address the floating IP of the provider's own host alone: a project's host deployed without it, with a floating IP of its own project, and no run of a project's side carrying it (owner decision 14); the check's not-found report in §12; `CONV_HOST_KEY_UNKNOWN`'s remediation for each side | §7.2, §9.3, §10, §12 (binding) | after TC5 |
+| the collection's optional `os_migrate_conversion_floating_ip_reuse`, `true` by default (upstream's `reuse: true`), and the deploy's `os_migrate_{side}_conversion_floating_ip_reuse`; a project's side deployed with it `false`, so its host takes a new floating IP of its project, never one the project holds detached (owner decision 14, the decision that followed it) | §6.5, §7.2 (binding) | after TC5 |
 
 ## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
@@ -8998,8 +9023,8 @@ another only where a service lets an admin act by id or on the project's behalf.
   defaults, choose a floating IP's address. For a `member` project credential the provider's admin creates it for the
   project (`project_id`), and the project's credential associates it (`TODO(LAB): confirm`).
 * **Conversion hosts** count against the plan's projects' quotas, as they count today against the credential's - a
-  project's host's floating IP too: the role takes it from that project, never the provider's configured address
-  (§7.2; §26.10 decision 14, the owner's decision of 2026-10-30).
+  project's host's floating IP too: the role creates a new one in that project, never taking one the project holds
+  detached nor the provider's configured address (§7.2; §26.10 decision 14, the owner's decisions of 2026-10-30).
 
 ### 27.7 Checks, findings and the cutover gate
 
