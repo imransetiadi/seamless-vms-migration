@@ -133,6 +133,12 @@ def test_external_egress_reaches_the_services_the_gpu_and_network_cut_over_call(
     assert community | rhosp_public | {53} <= _external_tcp_ports()
 
 
+def test_external_egress_reaches_the_smtp_submission_ports():
+    """SDD §17, §24.3 (plan task NT6): the installation's relay on 587 (STARTTLS) or 465 (implicit
+    TLS); a port the policy blocks times out, and every email channel's messages would fail."""
+    assert {587, 465} <= _external_tcp_ports()
+
+
 def test_external_egress_reaches_the_verification_ports_the_plan_form_proposes():
     """SDD §17, §7.5: a `tcp:<port>` check the policy blocks times out and fails the verification,
     so auto_rollback would roll back a migration that worked: the dashboard's defaults pass."""

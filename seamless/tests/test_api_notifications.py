@@ -37,7 +37,13 @@ OTHERS = (Role.viewer, Role.operator, Role.approver)
 
 @pytest.fixture
 def api(tmp_path):
-    settings, tokens = api_settings(tmp_path, secrets_dir=tmp_path / "secrets")
+    settings, tokens = api_settings(
+        tmp_path,
+        secrets_dir=tmp_path / "secrets",
+        # an email channel needs the installation's relay (SDD §24.3, plan task NT6)
+        smtp_host="relay.example.com",
+        smtp_from="seamless@example.com",
+    )
     store = Store(f"sqlite:///{tmp_path / 'api.db'}")
     store.create_schema()
     with TestClient(create_app(settings, store)) as client:
@@ -594,7 +600,8 @@ def test_a_notify_secret_name_is_refused_for_a_provider_a_hook_and_a_dns_target(
 def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     """SDD §8.7, §12, §24.3 (plan task NT5): an admin's test sends a fixed message through the
     channel at once and answers its outcome; it is recorded as a delivery with the trigger test;
-    a disabled channel answers 409, a kind without a sender fails with no_sender."""
+    a disabled channel answers 409, a kind without a sender yet (the webhook's, plan task NT8)
+    fails with no_sender."""
     from seamless_migrate.notify.notifier import SendResult
 
     class Scripted:
@@ -609,7 +616,7 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     sender = Scripted()
     api.client.app.state.services.notifier.senders["slack"] = sender
     register(api, SLACK)
-    register(api, EMAIL)
+    register(api, WEBHOOK)  # the webhook sender comes with plan task NT8: no sender yet
     for role in OTHERS:
         assert api.post(f"{CHANNELS}/ops-slack/test", role=role).status_code == 403
     assert api.post(f"{CHANNELS}/nope/test").status_code == 404
@@ -619,7 +626,7 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     sent = api.post(f"{CHANNELS}/ops-slack/test")
     assert sent.json() == {"outcome": "sent", "reason": None}
     assert len(sender.keys) == 2 and all(k.startswith("ops-slack_test_") for k in sender.keys)
-    no_sender = api.post(f"{CHANNELS}/app-owners/test")
+    no_sender = api.post(f"{CHANNELS}/cmdb/test")
     assert no_sender.json() == {"outcome": "failed", "reason": "no_sender"}
     assert patch(api, "/notifications/channels/ops-slack", {"enabled": False}).status_code == 200
     refused = api.post(f"{CHANNELS}/ops-slack/test")
@@ -628,7 +635,7 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     assert [(e.kind, e.data["channel"], e.data["trigger"], e.data["reason"]) for e in recorded] == [
         ("notification.failed", "ops-slack", "test", "invalid_payload"),
         ("notification.sent", "ops-slack", "test", None),
-        ("notification.failed", "app-owners", "test", "no_sender"),
+        ("notification.failed", "cmdb", "test", "no_sender"),
     ]
     assert all(e.data["tries"] == 1 and e.data["event_seq"] is None for e in recorded)
     assert api.store.list("notification_cursor", NotificationCursor) == []

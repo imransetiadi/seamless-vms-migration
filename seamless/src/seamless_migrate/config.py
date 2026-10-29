@@ -207,6 +207,15 @@ class Settings(BaseModel):
     memory_redact_names: bool = False
     #: the address people reach the dashboard at: a notification's link (SDD §8.6, §24.5)
     public_url: str | None = None
+    #: the installation's SMTP relay (SDD §8.7, §24.3): unset, no email channel can be registered
+    smtp_host: str | None = None
+    smtp_from: str | None = None
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    #: starttls, or tls for implicit TLS on 465; there is no plain-text mode
+    smtp_security: Literal["starttls", "tls"] = "starttls"
+    smtp_ca_file: Path | None = None
+    #: the secret (§13.3) whose username and password the sender authenticates with, after TLS
+    smtp_secret: str | None = Field(default=None, repr=False)
     dashboard_dir: Path | None = None
     metrics_public: bool = False
     log_level: str = "INFO"
@@ -289,6 +298,11 @@ class Settings(BaseModel):
             "MEMORY_SECRET": "memory_secret",
             "MEMORY_PROJECT": "memory_project",
             "PUBLIC_URL": "public_url",
+            "SMTP_HOST": "smtp_host",
+            "SMTP_FROM": "smtp_from",
+            "SMTP_SECURITY": "smtp_security",
+            "SMTP_CA_FILE": "smtp_ca_file",
+            "SMTP_SECRET": "smtp_secret",
             "LOG_LEVEL": "log_level",
         }
         for env_name, field in text_fields.items():
@@ -297,6 +311,7 @@ class Settings(BaseModel):
                 values[field] = value.strip()
         numeric_fields = {
             "PORT": ("port", int),
+            "SMTP_PORT": ("smtp_port", int),
             "DEMO_SPEED": ("demo_speed", float),
             "DEMO_SEED": ("demo_seed", int),
             "DEMO_FAILURE_RATE": ("demo_failure_rate", float),

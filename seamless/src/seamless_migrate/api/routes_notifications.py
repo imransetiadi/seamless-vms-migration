@@ -27,6 +27,7 @@ from ..domain.models import (
     channel_view,
 )
 from ..events import emit
+from ..notify.email import relay_configured
 from ..security.auth import Principal
 from ..security.secret_store import SecretStoreError, secret_store
 from ..store import ConflictError, NotFound
@@ -58,14 +59,23 @@ class SubscriptionCreate(_Model):
     )
 
 
-def _channel(body: dict[str, Any]) -> NotificationChannel:
-    """``body`` as a channel, a field it does not take refused at any depth (SDD §12, AP-01)."""
+def _channel(body: dict[str, Any], request: Request) -> NotificationChannel:
+    """``body`` as a channel, a field it does not take refused at any depth (SDD §12, AP-01); an
+    email channel needs the installation's relay (§24.3, plan task NT6)."""
     try:
-        return NotificationChannel.model_validate(body, context=REQUEST_BODY)
+        channel = NotificationChannel.model_validate(body, context=REQUEST_BODY)
     except ValidationError as exc:
         raise ApiError(
             422, "validation_error", validation_message(exc.errors(), "invalid channel")
         ) from None
+    if channel.kind == "email" and not relay_configured(services(request).settings):
+        raise ApiError(
+            422,
+            "validation_error",
+            "kind: an email channel needs the installation's SMTP relay - set SEAMLESS_SMTP_HOST "
+            "and SEAMLESS_SMTP_FROM (SDD §15.1, §24.3)",
+        )
+    return channel
 
 
 async def _view(request: Request, channel: NotificationChannel, principal: Principal) -> Any:
@@ -147,7 +157,7 @@ async def create_channel(
 ) -> NotificationChannelView:
     svc = services(request)
     now = svc.orchestrator.now()
-    channel = _channel(body).model_copy(update={"created_at": now, "updated_at": now})
+    channel = _channel(body, request).model_copy(update={"created_at": now, "updated_at": now})
     async with svc.orchestrator.provider_lock():
         try:
             await svc.db.put("notification_channel", channel, expected_version=0)
@@ -180,7 +190,7 @@ async def update_channel(
         channel, version = await svc.db.get_versioned(
             "notification_channel", name, NotificationChannel
         )
-        merged = _channel({**channel.model_dump(mode="json"), **body})
+        merged = _channel({**channel.model_dump(mode="json"), **body}, request)
         updated = merged.model_copy(
             update={"created_at": channel.created_at, "updated_at": svc.orchestrator.now()}
         )
