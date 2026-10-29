@@ -211,13 +211,20 @@ class Notifier:
         return cursor, version
 
     async def _advance(self, name: str, last_cursor_write: float) -> float:
-        """One page of the channel's events; returns when the cursor was last written."""
+        """One page of the channel's events; returns when the cursor was last written.
+
+        The pass judges only the events written before it read the channel (SDD §24.6): the
+        store's newest seq is read first, so an event written after a channel was read - one an
+        admin enabled meanwhile - waits for the next pass instead of being skipped as disabled."""
+        bound = await asyncio.to_thread(self.store.max_seq)
         channel = await asyncio.to_thread(
             self.store.get, "notification_channel", name, NotificationChannel
         )
         cursor, version = await self._cursor(channel)
+        if bound <= cursor.seq:
+            return last_cursor_write
         events = await asyncio.to_thread(
-            self.store.events, cursor.seq, None, None, self.timing.page
+            self.store.events, cursor.seq, None, None, self.timing.page, None, False, bound + 1
         )
         if not events:
             return last_cursor_write
@@ -488,13 +495,17 @@ class Notifier:
 
 
 def senders_for(settings: Settings) -> dict[str, Sender]:
-    """The senders the server runs with (SDD §8.7): the email sender (plan task NT6) and the
-    webhook sender (NT8); the Slack sender follows with NT7, and until then its kind fails with
-    ``no_sender``."""
+    """The senders the server runs with (SDD §8.7): the email sender (plan task NT6), the Slack
+    sender (NT7) and the webhook sender (NT8)."""
     from .email import EmailSender  # the senders import SendResult from here
+    from .slack import SlackSender
     from .webhook import WebhookSender
 
-    return {"email": EmailSender(settings), "webhook": WebhookSender(settings)}
+    return {
+        "email": EmailSender(settings),
+        "slack": SlackSender(settings),
+        "webhook": WebhookSender(settings),
+    }
 
 
 __all__ = ["NotifyTrigger", "Notifier", "SendResult", "Sender", "Timing", "senders_for"]

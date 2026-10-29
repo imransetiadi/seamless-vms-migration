@@ -602,7 +602,7 @@ def test_a_channels_test_answers_its_outcome_and_is_recorded(api):
     channel at once and answers its outcome; it is recorded as a delivery with the trigger test;
     a disabled channel answers 409; a webhook channel sends through the webhook sender (plan
     task NT8) - no_secret while its signing key is unwritten, and a signed POST to its URL once it
-    is - and a kind without a sender (the Slack sender comes with NT7) fails with no_sender."""
+    is - and a kind without a sender (removed for one call) fails with no_sender."""
     import httpx
 
     from seamless_migrate.notify.notifier import SendResult
