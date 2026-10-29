@@ -211,13 +211,20 @@ class Notifier:
         return cursor, version
 
     async def _advance(self, name: str, last_cursor_write: float) -> float:
-        """One page of the channel's events; returns when the cursor was last written."""
+        """One page of the channel's events; returns when the cursor was last written.
+
+        The pass judges only the events written before it read the channel (SDD §24.6): the
+        store's newest seq is read first, so an event written after a channel was read - one an
+        admin enabled meanwhile - waits for the next pass instead of being skipped as disabled."""
+        bound = await asyncio.to_thread(self.store.max_seq)
         channel = await asyncio.to_thread(
             self.store.get, "notification_channel", name, NotificationChannel
         )
         cursor, version = await self._cursor(channel)
+        if bound <= cursor.seq:
+            return last_cursor_write
         events = await asyncio.to_thread(
-            self.store.events, cursor.seq, None, None, self.timing.page
+            self.store.events, cursor.seq, None, None, self.timing.page, None, False, bound + 1
         )
         if not events:
             return last_cursor_write

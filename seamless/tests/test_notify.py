@@ -496,3 +496,29 @@ async def test_a_test_message_is_recorded_with_the_trigger_test(lab):
         lab.cursor("ops-slack")
     assert lab.notifier.counts == {("slack", "failed"): 1, ("slack", "sent"): 1}
     lab.store.dispose()
+
+
+async def test_an_event_written_after_a_channel_is_read_waits_for_the_next_pass(lab):
+    """SDD §24.6: a pass judges only the events written before it read the channel. A channel
+    enabled while a pass is in flight - read disabled, then an event written - must not lose
+    that event to the disabled reading: the next pass, which reads the channel enabled, sends it."""
+    lab.channel(enabled=False)
+    lab.subscribe("ops-slack")
+    original_get = lab.store.get
+    fresh: list = []
+
+    def get(kind, id_, model_cls):
+        found = original_get(kind, id_, model_cls)
+        if kind == "notification_channel" and not fresh and not found.enabled:
+            # the pass has read the channel disabled; now the admin enables it and an event lands
+            lab.store.put("notification_channel", found.model_copy(update={"enabled": True}))
+            fresh.extend(lab.downtime(1))
+        return found
+
+    lab.store.get = get
+
+    async def body():
+        [seen] = await lab.wait_outcomes(1)
+        assert seen.kind == "notification.sent" and seen.data["event_seq"] == fresh[0].seq
+
+    await run(lab, body)
