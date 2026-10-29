@@ -82,6 +82,12 @@ PERSISTED_KINDS = frozenset(
         "hook.created",
         "hook.updated",
         "hook.deleted",
+        # the notification catalog's and the subscriptions' changes (SDD §4.3, §24.3, §24.4)
+        "channel.created",
+        "channel.updated",
+        "channel.deleted",
+        "subscription.created",
+        "subscription.deleted",
         "auth.denied",
         "user.created",
         "events.pruned",

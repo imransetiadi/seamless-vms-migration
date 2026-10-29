@@ -23,6 +23,7 @@ from ..domain.models import (
     Provider,
     ProviderCreate,
     is_blank,
+    is_notify_secret_name,
     utcnow,
 )
 from ..events import emit
@@ -163,6 +164,15 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
             "validation_error",
             f"{', '.join(taken)}: provider-* names belong to the secrets Seamless stores for each "
             "provider; this one is another provider's",
+        )
+    # notify-* names are the notification channels' (SDD §13.3, §24.3): a check would send a
+    # channel's secret to this provider's endpoint, and writing the channel's would replace it
+    channels = [field for field, name in names.items() if is_notify_secret_name(name)]
+    if channels:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(channels)}: notify-* names belong to the notification channels' secrets",
         )
 
 

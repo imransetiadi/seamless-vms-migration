@@ -9,7 +9,14 @@ from fastapi import APIRouter, Body, Depends, Request, Response
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, Role
-from ..domain.models import REQUEST_BODY, Hook, Plan, PlanSpec, Provider
+from ..domain.models import (
+    REQUEST_BODY,
+    Hook,
+    Plan,
+    PlanSpec,
+    Provider,
+    is_notify_secret_name,
+)
 from ..events import emit
 from ..plan_checks import unknown_hook
 from ..security.auth import Principal
@@ -52,6 +59,13 @@ async def _check_hook(request: Request, hook: Hook) -> None:
             "secret: provider-* names belong to the secrets Seamless stores for each provider; "
             "a webhook would send it to its URL",
         )
+    if is_notify_secret_name(hook.secret):
+        raise ApiError(
+            422,
+            "validation_error",
+            "secret: notify-* names belong to the notification channels' secrets (SDD §24.3); "
+            "a webhook would send it to its URL",
+        )
     for provider in await db.list("provider", Provider):
         named = {provider.credentials_secret}
         if provider.conversion_host is not None:
@@ -72,6 +86,15 @@ async def check_plan_hooks(request: Request, spec: PlanSpec) -> None:
     why = unknown_hook(spec, names)
     if why is not None:
         raise ApiError(422, "validation_error", why)
+    # a DNS target's TSIG secret is never a notification channel's (SDD §13.3, §24.3)
+    for vm_id, target in spec.network_cutover.dns_targets.items():
+        if is_notify_secret_name(target.tsig_secret):
+            raise ApiError(
+                422,
+                "validation_error",
+                f"network_cutover.dns_targets.{vm_id}.tsig_secret: notify-* names belong to the "
+                "notification channels' secrets",
+            )
 
 
 async def _emit(request: Request, kind: str, hook: Hook, actor: str, **data: Any) -> None:
