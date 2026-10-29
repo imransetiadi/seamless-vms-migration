@@ -1268,3 +1268,35 @@ def test_what_is_not_a_ceph_key_line_stays(text):
     alone, and the bare pattern a CephX key's exact shape - a variable or field whose name holds
     the word, and a shorter AQ run, are not secrets and stay."""
     assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "POST https://hooks.slack.com/services/T000/B000/notasecret answered 404\n",
+        '{"url": "https://hooks.slack.com/services/T000/B000/notasecret"}',
+        "ConnectError: cannot reach hooks.slack.com/services/T000/B000/notasecret\n",
+        "url='https://hooks.slack.com/services/T000/B000/notasecret', status=404",
+        "<https://hooks.slack.com/services/T000/B000/notasecret>",
+        '{"error": "HTTP 404 for https://hooks.slack.com/services/T000/B000/notasecret\\nx"}',
+        "HTTPS://HOOKS.SLACK.COM/SERVICES/T000/B000/notasecret 404\n",
+    ],
+    ids=["prose", "json", "no scheme", "repr", "angle brackets", "json string", "upper case"],
+)
+def test_a_slack_incoming_webhook_url_is_redacted(text):
+    """SDD §13.4, §24.3, §24.8 (plan task NT7): a Slack incoming webhook URL is a channel's
+    credential - its path after /services/ goes, to the URL's end, with or without the scheme and
+    in any case; the text around it stays, and a second pass changes nothing."""
+    out = redact(text)
+    assert "notasecret" not in out and "T000" not in out and "B000" not in out, out
+    assert re.search(r"(?i)/services/\[REDACTED\]", out), out
+    assert out.startswith(text[:9]) and out.endswith(text[-1])
+    if "404" in text:
+        assert "404" in out
+    assert redact(out) == out
+    # what is no webhook URL stays
+    for kept in (
+        "https://hooks.slack.com/ and https://api.slack.com/api/chat.postMessage\n",
+        "the services/ directory of the chart\n",
+    ):
+        assert redact(kept) == kept
