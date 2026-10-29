@@ -2,6 +2,7 @@ import ast
 import json
 import re
 import string
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
     AppProbe,
     ConversionHostConfig,
+    CutoverWindow,
     GpuDevice,
     HandoverConfig,
     HostKeyPin,
@@ -21,6 +23,7 @@ from seamless_migrate.domain.models import (
     VMRef,
     Wave,
     invalid_plan_settings,
+    utc_text,
     utcnow,
 )
 from seamless_migrate.planning.gpu import gpu_requests
@@ -42,6 +45,7 @@ from seamless_migrate.planning.preflight import (
     fitting_flavor,
     flavor_prestaged,
     has_blocker,
+    keypair_fingerprint,
     quota_share,
     resolve_mappings,
     resource_demand,
@@ -50,8 +54,10 @@ from seamless_migrate.planning.preflight import (
 from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.providers.openstack import OpenStackProvider
 from tests.cloud_support import AUTH_URL, InProcessCloud
+from tests.credential_support import tenant_project
 from tests.factories import make_disk, make_plan, make_provider, make_vm
 from tests.key_support import bare, public_key
+from tests.key_support import fingerprint as seed_fingerprint
 
 SRC = make_provider()
 # the destination provider a message about the destination cloud names (SDD §1 naming, plan T6)
@@ -103,6 +109,9 @@ def check(
     lb_pools=None,
     sync_passes=None,
     host_key_checking=None,
+    src_caps=None,
+    now=None,
+    keypair_fingerprints=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -119,6 +128,9 @@ def check(
         lb_pools=lb_pools,
         sync_passes=sync_passes,
         host_key_checking=host_key_checking,
+        src_caps=src_caps,
+        now=now,
+        keypair_fingerprints=keypair_fingerprints,
     )
 
 
@@ -197,6 +209,11 @@ def test_catalog_is_complete():
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
+        # the plan's project credentials and its VMs' keys (SDD §9.3, §27.7, plan task TC6)
+        "DST_KEYPAIR_KEY_MISMATCH",
+        "PROJECT_CREDENTIAL_EXPIRING",
+        "PROJECT_CREDENTIAL_UNRESTRICTED",
+        "PROJECT_CREDENTIAL_ROLE_MISSING",
         "DST_CAPABILITY_MISSING",
         "DST_RELEASE_OUTSIDE_SUPPORT",
         "DST_DNS_INTEGRATION_MISSING",
@@ -1035,6 +1052,9 @@ def test_finding_dst_project_missing_and_image_root_quota():
     assert f.severity == Severity.blocker and "fin-rhoso" in f.message
     # both messages name the destination provider (SDD §1 naming, §9.3, review RV20-05)
     assert "which RHOSO 18.0 does not list" in f.message
+    # its remediation names the mapping and the plan's destination project, where a plan with one
+    # lands its VMs (SDD §9.3, §27.4, plan task TC6)
+    assert "plan.mappings.projects" in f.remediation and "destination_project" in f.remediation
     # unmapped, no same-named project, several destination projects: nothing to charge
     f = only(check(vm, dst=dst), "DST_PROJECT_MISSING")
     assert "and RHOSO 18.0 has 2 projects" in f.message
@@ -1047,6 +1067,241 @@ def test_finding_dst_project_missing_and_image_root_quota():
     assert resource_demand(image, make_plan())["volumes"] == 1
     assert resource_demand(image, make_plan(default_strategy=Strategy.warm))["gigabytes"] == 30
     assert resource_demand(image, make_plan(default_strategy=Strategy.cold))["volumes"] == 0
+
+
+# -- the plan's project credentials (SDD §9.3, §27.7, plan task TC6) ------------------------------
+
+#: validation's clock in the credential rows' tests
+NOW = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
+CREDENTIAL_CODES = (
+    "PROJECT_CREDENTIAL_EXPIRING",
+    "PROJECT_CREDENTIAL_UNRESTRICTED",
+    "PROJECT_CREDENTIAL_ROLE_MISSING",
+)
+
+
+def project_entry(name, *, roles=("member", "reader"), restricted=True, expires_at=None):
+    """A project credential's entry of a check report as validation's check reads it (SDD §10
+    "The check of project credentials"): a made-up tenant's, ``tenant-a`` and the like."""
+    return {
+        "status": "ok",
+        "message": None,
+        "project_name": name,
+        "domain": "Default",
+        "user_id": f"user-{name}",
+        "roles": None if roles is None else list(roles),
+        "restricted": restricted,
+        "expires_at": expires_at,
+        "checked_at": "2026-10-29T11:59:00Z",
+    }
+
+
+def tenants(source=None, destination=None, **plan_kw):
+    """A plan that names a made-up source project (tenant-a) and destination project (tenant-c),
+    each 32 hex digits, and the check reports validation's checks read for their credentials:
+    ``(plan, src_caps, dst_caps)``. ``source`` and ``destination`` give each entry's fields
+    (``project_entry``); None names no project on that side."""
+    ids = {"source": tenant_project(), "destination": tenant_project()}
+    plan = make_plan(
+        source_project=ids["source"] if source is not None else None,
+        destination_project=ids["destination"] if destination is not None else None,
+        **plan_kw,
+    )
+    src_caps, dst_caps = (
+        {"projects": {ids[side]: project_entry(name, **fields)}} if fields is not None else {}
+        for side, name, fields in (
+            ("source", "tenant-a", source),
+            ("destination", "tenant-c", destination),
+        )
+    )
+    return plan, src_caps, dst_caps
+
+
+def credential_findings(plan, src_caps, dst_caps, code, **kw):
+    """The findings of ``code`` a validation of ``plan`` gives with those check reports at NOW."""
+    found = check(plan=plan, src_caps=src_caps, dst_caps=dst_caps, now=NOW, **kw)
+    return [f for f in found if f.code == code]
+
+
+def test_finding_project_credential_expiring():
+    """SDD §9.3, §27.7 (owner decision 9, plan task TC6): a project credential the plan uses that
+    expires within 7 days of the validation warns - one finding per credential, naming its
+    provider, the plan's side and the project -; at 7 days exactly it does, a second later it does
+    not. A credential that never expires, another project's of the provider, and a side whose
+    plan names no project - the provider's own credential, whose check reads no expiry - are not
+    judged."""
+    soon = utc_text(NOW + timedelta(days=3))
+    plan, src_caps, dst_caps = tenants(source={}, destination={"expires_at": soon})
+    [f] = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_EXPIRING")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        f"The credential of project tenant-c ({plan.destination_project}) at RHOSO 18.0, the "
+        f"plan's destination project, expires at {soon}, within 7 days."
+    )
+    assert f.remediation == CATALOG["PROJECT_CREDENTIAL_EXPIRING"].remediation
+    # each credential the plan uses, the source's naming the source provider
+    plan, src_caps, dst_caps = tenants(
+        source={"expires_at": soon}, destination={"expires_at": soon}
+    )
+    assert [
+        f.message
+        for f in credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_EXPIRING")
+    ] == [
+        f"The credential of project tenant-a ({plan.source_project}) at RHOSP 17.1, the plan's "
+        f"source project, expires at {soon}, within 7 days.",
+        f"The credential of project tenant-c ({plan.destination_project}) at RHOSO 18.0, the "
+        f"plan's destination project, expires at {soon}, within 7 days.",
+    ]
+
+    def expiring(expires_at):
+        plan, src_caps, dst_caps = tenants(destination={"expires_at": expires_at})
+        return credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_EXPIRING")
+
+    # the threshold: 7 days exactly warns, a second more does not
+    assert len(expiring(utc_text(NOW + timedelta(days=7)))) == 1
+    assert expiring(utc_text(NOW + timedelta(days=7, seconds=1))) == []
+    # an expiry written with another offset is the same time: 7 days and a second on is none
+    jakarta = timezone(timedelta(hours=7))
+    assert len(expiring((NOW + timedelta(days=7)).astimezone(jakarta).isoformat())) == 1
+    assert expiring((NOW + timedelta(days=7, seconds=1)).astimezone(jakarta).isoformat()) == []
+    # a credential that never expires, or an expiry that is no time, is not judged
+    assert expiring(None) == [] and expiring("soon") == []
+    # another project's credential of the providers, and sides that name no project
+    other = {"projects": {tenant_project(): project_entry("tenant-d", expires_at=soon)}}
+    assert credential_findings(make_plan(), other, other, "PROJECT_CREDENTIAL_EXPIRING") == []
+
+
+def test_finding_project_credential_expiring_before_the_window_ends():
+    """SDD §9.3, §27.7 (owner decision 9, plan task TC6): a credential that outlives the 7 days but
+    expires before the plan's cutover window ends warns, naming the window's end - a cutover in
+    the window would be cut off by it -; one that expires at the window's end or later does not,
+    nor does it without a window; one that does both says both."""
+    window = CutoverWindow(start=NOW + timedelta(days=20), end=NOW + timedelta(days=21))
+
+    def expiring(expires, cutover_window=window):
+        plan, src_caps, dst_caps = tenants(
+            destination={"expires_at": utc_text(expires)}, cutover_window=cutover_window
+        )
+        found = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_EXPIRING")
+        return plan, found
+
+    expires = NOW + timedelta(days=20, hours=12)
+    plan, [f] = expiring(expires)
+    assert f.message == (
+        f"The credential of project tenant-c ({plan.destination_project}) at RHOSO 18.0, the "
+        f"plan's destination project, expires at {utc_text(expires)}, before the plan's cutover "
+        f"window ends at {utc_text(window.end)}."
+    )
+    assert expiring(window.end)[1] == []
+    assert expiring(window.end + timedelta(hours=1))[1] == []
+    assert expiring(expires, cutover_window=None)[1] == []
+    # within 7 days and before the window ends: both, in one finding
+    early = CutoverWindow(start=NOW + timedelta(days=1), end=NOW + timedelta(days=5))
+    _, [f] = expiring(NOW + timedelta(days=2), cutover_window=early)
+    assert f.message.endswith(
+        f", within 7 days and before the plan's cutover window ends at {utc_text(early.end)}."
+    )
+
+
+def test_finding_project_credential_unrestricted():
+    """SDD §9.3, §27.7, §27.8 (plan task TC6): an unrestricted application credential the plan uses
+    - it may create other application credentials and trusts - warns, one finding per credential
+    naming its provider, the plan's side and the project; a restricted one, and one whose flag the
+    check could not read, do not."""
+    plan, src_caps, dst_caps = tenants(source={"restricted": False}, destination={})
+    [f] = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_UNRESTRICTED")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        f"The application credential of project tenant-a ({plan.source_project}) at RHOSP 17.1, "
+        "the plan's source project, is unrestricted: it may create other application "
+        "credentials and trusts."
+    )
+    assert f.remediation == CATALOG["PROJECT_CREDENTIAL_UNRESTRICTED"].remediation
+    plan, src_caps, dst_caps = tenants(
+        source={"restricted": False}, destination={"restricted": False}
+    )
+    both = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_UNRESTRICTED")
+    assert [plan.destination_project in f.message for f in both] == [False, True]
+    for restricted in (True, None):
+        plan, src_caps, dst_caps = tenants(
+            source={"restricted": restricted}, destination={"restricted": restricted}
+        )
+        assert (
+            credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_UNRESTRICTED") == []
+        )
+    # an entry whose check failed is not judged: validation refuses its plan before (SDD §8)
+    plan, src_caps, dst_caps = tenants(source={"restricted": False}, destination={})
+    src_caps["projects"][plan.source_project]["status"] = "error"
+    assert credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_UNRESTRICTED") == []
+
+
+def test_finding_project_credential_role_missing():
+    """SDD §9.3, §27.7 (plan task TC6): a project credential the plan uses whose token lacks member
+    in its project blocks every strategy, naming its provider, the plan's side, the project, the
+    role and the roles its token holds. A token lists the roles its roles imply, so manager and
+    admin carry member; roles the check could not read are not judged."""
+    plan, src_caps, dst_caps = tenants(source={}, destination={"roles": ["reader"]})
+    found = check(plan=plan, src_caps=src_caps, dst_caps=dst_caps, now=NOW)
+    f = only(found, "PROJECT_CREDENTIAL_ROLE_MISSING")
+    assert (f.severity, f.strategies) == (Severity.blocker, [])
+    assert has_blocker(found)
+    assert f.message == (
+        f"The credential of project tenant-c ({plan.destination_project}) at RHOSO 18.0, the "
+        "plan's destination project, lacks the role member, which the plan's steps in the "
+        "project need; its token holds reader."
+    )
+    assert f.remediation == CATALOG["PROJECT_CREDENTIAL_ROLE_MISSING"].remediation
+    plan, src_caps, dst_caps = tenants(source={"roles": []}, destination={})
+    [f] = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING")
+    assert f.message == (
+        f"The credential of project tenant-a ({plan.source_project}) at RHOSP 17.1, the plan's "
+        "source project, lacks the role member, which the plan's steps in the project need; its "
+        "token holds no role."
+    )
+    for roles in (
+        ["member"],
+        ["manager", "member", "reader"],
+        ["admin", "manager", "member", "reader"],
+        None,
+    ):
+        plan, src_caps, dst_caps = tenants(source={"roles": roles}, destination={"roles": roles})
+        assert (
+            credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING") == []
+        ), roles
+
+
+def test_finding_project_credential_role_missing_for_octavia():
+    """SDD §9.3, §27.5, §27.7 (plan task TC6): a plan that maps Octavia pools needs
+    load-balancer_member in each side's project credential - the member helper drains at the
+    source and joins at the destination with them (§8.5) -; a plan that maps none never asks for
+    it, and a credential that lacks member too names both roles in one finding."""
+    pools = {"lb_pools": {"src-pool": "dst-pool"}}
+    octavia = ["load-balancer_member", "member", "reader"]
+    plan, src_caps, dst_caps = tenants(
+        source={}, destination={"roles": octavia}, network_cutover=pools
+    )
+    [f] = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING")
+    assert f.severity == Severity.blocker
+    assert f.message == (
+        f"The credential of project tenant-a ({plan.source_project}) at RHOSP 17.1, the plan's "
+        "source project, lacks the role load-balancer_member, which the member helper needs for "
+        "the Octavia pools the plan maps; its token holds member, reader."
+    )
+    plan, src_caps, dst_caps = tenants(
+        source={"roles": octavia}, destination={"roles": octavia}, network_cutover=pools
+    )
+    assert credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING") == []
+    plan, src_caps, dst_caps = tenants(source={}, destination={})
+    assert credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING") == []
+    plan, src_caps, dst_caps = tenants(
+        source={}, destination={"roles": ["reader"]}, network_cutover=pools
+    )
+    [_, f] = credential_findings(plan, src_caps, dst_caps, "PROJECT_CREDENTIAL_ROLE_MISSING")
+    assert f.message.endswith(
+        "lacks the role member, which the plan's steps in the project need, and the role "
+        "load-balancer_member, which the member helper needs for the Octavia pools the plan "
+        "maps; its token holds reader."
+    )
 
 
 def test_finding_map_network_missing():
@@ -1179,6 +1434,59 @@ def test_finding_map_keypair_prestaged():
     assert f.remediation.startswith("Nothing to do")
     owned = check(vm, plan=prestage, src=src, dst=dst_inv(keypairs=["ops-key"]))
     assert all("KEYPAIR" not in x.code for x in owned)
+
+
+def test_finding_dst_keypair_key_mismatch():
+    """SDD §9.3, §27.6 (plan task TC6): a VM whose key name both credentials' users hold, with
+    another key at the destination - by their fingerprints, as validation read each key with the
+    plan's credential on its side -, is blocked: its server would boot with that other key, as a
+    tenant's VM would with the key another tenant's plan pre-staged for the same user. The same
+    key under another comment is no mismatch; a key validation could not read, and a name the
+    destination's user (DST_KEYPAIR_MISSING's) or the source's user lacks, are not judged."""
+    vm = make_vm(key_name="deploy")
+    src, dst = src_inv(keypairs=["deploy"]), dst_inv(keypairs=["deploy"])
+    theirs = keypair_fingerprint(public_key(1, "tenant-a@ops"))
+    ours = keypair_fingerprint(public_key(2, "tenant-b@ops"))
+    prints = {"deploy": (theirs, ours)}
+    found = check(vm, src=src, dst=dst, keypair_fingerprints=prints)
+    f = only(found, "DST_KEYPAIR_KEY_MISMATCH")
+    assert (f.severity, f.strategies) == (Severity.blocker, [])
+    assert has_blocker(found)
+    assert f.message == (
+        "The VM boots with keypair 'deploy', which the migration user of RHOSO 18.0 holds with "
+        f"another key than the migration user of RHOSP 17.1: {ours} at RHOSO 18.0, {theirs} at "
+        "RHOSP 17.1. The migrated server would boot with that other key."
+    )
+    assert f.remediation == CATALOG["DST_KEYPAIR_KEY_MISMATCH"].remediation
+    # the fingerprint ssh-keygen -l prints, of the key alone: another comment is the same key
+    assert theirs == seed_fingerprint(1) == keypair_fingerprint(public_key(1))
+    same = {"deploy": (theirs, keypair_fingerprint(public_key(1, "copied")))}
+    assert "DST_KEYPAIR_KEY_MISMATCH" not in [
+        x.code for x in check(vm, src=src, dst=dst, keypair_fingerprints=same)
+    ]
+    # not judged: a key not read, a name one side's user lacks, nothing read at all
+    for case, (s, d, read) in {
+        "the destination's key not read": (src, dst, {"deploy": (theirs, None)}),
+        "the source's key not read": (src, dst, {"deploy": (None, ours)}),
+        "no key read": (src, dst, {}),
+        "nothing read": (src, dst, None),
+        "the source's user lacks it": (src_inv(), dst, prints),
+    }.items():
+        codes = [x.code for x in check(vm, src=s, dst=d, keypair_fingerprints=read)]
+        assert "DST_KEYPAIR_KEY_MISMATCH" not in codes, case
+    lacking = [x.code for x in check(vm, src=src, dst=dst_inv(), keypair_fingerprints=prints)]
+    assert "DST_KEYPAIR_MISSING" in lacking and "DST_KEYPAIR_KEY_MISMATCH" not in lacking
+    # a key that is no OpenSSH public key has no fingerprint: an x509 certificate, a broken line,
+    # a blob of another type than its line names
+    for key in (
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        "ssh-ed25519 not*base64",
+        "ssh-rsa " + public_key(1).split()[1],
+        "ssh-ed25519",
+        "",
+        None,
+    ):
+        assert keypair_fingerprint(key) is None, key
 
 
 def test_finding_map_flavor_auto_records_resolved_mapping():
@@ -3704,6 +4012,91 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     # a VMware NIC too: the migration kit creates every port with the NIC's MAC (§7.2)
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, source=vmware)]
+
+
+def test_the_port_and_floating_ip_roles_are_the_plans_destination_credentials():
+    """SDD §9.3, §27.5, §27.6 (plan task TC6): for a plan with a destination project the role
+    halves read that project's credential, as validation's check read its entry - NET_PORT_NOT_
+    PERMITTED its roles, naming the project; DST_FIP_ADDRESS_UNAVAILABLE the credential that
+    reserves the address, as credentials.reservation names it: the project's when its roles may
+    choose one, else the destination provider's own, which reserves for the project and so needs
+    admin whatever the profile. A plan without a destination project reads the provider's own
+    roles, as before."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    shared = net("p", "rhoso-net", own=False, project_id="project-admin")
+    dst = resolved_dst([shared], [subnet_of("p", "rhoso-net", "10.0.0.0/24")])
+
+    def caps(own_roles, project, project_roles, profile=None):
+        report = {"roles": own_roles, "projects": {project: project_entry("tenant-c")}}
+        report["projects"][project]["roles"] = project_roles
+        return {**report, "policy_profile": profile} if profile else report
+
+    def refused(own_roles, project_roles, named=True):
+        project = tenant_project()
+        plan = make_plan(
+            mappings=Mappings(networks={"app-net": "rhoso-net"}),
+            destination_project=project if named else None,
+        )
+        found = check(vm, plan=plan, dst=dst, dst_caps=caps(own_roles, project, project_roles))
+        return project, [f for f in found if f.code == "NET_PORT_NOT_PERMITTED"]
+
+    # the project's member token is judged, not the provider's admin one
+    project, [f] = refused(["admin", "member", "reader"], ["member", "reader"])
+    assert f.message == (
+        f"The credential of project tenant-c ({project}) at RHOSO 18.0 may not put these NICs on "
+        "their network: fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): Neutron lets "
+        "only the admin or advsvc role, or that project, choose a port's address or MAC there, "
+        "and the credential's token has neither."
+    )
+    # the project's advsvc token takes it, whatever the provider's own holds; its roles not read
+    # are not judged
+    assert refused(["member"], ["advsvc", "member"])[1] == []
+    assert refused(["member"], None)[1] == []
+    # a plan without a destination project: the provider's own token, as before
+    assert refused(["admin"], ["member"], named=False)[1] == []
+    _, [f] = refused(["member"], ["admin"], named=False)
+    assert f.message.startswith("The credential of RHOSO 18.0 may not put these NICs")
+
+    floating = make_vm(
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", floating_ips=["203.0.113.10"])]
+    )
+
+    def unkept(own_roles, project_roles, profile="legacy", named=True):
+        project = tenant_project()
+        plan = make_plan(
+            network_cutover={"floating_ips": "keep_address"},
+            destination_project=project if named else None,
+        )
+        report = caps(own_roles, project, project_roles, profile)
+        found = check(floating, plan=plan, dst_caps=report)
+        return project, [f for f in found if f.code == "DST_FIP_ADDRESS_UNAVAILABLE"]
+
+    # a member project: the provider's admin reserves the address for it
+    assert unkept(["admin", "member", "reader"], ["member", "reader"])[1] == []
+    project, [f] = unkept(["manager", "member", "reader"], ["member", "reader"], "secure_rbac")
+    assert f.message == (
+        "Floating IPs of web-01 that RHOSO 18.0 cannot keep: the own credential of RHOSO 18.0, "
+        f"which reserves them for project tenant-c ({project}) since that project's credential "
+        "may not choose a floating IP's address, lacks the admin role."
+    )
+    # a project credential that may choose one reserves itself, whatever the provider's own holds:
+    # admin, or manager under secure-RBAC alone (credentials.may_choose_address)
+    assert unkept(["member"], ["manager", "member"], "secure_rbac")[1] == []
+    assert unkept(["member"], ["admin", "member"])[1] == []
+    assert len(unkept(["member"], ["manager", "member"], "legacy")[1]) == 1
+    # roles of the project not read: the provider's own reserves, its admin judged
+    assert unkept(["admin"], None)[1] == []
+    assert len(unkept(["member"], None)[1]) == 1
+    # a plan without a destination project: the provider's own token by its profile, as before
+    assert unkept(["manager", "member"], ["member"], "secure_rbac", named=False)[1] == []
+    _, [f] = unkept(["member"], ["admin"], named=False)
+    assert f.message == (
+        "Floating IPs of web-01 that RHOSO 18.0 cannot keep: the credential's token has no role "
+        "that may choose a floating IP's address (admin)."
+    )
 
 
 def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_rule():
