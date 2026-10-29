@@ -1,3 +1,4 @@
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
@@ -24,6 +25,50 @@ function emitPhase(server: MockServer, message: string) {
 }
 
 describe('Events page', () => {
+  it('keeps manually loaded older pages after leaving and going Back', async () => {
+    function Journey() {
+      const location = useLocation(); const navigate = useNavigate();
+      return location.pathname === '/events' ? <><Events /><Link to="/plans">Leave older list</Link></> : <button onClick={() => navigate(-1)}>Back older list</button>;
+    }
+    const server = createTestServer();
+    server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'test', message: 'retained older record', data: {} });
+    for (let i = 0; i < 501; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'test', message: 'newer record', data: {} });
+    renderWithApp(<Journey />, { route: '/events', server });
+    const user = userEvent.setup({ delay: null });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    await user.type(screen.getByLabelText('Search events'), 'retained older record');
+    await user.click(screen.getByRole('button', { name: 'Load older events' }));
+    expect(await screen.findByText('retained older record')).toBeInTheDocument();
+    await user.click(screen.getByText('Leave older list'));
+    await user.click(screen.getByText('Back older list'));
+    expect(screen.getByText('retained older record')).toBeInTheDocument();
+  });
+  it('restores filters and Pause after leaving and going Back', async () => {
+    function Journey() {
+      const location = useLocation();
+      const navigate = useNavigate();
+      return location.pathname === '/events' ? <><Events /><Link to="/plans">Leave list</Link></> : <button onClick={() => navigate(-1)}>Back</button>;
+    }
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Journey />, { route: '/events' });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    await user.type(screen.getByLabelText('Search events'), 'web-01');
+    await user.selectOptions(screen.getByLabelText('Category'), 'migrations');
+    await user.click(screen.getByRole('button', { name: 'Pause live updates' }));
+    await user.click(screen.getByText('Leave list'));
+    await user.click(screen.getByText('Back'));
+    expect(screen.getByLabelText('Search events')).toHaveValue('web-01');
+    expect(screen.getByLabelText('Category')).toHaveValue('migrations');
+    expect(screen.getByRole('button', { name: 'Resume live updates' })).toBeInTheDocument();
+  });
+  it.each([['connecting', 'Connecting'], ['reconnecting', 'Reconnecting'], ['closed', 'Offline'], ['unauthorized', 'Signed out']] as const)('does not claim Live while %s, and recovers', async (status, label) => {
+    const hub = new LiveEventHub(); hub.setStatus(status);
+    renderWithApp(<LiveContext.Provider value={hub}><Events /></LiveContext.Provider>, { route: '/events' });
+    expect(await screen.findByText(`${label} · showing last loaded events`)).toBeInTheDocument();
+    expect(screen.queryByText('Live · waiting for new events')).not.toBeInTheDocument();
+    act(() => hub.setStatus('open'));
+    expect(screen.getByText('Live · waiting for new events')).toBeInTheDocument();
+  });
   it('returns focus to Search events when filters hide the list and the last older page removes its button', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
@@ -127,6 +172,7 @@ describe('Events page', () => {
 
   it('ignores replayed events it already has (a server that replays history on connect)', async () => {
     const hub = new LiveEventHub();
+    hub.setStatus('open');
     const { server } = renderWithApp(
       <LiveContext.Provider value={hub}>
         <Events />
@@ -147,6 +193,7 @@ describe('Events page', () => {
 
   it('shows a new event the stream delivers twice once (SDD §16, perf audit PF-07)', async () => {
     const hub = new LiveEventHub();
+    hub.setStatus('open');
     const { server } = renderWithApp(
       <LiveContext.Provider value={hub}>
         <Events />

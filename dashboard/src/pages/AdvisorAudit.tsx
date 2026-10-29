@@ -1,3 +1,4 @@
+import { useListState } from '../lib/useListState';
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -37,10 +38,11 @@ function download(name: string, body: string, type: string) {
 export default function AdvisorAudit() {
   usePageTitle('Advisor audit');
   const searchId = useId();
+  const listState = useListState('advisor-audit');
   const audit = useEventTail({ audit: true }, AUDIT_KEEP);
-  const [action, setAction] = useState('all');
-  const [actor, setActor] = useState('all');
-  const [query, setQuery] = useState('');
+  const [action, setAction] = listState.field('action', 'all');
+  const [actor, setActor] = listState.field('actor', 'all');
+  const [query, setQuery] = listState.field('query', '');
   const searchRef = useRef<HTMLInputElement>(null);
   const filtersActive = query !== '' || action !== 'all' || actor !== 'all';
   const clearFilters = () => {
@@ -53,7 +55,7 @@ export default function AdvisorAudit() {
   // Load older audit events (SDD §12, §16): the page before the oldest loaded; the window it was read below stays
   // loaded, so reading the newest audit events again leaves no gap; a full page may have more before it
   const api = useApi();
-  const [older, setOlder] = useState<{ events: Event[]; more: boolean } | null>(null);
+  const [older, setOlder] = listState.field<{ events: Event[]; more: boolean } | null>('older', null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<unknown>(null);
   const [announcement, setAnnouncement] = useState('');

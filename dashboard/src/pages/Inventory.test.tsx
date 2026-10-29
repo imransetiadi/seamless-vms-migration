@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { Route, Routes, useNavigationType } from 'react-router-dom';
+import { Link, Route, Routes, useLocation, useNavigate, useNavigationType } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import type { DestinationInventory, GpuCapacity } from '../api/types';
 import { Layout } from '../components/Layout';
@@ -15,6 +15,28 @@ function NavigationType() {
 const REFUSED = { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
 
 describe('Inventory', () => {
+  it('restores selected VM IDs with Selected only after leaving and going Back', async () => {
+    function Journey() {
+      const location = useLocation(); const navigate = useNavigate();
+      return location.pathname.startsWith('/inventory') ? <><Inventory /><Link to="/plans">Leave inventory</Link></> : <button onClick={() => navigate(-1)}>Back inventory</button>;
+    }
+    renderWithApp(<Journey />, { route: '/inventory/rhosp17-dc1', path: '/:section/:providerId?' });
+    const user = userEvent.setup({ delay: null });
+    const row = await screen.findByRole('row', { name: /app-billing-01/ });
+    const checkbox = within(row).getByRole('checkbox');
+    await user.click(checkbox);
+    await user.click(screen.getByRole('checkbox', { name: /Selected only/i }));
+    await user.click(screen.getByText('Leave inventory'));
+    await user.click(screen.getByText('Back inventory'));
+    expect(screen.getByRole('checkbox', { name: /Selected only/i })).toBeChecked();
+    expect(within(screen.getByRole('row', { name: /app-billing-01/ })).getByRole('checkbox')).toBeChecked();
+  });
+  it('shows one recovery message for a missing provider', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/not-found', path: '/inventory/:providerId' });
+    expect(await screen.findByText('Provider not-found does not exist')).toBeInTheDocument();
+    expect(screen.queryByText(/^Cannot read the inventory/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
   it('keeps a failed inventory said, with Retry busy and focused, while it is read again (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     let hold: Promise<void> | null = null;

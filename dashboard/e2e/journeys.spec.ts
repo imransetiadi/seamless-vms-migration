@@ -214,10 +214,10 @@ test('on a phone the demo power note sits under its button, not squeezed beside 
 async function coveredFocus(page: Page): Promise<string | null> {
   return page.evaluate(() => {
     const focused = document.activeElement as HTMLElement | null;
-    if (!focused || focused === document.body) return null;
+    if (!focused || focused === document.body) return 'BODY';
     const box = focused.getBoundingClientRect();
     const top = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
-    if (!top || top === focused || focused.contains(top) || top.contains(focused)) return null;
+    if (top && (top === focused || focused.contains(top) || top.contains(focused))) return null;
     return (focused.getAttribute('aria-label') || focused.id || focused.textContent || focused.tagName).trim().slice(0, 60);
   });
 }
@@ -234,6 +234,8 @@ async function tabCovered(page: Page, stops: number): Promise<string[]> {
   const covered: string[] = [];
   for (let i = 0; i < stops; i += 1) {
     await page.keyboard.press('Tab');
+    // WebKit scrolls focused controls asynchronously; inspect after scrolling settles.
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     const hit = await coveredFocus(page);
     if (hit) covered.push(hit);
   }

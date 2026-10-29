@@ -79,7 +79,7 @@
 }
 
 @utility card {
-  @apply rounded-lg border border-border bg-card text-card-foreground;
+  @apply min-w-0 wrap-anywhere rounded-lg border border-border bg-card text-card-foreground;
 }
 
 @utility num {

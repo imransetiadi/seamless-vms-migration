@@ -44,12 +44,13 @@ test('a failed page chunk keeps navigation and offers an explicit reload', async
 });
 
 test('network, audit and input scrollers have named keyboard access', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 320, height: 844 });
   await signIn(page, '/migrations/mig-5d7e2b4a12');
   await page.getByRole('button', { name: 'Edit network', exact: true }).focus();
   await page.keyboard.press('Tab');
   const network = page.getByRole('region', { name: 'NICs of app-billing-01', exact: true });
   await expect(network).toBeFocused();
+  expect(await network.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeGreaterThan(0);
   await page.keyboard.press('ArrowRight');
   await expect.poll(() => network.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
   await page.goto('/advisor/recommendations/rec-d4e6f8a09001');
@@ -290,6 +291,11 @@ for (const width of [320, 768, 1440]) {
         const box = (await target.boundingBox())!;
         expect(box.height).toBeGreaterThanOrEqual(44);
         expect(box.width).toBeGreaterThanOrEqual(44);
+        await target.click({ position: { x: 2, y: box.height / 2 } });
+        await expect(checkbox).toBeChecked();
+        await checkbox.focus();
+        await page.keyboard.press('Space');
+        await expect(checkbox).not.toBeChecked();
         await target.click();
         await expect(checkbox).toBeChecked();
       }

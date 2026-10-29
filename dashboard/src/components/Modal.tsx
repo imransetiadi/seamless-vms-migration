@@ -24,6 +24,11 @@ function focusables(container: HTMLElement | null): HTMLElement[] {
   const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]:not(:disabled)'));
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
     if (el.tabIndex < 0 || el.matches(':disabled, input[type="hidden"]') || el.closest('[inert], [hidden]') || inClosedDetails(el)) return false;
+    if (getComputedStyle(el).visibility === 'hidden') return false;
+    for (let parent: HTMLElement | null = el; parent; parent = parent.parentElement) {
+      if (getComputedStyle(parent).display === 'none') return false;
+      if (parent === container) break;
+    }
     if (!(el instanceof HTMLInputElement) || el.type !== 'radio' || !el.name) return true;
     const group = radios.filter((radio) => radio.name === el.name && radio.form === el.form);
     return el === (group.find((radio) => radio.checked) ?? group[0]);
@@ -151,18 +156,16 @@ export function Modal({
       event.preventDefault();
       return;
     }
-    const first = items[0];
-    const last = items[items.length - 1];
+    // Safari's default Tab order skips buttons; own the complete dialog order in every engine.
+    event.preventDefault();
     const active = document.activeElement;
-    const beforeFirst = active && first && (first.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_PRECEDING);
-    const afterLast = active && last && (last.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_FOLLOWING);
-    if (event.shiftKey && (active === first || beforeFirst)) {
-      event.preventDefault();
-      last?.focus();
-    } else if (!event.shiftKey && (active === last || afterLast)) {
-      event.preventDefault();
-      first?.focus();
-    }
+    const index = items.indexOf(active as HTMLElement);
+    const next = index >= 0
+      ? items[(index + (event.shiftKey ? -1 : 1) + items.length) % items.length]
+      : event.shiftKey
+        ? [...items].reverse().find((item) => active && (item.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_FOLLOWING)) ?? items.at(-1)
+        : items.find((item) => active && (item.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_PRECEDING)) ?? items[0];
+    next?.focus();
   };
 
   return createPortal(

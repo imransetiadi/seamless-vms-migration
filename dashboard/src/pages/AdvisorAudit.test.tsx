@@ -1,3 +1,4 @@
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
@@ -17,6 +18,24 @@ async function auditTable() {
 }
 
 describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
+  it('retains loaded older audit pages after leaving and going Back', async () => {
+    function Journey() {
+      const location = useLocation(); const navigate = useNavigate();
+      return location.pathname === '/advisor/audit' ? <><AdvisorAudit /><Link to="/plans">Leave audit</Link></> : <button onClick={() => navigate(-1)}>Back audit</button>;
+    }
+    const server = createTestServer();
+    server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'older-actor', message: 'old target', data: {} });
+    for (let i = 0; i < 1001; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'newer-actor', message: 'newer', data: {} });
+    renderWithApp(<Journey />, { route: '/advisor/audit', server });
+    const user = userEvent.setup({ delay: null });
+    await screen.findByRole('table', { name: /advisor audit events/i });
+    await user.type(screen.getByLabelText('Search'), 'older-actor');
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    expect(await screen.findByText('older-actor', { selector: 'td' })).toBeInTheDocument();
+    await user.click(screen.getByText('Leave audit'));
+    await user.click(screen.getByText('Back audit'));
+    expect(screen.getByText('older-actor', { selector: 'td' })).toBeInTheDocument();
+  });
   it('lists who decided what, when and with which model version, newest first', async () => {
     renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });
     const table = await auditTable();

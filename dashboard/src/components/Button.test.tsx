@@ -7,6 +7,14 @@ import { Button } from './Button';
 describe('Button', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('focuses a pointer trigger before opening its dialog on browsers that omit native focus', () => {
+    let trigger: Element | null = null;
+    render(<Button onClick={() => { trigger = document.activeElement; }}>Open</Button>);
+    const button = screen.getByRole('button', { name: 'Open' });
+    fireEvent.click(button);
+    expect(trigger).toBe(button);
+  });
+
   it('says why a soft-disabled action is unavailable when it is tapped or clicked, not only on hover', async () => {
     const user = userEvent.setup({ delay: null });
     const onClick = vi.fn();

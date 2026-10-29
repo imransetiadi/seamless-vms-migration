@@ -1,5 +1,6 @@
+import { useListState, validListSort } from '../lib/useListState';
 import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { POWER_STATES, type GpuDevice, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
@@ -48,6 +49,7 @@ interface Row {
 }
 
 export interface VmTableProps {
+  persistenceKey?: string;
   vms: VMRef[];
   providerKind: ProviderKind;
   /** Enables the selection column (plan creation). */
@@ -88,18 +90,19 @@ function ReadinessCell({ flags, level }: { flags: ReadinessFlag[]; level: Readin
 }
 
 /** Inventory table with search, power/readiness/project filters, sorting and optional selection. */
-export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '', holders }: VmTableProps) {
+export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '', holders, persistenceKey }: VmTableProps) {
   const searchId = useId();
-  const [query, setQuery] = useState(initialQuery);
-  const [power, setPower] = useState<PowerState | 'all'>('all');
-  const [readiness, setReadiness] = useState<ReadinessFilter>('all');
-  const [project, setProject] = useState('all');
-  const [os, setOs] = useState<OsFilter>('all');
-  const [plan, setPlan] = useState<PlanFilter>('all');
-  const [gpu, setGpu] = useState<GpuFilter>('all');
-  const [selectedOnly, setSelectedOnly] = useState(false);
-  const [sort, setSort] = useState<SortState<SortKey> | null>(null);
-  const [limit, setLimit] = useState(pageSize);
+  const listState = useListState(persistenceKey);
+  const [query, setQuery] = listState.field('query', initialQuery);
+  const [power, setPower] = listState.field<PowerState | 'all'>('power', 'all');
+  const [readiness, setReadiness] = listState.field<ReadinessFilter>('readiness', 'all');
+  const [project, setProject] = listState.field('project', 'all');
+  const [os, setOs] = listState.field<OsFilter>('os', 'all');
+  const [plan, setPlan] = listState.field<PlanFilter>('plan', 'all');
+  const [gpu, setGpu] = listState.field<GpuFilter>('gpu', 'all');
+  const [selectedOnly, setSelectedOnly] = listState.field('selectedOnly', false);
+  const [sort, setSort] = listState.field<SortState<SortKey> | null>('sort', null, validListSort(['name', 'project', 'power', 'cpu', 'disk', 'used', 'readiness']));
+  const [limit, setLimit] = listState.field('limit', pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const tableRef = useRef<HTMLTableElement>(null);
@@ -345,7 +348,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
           action={<Button onClick={clearFilters}>Clear filters</Button>}
         />
       ) : (
-        <div className="table-wrap rounded-lg border border-border" onFocus={(event) => event.target.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })}>
+        <div className="table-wrap rounded-lg border border-border" onFocus={(event) => { if (event.target.matches(':focus-visible')) event.target.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }); }}>
           <table ref={tableRef} tabIndex={-1} className="data-table outline-hidden">
             <caption className="sr-only">{caption}</caption>
             <thead>

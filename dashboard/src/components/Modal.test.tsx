@@ -40,6 +40,17 @@ function Dialog() {
 }
 
 describe('Modal (SDD §16)', () => {
+  it('skips CSS-hidden controls at the end of the dialog when wrapping Tab', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<Modal open onClose={() => {}} labelledBy="title">
+      <h2 id="title">Edit</h2><input aria-label="Name" /><button>Save</button>
+      <div style={{ display: 'none' }}><button>Hidden action</button></div>
+    </Modal>);
+    screen.getByRole('button', { name: 'Save' }).focus();
+    await user.keyboard('{Tab}');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveFocus();
+  });
+
   it('skips hidden inputs and controls disabled by their fieldset when focusing and wrapping Tab', async () => {
     const user = userEvent.setup({ delay: null });
     render(

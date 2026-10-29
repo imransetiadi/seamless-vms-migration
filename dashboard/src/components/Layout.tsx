@@ -407,11 +407,12 @@ export function Layout() {
   const mainRef = useRef<HTMLElement>(null);
   // where the focus goes when the drawer closes: its button, or the page when the choice was the page already shown
   const drawerReturnRef = useRef<HTMLElement | null>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
   const drawerTitleId = useId();
   const columnNavId = useId();
   const lastPath = useRef(pathname);
   const closeMenu = () => {
-    drawerReturnRef.current = null;
+    drawerReturnRef.current = menuButtonRef.current;
     setMenuOpen(false);
   };
   // the drawer closes on a choice; the link goes with it, so the focus goes where a navigation puts it — the page —
@@ -488,7 +489,8 @@ export function Layout() {
         <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
           <button
             type="button"
-            onClick={() => setMenuOpen(true)}
+            ref={menuButtonRef}
+            onClick={() => { drawerReturnRef.current = menuButtonRef.current; setMenuOpen(true); }}
             aria-haspopup="dialog"
             aria-expanded={menuOpen}
             aria-label="Open navigation"

@@ -1,3 +1,4 @@
+import { useDraftGuard } from '../lib/useDraftGuard';
 import { CircleAlert, CircleCheck, FileKey2, KeyRound, LockKeyhole, PlugZap, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { useId, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode, type Ref } from 'react';
 import { ApiError } from '../api/client';
@@ -522,6 +523,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   // the dialog swaps its content in place: the focus follows to the new step (SDD §16)
   const outcomeRef = useRef<HTMLHeadingElement>(null);
   const [form, setForm] = useState<FormState>(() => initialState(provider));
+  const [baseline, setBaseline] = useState(() => JSON.stringify(initialState(provider)));
   const [errors, setErrors] = useState<Errors>({});
   const [hostOpen, setHostOpen] = useState(false);
   const [pasteKey, setPasteKey] = useState(false);
@@ -546,6 +548,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setShownOpen(open);
     if (open) {
       setForm(initialState(provider));
+      setBaseline(JSON.stringify(initialState(provider)));
       setAdded(null);
       setErrors({});
       setOutcome(null);
@@ -554,6 +557,9 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       setHostOpen(Boolean(provider && presetFor(provider.distribution, provider.kind).kind === 'vmware'));
     }
   }
+
+  const dirty = open && !outcome && JSON.stringify(form) !== baseline;
+  const { close, guard } = useDraftGuard(dirty, busy, onClose);
 
   const preset = presetFor(form.distribution);
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
@@ -770,6 +776,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (declaresCeph && form.cephEnabled && form.cephKey.trim()) saved = keep(await setCephKey.mutateAsync({ id: saved.id, key: form.cephKey.trim() }));
       if (test) {
         saved = keep(await check.mutateAsync(saved.id));
+        setBaseline(JSON.stringify(form));
         setOutcome({ provider: saved, checked: true });
         requestAnimationFrame(() => outcomeRef.current?.focus());
       } else {
@@ -856,7 +863,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   }
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!busy} initialFocusRef={nameRef}>
+    <Modal open={open} onClose={close} labelledBy={titleId} size="lg" dismissible={!busy} initialFocusRef={nameRef}>
+      {guard}
       <form noValidate onSubmit={submit} className="flex max-h-[85vh] flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
@@ -1406,7 +1414,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabledReason={busy ? 'Wait for the request to finish.' : null}>
+          <Button type="button" size="lg" variant="ghost" onClick={close} disabledReason={busy ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button type="button" size="lg" variant="secondary" loading={busy} onClick={() => void save(false)}>

@@ -10,6 +10,8 @@ import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
+import { SectionNav } from '../components/SectionNav';
+import { useHashLanding } from '../lib/useHashLanding';
 import { Panel } from '../components/Panel';
 import { DataSentPanel } from '../components/DataSentPanel';
 import { DeploymentBadge } from '../components/DeploymentBadge';
@@ -91,6 +93,7 @@ function WaitingDecision({ rec, migrationId, onDecided }: { rec: AdvisorRecommen
 
 export default function Advisor() {
   usePageTitle('Advisor');
+  useHashLanding(true);
   const queryId = useId();
   const status = useAdvisorStatus();
   const notesQuery = useAdvisorNotes(NOTES_SHOWN);
@@ -168,6 +171,7 @@ export default function Advisor() {
           </>
         }
       />
+      <SectionNav label="Advisor sections" sections={[['recommendations', 'Recommendations'], ['similar-incidents', 'Similar incidents'], ['advisor-notes', 'Recent advisor notes'], ['advisor-data', 'Data sent to advisor']]} />
       <p role="status" aria-live="polite" className="sr-only">
         {decided}
       </p>
@@ -203,7 +207,7 @@ export default function Advisor() {
       )}
 
       <div className="grid items-start gap-4 xl:grid-cols-2">
-        <Panel title="Recommendations" description="What the advisor recommended and what was decided, newest first. Migrations run the decision.">
+        <Panel id="recommendations" title="Recommendations" description="What the advisor recommended and what was decided, newest first. Migrations run the decision.">
           {recommendations.isPending ? (
             <LoadingBlock rows={4} />
           ) : recommendations.error ? (
@@ -245,7 +249,7 @@ export default function Advisor() {
         </Panel>
 
         <div className="flex min-w-0 flex-col gap-4">
-          <Panel title="Similar incidents" description="Search agentmemory for past failures and their fixes">
+          <Panel id="similar-incidents" title="Similar incidents" description="Search agentmemory for past failures and their fixes">
             <form onSubmit={submit} className="flex flex-col gap-3" noValidate>
               <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem_auto] sm:items-end">
                 <div className="min-w-0">
@@ -327,7 +331,7 @@ export default function Advisor() {
             </div>
           </Panel>
 
-          <Panel title="Recent advisor notes" description="Classification, verification, screening and similar incidents across all migrations, newest first">
+          <Panel id="advisor-notes" title="Recent advisor notes" description="Classification, verification, screening and similar incidents across all migrations, newest first">
             {notesQuery.isPending ? (
               <LoadingBlock rows={4} />
             ) : notesQuery.error ? (
@@ -339,7 +343,7 @@ export default function Advisor() {
         </div>
       </div>
       {/* what each decision type sends, below the feed it explains (SDD §13.4, §16) */}
-      <div className="mt-4">
+      <div id="advisor-data" tabIndex={-1} className="mt-4 scroll-mt-20">
         <DataSentPanel />
       </div>
     </>

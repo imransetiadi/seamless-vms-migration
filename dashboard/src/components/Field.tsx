@@ -98,6 +98,7 @@ export function SelectField({
         className="input h-11 cursor-pointer pr-8"
         aria-invalid={error ? true : undefined}
         aria-describedby={describedBy(id, hint, error)}
+        required={required}
         aria-required={required || undefined}
         {...rest}
       >
@@ -129,6 +130,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
         className={cn('input', inputClassName)}
         aria-invalid={error ? true : undefined}
         aria-describedby={described}
+        required={required}
         aria-required={required || undefined}
         {...rest}
       />
@@ -155,6 +157,7 @@ export function TextAreaField({
         className="input min-h-20"
         aria-invalid={error ? true : undefined}
         aria-describedby={describedBy(id, hint, error)}
+        required={required}
         aria-required={required || undefined}
         {...rest}
       />
