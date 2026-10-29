@@ -625,8 +625,9 @@ Two fleets of 40 single-disk VMs, `c` = 2 MiB/s, waves: pilot of 3 + four waves 
 ### 8.3 Scale-out limits in 0.1.0
 
 One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialized attach/detach. Beyond
-≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances with separate databases until
-0.2.0.
+≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances with separate databases: the HA
+control plane of 0.5.0 (SDD §25) adds a second replica for availability, not capacity - one orchestrator, the
+leader's, still drives every migration (§9.3).
 
 ---
 
@@ -675,6 +676,9 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   1,000-VM plan; the old stopgap (`SEAMLESS_TICK_S=2–5` at ≥ 500 migrations) is no longer needed for the reads.
 * **Concurrency model:** store calls run in worker threads (`asyncio.to_thread`); the engine pool is 5 (+5
   overflow) connections per process, `pool_pre_ping=True` — a PostgreSQL restart is absorbed on the next call.
+  A server holds one connection more, the lease's, outside the pool (SDD §8). Since 0.5.0 a database outage
+  longer than the lease's renew deadline (20 s) deposes the leader and cancels its steps, which resume once a
+  replica leads again; a shorter restart deposes nobody (SDD §25.5).
 * **Redaction (SDD §4, §13.4):** text from outside the control plane is redacted over its cut plus 16 KiB and
   then cut (`redact_cut`, `redact_tail`), so its cost is bounded whatever the text's length — measured on the
   developer host (2026-10-11): 3.5–6.3 ms for the 18 KiB window of a 4 MiB playbook line, against 0.4–1.5 s to
@@ -690,7 +694,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | Item | Guidance |
 |---|---|
 | Size | 1 vCPU / 1–2 GiB, 20 GiB volume is generous (manifests: request 250 m / 512 Mi, limit 2 CPU / 1 GiB, 20 Gi PVC) |
-| Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process plus CLI/psql) |
+| Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process, a server's lease connection, plus CLI/psql; two replicas hold 2 × 11) |
 | Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)`, `events(kind, seq)` (`ix_events_kind_seq`: the audit trail's `kinds` filter and its `before` pages) |
 | Bloat | frequently updated documents: `ALTER TABLE documents SET (fillfactor = 70)` and an aggressive autovacuum (`autovacuum_vacuum_scale_factor = 0.05`) |
 | Retention | archive `events` older than 13 months ([MEMORY.md](MEMORY.md) §3.4); `VACUUM (ANALYZE)` after bulk deletes |
@@ -702,7 +706,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 |---|---|---|
 | `/stats`, `/metrics`, `/advisor/recommendations` and the tick keep every migration in memory | `VersionedDocuments` (SDD §11) reloads only changed documents, but holds the whole kind: ≈ 5 KB per migration as a model | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
 | `validate_plan` writes each VM separately | 4 SQL statements and as many worker-thread hops per VM since fa2ebf8 — the migration written once (a new one created already assessed, an existing one taking both transitions in one write, SDD §5.4) and a versioned `put` one statement (SDD §11), then one statement per event; before, 10 per VM on a first validation and 7 on a repeat. 1,000 VMs on PostgreSQL 16 (local Colima, the orchestrator harness): first validation 10,021 → 4,018 statements, 11.95 → 6.10 s wall (2.8 → 1.5 s CPU), repeat 9.07 → 6.55 s; SQLite 1.93 → 1.12 s. Linear, under the plan's lock; within SM-2 | one transaction per VM for the migration and its events (a Store transaction API, SDD §11 first) would leave about two round trips per VM; deferred — validation runs once per plan change |
-| Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
+| One orchestrator at a time | the lease's leader alone runs it, and a follower relays the API to it (SDD §25.3, §25.6); every write of a server first reads the lease's row under a key-share lock (SDD §11) | 0.5.0, a Technology Preview (FR-27): two replicas on a cluster for availability, elected by a lease row with an epoch that fences every write - not the PostgreSQL advisory locks this row once named, which give no number to fence writes with (D2, SDD §25.3) -, a takeover in about 35 s (§11); two orchestrators that share the migrations stay out (SDD §25.2) |
 | Event table growth | append-only; bounded by `seamless events export` and `seamless events prune` (SDD §15) on a retention schedule | partition by month for very large estates |
 
 ---
@@ -721,9 +725,15 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above half of `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
 | `seamless_cutover_refusals` | gauge | migrations in `precopy`, `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, SDD §7.2, §18) — the dashboard's "Cutover will refuse"; above 0, something is to fix before a cutover |
 | `seamless_gpu_waits` | gauge | migrations waiting at the cutover gate for GPU capacity (`gpu_wait` set, SDD §5.4 rule 5, §18, §22.7) - their sources keep running; above 0, a vGPU pool of a destination is full |
+| `seamless_leader` | gauge | 1 on the replica that leads - it holds the orchestrator's lease and its renew deadline has not passed - and 0 on a follower (SDD §18, §25.8): which replica drives the migrations |
+| `seamless_leader_epoch` | gauge | the epoch in the lease's row as this replica read it at the scrape, 0 before any lease: its increases are the changes of leader |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
-token Secret. Queries:
+token Secret. With the HA component each replica answers for itself - the same store figures, and its own
+`seamless_leader` -: a scrape through the Route reaches one replica at a time, so to see both, scrape each pod,
+which needs a NetworkPolicy that admits your Prometheus to the API port (the shipped ones admit only the router and
+the other replica). Neither leadership gauge carries a label, so no replica's host name leaves through them.
+Queries:
 
 ```text
 # mean downtime over 24 h
@@ -731,6 +741,9 @@ increase(seamless_downtime_seconds_sum[24h]) / increase(seamless_downtime_second
 
 # in-flight migrations
 sum(seamless_migrations{phase=~"precopy|syncing|cutover|verifying|rolling_back"})
+
+# replicas that lead: 1, and 0 during a failover (each replica scraped)
+sum(seamless_leader)
 
 # transfer throughput (bytes/s)
 rate(seamless_bytes_transferred_total[5m])
@@ -801,7 +814,7 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 | Single stream per disk and per SSH channel | WAN throughput bounded by `window/RTT` | multi-stream sync (several SSH channels per disk, chunk-range sharding); HPN-SSH |
 | Delta unit is the chunk | random-write workloads amplify the delta (§5.4) | adaptive chunk size per VM from the first pass |
 | One conversion-host pair per provider; attach/detach serialized | many small VMs are attach-bound | multiple host pairs / host pool |
-| Single replica orchestrator (D2) | no HA | **0.2.0** leader election |
+| One orchestrator at a time (D2) | the single host runs one control plane, and a lost host stops the migrations until it is back; one replica on a lost cluster node is replaced after about 12 minutes; with the HA component a lost leader costs about 35 s, plus the work its running steps do again (SDD §25.1, §25.5) | **0.5.0** HA control plane (FR-27, SDD §25), a Technology Preview until LAB-HA01–LAB-HA05 pass: a lease row with an epoch, followers that relay; two orchestrators that share the migrations and PostgreSQL's own high availability stay out (SDD §25.2) |
 | Whole-kind lists for `/stats`, `/metrics`, `/advisor/recommendations` and the tick (`VersionedDocuments`, §9.1) | only the documents that changed are loaded (61483aa, 08ec435), but every migration stays in memory, once for the API and once for the orchestrator | **0.2.0** store-side aggregates |
 | Image-booted VMs with `boot_disk_copy: true` re-image each pass | slow passes | use `false` when the image exists on the destination |
 | No LVM-thick detection finding | surprise slow passes | add a finding from `volume_backends` |
