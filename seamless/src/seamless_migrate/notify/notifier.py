@@ -488,10 +488,11 @@ class Notifier:
 
 
 def senders_for(settings: Settings) -> dict[str, Sender]:
-    """The senders the server runs with: plan tasks NT6-NT8 add the email, Slack and webhook
-    senders here; until then every kind fails with ``no_sender`` (SDD §8.7)."""
-    del settings
-    return {}
+    """The senders the server runs with (SDD §8.7): the email sender (plan task NT6); the Slack and
+    webhook senders follow with NT7 and NT8, and until then their kinds fail with ``no_sender``."""
+    from .email import EmailSender  # the sender imports SendResult from here
+
+    return {"email": EmailSender(settings)}
 
 
 __all__ = ["NotifyTrigger", "Notifier", "SendResult", "Sender", "Timing", "senders_for"]

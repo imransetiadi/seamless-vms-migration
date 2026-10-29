@@ -3104,6 +3104,15 @@ route waits for it.
   4yz reply), with a reason, an optional `Retry-After` and an email's refused count. The notifier reads the channel's
   secret (`notify-{name}`, §13.3) each time it sends, so a rotation needs no restart. Plan tasks NT6–NT8 bring the
   email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`.
+* **The email sender** (plan task NT6; §24.3, §24.5): `smtplib` in at most two threads of the notifier's own, never
+  asyncio's default pool; `SEAMLESS_SMTP_SECURITY` `starttls` opens the session in plain text, requires the STARTTLS
+  extension (a relay without it fails the message with `no_starttls`, and nothing but EHLO went in clear text) and
+  upgrades before anything else; `tls` connects with implicit TLS. The relay's certificate is verified against the
+  system's CAs or `SEAMLESS_SMTP_CA_FILE`; a failed verification is a TLS error, retried, and sends nothing. AUTH
+  (`SEAMLESS_SMTP_SECRET`'s `username` and `password`) only after TLS. A 4yz reply is `retry` and a 5yz reply `failed`,
+  each with its code as the reason; recipients the relay refused while it accepted others count as `refused`, and the
+  message is sent; all refused is `failed` (or `retry` when every reply was 4yz). The message is §24.5's email: the
+  sender's domain in the `Message-ID`, the key before it. A session has 30 s. No relay configured is `no_relay`.
 * **Retries, pacing, expiry** (§24.6): 5 tries with 10, 20, 40 and 80 s before the second to the fifth, each ±20 %,
   a `Retry-After` of up to 300 s honoured; one message a second per channel; a message whose event is more than an
   hour old when its turn comes is not sent, and a run of expired messages is one `notification.failed` with the
@@ -4296,7 +4305,8 @@ starting with `provider-` is refused unless it is exactly the provider's own (au
 starting with `notify-` belong to the notification channels (`notify-{name}`, §24.3), which the store writes through
 `PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`, a hook's `secret`
 or a DNS target's `tsig_secret` that folds to one is refused (422), so writing a channel's secret never replaces theirs,
-and a channel never reads theirs. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+and a channel never reads theirs. `SEAMLESS_SMTP_SECRET` names the secret whose `username` and `password` the email sender
+authenticates to the relay with (§15.1, §24.3); it is read each time a message is sent. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
@@ -4799,6 +4809,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
+| `SEAMLESS_SMTP_HOST`, `SEAMLESS_SMTP_FROM` | unset, unset | the installation's SMTP relay and the sender's address (§8.7, §24.3): while either is unset, an email channel cannot be registered (422) and an existing one's messages fail with `no_relay` |
+| `SEAMLESS_SMTP_PORT`, `SEAMLESS_SMTP_SECURITY` | `587`, `starttls` | the relay's port and `starttls` or `tls` (implicit TLS, port 465); there is no plain-text mode: a relay without STARTTLS fails the message (`no_starttls`) |
+| `SEAMLESS_SMTP_CA_FILE`, `SEAMLESS_SMTP_SECRET` | unset, unset | a CA file the relay's certificate is verified against instead of the system's; the secret (§13.3) whose `username` and `password` the client authenticates with, after TLS alone - unset, it does not authenticate |
 | `SEAMLESS_PUBLIC_URL` | unset | the address people reach the dashboard at (`https://seamless.example.com`): the link a notification carries, ids alone, never a token (§8.6, §24.5); unset, a message carries no link |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
 
@@ -5644,6 +5657,9 @@ is no origin a browser sends (review RV31-03).
   the README beside it are the restore runbook — Secrets, then the database, then the data PVC. The data PVC
   (Ansible run directories, the recorded warm state) is backed up by the cluster's volume snapshots or
   Velero/OADP; the Compose stack keeps its `pg_dump` recipe in `deploy/compose/README.md`.
+
+The OpenShift NetworkPolicy's external egress also reaches the SMTP submission ports 587 and 465, for the installation's
+relay (§8.7, §24.3; plan task NT6).
 
 ### 17.1 Single-host stack: Docker Compose on Linux, macOS (Colima) or Podman
 
@@ -6976,8 +6992,9 @@ a subscription's topics at least one and each once; what needs the catalog, the 
 channel or plan, the `notify-` names, a Slack secret's URL) is the routes' (NT3).
 
 The routes above with their roles and refusals, `NotificationChannelView` (§4.2), the `notify-` names (§13.3), the roles
-(§13.2) and the `channel.*` events (§4.3) are binding in those sections since plan task NT3. The test route follows with
-NT5, and an email channel's refusal while the relay is unset with NT6 (§15.1).
+(§13.2) and the `channel.*` events (§4.3) are binding in those sections since plan task NT3; the test route since NT5
+(§8.7). The SMTP relay, its variables and an email channel's refusal while the relay is unset are binding in §8.7,
+§13.3 and §15.1 since plan task NT6, with the NetworkPolicy's egress in §17.
 
 ### 24.4 Subscriptions and roles
 
