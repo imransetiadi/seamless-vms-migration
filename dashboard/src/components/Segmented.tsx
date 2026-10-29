@@ -15,12 +15,12 @@ export function Segmented<T extends string>({
 }) {
   const name = useId();
   return (
-    <div role="radiogroup" aria-label={label} className="inline-flex flex-wrap gap-1 rounded-md border border-border p-1">
+    <div role="radiogroup" aria-label={label} className="inline-flex flex-wrap gap-1 rounded-lg border border-border bg-background/50 p-1">
       {options.map((option) => (
         <label
           key={option.value}
           className={cn(
-            'inline-flex min-h-9 cursor-pointer items-center rounded px-3 text-sm transition-colors duration-150',
+            'inline-flex min-h-11 cursor-pointer items-center rounded-md px-3 text-sm transition-colors duration-150 sm:min-h-9',
             option.value === value ? 'bg-accent text-accent-foreground' : 'text-foreground hover:bg-muted',
             'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-ring',
           )}

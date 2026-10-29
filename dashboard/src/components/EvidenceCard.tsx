@@ -42,14 +42,14 @@ export function EvidenceCard({ rec }: { rec: AdvisorRecommendation }) {
             const Icon = EFFECT_ICONS[item.effect];
             const href = evidenceHref(item, rec);
             return (
-              <li key={item.key} aria-label={item.label} className="grid grid-cols-[6rem_minmax(0,1fr)] items-start gap-x-3 gap-y-1 px-3 py-2 text-sm sm:grid-cols-[6rem_minmax(0,1fr)_auto]">
-                <span className={cn('inline-flex w-24 shrink-0 items-center gap-1.5 font-medium', EFFECT_TONES[item.effect])}>
+              <li key={item.key} aria-label={item.label} className="grid grid-cols-1 items-start gap-x-3 gap-y-1 px-3 py-2 text-sm sm:grid-cols-[6rem_minmax(0,1fr)_auto]">
+                <span className={cn('inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5 font-medium', EFFECT_TONES[item.effect])}>
                   <Icon aria-hidden className="size-4 shrink-0 self-center" />
                   {EFFECT_LABELS[item.effect]}
                 </span>
-                <span className="col-span-2 row-start-2 min-w-0 wrap-break-word text-foreground sm:col-span-1 sm:col-start-2 sm:row-start-1">{item.display}</span>
+                <span className="row-start-2 min-w-0 wrap-break-word text-foreground sm:col-span-1 sm:col-start-2 sm:row-start-1">{item.display}</span>
                 {href && (
-                  <Link to={href} className="col-start-2 row-start-1 justify-self-end text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground sm:col-start-3">
+                  <Link to={href} className="row-start-3 justify-self-start text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground sm:col-start-3 sm:row-start-1 sm:justify-self-end">
                     {SOURCE_LABELS[item.source.kind]}
                   </Link>
                 )}

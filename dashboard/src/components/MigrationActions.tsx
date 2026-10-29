@@ -220,7 +220,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     <div className="flex flex-col gap-3">
       <p
         className={cn(
-          'flex items-start gap-2 rounded-md border px-3 py-2 text-sm text-foreground',
+          'flex items-start gap-2 wrap-anywhere rounded-md border px-3 py-2 text-sm text-foreground',
           step.action ? 'border-accent/50 bg-accent/10' : 'border-border bg-muted/40',
         )}
       >

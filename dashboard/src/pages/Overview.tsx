@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowRight,
   CircleCheck,
   CircleHelp,
   CircleX,
@@ -30,6 +31,7 @@ import { ThroughputChart } from '../components/ThroughputChart';
 import { Unavailable } from '../components/Unavailable';
 import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
+import { buttonClassName } from '../lib/buttonStyles';
 import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
@@ -83,9 +85,10 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
   return (
     <Panel
       title="Downtime now"
+      className="border-t-2 border-t-status-info shadow-sm"
       description={
         active.length
-          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on the destination or its source runs again.${demoNote ? ` ${demoNote}.` : ''}`
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down. Clocks stop on verified boot at the destination or source restart.${demoNote ? ` ${demoNote}.` : ''}`
           : 'VMs whose source is stopped appear here with a running clock.'
       }
     >
@@ -114,8 +117,9 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
                 <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-1">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Link to={`/migrations/${m.id}`} className="font-mono text-base font-semibold text-foreground underline-offset-4 hover:underline">
+                      <Link to={`/migrations/${m.id}`} className="inline-flex min-h-6 min-w-0 items-center gap-2 rounded-md font-mono text-base font-semibold text-foreground underline-offset-4 hover:underline">
                         {m.vm.name}
+                        <ArrowRight aria-hidden className="size-4 shrink-0 text-muted-foreground" />
                       </Link>
                       <PhaseBadge phase={m.phase} />
                     </div>
@@ -125,9 +129,9 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
                       {m.phase === 'cutover' ? `, final copy ${formatPct(m.progress_pct)}` : (DOWN_DETAIL[m.phase] ?? ', source VM stopped')}
                     </p>
                   </div>
-                  <p className="flex items-baseline gap-2">
+                  <p className="flex max-w-full flex-wrap items-baseline gap-2">
                     <span className="sr-only">Downtime </span>
-                    <span className={cn('num text-4xl font-semibold leading-none tracking-tight', tone === 'success' ? 'text-foreground' : TONE_CLASSES[tone].text)}>
+                    <span className={cn('num min-w-0 wrap-anywhere text-4xl font-semibold leading-none tracking-tight', tone === 'success' ? 'text-foreground' : TONE_CLASSES[tone].text)}>
                       {formatClock(elapsed)}
                     </span>
                     {slo !== null && <span className="num text-sm text-muted-foreground">of {formatClock(slo)}</span>}
@@ -260,8 +264,7 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
                 `${pr.done} of ${pr.total} done${pr.cancelled ? `, ${pr.cancelled} cancelled` : ''}`
               )}
               ,{' '}
-              {/* one unit: a narrow card breaks the line before it, never inside the duration */}
-              <span className="whitespace-nowrap">downtime SLO {formatDuration(plan.downtime_slo_s)}</span>
+              <span>downtime SLO {formatDuration(plan.downtime_slo_s)}</span>
             </p>
           </li>
         );
@@ -310,7 +313,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Overview"
-        description={`Live state of VM migrations into ${DESTINATIONS}.`}
+        description={`Live VM migrations to ${DESTINATIONS}.`}
         actions={
           <SelectField
             label="Plan"
@@ -376,9 +379,9 @@ export default function Overview() {
                 .filter(Boolean)
                 .join('; '),
             },
-            { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
+            { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, unfinished' },
             // Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19)
-            { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; the source VM is kept' },
+            { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; source VM kept' },
             { label: 'Finalized', value: formatNumber(s.finalized), hint: counted ? `${formatPct((s.finalized / counted) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
             // its source VM runs again and a person retries or cancels it: never all clear while one waits (SDD §16)
@@ -386,14 +389,14 @@ export default function Overview() {
               label: 'Rolled back',
               value: formatNumber(s.by_phase.rolled_back ?? 0),
               tone: (s.by_phase.rolled_back ?? 0) > 0 ? 'warning' : undefined,
-              hint: (s.by_phase.rolled_back ?? 0) > 0 ? 'the source VM runs again: retry or cancel' : 'none',
+              hint: (s.by_phase.rolled_back ?? 0) > 0 ? 'source running: retry or cancel' : 'none',
             },
             {
               label: 'Average downtime',
               value: formatDuration(s.avg_downtime_s),
               hint: [`p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}`, leftOutText(s)].filter(Boolean).join('; '),
             },
-            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: ['verified cutovers within their plan SLO', leftOutText(s)].filter(Boolean).join('; ') },
+            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: ['verified within plan SLO', leftOutText(s)].filter(Boolean).join('; ') },
           ]}
         />
       )}
@@ -402,7 +405,7 @@ export default function Overview() {
 
       {/* DOM order is the phone order: live clocks, then the human actions, then the history.
           On wide screens the actions take the right column beside both downtime panels. */}
-      <div className="mt-2 grid items-start gap-4 sm:mt-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] xl:grid-rows-[auto_1fr]">
+      <div className="mt-2 grid items-start gap-4 sm:mt-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:grid-rows-[auto_1fr]">
         {migrationsQuery.isPending ? (
           <LoadingBlock label="Loading the downtime clocks…" />
         ) : migrationsUnknown ? (
@@ -412,7 +415,7 @@ export default function Overview() {
         ) : (
           <DowntimeNow migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
         )}
-        <div className="flex min-w-0 flex-col gap-4 xl:col-start-2 xl:row-span-2 xl:row-start-1">
+        <div className="flex min-w-0 flex-col gap-4 lg:col-start-2 lg:row-span-2 lg:row-start-1">
           {migrationsQuery.isPending || plansQuery.isPending ? (
             <LoadingBlock label="Loading items that need attention…" />
           ) : (
@@ -456,7 +459,11 @@ export default function Overview() {
         </Panel>
       </div>
 
-      <Panel title="Plans" description="Completion per plan" className="mt-4">
+      <Panel title="Plans" description="Completion per plan" className="mt-4" actions={
+        <Link to="/plans" className={buttonClassName('secondary', 'lg')}>
+          View all plans <ArrowRight aria-hidden className="size-4 shrink-0" />
+        </Link>
+      }>
         {plansQuery.isPending || migrationsQuery.isPending ? (
           <LoadingBlock rows={4} />
         ) : plansUnknown ? (

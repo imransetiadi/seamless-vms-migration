@@ -7,6 +7,7 @@ import { niceByteTicks } from '../lib/ticks';
 import { useChartColors } from '../theme/useChartColors';
 import { ChartDataTable, ChartTooltipBody } from './ChartParts';
 import { EmptyState } from './EmptyState';
+import { ScrollRegion } from './ScrollRegion';
 
 function hhmm(ms: number): string {
   return formatTime(ms).slice(0, 5);
@@ -44,52 +45,56 @@ export function ThroughputChart({ series }: { series: ThroughputPoint[] }) {
   return (
     <figure className="m-0 flex min-w-0 flex-col gap-2">
       <figcaption className="text-sm text-muted-foreground">{summary}</figcaption>
-      <div className="h-56 w-full min-w-0 overflow-hidden">
-        <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 224 }}>
-          <AreaChart
-            data={data}
-            margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
-            accessibilityLayer
-            title="Throughput per minute"
-            desc={summary}
-          >
-            <CartesianGrid vertical={false} stroke={colors.grid} strokeWidth={1} />
-            <XAxis
-              dataKey="t"
-              type="number"
-              scale="time"
-              domain={['dataMin', 'dataMax']}
-              tickFormatter={hhmm}
-              tick={{ fill: colors.axis, fontSize: 12 }}
-              axisLine={{ stroke: colors.grid }}
-              tickLine={false}
-              minTickGap={40}
-            />
-            <YAxis
-              ticks={yTicks}
-              domain={[0, yTicks.at(-1) ?? 'auto']}
-              tickFormatter={yTick}
-              tick={{ fill: colors.axis, fontSize: 12 }}
-              axisLine={false}
-              tickLine={false}
-              width={76}
-            />
-            <Tooltip content={renderTooltip} cursor={{ stroke: colors.axis, strokeWidth: 1 }} isAnimationActive={false} />
-            <Area
-              type="monotone"
-              dataKey="bps"
-              name="Throughput"
-              stroke={colors.series1}
-              strokeWidth={2}
-              fill={colors.series1}
-              fillOpacity={0.1}
-              dot={false}
-              activeDot={{ r: 4, stroke: colors.surface, strokeWidth: 2, fill: colors.series1 }}
-              isAnimationActive={false}
-            />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
+      <ScrollRegion label="Throughput chart">
+        <div className="h-56 min-w-96">
+          <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 224 }}>
+            <AreaChart
+              data={data}
+              margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+              accessibilityLayer
+              title="Throughput per minute"
+              desc={summary}
+            >
+              <CartesianGrid vertical={false} stroke={colors.grid} strokeWidth={1} />
+              <XAxis
+                padding={{ left: 48, right: 48 }}
+                height={48}
+                dataKey="t"
+                type="number"
+                scale="time"
+                domain={['dataMin', 'dataMax']}
+                tickFormatter={hhmm}
+                tick={{ fill: colors.axis, fontSize: '0.75rem' }}
+                axisLine={{ stroke: colors.grid }}
+                tickLine={false}
+                minTickGap={40}
+              />
+              <YAxis
+                ticks={yTicks}
+                domain={[0, yTicks.at(-1) ?? 'auto']}
+                tickFormatter={yTick}
+                tick={{ fill: colors.axis, fontSize: '0.75rem' }}
+                axisLine={false}
+                tickLine={false}
+                width={128}
+              />
+              <Tooltip content={renderTooltip} cursor={{ stroke: colors.axis, strokeWidth: 1 }} isAnimationActive={false} />
+              <Area
+                type="monotone"
+                dataKey="bps"
+                name="Throughput"
+                stroke={colors.series1}
+                strokeWidth={2}
+                fill={colors.series1}
+                fillOpacity={0.1}
+                dot={false}
+                activeDot={{ r: 4, stroke: colors.surface, strokeWidth: 2, fill: colors.series1 }}
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </ScrollRegion>
       <ChartDataTable
         caption="Throughput per minute"
         columns={['Minute', 'Throughput']}

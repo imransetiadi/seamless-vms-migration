@@ -11,7 +11,7 @@ import { renderWithApp } from './utils';
 describe('the product names every destination it migrates into (SDD §1 naming, §21, review RV20-04)', () => {
   it('on the Overview page', async () => {
     renderWithApp(<Overview />, { route: '/', token: 'viewer' });
-    expect(await screen.findByText(`Live state of VM migrations into ${DESTINATIONS}.`)).toBeInTheDocument();
+    expect(await screen.findByText(`Live VM migrations to ${DESTINATIONS}.`)).toBeInTheDocument();
   });
 
   it("in the page's description", () => {

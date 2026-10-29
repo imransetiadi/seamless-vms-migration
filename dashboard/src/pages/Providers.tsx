@@ -85,7 +85,7 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
               ? value.join(', ') || 'none'
               : String(value) || 'not read';
         return (
-          <li key={key} className="inline-flex max-w-full items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
+          <li key={key} className="inline-flex max-w-full flex-wrap items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
             {/* wraps on a narrow screen: never cut off with an ellipsis (SDD §16) */}
             <span className="num min-w-0 wrap-break-word">{text}</span>
@@ -336,7 +336,7 @@ function HostKeys({ provider }: { provider: Provider }) {
 function CredentialState({ provider }: { provider: Provider }) {
   if (provider.credentials_secret && provider.credentials_updated_at) {
     return (
-      <span className="inline-flex items-center gap-1">
+      <span className="inline-flex max-w-full flex-wrap items-center gap-1">
         <KeyRound aria-hidden className="size-3.5 text-status-success" />
         Stored <time dateTime={provider.credentials_updated_at} title={formatDateTime(provider.credentials_updated_at)}>{formatRelative(provider.credentials_updated_at)}</time>
       </span>
@@ -385,8 +385,8 @@ function ProviderCard({
   const preset = presetFor(provider.distribution, provider.kind);
 
   return (
-    <article aria-labelledby={headingId} className="card flex min-w-0 flex-col gap-3 p-4">
-      <header className="flex items-start gap-3">
+    <article aria-labelledby={headingId} className="card flex min-w-0 flex-col wrap-anywhere gap-4 p-4 sm:p-5">
+      <header className="flex flex-wrap items-start gap-3">
         <PlatformMark preset={preset} />
         <div className="min-w-0 flex-1">
           <h3 id={headingId} className="text-base font-semibold text-foreground">
@@ -403,7 +403,7 @@ function ProviderCard({
         <p className={cn('text-sm', provider.status === 'error' ? 'text-status-danger' : 'text-muted-foreground')}>{provider.status_message}</p>
       )}
 
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-sm">
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-x-3 gap-y-1.5 text-sm">
         <dt className="text-muted-foreground">Endpoint</dt>
         <dd className="min-w-0">
           <code className="text-xs">{provider.endpoint}</code>
@@ -417,12 +417,12 @@ function ProviderCard({
         <dt className="text-muted-foreground">TLS</dt>
         <dd className="min-w-0 wrap-break-word">
           {provider.verify_tls ? (
-            <span className="inline-flex items-center gap-1">
+            <span className="inline-flex max-w-full flex-wrap items-center gap-1">
               <ShieldCheck aria-hidden className="size-3.5 text-status-success" />
               Verified
             </span>
           ) : (
-            <span className="inline-flex items-center gap-1 text-status-warning">
+            <span className="inline-flex max-w-full flex-wrap items-center gap-1 text-status-warning">
               <ShieldAlert aria-hidden className="size-3.5" />
               Verification off
             </span>
@@ -466,7 +466,7 @@ function ProviderCard({
 
       {check.error && <ErrorBanner error={check.error} title="Check failed" />}
 
-      <footer className="mt-auto flex flex-wrap gap-2 pt-1">
+      <footer className="mt-auto flex flex-wrap gap-2 border-t border-border pt-3">
         <Button
           icon={RefreshCw}
           loading={check.isPending}
@@ -626,7 +626,7 @@ function ProviderColumn({
     if (headingFocus) headingRef.current?.focus();
   }, [headingFocus]);
   return (
-    <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3">
+    <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-4">
       <div>
         <h2 ref={headingRef} id={headingId} tabIndex={-1} className="text-base font-semibold text-foreground outline-hidden">
           {title}

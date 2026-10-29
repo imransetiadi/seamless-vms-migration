@@ -1,47 +1,17 @@
 # Dashboard Page Overrides
 
-> **PROJECT:** Seamless Migrate
-> **Generated:** 2026-10-08 11:52:17
-> **Page Type:** Dashboard / Data View
+SDD §16 wins. Shared tokens and typography follow `../MASTER.md`.
 
-> ⚠️ **IMPORTANT:** Rules in this file **override** the Master file (`design-system/MASTER.md`).
-> Only deviations from the Master are documented here. For all other rules, refer to the Master.
-
----
-
-## Page-Specific Rules
-
-### Layout Overrides
-
-- **Max Width:** 1400px or full-width
-- **Grid:** 12-column grid for data flexibility
-- **Sections:** Hero (product + live preview or status) > Key metrics/indicators > How it works > CTA (Start trial / Contact)
-
-### Spacing Overrides
-
-- **Content Density:** High — optimize for information display
-
-### Typography Overrides
-
-- No overrides — use Master typography
-
-### Color Overrides
-
-- **Strategy:** Dark or neutral. Status colors (green/amber/red). Data-dense but scannable.
-
-### Component Overrides
-
-- No overrides — use Master component specs
-
----
-
-## Page-Specific Components
-
-- No unique components for this page
-
----
-
-## Recommendations
-
-- Effects: Hover tooltips, chart zoom on click, row highlighting on hover, smooth filter animations, data loading spinners
-- CTA Placement: Primary CTA in nav + After metrics
+- Max content width 1400px; page gutters 16px mobile and 24px desktop.
+- Overview starts with a compact scope header and eight key figures. All figures and hints remain visible.
+- Downtime now is the main operational card. Clocks, SLO, source state and warning labels remain readable.
+- From 1024px, clocks/history and human action queues use a 3:2 split. Below it, read clocks, approvals,
+  attention, then history. First clock and SLO remain inside the first 844px at 390px width.
+- Cards use 12px radius and quiet shadows; headers have a restrained tint. Static cards do not pretend to be links.
+- Use existing task CTAs and native links. The Plans summary offers View all plans; primary creation actions
+  stay on their owning page with the existing role rules. Buttons/segments use at least 44px on small screens.
+- Provider source/destination columns keep equal widths, 16px card separation and a separate action footer.
+- Plans places status below its name before 1024px; desktop keeps a separate status column with at least 8rem.
+- Soft light surfaces and current Fira typography stay intact. Test both themes, root text at 200%, text-spacing
+  overrides, keyboard access, long content and 320px reflow after spacing changes.
+- No marketing hero, trial CTA, invented status, external font or new motion dependency.

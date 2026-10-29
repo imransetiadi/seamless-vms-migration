@@ -151,7 +151,7 @@ describe('Overview page (mock data)', () => {
     expect(rolled).toBeGreaterThan(0);
     const tile = await screen.findByRole('group', { name: 'Rolled back' });
     expect(tile).toHaveTextContent(String(rolled));
-    expect(tile).toHaveTextContent('the source VM runs again: retry or cancel');
+    expect(tile).toHaveTextContent('source running: retry or cancel');
     expect(within(tile).getByText(String(rolled))).toHaveClass(TONE_CLASSES.warning.text);
     // beside Failed, in the strip's order
     const names = within(screen.getByRole('region', { name: 'Key metrics' })).getAllByRole('group').map((g) => g.getAttribute('aria-label'));
@@ -298,7 +298,7 @@ describe('Overview page (mock data)', () => {
     // longest down first: the failed cutover (41 min) before the rollback (19 min) and the cutovers
     const order = within(down).getAllByRole('listitem').map((item) => within(item).getAllByRole('link')[0]?.textContent);
     expect(order).toEqual(['legacy-rhel6-app', 'shared-disk-node-a', 'web-02', 'web-03']);
-    expect(down).toHaveTextContent(/or its source runs again/i);
+    expect(down).toHaveTextContent(/or source restart/i);
   });
 
   it('says so when no VM is down, and how many wait for the cutover', async () => {
