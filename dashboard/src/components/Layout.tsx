@@ -1,5 +1,6 @@
 import {
   Activity,
+  Bell,
   Bot,
   CircleX,
   ClipboardList,
@@ -64,7 +65,11 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: 'Activity',
-    items: [{ to: '/events', label: 'Events', icon: Activity, match: (p) => p.startsWith('/events') }],
+    items: [
+      { to: '/events', label: 'Events', icon: Activity, match: (p) => p.startsWith('/events') },
+      // the notification catalog beside Events (SDD §16, §24.9, plan task NT9)
+      { to: '/notifications', label: 'Notifications', icon: Bell, match: (p) => p.startsWith('/notifications') },
+    ],
   },
   {
     label: 'Advisor',

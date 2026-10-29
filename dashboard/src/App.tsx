@@ -19,6 +19,7 @@ const Users = lazy(() => import('./pages/Users'));
 const Hooks = lazy(() => import('./pages/Hooks'));
 const Inventory = lazy(() => import('./pages/Inventory'));
 const Events = lazy(() => import('./pages/Events'));
+const Notifications = lazy(() => import('./pages/Notifications'));
 const Advisor = lazy(() => import('./pages/Advisor'));
 const AdvisorAudit = lazy(() => import('./pages/AdvisorAudit'));
 const AdvisorPolicies = lazy(() => import('./pages/AdvisorPolicies'));
@@ -72,6 +73,7 @@ const ROUTES: Array<{ path?: string; index?: true; element: ReactNode }> = [
   { path: 'inventory', element: <Inventory /> },
   { path: 'inventory/:providerId', element: <Inventory /> },
   { path: 'events', element: <Events /> },
+  { path: 'notifications', element: <Notifications /> },
   { path: 'advisor', element: <Advisor /> },
   { path: 'advisor/audit', element: <AdvisorAudit /> },
   { path: 'advisor/policies', element: <AdvisorPolicies /> },

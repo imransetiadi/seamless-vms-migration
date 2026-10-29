@@ -29,6 +29,7 @@ const ROUTES: Array<[string, string]> = [
   ['/inventory/rhosp17-dc1', 'Inventory'],
   ['/inventory/rhoso-prod', 'Inventory'],
   ['/events', 'Events'],
+  ['/notifications', 'Notifications'],
   ['/advisor', 'Advisor'],
   ['/advisor/audit', 'Advisor audit'],
   ['/advisor/policies', 'Advisor policies'],
@@ -67,7 +68,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Users', 'Hooks', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Users', 'Hooks', 'Notifications', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
@@ -364,6 +365,42 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
     await user.click(screen.getByRole('button', { name: 'Delete drain-lb' }));
     await screen.findByRole('alertdialog');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the notification catalog: its channels, the add form refused, the secret dialog with a generated key, a test outcome and the delete confirmation (SDD §16, plan task NT9)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/notifications', 'admin');
+    await screen.findByRole('heading', { level: 1, name: 'Notifications' }, { timeout: 8_000 });
+    await settled();
+    const catalog = await screen.findByRole('list', { name: 'Channel catalog' });
+    await user.selectOptions(screen.getByLabelText('Kind'), 'webhook');
+    await user.type(screen.getByLabelText(/^Name/), 'itsm-2');
+    await user.type(screen.getByLabelText(/^URL/), 'http://itsm.example.com/hook');
+    await user.click(screen.getByRole('button', { name: 'Add channel' }));
+    await screen.findByRole('alert');
+    const mailbox = within(catalog).getByRole('listitem', { name: 'ops-mailbox' });
+    await user.click(within(mailbox).getByRole('button', { name: 'Send test to ops-mailbox' }));
+    await within(mailbox).findByRole('status');
+    expect(await violations()).toEqual([]);
+    await user.click(within(within(catalog).getByRole('listitem', { name: 'itsm-webhook' })).getByRole('button', { name: 'Set secret for itsm-webhook' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Set secret for itsm-webhook' });
+    await user.click(within(dialog).getByRole('button', { name: 'Generate key' }));
+    expect(await violations()).toEqual([]);
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await user.click(within(mailbox).getByRole('button', { name: 'Delete ops-mailbox' }));
+    await screen.findByRole('alertdialog');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("the plan page's Notifications panel: the plan's subscriptions, the every-plan one and the add form (SDD §16, plan task NT9)", async () => {
+    renderAt('/plans/plan-4f2a9c1e', 'operator');
+    await screen.findByRole('heading', { level: 1, name: 'DC1 → RHOSO production rollout' }, { timeout: 8_000 });
+    await settled();
+    const panel = await screen.findByRole('region', { name: 'Notifications' });
+    await within(panel).findByRole('listitem', { name: 'ops-slack' });
+    expect(within(panel).getByRole('listitem', { name: 'ops-mailbox' })).toHaveTextContent('Every plan');
+    expect(within(panel).getByRole('button', { name: 'Add subscription' })).toBeInTheDocument();
     expect(await violations()).toEqual([]);
   }, 30_000);
 
