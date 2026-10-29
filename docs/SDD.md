@@ -7299,7 +7299,7 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
 * **A channel may send ids instead of names** (`redact_names`, owner decision 8): a channel outside the organization
   whose VM and plan names are confidential.
 * **Recipients are personal data.** The API shows them to an admin alone (§24.3), no event names one, and an erasure
-  request reaches them (MEMORY.md §5, plan task NT11).
+  request reaches them (MEMORY.md §3.5, plan task NT11).
 * Nothing of a notification reaches Jev or agentmemory (§13.4).
 * `redact()` learns Slack incoming webhook URLs (`hooks.slack.com/services/…`), so one in an error or a log line is
   removed; binding in §13.4, with the Slack sender in §8.7, since plan task NT7.
