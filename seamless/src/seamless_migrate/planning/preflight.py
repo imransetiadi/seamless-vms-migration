@@ -2570,9 +2570,10 @@ def _host_key_findings(
     while their keys are checked, each with declared keys or a pin of its server, or one
     Seamless will create; else the warning that no hop checks a key. A side's host is the one the
     plan's runs reach with their credential there: in a project the plan names, that project's,
-    judged by its pin and the check's report of it (§10, §26.4)."""
+    judged by its pin and the check's report of it, never by the keys the provider declares for
+    its own host (§10, §26.4, §26.10 decision 12)."""
     # the selection reads this module (FIP_ADDRESS_ROLES): it is imported when it is used
-    from ..credentials import Step, credential_project, host_pin
+    from ..credentials import Step, credential_project, declared_keys, host_pin
 
     vmware = source.kind == ProviderKind.vmware
     step = Step.KIT if vmware else Step.MIGRATION
@@ -2600,9 +2601,9 @@ def _host_key_findings(
     for side, provider in needed:
         host = provider.conversion_host
         assert host is not None
-        if host.ssh_host_keys:
-            continue
         project = credential_project(step, side, plan)
+        if declared_keys(provider, project):
+            continue
         where = f" in project {project}" if project is not None else ""
         name = f"{side} {provider.label} ({host.name or SIDE_ALIASES[side]}{where})"
         message = _host_report(provider, project)

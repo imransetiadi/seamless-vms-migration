@@ -3219,6 +3219,73 @@ def test_finding_conv_host_key_unknown_for_a_projects_replaced_host():
     )
 
 
+def test_finding_conv_host_key_unknown_for_a_projects_host_whatever_its_provider_declares():
+    """SDD §9.3, §10, §26.5 (§26.10 decisions 12 and 13, the owner's decisions of 2026-10-29):
+    the keys a provider declares are its own host's. On a side where the plan names a project
+    they clear nothing: the project's host found replaced blocks the plan though its provider
+    declares keys, which still clear the provider's own host - found replaced too - for a plan
+    without a project. A project's host the check found in no server of its project blocks
+    nothing: the plan's pre-staging creates it."""
+    from tests.credential_support import project_credentials, tenant_project
+
+    a = tenant_project()
+    entry = {
+        "status": "ok",
+        "message": None,
+        "project_name": "tenant-a",
+        "domain": "Default",
+        "user_id": "user-tenant-a",
+        "roles": ["member"],
+        "restricted": True,
+        "expires_at": None,
+        "checked_at": "2026-10-29T08:00:00Z",
+    }
+    held = project_credentials(SRC.id, a)
+    pin = HostKeyPin(
+        server_id="srv-a-1", keys=[bare(public_key(3))], source="injected", pinned_at=utcnow()
+    )
+    held[a] = held[a].model_copy(update={"conversion_host_pin": pin})
+    declaring = _pinned(SRC).model_copy(
+        update={
+            "conversion_host": ConversionHostConfig(name="conv-src", ssh_host_keys=[public_key(2)]),
+            "status_message": "conversion host replaced: conv-src is now server srv-2; its pin "
+            "belongs to server srv-conv-1",
+            "project_credentials": held,
+        }
+    )
+
+    def reported(message):
+        return declaring.model_copy(
+            update={"capabilities": {"projects": {a: {**entry, "message": message}}}}
+        )
+
+    def judged(source, plan):
+        return [
+            f
+            for f in check(plan=plan, source=source, host_key_checking=True)
+            if f.code == "CONV_HOST_KEY_UNKNOWN"
+        ]
+
+    tenant_plan = make_plan(source_project=a)
+    replaced = reported(
+        "conversion host replaced: conv-src is now server srv-a-2; its pin belongs to server "
+        "srv-a-1"
+    )
+    f = only(
+        check(plan=tenant_plan, source=replaced, host_key_checking=True), "CONV_HOST_KEY_UNKNOWN"
+    )
+    assert f.severity == Severity.blocker
+    assert f"source RHOSP 17.1 (conv-src in project {a}): conv-src is now server srv-a-2" in (
+        f.message
+    )
+    assert judged(replaced, make_plan()) == [], "the provider's own host, on its declared keys"
+    missing = reported(
+        f"conversion host not found: no server is named conv-src in project {a}; its pin belongs "
+        "to server srv-a-1"
+    )
+    assert judged(missing, tenant_plan) == []
+
+
 def test_finding_conv_host_key_unknown_not_for_a_host_seamless_will_create():
     """SDD §9.3, §26.3: a host Seamless manages gets its key injected when its pre-staging creates
     it, or its console read and pinned when it exists: no finding without a pin. Nor for a

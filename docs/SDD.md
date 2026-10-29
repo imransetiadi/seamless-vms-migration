@@ -2362,14 +2362,21 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     rollback - uses both conversion hosts, under their aliases `os_migrate_conv_src` and `os_migrate_conv_dst` (§26.4);
     a VMware kit run (pre-copy, sync, cutover) the destination's host of the inventory's `conversion_host` group, under
     `conversion_host`. A host without declared keys is looked up as the provider check finds it (§10): by its name
-    (`conversion_host.name`, else its side's alias), else by its address. A lookup that fails fails the run as
-    transient, a rollback's excepted, which logs it. A plan with a project on a side looks its host up there with the
-    plan's credential, where the deploy created it (above, §27.5), and that host - another server than the provider's
-    own - has its own pin, on the project's credential (`ProjectCredential.conversion_host_pin`, §4.2; the owner's
-    decision of 2026-10-29, after plan task TC5). A run reads and writes the pin of the credential it reaches the host
-    with (`credentials.host_pin`, §26.4): the provider's own pin for its own credential, a project's for that
-    project's credential, never another's - so two projects of one provider each keep their own host's pin, and
-    neither run meets the other's.
+    (`conversion_host.name`, else its side's alias), else - the provider's own host alone (below) - by its address. A
+    lookup that fails fails the run as transient, a rollback's excepted, which logs it. A plan with a project on a side
+    looks its host up there with the plan's credential, where the deploy created it (above, §27.5), and that host -
+    another server than the provider's own - has its own pin, on the project's credential
+    (`ProjectCredential.conversion_host_pin`, §4.2; the owner's decision of 2026-10-29, after plan task TC5). A run
+    reads and writes the pin of the credential it reaches the host with (`credentials.host_pin`, §26.4): the
+    provider's own pin for its own credential, a project's for that project's credential, never another's - so two
+    projects of one provider each keep their own host's pin, and neither run meets the other's. The provider's
+    declared keys and its address are its own host's, never a project's (the owner's decisions of 2026-10-29 that
+    followed, §26.10 decisions 12 and 13; `credentials.declared_keys` and `credentials.host_address`, §10): a
+    project's host is checked against its project's pin alone - the key its pre-staging injects when it creates the
+    host, else its console's -, whatever keys the provider declares; and it is looked up by its name alone, in its
+    project. One whose name no server of the project bears is not found, which fails the run as a lookup that
+    fails - its reason "no server is named {name} in project {project id}" -, a rollback's excepted, which logs it;
+    it never resolves to the provider's own host.
   * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
     `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
     resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
@@ -2385,17 +2392,17 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     is what the host was found by, else its name). A rollback refuses nothing and reads no console: it starts the
     source whatever its hosts' keys (§26.5).
   * **The injected key** (§26.3). Before a pre-staging, a host the deploy manages (`conversion_host.manage`, or a
-    provider without `conversion_host`), without declared keys, whose name finds no server - the role creates it - gets
-    an ed25519 key pair made in memory: its private half in `{data_dir}/plans/{plan_id}/host-key-{side}.key` (`src`,
-    `dst`), 0600 with its final newline, passed as `os_migrate_{side}_conversion_host_key_private_path` and removed
-    after the run whatever its outcome, never logged; its public half under the side's alias in the run's
-    `known_hosts`. The role's report (`osm/conversion/hosts.json`, §6.5) is removed before the run and read after it,
-    also after a failure: a server under `created` of a side that got a key is pinned with it as the pin of the side's
-    credential (source `injected`, `conversion_host.key_pinned`) - not pinned when that credential went meanwhile, its
-    pin going with it (§12); one under `found` does not hold it and is not pinned - a run that succeeded is refused
-    for it "host key unknown: ...", unless the side's pin is that server's. A run whose output refuses the
-    key of a server it created fails "the conversion host {name}, created with an injected host key, does not present
-    it: check its image's cloud-init".
+    provider without `conversion_host`), without declared keys - a project's host has none (above) -, whose name finds
+    no server - the role creates it - gets an ed25519 key pair made in memory: its private half in
+    `{data_dir}/plans/{plan_id}/host-key-{side}.key` (`src`, `dst`), 0600 with its final newline, passed as
+    `os_migrate_{side}_conversion_host_key_private_path` and removed after the run whatever its outcome, never logged;
+    its public half under the side's alias in the run's `known_hosts`. The role's report (`osm/conversion/hosts.json`,
+    §6.5) is removed before the run and read after it, also after a failure: a server under `created` of a side that got
+    a key is pinned with it as the pin of the side's credential (source `injected`, `conversion_host.key_pinned`) - not
+    pinned when that credential went meanwhile, its pin going with it (§12); one under `found` does not hold it and is
+    not pinned - a run that succeeded is refused for it "host key unknown: ...", unless the side's pin is that server's.
+    A run whose output refuses the key of a server it created fails "the conversion host {name}, created with an
+    injected host key, does not present it: check its image's cloud-init".
   * **A refusal in the output** - the collection's "host key refused: " and "link refused by the source conversion
     host" (§6.6), ssh's "Host key verification failed.", "No ... host key is known for ... and you have requested strict
     checking" and "no matching host key type found", also as Ansible's unreachable message carries them - fails the run
@@ -4078,7 +4085,12 @@ host's pin is `Provider.conversion_host_pin` (§4.2), and the host each of its p
 with that project's (§7.2, §27.5) - has its own, `ProjectCredential.conversion_host_pin` (the owner's decision of
 2026-10-29, after plan task TC5). The server alone writes them, and each reader takes the pin of the credential that
 reaches the host, never another's (`credentials.host_pin(provider, project_id)`: the provider's own for its own
-credential, None, else that project credential's - none for a project it holds no credential for):
+credential, None, else that project credential's - none for a project it holds no credential for); the provider's
+declared keys and its address are its own host's, the one its own credential reaches, never a project's host's (the
+owner's decisions of 2026-10-29 that followed, §26.10 decisions 12 and 13: `credentials.declared_keys(provider,
+project_id)` gives `conversion_host.ssh_host_keys` for None and none for a project, and
+`credentials.host_address(provider, project_id)` `conversion_host.address` for None and none for a project, whose
+host is looked up by its name alone):
 * **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
   of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
   looks the host's server up with its own credential: by its name, `conversion_host.name`, else its side's name as the
@@ -4101,14 +4113,19 @@ credential, None, else that project credential's - none for a project it holds n
   key out of band, so no demo plan meets `CONV_HOST_KEY_UNKNOWN` while keys are checked (§9.3).
 * **A project's host** (the owner's decision of 2026-10-29, after plan task TC5). After each project credential's
   sign-in that answered `ok` ("The check of project credentials", below), a credential that holds a pin has its
-  project's host looked up with it, as a run of a plan with the project finds the host (§7.2): by its name, else its
-  address, as above. A host that resolves to another server than the pin's is reported in that project's entry of
-  the report (`projects`): its `message` the words above, its `status` staying `ok`. The check reads no console of a
-  project's host and pins nothing for a project: a project's host is pinned by the pre-staging that creates it, with
-  the key it injects, or by a run that meets it without a pin (§7.2, §26.8). A credential without a pin, or whose
-  sign-in failed, is not looked up; a lookup that fails is logged by its provider error and reports nothing.
-  Validation's `CONV_HOST_KEY_UNKNOWN` (§9.3) judges a side where the plan names a project by that project's pin and
-  this report, in place of the provider's own pin and `status_message` (§26.5).
+  project's host looked up with it, as a run of a plan with the project finds the host (§7.2): by its name alone -
+  `conversion_host.name`, else its side's name, as above -, never by `conversion_host.address`, the provider's own
+  host's (§26.10 decision 13). A host that resolves to another server than the pin's is reported in that project's
+  entry of the report (`projects`): its `message` the words above, its `status` staying `ok`; so is a host whose name
+  no server of the project bears, "conversion host not found: no server is named {name} in project {project id};
+  its pin belongs to server {old id}". The check reads no console of a project's host and pins nothing for a project:
+  a project's host is pinned by the pre-staging that creates it, with the key it injects, or by a run that meets it
+  without a pin (§7.2, §26.8). A credential without a pin, or whose sign-in failed, is not looked up; a lookup that
+  fails is logged by its provider error and reports nothing. The provider's declared keys change none of this: they
+  are its own host's (§26.10 decision 12). Validation's `CONV_HOST_KEY_UNKNOWN` (§9.3) judges a side where the plan
+  names a project by that project's pin and this report, in place of the provider's own pin, its declared keys and
+  `status_message` (§26.5): a host found replaced blocks the plan, one not found does not - the plan's pre-staging
+  creates it (§7.2).
 * **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
   `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
   that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
@@ -4148,8 +4165,8 @@ credential has expired.
                  message: str|null,           # why an error is one, in Seamless's words with an HTTP status or a
                                               # failure's kind - never a message Keystone wrote, never a
                                               # credential's value; on an ok entry null, or the report of
-                                              # its project's conversion host found replaced ("Host key
-                                              # pins", above)
+                                              # its project's conversion host found replaced or not found
+                                              # ("Host key pins", above)
                  project_name: str|null,      # its token's project
                  domain: str|null,            # that project's domain: its name, else its id
                  user_id: str|null,           # its token's user (the credential's)
@@ -8391,7 +8408,10 @@ in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task; plan task ST7's - the t
 `GET /me`'s `host_key_checking` and the dashboard's host keys, its warning and the form's declared keys - in §9.3, §12,
 §15.1 and §16 since that task; the owner's decision of 2026-10-29, after plan task TC5 (§26.10, decision 11) - a pin
 per project credential, the one rule that selects a step's pin, the check's report of a project's replaced host and
-the project credential routes' rules for its pin - in §4.2, §7.2, §10 and §12 since it. The facts
+the project credential routes' rules for its pin - in §4.2, §7.2, §10 and §12 since it; the owner's decisions of
+2026-10-29 that followed it (§26.10, decisions 12 and 13) - the declared keys and the address the provider's own
+host's alone, a project's host looked up by its name in its project alone and reported not found - in §7.2 and §10
+since them. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -8491,7 +8511,10 @@ decision 10).
     §10 since plan task ST2.
   * The console is the guest's text: it is never logged, stored, or sent to the advisor or to memory (§13.4).
 * **Declared, by the operator.** `conversion_host.ssh_host_keys` (§4.2, §12, binding since plan task ST2): the host's
-  public keys in OpenSSH's one-line form, ed25519, ECDSA or RSA. Declared keys win over a pin.
+  public keys in OpenSSH's one-line form, ed25519, ECDSA or RSA. Declared keys win over a pin. They are the keys of
+  the provider's own host, the one its own credential reaches, and of no project's host (owner decision 12; binding
+  in §7.2 and §10 since it): a project's host - a server Seamless creates in that project (§27.5) - is checked
+  against its project's pin alone.
 * **Never** an SSH connection's word (no `accept-new`, no trust on first use), a scan alone, or DNS
   (`VerifyHostKeyDNS`).
 
@@ -8518,9 +8541,15 @@ decision 10).
   an admin writes the credential again - the same project's host, whose pin is its server's - and gone with the
   credential's deletion: a later credential for the project starts without one, and its host is pinned again from
   its console by a run, or created and pinned with an injected key by a pre-staging; no pin outlives the credential
-  that reached its host (§12). The provider check reports a project's host found replaced in that project's entry of
-  its report and reads no project host's console (§10). Declared keys (`conversion_host.ssh_host_keys`) stay the
-  provider's and win over every pin, a project's too (§26.3).
+  that reached its host (§12). The provider check reports a project's host found replaced, or not found, in that
+  project's entry of its report and reads no project host's console (§10). Declared keys
+  (`conversion_host.ssh_host_keys`) and the address (`conversion_host.address`) are the provider's own host's (owner
+  decisions 12 and 13; binding in §7.2 and §10 since them): the declared keys win over the provider's own pin alone,
+  and a project's host is checked against its project's pin whatever the provider declares; it is looked up by its
+  name alone, with its project's credential, in that project - never by the provider's address -, so it never
+  resolves to the provider's own host, and one whose name no server of the project bears is not found (§7.2, §10).
+  A project's host found replaced is refused until it is deleted and a pre-staging creates and pins it again: an
+  operator's declared keys do not reach it.
 * **Why per host.** A conversion host serves every plan of the project its credential reaches - its provider's own,
   or a project credential's -, so a plan's pre-staging data would hold one pin per plan for one host. The database
   also keeps the pin when the data volume is lost or moved.
@@ -8580,7 +8609,8 @@ decision 10).
   * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
     keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
     to another server than the one the provider's host resolves to - for a plan with a project on that side, the
-    project's pin and the check's report of the project's host (§10, owner decision 11);
+    project's pin and the check's report of the project's host (§10, owner decision 11), never the provider's
+    declared keys (owner decision 12);
   * CONV_HOST_KEYS_UNCHECKED, a warning while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`: the plan's data path
     authenticates no conversion host.
 
@@ -8732,6 +8762,27 @@ The owner took each default as written on 2026-10-23 (D8):
     * **The check reports, never pins:** a project's host is one Seamless creates (§27.5), pinned with the key its
       pre-staging injects; the check reports a project's host found replaced in that project's entry, as it reports
       its own in `status_message`, and reads no project host's console (§10).
+12. **Declared keys are the provider's own host's**, decided by the owner on 2026-10-29, after decision 11. An
+    operator declares the keys of a host they bring, or whose key they read out of band: the provider's own, the one
+    its own credential reaches (§26.3). A project's host is another server, one Seamless creates in that project
+    (§27.5), whose keys no operator declared. While declared keys won over every pin, a provider that declared keys
+    made a project plan's pre-staging inject no key into the project's new host - the declared keys stood for it - and
+    each of the plan's runs was refused: the host presents its own key, not the provider's host's. A project's host
+    now uses its project's pin - the key its pre-staging injects when it creates the host, else its console's, by
+    decision 11's rules -, whatever the provider declares (`credentials.declared_keys`, §10); the provider's own host
+    keeps requiring and using its declared keys as before. A project's host found replaced is so refused until it is
+    deleted and a pre-staging creates and pins it again: declared keys are no way out for it.
+13. **A project's host is looked up by its name, in its project alone**, decided by the owner on 2026-10-29.
+    `conversion_host.address` is the provider's own host's address. TC5's lookup - by name, else by address (§7.2,
+    §10) - let a project side fall back to it, and an address is no project's: with a project credential that holds
+    `admin` it may lead to the provider's own host (§27.8), and in a project whose networks overlap the provider's it
+    may be another server's. A run would then read that server's console and pin it as the project's host, or the
+    check report the project's host replaced by it. A project's pre-staging creates its host under its name
+    (`conversion_host.name`, else its side's alias, §7.2), so that name, in the project, is what finds it
+    (`credentials.host_address` gives a project no address, §10). One whose name no server of the project bears is
+    not found: a run fails as for a lookup that fails - transient, a rollback's excepted, which logs it -, the plan's
+    pre-staging creates it, and the check reports it in the project's entry, as it reports a host found replaced; it
+    never resolves to the provider's own host.
 
 ### 26.11 Contract changes (each binding from its plan task)
 
@@ -8747,6 +8798,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
 | a pin per project credential (`ProjectCredential.conversion_host_pin`); the one rule that selects a step's pin (`credentials.host_pin`); the check's report of a project's replaced host; the project credential routes' rules for its pin (owner decision 11) | §4.2, §7.2, §10, §12 (binding) | after TC5 |
+| the declared keys and the address the provider's own host's alone (`credentials.declared_keys`, `credentials.host_address`); a project's host looked up by its name in its project alone: a run's failure and the check's report of one not found (owner decisions 12 and 13) | §7.2, §10 (binding) | after TC5 |
 
 ## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
