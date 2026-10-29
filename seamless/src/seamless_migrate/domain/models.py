@@ -218,6 +218,28 @@ class CephAccess(_Model):
         return client
 
 
+#: a Keystone project's id as a provider's project credentials key it: 1-64 letters, digits, "-"
+#: or "_" (SDD §4.2, §27.4)
+ProjectId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+
+def is_project_id(value: str) -> bool:
+    """Whether ``value`` is a project id a project credential takes (SDD §4.2, §12): the whole
+    value, a trailing newline too."""
+    return re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
+
+
+class ProjectCredential(_Model):
+    """A provider's application credential for one Keystone project (SDD §4.2, §27.4): written by
+    ``PUT /providers/{id}/projects/{project_id}/credentials``, its value in the secret store
+    alone."""
+
+    #: its secret's name, provider-{id}.project-<h> (§13.3), never a value
+    secret: str
+    #: when an admin wrote it
+    updated_at: UTCDateTime
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -254,6 +276,10 @@ class Provider(_Model):
     #: server-owned: its conversion host's pinned host keys, which the provider check writes
     #: (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it (§12)
     conversion_host_pin: HostKeyPin | None = None
+    #: server-owned: an application credential per Keystone project, by project id, which PUT and
+    #: DELETE …/projects/{project_id}/credentials write (SDD §4.2, §12, §27.4) - POST ignores it,
+    #: PATCH refuses it; a vmware provider takes none
+    project_credentials: dict[ProjectId, ProjectCredential] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _distribution_matches_kind(self) -> Provider:

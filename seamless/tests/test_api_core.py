@@ -317,6 +317,21 @@ ROUTES = [
             + "\n-----END OPENSSH PRIVATE KEY-----"
         },
     ),
+    # a provider's credential per Keystone project (SDD §12, §27.4, plan task TC2), project ids of
+    # 32 hex digits made up here: a body without the secret, which writes nothing for an admin
+    # either (422) - a failing matrix prints its body, and no secret may reach a failure message
+    (
+        "PUT",
+        "/api/v1/providers/src-osp/projects/5e1f0c2b9a7d4e3f8b6a1c0d2e4f6a8b/credentials",
+        Role.admin,
+        {"application_credential_id": "matrix-project-credential"},
+    ),
+    (
+        "DELETE",
+        "/api/v1/providers/src-osp/projects/0f1e2d3c4b5a69788796a5b4c3d2e1f0/credentials",
+        Role.admin,
+        None,
+    ),
     ("DELETE", "/api/v1/providers/nope-1", Role.admin, None),
     ("POST", "/api/v1/providers/src-osp/check", Role.operator, None),
     ("GET", "/api/v1/providers/src-osp/inventory", Role.viewer, None),

@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import fcntl
+import hashlib
 import os
 import re
 import shutil
@@ -284,3 +285,12 @@ def ceph_key_secret_name(provider_id: str) -> str:
     """The source cluster's Ceph key, written by ``PUT /providers/{id}/ceph-key`` (SDD §13.3,
     §28.4): a provider id never holds a ``.``, so the name is no other provider's own."""
     return f"provider-{provider_id}.ceph"
+
+
+def project_secret_name(provider_id: str, project_id: str) -> str:
+    """A project credential's secret, written by ``PUT /providers/{id}/projects/{project_id}/
+    credentials`` (SDD §13.3, §27.4): ``provider-{id}.project-<h>``, ``<h>`` the first 16 hex digits
+    of the project id's SHA-256 - lower case and at most 97 characters, so both stores hold it, and,
+    a provider id never holding a ``.``, no other provider's own."""
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:16]
+    return f"provider-{provider_id}.project-{digest}"

@@ -58,6 +58,22 @@ class ProviderCredentialsRequest(_Body):
         }
 
 
+class ProjectCredentialsRequest(_Body):
+    """A Keystone project's application credential (SDD §12 ``PUT /providers/{id}/projects/
+    {project_id}/credentials``, §27.4): its id and its secret alone - no password, which signs in to
+    every project of its user, and no ``auth_url``, which would send the secret elsewhere."""
+
+    application_credential_id: str = Field(max_length=256)
+    application_credential_secret: str = Field(max_length=_SECRET, repr=False)
+
+    def values(self) -> dict[str, str]:
+        """The keys to store: the id stripped, the secret as given, as the provider's own."""
+        return {
+            "application_credential_id": self.application_credential_id.strip(),
+            "application_credential_secret": self.application_credential_secret,
+        }
+
+
 class ConversionKeyRequest(_Body):
     private_key: str = Field(min_length=64, max_length=16384, repr=False)
 

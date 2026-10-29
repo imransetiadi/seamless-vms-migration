@@ -198,6 +198,45 @@ def openstack_cloud_entry(provider: Any, settings: Settings) -> dict[str, Any]:
     return load_cloud_auth(provider.cloud, settings)
 
 
+def openstack_project_cloud_entry(
+    provider: Any, project_id: str, settings: Settings
+) -> dict[str, Any]:
+    """The connection entry of ``provider``'s credential for the Keystone project ``project_id``,
+    in ``clouds.yaml`` shape (SDD §13.3, §27.4): the application credential its secret holds, which
+    signs in at the auth URL of the provider's own credential, else at the provider's endpoint. It
+    takes no ``auth_url`` of its own - no other key of its secret is read - so it is never sent to
+    another endpoint; the entry's other keys are the provider credential's (``_reach``)."""
+    credential = provider.project_credentials.get(project_id)
+    if credential is None:
+        raise SecretNotFound(f"{provider.id}: no credential for project {project_id}")
+    values = read_secret(credential.secret, settings)
+    missing = [key for key in _APP_CRED_AUTH if not values.get(key)]
+    if missing:
+        raise SecretNotFound(f"secret {credential.secret!r} is missing {', '.join(missing)}")
+    entry = _reach(provider, settings)
+    auth_url = entry.pop("auth_url", None) or provider.endpoint
+    entry["auth"] = {"auth_url": auth_url, **{key: values[key] for key in _APP_CRED_AUTH}}
+    entry["auth_type"] = "v3applicationcredential"
+    return entry
+
+
+def _reach(provider: Any, settings: Settings) -> dict[str, Any]:
+    """How the provider's own credential reaches its cloud, without who signs in (SDD §13.3): its
+    auth URL when it names one, and its secret's ``interface`` and ``region_name``, or every key of
+    its ``clouds.yaml`` entry but ``auth`` and ``auth_type``; nothing without a credential of its
+    own, whose project credentials then sign in at its endpoint."""
+    if provider.credentials_secret:
+        values = read_secret(provider.credentials_secret, settings)
+        return {k: values[k] for k in ("auth_url", "interface", "region_name") if values.get(k)}
+    if provider.cloud and settings.clouds_yaml is not None:
+        entry = load_cloud_auth(provider.cloud, settings)
+        reach = {k: v for k, v in entry.items() if k not in ("auth", "auth_type")}
+        if entry["auth"].get("auth_url"):
+            reach["auth_url"] = entry["auth"]["auth_url"]
+        return reach
+    return {}
+
+
 def write_secret_file(path: Path, content: str) -> Path:
     """Create ``path`` with mode 0600 (never wider, even briefly) and write ``content``."""
     path = Path(path)
