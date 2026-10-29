@@ -2424,12 +2424,14 @@ def _addresses_in(call) -> list[str]:
 
 
 async def test_a_projects_conversion_host_is_deployed_with_a_floating_ip_of_its_own_project(env):
-    """SDD §7.2, §27.6 (§26.10 decision 14, the owner's decision of 2026-10-30): the configured
-    address (conversion_host.address) is the floating IP of the provider's own host alone. The
-    pre-staging passes it to the deploy as the side's floating IP where the plan names no project,
-    as before, and never for a project's host: the role then takes a floating IP of that project,
-    as it does when no address is given (create_fip.yml), and no file of the deploy's run holds the
-    provider's address."""
+    """SDD §6.5, §7.2, §27.6 (§26.10 decision 14, the owner's decisions of 2026-10-30): the
+    configured address (conversion_host.address) is the floating IP of the provider's own host
+    alone. The pre-staging passes it to the deploy as the side's floating IP where the plan names
+    no project, as before, and never for a project's host, whose side gets
+    os_migrate_{side}_conversion_floating_ip_reuse false instead: the role then creates a new
+    floating IP of that project (create_fip.yml), never one the project holds detached, and no
+    file of the deploy's run holds the provider's address. A side without a project gets no such
+    variable: its host takes a floating IP as upstream's role does."""
     t = _addressed(_projects(env))
 
     async def deploy_of(plan):
@@ -2445,9 +2447,19 @@ async def test_a_projects_conversion_host_is_deployed_with_a_floating_ip_of_its_
             for side in _HOST_ADDRESSES
         }
 
+    def reuse(deploy):
+        """Each side's reuse the deploy passes, "unset" where it passes none: a null would read
+        as false through the role's | bool."""
+        return {
+            side: deploy["vars"].get(f"os_migrate_{side}_conversion_floating_ip_reuse", "unset")
+            for side in _HOST_ADDRESSES
+        }
+
     tenant = await deploy_of(make_plan(id="plan-00c0ffee", prestage_resources=[], **t.plan_kw))
     assert floating(tenant) == {"src": None, "dst": None}
     assert _addresses_in(tenant) == []
+    # each project's host takes a new floating IP, never one its project holds detached
+    assert reuse(tenant) == {"src": False, "dst": False}
     # each side's host is still deployed, in its project (SDD §27.5)
     assert tenant["vars"]["os_migrate_deploy_src_conversion_host"] is True
     assert tenant["vars"]["os_migrate_deploy_dst_conversion_host"] is True
@@ -2457,13 +2469,16 @@ async def test_a_projects_conversion_host_is_deployed_with_a_floating_ip_of_its_
     )
     assert floating(one) == {"src": "192.0.2.20", "dst": None}
     assert _addresses_in(one) == ["src"]
+    assert reuse(one) == {"src": "unset", "dst": False}
     # no project: each provider's own host at its configured address, as before
     plain = await deploy_of(make_plan(id="plan-00c0ffee", prestage_resources=[]))
     assert floating(plain) == _HOST_ADDRESSES
+    assert reuse(plain) == {"src": "unset", "dst": "unset"}
 
-    # what the deploy does without an address (SDD §7.2): the side's variable defaults to false,
-    # and create_fip.yml then takes a floating IP of the run's credential's project - reusing one
-    # it holds detached - with no address of its own
+    # what the deploy does with them (SDD §6.5): each side's address defaults to false and its
+    # reuse to true, upstream's; create_fip.yml's task without an address then passes the reuse
+    # as the floating_ip module's - false: a new floating IP of the run's credential's project,
+    # never one it holds detached
     root = find_repo_root()
     play = yaml.safe_load(
         (root / "playbooks" / "deploy_conversion_hosts.yml").read_text(encoding="utf-8")
@@ -2476,21 +2491,28 @@ async def test_a_projects_conversion_host_is_deployed_with_a_floating_ip_of_its_
         and "os_migrate_conversion_cloud" in task.get("vars", {})
     }
     assert {
-        side: v["os_migrate_conversion_floating_ip_address"] for side, v in deploys.items()
+        side: (
+            v["os_migrate_conversion_floating_ip_address"],
+            v["os_migrate_conversion_floating_ip_reuse"],
+        )
+        for side, v in deploys.items()
     } == {
-        side: f"{{{{ os_migrate_{side}_conversion_floating_ip_address | default(false) }}}}"
+        side: (
+            f"{{{{ os_migrate_{side}_conversion_floating_ip_address | default(false) }}}}",
+            f"{{{{ os_migrate_{side}_conversion_floating_ip_reuse | default(true) }}}}",
+        )
         for side in _HOST_ADDRESSES
     }
-    tasks = yaml.safe_load(
-        (root / "roles" / "conversion_host" / "tasks" / "create_fip.yml").read_text(
-            encoding="utf-8"
-        )
-    )
+    role = root / "roles" / "conversion_host"
+    defaults = yaml.safe_load((role / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    assert defaults["os_migrate_conversion_floating_ip_reuse"] is True
+    tasks = yaml.safe_load((role / "tasks" / "create_fip.yml").read_text(encoding="utf-8"))
     [auto] = [
         task for task in tasks if "not os_migrate_conversion_floating_ip_address" in task["when"]
     ]
     module = auto["os_migrate.os_migrate.floating_ip"]
-    assert "floating_ip_address" not in module and module["reuse"] is True
+    assert "floating_ip_address" not in module
+    assert module["reuse"] == "{{ os_migrate_conversion_floating_ip_reuse | bool }}"
 
 
 async def test_no_run_of_a_projects_side_carries_its_providers_conversion_host_address(env):

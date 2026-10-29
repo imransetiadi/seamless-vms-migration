@@ -725,6 +725,11 @@ def _common_openstack_vars(
         for key, value in optional.items():
             if value:
                 out[f"os_migrate_{side}_conversion_{key}"] = value
+        if project is not None:
+            # a project's host takes a new floating IP, never one the project holds detached - the
+            # tenant's own, or a keep-address reservation; a provider's own host keeps the role's
+            # default (SDD §6.5, §7.2; §26.10 decision 14, the owner's decisions of 2026-10-30)
+            out[f"os_migrate_{side}_conversion_floating_ip_reuse"] = False
     out["os_migrate_conversion_host_ssh_user"] = ssh_user
     return out
 
