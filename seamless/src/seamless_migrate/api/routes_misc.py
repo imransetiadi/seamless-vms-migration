@@ -234,11 +234,16 @@ async def similar_incidents(
 async def metrics(request: Request, _: Principal | None = Depends(metrics_access)) -> str:
     svc = services(request)
     migrations = await svc.all_documents("migration", Migration)
+    # SDD §18, §25.8: whether this replica leads - a server's leadership says so by §8's rule; the
+    # API on a store a test hands it holds no lease -, and the lease's epoch as this scrape reads it
+    leading = svc.leadership is not None and svc.leadership.leads()
     text = render_metrics(
         migrations,
         svc.orchestrator.step_stats,
         advisor_calls(svc.jev),
         svc.orchestrator.tick_stats,
         svc.notifier.counts if svc.notifier is not None else None,
+        leading=leading,
+        lease_epoch=await svc.db.lease_epoch(),
     )
     return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")
