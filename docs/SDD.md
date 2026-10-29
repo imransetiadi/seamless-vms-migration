@@ -593,7 +593,9 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
-`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. The `channel.*` events
+`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
+the source again); `migration.phase` to `failed` carries `source_stopped`, whether the downtime clock was open at the
+failure (§24.5, plan task NT4). The `channel.*` events
 carry the channel's `name` and `kind`; `channel.updated` the fields it set (`fields`), `secret` among them when the secret
 was written; `channel.deleted` a secret the store could not remove (`secret_left`). The `subscription.*` events carry the
 subscription's `id`, `channel`, `plan_id` (null for every plan) and `topics`. None of them carries a URL, a recipient or
@@ -2981,6 +2983,32 @@ mapped pool: a member of the pool (§10: `pool_members`) whose address is one of
 
 ---
 
+### 8.6 Notification messages (plan task NT4, §24.5)
+
+`seamless_migrate.notify.messages` holds §24.5 as pure functions, which the notifier of §24.6 (plan task NT5) calls
+and the tests call alone:
+
+* `triggers_for(event, plan, migration, migrations)` is the trigger table: the `NotifyTrigger`s (§4.1) an event of
+  §4.3 fires, in a list - most events fire one, `wave.started` and `plan.started` may fire `approval.wave` beside
+  their `progress.*`, and an event the table does not name fires none. `approval.cutover` and `approval.wave` follow
+  the Pending approvals rule of §16: the plan requires approval and no approval counts (`counted_approvals`, §5.4
+  rule 1); `approval.wave` counts the wave's single-shot migrations in `ready` (a plan without waves: the plan's) and
+  fires only for one or more.
+* `build_message(trigger, event, plan, migration, migrations, *, redact_names, public_url)` is the message: the
+  title and the lines of §24.5's table, the values (names cut at 200 characters, or ids when the channel redacts
+  names; times in ISO 8601 UTC; durations in minutes and seconds), and the ending - `Plan {plan} ({plan_id})`,
+  `migration {migration_id}` when it has one, and the link, built on `SEAMLESS_PUBLIC_URL` (§15.1) from ids alone,
+  none while the variable is unset. A message never holds an error's text, a reason, an address, a provider's name,
+  a comment or who acted: the functions read none of them.
+* `email_message(message, sender, recipients, key, domain)`, `slack_payload(message)` and `webhook_document(message)`
+  are the three formats of §24.5: the plain-text email with `Subject: [Seamless] {title}` (every control character
+  of a name a space), `Message-ID: <{key}@{domain}>` and `Auto-Submitted: auto-generated`; the Slack payload with
+  its header, section and context blocks, every value's `&`, `<` and `>` escaped and nothing unfurled; the Standard
+  Webhooks payload `{"type", "timestamp", "data"}` with the fields §24.5 lists.
+
+The orchestrator gives the messages their two facts (§4.3): `migration.downtime_ended` says its `cause`, and a
+`migration.phase` to `failed` whether the source was stopped (`source_stopped`).
+
 ## 9. Planning
 
 ### 9.1 Estimator (`planning/estimator.py`)
@@ -4632,6 +4660,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
+| `SEAMLESS_PUBLIC_URL` | unset | the address people reach the dashboard at (`https://seamless.example.com`): the link a notification carries, ids alone, never a token (§8.6, §24.5); unset, a message carries no link |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
 
 The numeric variables are bounded; a value outside its bounds refuses to start the control plane
@@ -6820,7 +6849,7 @@ The routes above, their roles and the `subscription.*` events are binding in §4
 * `progress.*` fires on `plan.started`, `plan.paused`, `plan.completed`, `plan.cancelled`, `plan.finalized`,
   `wave.started` and `wave.completed`, one trigger per kind.
 
-Two event data additions close the gap of §24.1 (plan task NT4):
+Two event data additions close the gap of §24.1 (plan task NT4; binding in §4.3 since it landed):
 * `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback
   started the source again);
 * `migration.phase` to `failed` carries `source_stopped`: whether the downtime clock was open at the failure.
@@ -6882,6 +6911,9 @@ Two event data additions close the gap of §24.1 (plan task NT4):
   * the plan's and the wave's id and name;
   * the migration's id, VM name, strategy and phase;
   * the downtime, the estimate and the SLO, in seconds.
+
+The topics, the triggers, the messages and the formats above are binding in §8.6 since plan task NT4, and
+`SEAMLESS_PUBLIC_URL` in §15.1.
 
 ### 24.6 Delivery
 
