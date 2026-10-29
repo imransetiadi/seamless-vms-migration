@@ -188,6 +188,9 @@ class Settings(BaseModel):
     max_step_retries: int = Field(default=2, ge=0)
     #: wall-clock ceiling of one step attempt in seconds; 0 = unbounded (SDD §15.1)
     step_timeout_s: float = Field(default=0.0, ge=0)
+    #: the orchestrator lease's length in seconds (SDD §11, §15.1, §25.3): at least 10, as the
+    #: renew deadline is two thirds of it and the retry period 2 s
+    leader_lease_s: float = Field(default=30.0, ge=10)
     #: failed bearer authentications per client address per minute before 429 (0 = off)
     auth_lockout_per_minute: int = Field(default=60, ge=0)
     jev_mode: JevMode = "off"
@@ -321,6 +324,7 @@ class Settings(BaseModel):
             "SOURCE_WATCH_S": ("source_watch_s", float),
             "MAX_STEP_RETRIES": ("max_step_retries", int),
             "STEP_TIMEOUT_S": ("step_timeout_s", float),
+            "LEADER_LEASE_S": ("leader_lease_s", float),
             "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),
             "JEV_TIMEOUT_S": ("jev_timeout_s", float),
             "JEV_MIN_CONFIDENCE": ("jev_min_confidence", float),
