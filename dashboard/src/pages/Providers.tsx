@@ -110,7 +110,8 @@ function CephAccessSummary({ provider }: { provider: Provider }) {
         </h4>
         <TechPreviewBadge feature="extents" />
       </div>
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+      {/* the provider card's own column split: a label never takes the room its value needs at 320 px or 200% text (SDD §16) */}
+      <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-x-3 gap-y-1 text-xs">
         <dt className="text-muted-foreground">Cluster</dt>
         <dd className="min-w-0 wrap-break-word">
           <code>{ceph.fsid}</code>
@@ -124,7 +125,7 @@ function CephAccessSummary({ provider }: { provider: Provider }) {
         <dt className="text-muted-foreground">Key</dt>
         <dd>
           {ceph.key_updated_at ? (
-            <span className="inline-flex items-center gap-1">
+            <span className="inline-flex max-w-full flex-wrap items-center gap-1">
               <KeyRound aria-hidden className="size-3.5 text-status-success" />
               Key stored{' '}
               <time dateTime={ceph.key_updated_at} title={formatDateTime(ceph.key_updated_at)}>

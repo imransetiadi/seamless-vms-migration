@@ -48,6 +48,26 @@ test('chart labels follow 200% root text size and stay keyboard-scrollable', asy
   }
 });
 
+test('the Ceph access summary gives each value at least its label\'s room at 320px with 200% text', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 900 });
+  await signIn(page);
+  await page.goto('/providers');
+  const ceph = page.getByRole('group', { name: 'Ceph access', exact: true });
+  await expect(ceph).toBeVisible();
+  await page.addStyleTag({ content: 'html { font-size: 200%; }' });
+  await page.evaluate(() => document.fonts.ready);
+  await expect.poll(() => page.locator('main h1').evaluate((el) => parseFloat(getComputedStyle(el).fontSize))).toBe(40);
+  const rows = await ceph.locator('dt').evaluateAll((labels) =>
+    labels.map((label) => ({
+      label: label.textContent,
+      labelWidth: label.getBoundingClientRect().width,
+      valueWidth: label.nextElementSibling!.getBoundingClientRect().width,
+    })),
+  );
+  expect(rows.map((row) => row.label)).toEqual(['Cluster', 'Monitors', 'User', 'Key']);
+  for (const row of rows) expect(row.valueWidth, row.label!).toBeGreaterThanOrEqual(row.labelWidth);
+});
+
 test('200% text keeps dashboard actions and status labels inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 900 });
   await signIn(page);
