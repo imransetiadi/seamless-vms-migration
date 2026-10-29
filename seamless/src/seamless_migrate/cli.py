@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import sys
-from collections.abc import Coroutine, Sequence
+from collections.abc import Coroutine, Iterator, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -236,8 +237,33 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
     configure_logging(settings)
     if settings.auth_disabled:
         log.warning("authentication is DISABLED (loopback only)")
-    run_server(build_app(settings), settings, args.reload)
+    with _server_lock(settings):
+        run_server(build_app(settings), settings, args.reload)
     return 0
+
+
+@contextlib.contextmanager
+def _server_lock(settings: Settings) -> Iterator[None]:
+    """One server per SQLite database (SDD §15, §25.3): an exclusive flock on
+    ``{database}.server.lock`` for the server's life, refused while another server holds it. SQLite
+    serves one host's processes, so it never has a second replica; on PostgreSQL the lease decides
+    (§11)."""
+    from sqlalchemy.engine import make_url
+
+    from .store import Store
+
+    if make_url(settings.db_url).get_backend_name() != "sqlite":
+        yield
+        return
+    store = Store(settings.db_url)
+    lock = store.cross_process_lock("server")
+    try:
+        if not lock.try_acquire():
+            raise CliError("another server runs against this database")
+        yield
+    finally:
+        lock.close()
+        store.dispose()
 
 
 def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
