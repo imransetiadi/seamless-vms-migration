@@ -385,11 +385,18 @@ known before the first connection, and `StrictHostKeyChecking=no` is gone from t
   host - the role passes an ed25519 pair the control plane made in memory as the server's user data, with
   `ssh_deletekeys: true`, and the public half is pinned once the role reports the server created -, read once from
   the Nova console log's `SSH HOST KEY KEYS` block for a host Seamless did not create and for 0.4.0's hosts, or
-  declared by the operator in the provider's `conversion_host.ssh_host_keys`. Declared keys win over a pin. No key
-  is ever learned from an SSH connection: no `accept-new`, no trust on first use, no scan, no DNS.
-* **The pin** is the provider's (`conversion_host_pin`: the Nova server's id, the keys, their source `injected` or
-  `console`, the time; SDD §26.4). It belongs to one server: a host that resolves to another server is refused as
-  replaced until the operator declares its keys, or deletes it and pre-stages it again.
+  declared by the operator in the provider's `conversion_host.ssh_host_keys` - for the provider's own host alone,
+  never a project's, a server Seamless creates in that project (SDD §26.10 decision 12). Declared keys win over the
+  provider's own pin. No key is ever learned from an SSH connection: no `accept-new`, no trust on first use, no
+  scan, no DNS.
+* **The pin** is the provider's for its own host (`conversion_host_pin`: the Nova server's id, the keys, their source
+  `injected` or `console`, the time; SDD §26.4) and a project credential's for the host a plan with that project
+  deploys in it (`ProjectCredential.conversion_host_pin`, SDD §26.10 decision 11): two tenants' hosts never share or
+  replace a pin. It belongs to one server: a host that resolves to another server is refused as replaced until the
+  operator declares its keys - the provider's own host alone - or deletes it and pre-stages it again, a project's
+  host's one way out. A project's host is looked up by its name in its project alone and takes a floating IP of its
+  own project, never the provider's `conversion_host.address` (SDD §26.10 decisions 13 and 14): it never resolves
+  to the provider's own host or another server at that address.
 * **Each run writes its own `known_hosts`** in its run directory, one hashed entry per key under the host's alias
   (`os_migrate_conv_src`, `os_migrate_conv_dst`; `conversion_host` for a VMware destination's host), and every hop
   runs with `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<the run's file>`, `GlobalKnownHostsFile=/dev/null`,
