@@ -208,6 +208,51 @@ def test_a_released_lease_is_taken_at_the_next_try(replicas):
     assert a.release(1) is False, "a released lease taken by another is not released again"
 
 
+def test_a_replica_takes_its_own_lapsed_lease_only_once_it_has_been_expired_for_the_pause(replicas):
+    """SDD §11, §25.3 (the owner's decision of 2026-10-29): a lease whose holder is the replica's
+    own - the term a deposition let lapse - it reads and takes as expired only once the database's
+    clock passed its expiry by the pause, three retry periods: every try that began before takes
+    nothing and locks nothing, the first one after takes it. Another replica's lapsed lease each
+    replica takes at its first try after the expiry, the deposed one too."""
+    a = lease_of(replicas[0], A, retry_s=0.1)
+    b = lease_of(replicas[1], B, retry_s=0.1)
+    pause = timedelta(seconds=3 * 0.1)
+    assert a.campaign() == 1
+    wait_expired(a)
+    lapsed = a.read()
+    tries: list[tuple[datetime, int | None, list[str]]] = []
+    sent: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        sent.append(statement)
+
+    sa.event.listen(replicas[0].engine, "before_cursor_execute", record)
+    try:
+        while not tries or tries[-1][1] is None:
+            assert len(tries) < 500, "it never took its lapsed lease again"
+            at, first = _database_clock(replicas[0]), len(sent)
+            tries.append((at, a.campaign(), sent[first:]))
+            time.sleep(0.02)
+    finally:
+        sa.event.remove(replicas[0].engine, "before_cursor_execute", record)
+    held_back = [at for at, _, _ in tries[:-1]]
+    assert held_back and held_back[0] >= lapsed.expires_at, "tries on its expired lease"
+    assert all(at < lapsed.expires_at + pause for at in held_back), "a try after the pause took it"
+    locks = re.compile(r"\bFOR UPDATE\b|\bBEGIN IMMEDIATE\b", re.IGNORECASE)
+    assert [s for _, _, statements in tries[:-1] for s in statements if locks.search(s)] == [], (
+        "a lease it waits for is never locked"
+    )
+    assert any(locks.search(s) for s in tries[-1][2]), "the take locks the row"
+    taken = a.read()
+    assert (taken.holder, taken.epoch) == ("seamless-a", 2)
+    assert taken.acquired_at - lapsed.expires_at >= pause, "not before the pause"
+
+    wait_expired(b)
+    assert b.campaign() == 3, "another replica's lapsed lease, at the first try"
+    wait_expired(a)
+    assert a.campaign() == 4, "the lease another replica took meanwhile, at the first try"
+
+
 def _database_clock(store: Store) -> datetime:
     """The database's own clock, read in SQL of this test's - not the lease module's."""
     with store.engine.connect() as conn:

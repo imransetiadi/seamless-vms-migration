@@ -3,9 +3,10 @@ plan task HA3).
 
 Two replicas run in one test process, each with a store, a bus and an orchestrator of its own, on
 one SQLite file and, with SEAMLESS_TEST_PG_URL, on PostgreSQL. Their leases last two seconds - the
-renew deadline 1.33 s, the last third the margin -, and expire by the database's clock, which no
-test fakes. A playbook here is a real process group: a shell in a session of its own with a
-`sleep` child. Replicas are seamless-a and seamless-b, their addresses in 192.0.2.0/24 (RFC 5737).
+renew deadline 1.33 s, the last third the margin -, a deposed replica's pause three tries of a tenth
+of a second, and they expire by the database's clock, which no test fakes. A playbook here is a real
+process group: a shell in a session of its own with a `sleep` child. Replicas are seamless-a to
+seamless-c, their addresses in 192.0.2.0/24 (RFC 5737).
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -76,6 +78,45 @@ def lease_now(store: Store) -> LeaseRow:
 def acquired(store: Store) -> list[dict[str, Any]]:
     """The data of every leader.acquired, in order."""
     return [e.data for e in store.events(limit=1000) if e.kind == "leader.acquired"]
+
+
+def expired_now(store: Store) -> bool:
+    """Whether the lease has expired by the database's clock, as an observer reads it now; False
+    while nobody took it."""
+    row = Lease(store.engine, "observer", "192.0.2.99:8080", 30.0).read()
+    return row is not None and row.expired
+
+
+def database_clock(store: Store) -> datetime:
+    """The database's own clock, read in SQL of this test's - not the lease module's."""
+    with store.engine.connect() as conn:
+        if conn.dialect.name == "postgresql":
+            return conn.execute(sa.text("SELECT clock_timestamp()")).scalar_one()
+        text = conn.execute(sa.text("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')")).scalar_one()
+    return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+async def stall_the_tick_loop(h: Harness, clock: Monotonic) -> Callable[[], None]:
+    """Hang the replica's next tick and move its orchestrator's clock 31 s on - no tick for
+    max(5 × tick_s, 30 s) -: its leader renews no more, and its renew deadline deposes it (SDD §8,
+    §12). The hung tick ends with the orchestrator's stop; the call returned gives the ticks after
+    their own work back."""
+    await until(lambda: h.orch.health()["ticks"] > 0, 5, "a tick")
+    tick, hung = h.orch.tick, asyncio.Event()
+
+    async def hanging_tick() -> None:
+        hung.set()
+        await asyncio.Event().wait()
+
+    h.orch.tick = hanging_tick
+    await until(hung.is_set, 5, "the hung tick")
+    clock.advance(31)
+    assert not h.orch.health()["healthy"]
+
+    def unstall() -> None:
+        h.orch.tick = tick
+
+    return unstall
 
 
 class CutOff:
@@ -489,13 +530,158 @@ async def test_a_stopping_leader_releases_its_lease_once_its_steps_ended(
     assert acquired(any_store)[-1]["cause"] == "released"
 
 
+async def test_a_deposed_replica_lets_a_healthy_follower_take_the_lease_first(
+    cluster, any_store, monkeypatch
+):
+    """SDD §8, §11, §25.3 (the owner's decision of 2026-10-29): a replica deposed by its renew
+    deadline - its tick loop stalled - takes its own lapsed lease only once it has been expired for
+    the pause, three retry periods by the database's clock, so a healthy follower takes it first,
+    as `expired`. The follower's first try after the expiry here comes just after the deposed
+    replica's, whose tries run in step with its last renewal: the phase in which, before the pause,
+    the deposed replica took its lease again. That try takes nothing, and past its pause the deposed
+    replica follows the new leader."""
+    clock = Monotonic()
+    a_h, a = cluster("seamless-a", harness={"monotonic": clock})
+    _, b = cluster("seamless-b")
+    await a.start()
+    await b.start()
+    assert (a.epoch, b.epoch) == (1, None)
+    tried = threading.Event()  # the deposed replica tried the lease once it expired
+    after_expiry: list[int | None] = []
+    deposed_campaign, follower_campaign = a.elector.lease.campaign, b.elector.lease.campaign
+
+    def deposed_tries(**kw: Any) -> int | None:
+        expired = expired_now(any_store)
+        epoch = deposed_campaign(**kw)
+        if expired or epoch is not None:
+            after_expiry.append(epoch)
+            tried.set()
+        return epoch
+
+    def follower_tries(**kw: Any) -> int | None:
+        if a.last_deposition is not None:  # its first try after the expiry: just after A's
+            tried.wait(10)
+        return follower_campaign(**kw)
+
+    monkeypatch.setattr(a.elector.lease, "campaign", deposed_tries)
+    monkeypatch.setattr(b.elector.lease, "campaign", follower_tries)
+    await stall_the_tick_loop(a_h, clock)
+    await until(lambda: a.last_deposition is not None, 10, "the deposition")
+    assert "renew deadline" in a.last_deposition.reason
+    await until(lambda: lease_now(any_store).epoch == 2, 10, "a takeover of the lapsed lease")
+    row = lease_now(any_store)
+    assert (row.holder, row.epoch) == ("seamless-b", 2), "the deposed replica took its lease again"
+    assert after_expiry and set(after_expiry) == {None}, "its tries after the expiry took nothing"
+    taken = acquired(any_store)[-1]
+    assert (taken["holder"], taken["cause"], taken["previous_holder"]) == (
+        "seamless-b",
+        "expired",
+        "seamless-a",
+    )
+    await asyncio.sleep(SHORT_RETRY_S * 6)  # past its pause, it tries the new leader's lease
+    assert a.epoch is None and lease_now(any_store).holder == "seamless-b"
+
+
+async def test_a_lone_deposed_replica_takes_its_lease_again_after_the_pause(
+    cluster, any_store, monkeypatch
+):
+    """SDD §8, §11, §25.5 (the owner's decision of 2026-10-29): a deposed replica no follower
+    relieves - its tick loop stalled, then well again - campaigns through its pause, each try
+    taking nothing while its lapsed lease has been expired for less than three retry periods by the
+    database's clock, and takes it again at its first try after: it leads again, as `expired` after
+    itself, and its orchestrator ticks again."""
+    clock = Monotonic()
+    h, a = cluster("seamless-a", harness={"monotonic": clock})
+    await a.start()
+    tries: list[tuple[datetime, int | None]] = []
+    campaign = a.elector.lease.campaign
+
+    def noted(**kw: Any) -> int | None:
+        at = database_clock(any_store)  # before the try's own reads of the database's clock
+        epoch = campaign(**kw)
+        tries.append((at, epoch))
+        return epoch
+
+    monkeypatch.setattr(a.elector.lease, "campaign", noted)
+    unstall = await stall_the_tick_loop(h, clock)
+    await until(lambda: a.last_deposition is not None, 10, "the deposition")
+    unstall()
+    lapsed = lease_now(any_store)
+    assert (lapsed.holder, lapsed.epoch) == ("seamless-a", 1)
+    await until(lambda: a.epoch == 2, 10, "its second term")
+    taken = lease_now(any_store)
+    pause = timedelta(seconds=3 * SHORT_RETRY_S)
+    assert (taken.holder, taken.epoch) == ("seamless-a", 2)
+    assert taken.acquired_at - lapsed.expires_at >= pause, "not before the pause"
+    held_back = [at for at, epoch in tries if epoch is None]
+    assert any(at >= lapsed.expires_at for at in held_back), "it tried its expired lease"
+    assert all(at < lapsed.expires_at + pause for at in held_back), "a try after the pause took it"
+    assert tries[-1][1] == 2
+    assert acquired(any_store)[-1] == {
+        "holder": "seamless-a",
+        "epoch": 2,
+        "previous_holder": "seamless-a",
+        "previous_epoch": 1,
+        "cause": "expired",
+        "resumes": 0,
+    }
+    await until(lambda: h.orch.health()["ticks"] > 0, 10, "its orchestrator's ticks")
+    assert h.orch.health()["healthy"]
+
+
+async def test_a_replica_that_released_its_lease_or_never_led_keeps_todays_timing(
+    cluster, any_store, monkeypatch
+):
+    """SDD §8, §11, §25.3 (the owner's decision of 2026-10-29): only a deposition pauses a replica,
+    and only before its own lapsed lease. The first campaign at the start takes the lease nobody
+    holds at once; the lease an orderly stop released, the follower takes at its next try; and the
+    lease that lapsed under its leader cut off from the database, a replica that never led takes at
+    its first try after the expiry - no try of theirs that began with the lease expired takes
+    nothing."""
+    _, a = cluster("seamless-a")
+    _, b = cluster("seamless-b")
+    _, c = cluster("seamless-c")
+    await a.start()
+    assert a.epoch == 1, "its first try at the start took the lease"
+    held_back: list[str] = []
+
+    def at_once(leadership: Any) -> None:
+        campaign = leadership.elector.lease.campaign
+
+        def tries(**kw: Any) -> int | None:
+            expired = expired_now(any_store)
+            epoch = campaign(**kw)
+            if expired and epoch is None:
+                held_back.append(leadership.holder)
+            return epoch
+
+        monkeypatch.setattr(leadership.elector.lease, "campaign", tries)
+
+    at_once(b)
+    await b.start()
+    await a.stop()  # it releases its lease
+    await until(lambda: b.epoch == 2, 5, "the takeover of the released lease")
+    at_once(c)
+    await c.start()
+    assert c.epoch is None
+    cut_off(b, monkeypatch)
+    await until(lambda: b.last_deposition is not None, 10, "the deposition")
+    await until(lambda: c.epoch == 3, 10, "the takeover of the lapsed lease")
+    assert held_back == []
+    assert [(d["holder"], d["epoch"], d["cause"]) for d in acquired(any_store)] == [
+        ("seamless-a", 1, "first"),
+        ("seamless-b", 2, "released"),
+        ("seamless-c", 3, "expired"),
+    ]
+
+
 async def test_a_deposed_replica_campaigns_again_and_can_lead_again(
     cluster, any_store, monkeypatch
 ):
     """SDD §8, §25.3: a deposed replica follows. Once its orchestrator's stop ended it campaigns
-    again, and once its old lease expired it takes the next epoch - recorded as `expired`, itself
-    the previous holder -, starts its orchestrator again as a new process would and reopens its
-    book of process groups."""
+    again, and once its old lease has been expired for its pause it takes the next epoch - recorded
+    as `expired`, itself the previous holder -, starts its orchestrator again as a new process would
+    and reopens its book of process groups."""
     h, a = cluster("seamless-a")
     order: list[str] = []
     start, stop = h.orch.start, h.orch.stop
