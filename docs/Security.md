@@ -6,7 +6,7 @@
 | Version | 0.1.0 |
 | Status | Security design and threat model companion to the SDD (the SDD stays binding for interfaces) |
 | Date | 2026-10-08 |
-| Related | [SDD.md](SDD.md) §6.6, §7, §13, §14, §17 · [PRD.md](PRD.md) NFR-06, NFR-07 · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) §10, §11 · [Performance.md](Performance.md) |
+| Related | [SDD.md](SDD.md) §6.6, §7, §13, §14, §17, §24 · [PRD.md](PRD.md) NFR-06, NFR-07 · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) §10, §11 · [Performance.md](Performance.md) |
 
 How to read the status tags: **Impl** — specified by the SDD or the plan and covered by a named test;
 **Cfg** — delivered as a deployment setting or operating procedure; **Rec** — a recommendation that is *not*
@@ -46,6 +46,8 @@ can print anything to its console and can name its VM anything).
 | `POSTGRES_PASSWORD`, `JEV_MCP_AUTH_TOKEN`, `TYPESAFE_API_KEY`, `AGENTMEMORY_SECRET` | **Secret** | `deploy/compose/.env` (0600, git-ignored) or OpenShift Secrets | Environment/Secret only; never committed (§7, §10) |
 | A webhook hook's bearer token and an RFC 2136 DNS target's TSIG key (0.4.0, SDD §23) | **Secret** | The secret store, under the name the hook or the target gives (`SEAMLESS_SECRET_STORE`: files 0600 in a 0700 directory, or the namespace's Secrets; SDD §13.3) | Never in the database, the API, events or logs; read each time it is used; never a provider's secret (§7.1, C2-11, C2-13) |
 | The hook catalog - each hook's playbook path or webhook URL (SDD §23.3) | **Integrity-critical**: a hook runs code with the control plane's reach | PostgreSQL `documents`, kind `hook` | Admin-only writes, each a `hook.*` event with its actor; hook playbooks on a reviewed, read-only mount (C2-09) |
+| Notification channel secrets (0.5.0, SDD §24.3): a Slack incoming webhook's URL - the credential itself: whoever holds it posts into the Slack channel -, a webhook channel's Standard Webhooks signing key, and the SMTP relay's `username` and `password` | **Secret** | The secret store: `notify-{name}`, key `url` or `signing_key` (files 0600 in a 0700 directory, or the namespace's Secret `seamless-notify-{name}`); the relay's under the name `SEAMLESS_SMTP_SECRET` gives (SDD §13.3) | A channel's secret is named after the channel, never by the admin, and written through a write-only admin route; never in the database, an API answer, an event, a log line or a reason; read at each try, so a rotation needs no restart; a Slack URL `redact()`ed wherever it stands; the signing key never travels, only the signature (C2-16, C2-18, §7.1) |
+| Notification recipients (0.5.0, SDD §24.3, §24.8) | **Personal data** (Confidential) | PostgreSQL `documents`, kind `notification_channel` (`recipients`); the relay's and the recipients' mail systems once a message went | Shown in full to an admin alone - every other role reads their number -; no event, log line or message body names one; an erasure request reaches them ([MEMORY.md](MEMORY.md) §3.5) |
 | SSH keys: conversion keypair, dst→src link keypair | **Secret** | the conversion key, one per installation: `{data_dir}/conversion/` (dir 0700, key 0600; issue #112); the link key, one per plan, and the conversion keys earlier versions made per plan: `{data_dir}/plans/{plan_id}/osm/conversion/` (dir 0700, key 0600) (SDD §7.2) | Kept: nothing deletes them, and a re-keyed conversion host keeps the earlier key authorized (D8). One conversion key reaches every managed conversion host, as every plan's key already sat in the same data directory |
 | Disk contents in transit and on conversion hosts | **Confidential** (customer data, may include secrets) | SSH channel, NBD on loopback, attached volumes | Encrypted in transit; loopback-only NBD; temporary volumes deleted |
 | VM inventory, plans, advisor notes, events (names, addresses, sizes, actors) | **Confidential** | PostgreSQL `documents`, `events`; dashboard | RBAC, TLS, DB isolation, backup encryption |
@@ -85,12 +87,14 @@ can print anything to its console and can name its VM anything).
 | TB1 operator → API | commands, plan data, tokens | TLS at the Route; `Authorization: Bearer` header only (never in URLs; the dashboard streams with `fetch`, not `EventSource`, SDD §12) |
 | TB2 control plane → clouds, vCenter | credentials, inventory, volume/server operations | TLS with verification on by default (`verify_tls=true`, `ca_cert_path`); Keystone application credentials recommended |
 | TB2 control plane → webhook endpoints and DNS servers (0.4.0, SDD §23) | a hook's context document - ids, labels, addresses, floating IPs, never a credential - with its bearer token; DNS reads and compare-and-swap updates | a webhook: an `https://` URL without user information, TLS verified, no redirect followed; Designate with the destination provider's credential, as TB2; RFC 2136 over TCP, each message TSIG-signed (SDD §8.4) |
+| TB2 control plane → the SMTP relay, Slack and webhook receivers (0.5.0, SDD §24) | the messages of SDD §24.5 - VM, plan and wave names (ids on a channel that redacts them), ids, phases, times, the downtime - as §8.1 lists them; the relay's credential; a webhook's signature | SMTP over STARTTLS (587) or implicit TLS (465), never plain text, the relay's certificate verified (the system's CAs or `SEAMLESS_SMTP_CA_FILE`), AUTH after TLS alone; HTTPS with the certificate verified and no redirect followed; a Slack URL is the request's address and nothing else; the signing key never travels (§8, C2-16, C2-18) |
 | TB3 control plane → conversion hosts | Ansible over SSH | key auth, `BatchMode=yes`; host-key policy in §6.3 |
 | TB4 src ↔ dst conversion hosts | disk blocks | SSH encryption; NBD exports bound to loopback and read-only; blocksync manifest digest compared end-to-end (SDD §6.2) |
 | TB5 control plane → PostgreSQL | documents, events | NetworkPolicy / internal Compose network; a password (scram-sha-256) on every `pg_hba` line (§9.4); TLS recommended (§8) |
 | TB6 control plane → Jev | redacted summaries; screened console excerpts only where the console may leave (`SEAMLESS_JEV_DEPLOYMENT=on_prem`, or `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE=true`; by default it never leaves the installation, SDD §13.4) | env whitelist for the stdio child; bearer on the HTTP sidecar; TLS to the provider; circuit breaker (§10) |
 | TB7 control plane → agentmemory | redacted lessons | redaction; 5 s timeout; failures swallowed ([MEMORY.md](MEMORY.md)) |
 | TB8 untrusted content → AI | console excerpts, names, tags | `jev_screen`; bounded outputs; deterministic fallback (§10) |
+| TB8 untrusted names → notification messages (0.5.0) | the VM, plan and wave names a tenant or an operator chose | escaped for Slack (`&`, `<`, `>`), every control character a space in an email's subject, JSON strings for a webhook: nothing interprets them, and no message carries an error's text or a person's words (C2-14, C2-15, SDD §24.8) |
 
 ---
 
@@ -133,6 +137,12 @@ QASuite case that exercises the control.
 | C2-11 | Spoofing | A webhook's call goes to another host, or its token travels in clear | `https://` URLs alone, without user information (422 otherwise); TLS verified; no redirect followed; the bearer token is the secret's `token`, read at each run, and a hook's secret is never a provider's (SDD §13.3) | Impl | L | `test_a_webhook_hook_needs_https`, `test_a_webhook_hook_posts_the_context_with_its_bearer_secret` |
 | C2-12 | Denial of service | A hook that hangs holds the downtime, or runs twice after a restart | A timeout per hook (300 s by default, 1-1800 s), past which a playbook's process group is stopped; a `post_create` hook's timeout counts in the downtime estimate (SDD §9.1); the idempotency key - the migration, the attempt, the point - is the same when a resumed step runs a hook again | Impl | L | `test_a_hook_that_exceeds_its_timeout_fails`, `test_hooks_inside_the_downtime_add_their_timeouts`, `test_a_rerun_hook_gets_the_same_idempotency_key` |
 | C2-13 | Tampering | The network cut-over changes what is not its own: a DNS record another writer changed, an address left on two ports, a load balancer's TLS keys | The DNS swap is a compare-and-swap - a record that holds another address is left as it is -, and an RFC 2136 update is TSIG-signed with a key from the secret store, never logged; the floating IP move is journaled and returns the address to the source before a rollback starts it; the member helper never reads a TLS container (SDD §8.3-§8.5) | Impl | L | `test_a_swap_that_finds_another_address_changes_nothing`, `test_an_rfc2136_swap_is_a_compare_and_swap`, `test_no_tsig_key_reaches_a_log_line`, `test_a_rollback_gives_the_address_back_to_the_source_before_it_starts`, `test_tls_containers_are_mapped_never_read` |
+| C2-14 | Tampering | Header injection (0.5.0, SDD §24): a VM, plan or wave name - text a tenant or an operator chose (TB8) - carrying a CR, an LF or another control character adds a header to an email (a `Bcc` that copies it elsewhere) or ends its headers early; Python's `email` package before 3.11.10 and 3.12.5 did not quote a newline in a header it wrote (CVE-2024-6923) | `Subject: [Seamless] {title}` with every control character of a name replaced by a space, whatever Python runs; `From` is `SEAMLESS_SMTP_FROM` and `To` the channel's recipients, each an addr-spec in its dot-atom form of at most 254 characters, checked whenever the channel is written; `Message-ID` is the message's key (`<channel>_<seq>`) at the sender's domain; plain text in UTF-8, no HTML (SDD §8.6, §24.5) | Impl | L | `test_an_email_subject_holds_no_control_character`, `test_an_email_channel_needs_recipients_and_takes_no_url`, `test_the_message_id_is_the_key_and_auto_submitted_is_set` |
+| C2-15 | Tampering / Spoofing | mrkdwn injection: a name holding `<!channel>`, `<!here>` or `<https://…\|text>` notifies everyone in a Slack channel or shows a forged link inside a message that bears the installation's name; a link Slack unfurls makes Slack fetch the page a name points to | Every value's `&`, `<` and `>` escaped (`&amp;`, `&lt;`, `&gt;`) in the text and every block, so Slack shows them as text; `unfurl_links` and `unfurl_media` false; the one link is the dashboard's, built from ids on `SEAMLESS_PUBLIC_URL`; a webhook gets the names as JSON strings and an email as plain text (SDD §24.5) | Impl | L | `test_slack_values_are_escaped_so_no_name_mentions_a_channel`, `test_slack_gets_text_and_blocks_and_nothing_unfurls`, `test_a_link_carries_ids_alone_and_none_without_a_public_url`, `test_the_webhook_document_is_the_standard_webhooks_payload` |
+| C2-16 | Info disclosure / Spoofing | A leaked webhook URL: a Slack incoming webhook's URL is its credential - whoever holds it posts into the Slack channel as the installation -, and a webhook channel's URL may carry a receiver's token | The Slack URL lives in the channel's secret alone (`notify-{name}`, key `url`), written through `PUT /notifications/channels/{name}/secret` (admin, write-only) and checked to begin with `https://hooks.slack.com/services/`; never in the database, an API answer, an event, a log line or a reason - `redact()` removes the path of such a URL wherever it stands (SDD §13.4), the sender's reasons are a status, one word of Slack's or an error's class, and httpx's request log line is dropped; the secret's name is the channel's, never the admin's choice, and a provider's, a hook's or a DNS target's secret that folds to `notify-` is refused, so no channel reads or replaces another secret (SDD §13.3); a webhook's URL is shown in full to an admin alone and named by no event; Slack revokes a URL it finds published, and the channel's messages then fail at once (`no_service`); rotation and a leak: docs/Operations.md §7.4, playbook I (§13.2) | Impl + Cfg | L | `test_a_channels_secret_is_write_only_and_named_after_it`, `test_a_slack_secret_must_be_a_slack_incoming_webhook_url`, `test_the_slack_url_reaches_no_event_no_log_line_and_no_answer`, `test_a_slack_incoming_webhook_url_is_redacted`, `test_recipients_and_webhook_urls_are_shown_in_full_to_an_admin_alone`, `test_the_catalogs_events_carry_no_url_recipient_or_secret`, `test_a_notify_secret_name_is_refused_for_a_provider_a_hook_and_a_dns_target`, `test_a_revoked_slack_webhook_fails_without_a_retry` |
+| C2-17 | Denial of service | A flood: a wave's cutovers or a burst of events become a stream of messages that Slack throttles (429), that fills mailboxes, or that piles up behind a slow channel; a channel that never answers holds a migration back | One message a second per channel, Slack's limit for a webhook, kept for every kind; at most 5 tries over about 5 minutes, a `Retry-After` honoured up to 300 s; a message whose event is an hour old when its turn comes is not sent, and a run of them is one `notification.failed` (`expired`); `approval`, `downtime` and `problem` by default, `outcome` and `progress` on request, one message per event; `notification.*`, `channel.*` and `subscription.*` are never notified, so no message makes another; a channel holds back its own messages alone, never another channel's or a step: no step, gate, transition or route waits for the notifier, an HTTP request has 15 s and an SMTP session 30 s, in two threads of the notifier's own (SDD §8.7, §24.6) | Impl | L | `test_a_channel_sends_at_most_one_message_a_second`, `test_a_slack_429_waits_its_retry_after`, `test_a_temporary_failure_is_retried_with_backoff_and_retry_after`, `test_a_message_whose_event_is_an_hour_old_expires`, `test_a_run_of_expired_messages_is_one_event`, `test_notification_events_are_never_notified`, `test_a_failing_channel_holds_back_no_other_channel`, `test_a_channel_that_never_answers_delays_no_migration` |
+| C2-18 | Spoofing / Tampering | A forged or replayed webhook: someone who learns a receiver's URL posts a document of their own ("web-01 migrated"), or sends a captured request again | Each request is signed as Standard Webhooks specify: `webhook-signature` is `v1,` and the base64 HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<body>` with the channel's signing key, which never leaves the control plane; each try takes a new timestamp and signature under the same `webhook-id`; HTTPS with the certificate verified, no redirect followed (SDD §8.7, §13.3). **The receiver must verify** - the signature in constant time, the timestamp's age and the ids it saw (docs/Operations.md §7.4) - or it believes whoever reaches it | Impl + **Cfg** | L; M for a receiver that does not verify | `test_a_webhook_is_signed_as_standard_webhooks_specify`, `test_each_try_is_signed_anew_with_the_same_webhook_id`, `test_the_signing_key_never_leaves_the_control_plane`, `test_a_webhook_redirect_is_not_followed` |
+| C2-19 | Info disclosure | The installation's data reaches a third party or the wrong audience: Slack's service outside the organization, a receiver, the relay and the recipients' mail systems; a man in the middle who strips STARTTLS or poses as the relay; the recipients, personal data, exposed | Only an admin keeps the catalog, each change a `channel.*` event with its actor, and an operator subscribes a channel of it to a plan (§5.2); a message's content is fixed (§8.1) - names, ids, phases, times and the downtime, never a credential, an address, a hostname, a provider, an error's text, a comment or who acted, and a link of ids alone -, and `redact_names` sends ids instead of names; SMTP never in plain text - a relay that offers no STARTTLS gets nothing but EHLO -, its certificate verified, AUTH after TLS alone; recipients shown to an admin alone and named by no event; nothing of a notification reaches Jev or agentmemory (§10.4) | Impl + Cfg | M (names leave unless the channel redacts them) | `test_no_message_carries_an_error_an_address_a_comment_or_an_actor`, `test_a_channel_that_redacts_names_sends_ids`, `test_only_an_admin_changes_the_channel_catalog`, `test_only_an_admin_subscribes_a_channel_to_every_plan`, `test_a_relay_without_starttls_gets_nothing_in_clear_text`, `test_a_relay_whose_certificate_fails_verification_gets_nothing`, `test_email_goes_over_starttls_and_authenticates_after_it` |
 
 ### 4.3 Conversion hosts and the data path (C3)
 
@@ -271,6 +281,7 @@ The main routes by role; SDD §12 lists every route with its minimum role (`test
 | `GET /users`, `POST /users` | admin | — | — | — | ✓ |
 | `GET /me`, `GET /providers`, `GET /providers/{id}`, `GET /providers/{id}/inventory` | viewer | ✓ | ✓ | ✓ | ✓ |
 | `GET /hooks`, `GET /hooks/{name}` | viewer | ✓ | ✓ | ✓ | ✓ |
+| `GET /notifications/channels`, `GET /notifications/channels/{name}`, `GET /notifications/subscriptions` (recipients and a webhook's URL in full for an admin alone, SDD §24.3) | viewer | ✓ | ✓ | ✓ | ✓ |
 | `GET /plans`, `/plans/{id}`, `/migrations`, `/migrations/{id}`, `/events`, `/events/stream`, `/stats`, `/advisor/status` | viewer | ✓ | ✓ | ✓ | ✓ |
 | `GET /metrics` | viewer (public when `SEAMLESS_METRICS_PUBLIC`) | ✓ | ✓ | ✓ | ✓ |
 | `POST /providers/{id}/check` | operator | ✗ | ✓ | ✓ | ✓ |
@@ -278,9 +289,11 @@ The main routes by role; SDD §12 lists every route with its minimum role (`test
 | `POST /plans` or `PATCH /plans/{id}` **that sets** `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` | approver | ✗ | ✗ | ✓ | ✓ |
 | `POST /migrations/{id}/sync`, `…/rollback`, `…/retry`, `…/cancel`; `PUT /migrations/{id}/strategy` | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /advisor/similar-incidents` | operator | ✗ | ✓ | ✓ | ✓ |
+| `POST /notifications/subscriptions` to a plan, `DELETE /notifications/subscriptions/{id}` of a plan's (SDD §24.4) | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /migrations/{id}/approve`, `…/cutover`, `…/finalize` | approver | ✗ | ✗ | ✓ | ✓ |
 | `POST /providers`, `PATCH /providers/{id}`, `PUT /providers/{id}/credentials`, `PUT /providers/{id}/conversion-key`, `DELETE /providers/{id}` | admin | ✗ | ✗ | ✗ | ✓ |
 | `POST /hooks`, `PATCH /hooks/{name}`, `DELETE /hooks/{name}` (code the control plane runs, C2-09) | admin | ✗ | ✗ | ✗ | ✓ |
+| `POST /notifications/channels`, `PATCH /notifications/channels/{name}`, `DELETE /notifications/channels/{name}`, `PUT …/secret`, `POST …/test`; a subscription to every plan and its removal (a channel decides where the installation's data goes, C2-19) | admin | ✗ | ✗ | ✗ | ✓ |
 
 Design intent: operators can run and *undo* (rollback, cancel) but cannot authorize the risky forward steps
 (cutover, finalize) nor change the policy that gates them (approval required, automatic cutover, change window: SDD §12); only admins can define the endpoints the control plane connects to (the SSRF surface,
@@ -291,8 +304,10 @@ default, `require_distinct_approver`, SDD §5.4) refuses a cutover's requester a
 ### 5.3 Audit
 
 Every mutating call emits a persisted event (`plan.*`, `migration.*`, `provider.*`, `user.created`, `advisor.*`, `policy.*`,
-`decision.*`, `memory.lesson_saved`, `auth.denied`, `events.pruned` — a CLI prune records who cut the trail and where, SDD §15; SDD §4.3) with `ts`, `actor`, `message` and structured `data`; ephemeral
-progress/log/heartbeat events are never stored. Forward `SEAMLESS_LOG_JSON=true` logs to your platform
+`decision.*`, `memory.lesson_saved`, `channel.*`, `subscription.*`, `auth.denied`, `events.pruned` — a CLI prune records who cut the trail and where, SDD §15; SDD §4.3) with `ts`, `actor`, `message` and structured `data`; ephemeral
+progress/log/heartbeat events are never stored. Each notification message is recorded once, as `notification.sent` or
+`notification.failed` with its channel, trigger, key, tries and reason - never the URL, a recipient, the body or the
+answer (SDD §24.7) -, so whether an approver was told is on the trail. Forward `SEAMLESS_LOG_JSON=true` logs to your platform
 logging, and export `events` to a SIEM by polling `GET /api/v1/events?since=<seq>&limit=1000` or by
 database-side export. On PostgreSQL an event appended by another process (the `seamless` CLI while
 the server runs) can commit after a higher sequence number from the server; poll with an overlap
@@ -470,6 +485,9 @@ readers could impersonate the host anyway; the attacker of C3-01, on the data ne
 | A webhook hook's bearer token (0.4.0) | the webhook's owner; an admin stores it as the hook's secret, key `token` (SDD §13.3) | the secret store, by the name the hook gives - never a provider's secret | when the webhook's owner rotates it: replace the secret's `token`; each run reads it anew |
 | An RFC 2136 DNS target's TSIG key (0.4.0) | the DNS server's administrator (BIND's `tsig-keygen`, for one) | the secret store, keys `name`, `secret` and `algorithm` (SDD §13.3) | per the DNS server's policy: add the new key there, replace the secret, remove the old key; let the key update the plan's records alone |
 | The source provider's Ceph key (0.5.0, SDD §28.4) | the Ceph administrator: `ceph auth get-or-create client.<client>` with the metadata-only caps of docs/Operations.md §7.3; an admin writes it with `PUT /providers/{id}/ceph-key` (write-only) | the secret store, `provider-{id}.ceph`, key `key` (SDD §13.3); `Provider.ceph.key_updated_at` says when; never read back | on suspicion, staff change or a conversion host's address change: `ceph auth caps` or a new user at the cluster, then `PUT …/ceph-key` again (each run reads it anew); `ceph: null` on the provider, or its deletion, deletes the secret - delete the Ceph user then |
+| A Slack channel's incoming webhook URL (0.5.0, SDD §24.3) | a Slack workspace's admin: a Slack app's incoming webhook, which posts into one Slack channel; an admin of Seamless writes it with the Notifications page's Set secret or `PUT /notifications/channels/{name}/secret` (write-only) | the secret store, `notify-{name}`, key `url` (SDD §13.3); never read back | on suspicion, on staff change, or once Slack revoked it (it revokes a URL it finds published): a new webhook in Slack, the secret set again - each try reads it -, the old webhook removed in Slack (docs/Operations.md §7.4) |
+| A webhook channel's signing key (0.5.0) | the admin: the Set secret dialog's Generate key, or `whsec_` and the base64 of 24 to 64 random bytes (docs/Operations.md §7.4); the receiver holds the same key | the secret store, `notify-{name}`, key `signing_key`; the receiver's own store | on suspicion or the receiver's change: the receiver accepts the old and the new key, the secret set again, the old key dropped at the receiver a minute later |
+| The SMTP relay's credential (0.5.0, `SEAMLESS_SMTP_SECRET`) | the relay's administrator | the secret `SEAMLESS_SMTP_SECRET` names, keys `username` and `password`, read at each message (SDD §13.3): 0600 files in the `seamless-secrets` volume, or the Secret `seamless-<name>` labelled `seamless.io/provider-secret: "true"` | per the relay's policy: a new password or relay user, the secret written again, the old one retired - a message the relay refuses meanwhile fails for good (a 5yz reply) |
 | TLS private keys (Route certificate) | PKI | OpenShift Secret / external certificate | per PKI policy; never in git |
 
 ### 7.2 Handling rules
@@ -521,6 +539,8 @@ provider supports per-key budgets or scopes, create one key per environment.
 | Control plane → Jev sidecar | HTTP + bearer on an internal network (Compose) | jev-mcp serves plain HTTP: keep it internal or terminate TLS in front; the token is mandatory for non-loopback binds |
 | Control plane → provider API | HTTPS | provider TLS; egress allowed only to the provider |
 | Control plane → agentmemory | HTTP(S) | loopback/host gateway in Compose; TLS and bearer for any remote server |
+| Control plane → the SMTP relay (0.5.0, email channels) | SMTP submission with STARTTLS (587) or implicit TLS (465, `SEAMLESS_SMTP_SECURITY=tls`) | never plain text: a relay that offers no STARTTLS fails the message (`no_starttls`) after nothing but EHLO, so whoever strips STARTTLS on the way gets neither the message nor the password; the certificate verified against the system's CAs or `SEAMLESS_SMTP_CA_FILE` (a failure is `tls_error`, tried again, and sends nothing); AUTH after TLS alone; 30 s a session. Beyond the relay, delivery follows the mail systems' own TLS policy |
+| Control plane → Slack and webhook receivers (0.5.0) | HTTPS | the certificate verified against the system's CAs; no redirect followed; 15 s a request; a Slack URL is the request's credential (C2-16), and a receiver checks the Standard Webhooks signature (C2-18) |
 | Control plane → migrated VMs (verification probes, SDD §7.5) | TCP connect; HTTP(S) `GET` of the configured path | No credentials are sent; only the status is read. HTTPS certificates are **not** verified — the probe targets an address the certificate does not name — so a passed probe proves the service answers, not who answered (C2-08). Egress to the destination's tenant networks must be allowed for probes to reach them; otherwise an application probe reports *Unreachable* and the migration needs review, never a rollback — but a deterministic `tcp:<port>` check (`tcp_ports`, `windows_tcp_ports`) that cannot connect **fails** the verification, and `auto_rollback` rolls the VM back. The shipped NetworkPolicy allows the ports the plan form proposes (22, 3389); add every other port your plans verify |
 
 **NetworkPolicy** (`deploy/openshift/networkpolicy.yaml`): default-deny for ingress and egress; ingress to the
@@ -534,12 +554,32 @@ migration back; a plan that verifies other ports, or application probes on them,
 also opens what the GPU capacity read and the network cut-over call (SDD §17): Placement, Heat, Octavia and
 Designate on their community and RHOSP 17.1 public ports, TCP 53 to an RFC 2136 DNS target's server, and 443 for
 webhook hooks - a webhook served on another port needs its own entry.
+For notifications it opens the SMTP submission ports 587 and 465 to the installation's relay, and Slack and the
+webhook receivers use 443 (SDD §17, §24.8); a relay or a receiver on another port, or inside the cluster - the
+external rule excepts the cluster's own networks -, needs its own entry (docs/Operations.md §7.4).
 **Tighten** `0.0.0.0/0` to the
-CIDRs of your clouds, vCenter, conversion hosts, Jev provider, agentmemory and the destination's tenant networks
-(the migrated VMs) before production.
+CIDRs of your clouds, vCenter, conversion hosts, Jev provider, agentmemory, the destination's tenant networks
+(the migrated VMs), the SMTP relay and the webhook receivers before production; Slack's addresses are not fixed.
 **DNS:** the conversion subnets default to the public resolver `8.8.8.8`
 (`roles/conversion_host/defaults/main.yml:15-16`, SEC-08); override
 `os_migrate_{src,dst}_conversion_subnet_dns_nameservers` with internal resolvers.
+
+### 8.1 Notifications: the data that leaves the installation (0.5.0, SDD §24.8)
+
+| Channel kind | Sent to | Sent | Never sent |
+|---|---|---|---|
+| `email` | the installation's SMTP relay, then the recipients' mail systems | the title and the lines of SDD §24.5: VM, plan and wave names (ids when the channel redacts names), migration, plan and wave ids, the strategy, the phase, times in UTC, the downtime, the estimate, the SLO, counts, the dashboard link of ids alone; the sender's and the recipients' addresses, and the key as `Message-ID` | credentials, tokens and secrets; IP addresses, DNS names and hostnames; provider names and endpoints; the text of errors, of a phase change's reason and of a step's or a hook's output; findings' messages; console output; comments and reasons people typed; who acted |
+| `slack` | Slack's service, outside the organization | the same, as Slack's text and blocks, nothing unfurled | the same; the webhook's URL is the request's address and nothing else |
+| `webhook` | the receiver at the channel's URL | the same, as the Standard Webhooks document's fields, with the topic, the event's `seq` and `kind`, and the key as `webhook-id` | the same; the signing key - only the signature travels |
+
+* **Names are untrusted text** (TB8): a tenant or an operator chose them. They are escaped for Slack, made safe in an
+  email's subject and sent as JSON strings to a webhook; nothing interprets them (C2-14, C2-15).
+* **A channel may send ids instead of names** (`redact_names`): a channel outside the organization whose VM and plan
+  names are confidential (C2-19).
+* **Recipients are personal data**: an admin alone reads them, no event or log line names one, and an erasure
+  request reaches them ([MEMORY.md](MEMORY.md) §3.5).
+* **The link** is built on `SEAMLESS_PUBLIC_URL` from ids alone, never a token; unset, a message carries none.
+* Nothing of a notification reaches Jev or agentmemory (§10.4).
 
 ---
 
@@ -708,6 +748,9 @@ The network cut-over (0.4.0) adds nothing to what Jev and agentmemory receive: a
 answer, a DNS name or record, a floating IP, and a source's Heat stacks and Octavia pools reach neither; the
 strategy evidence sends finding codes and severities alone, and the verification's `floating_ip:` checks stay out of
 the evidence `jev_verify` judges (SDD §13.4, §23.9).
+
+Notifications (0.5.0) add nothing to what Jev and agentmemory receive: no message, recipient, channel URL or key
+reaches either (SDD §13.4, §24.8). What each channel kind sends, and to whom, is §8.1's.
 
 ### 10.5 Provider choice
 
@@ -889,6 +932,22 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
       the plan's records alone.
 - [ ] The destination credential reaches the Designate zones the plan's DNS targets name, project-scoped.
 
+**Notifications (SDD §24, 0.5.0)**
+- [ ] The relay is reached with `SEAMLESS_SMTP_SECURITY=starttls` on 587 or `tls` on 465, on a certificate the control
+      plane verifies - its CA in `SEAMLESS_SMTP_CA_FILE` when it is private -; `SEAMLESS_SMTP_SECRET` names a relay
+      user of the installation's own that may send as `SEAMLESS_SMTP_FROM` alone, or the relay admits the control
+      plane by its address.
+- [ ] Each Slack channel has a webhook of its own, set with Set secret or `PUT …/secret` from a prompt or a file,
+      never typed on a command line; `GET /notifications/channels` shows no Slack URL (C2-16).
+- [ ] Each webhook channel has a signing key of its own, and its receiver verifies the signature in constant time,
+      refuses an old timestamp and drops an id it saw (C2-18, docs/Operations.md §7.4).
+- [ ] A channel that leaves the organization - Slack, an outside receiver or mailbox - redacts names where VM or plan
+      names are confidential (`redact_names`, C2-19); `SEAMLESS_PUBLIC_URL` is the dashboard's HTTPS address.
+- [ ] The egress reaches the relay's port and 443 for Slack and the receivers, the relay and the receivers by their
+      addresses (§8).
+- [ ] An alert fires on `seamless_notifications_total{outcome="failed"}`, and the Notifications page shows no channel
+      failing in a row.
+
 **Operations**
 - [ ] Logs forwarded; `events` exported to write-once storage (`seamless events export -o …`, or Export the whole trail on
       the dashboard's Events page — the same JSON lines, 5bdfe79; it holds the trail in the browser's memory, so for a
@@ -986,9 +1045,16 @@ changed any state — verify that in the events; have a human inspect the consol
 not through an AI tool; treat the tenant/VM as hostile until explained; keep the evidence; do not finalize
 until a human clears `review_required`.
 
-**H. Secret committed to git:** **rotate first** (A–C as applicable) → `git filter-repo --replace-text …` on a
-fresh clone → coordinate a force-push of affected branches → ask the host to purge cached views and forks →
-rescan with `gitleaks` → add the pattern to the scanning rules → record the incident.
+**H. Secret committed to git:** **rotate first** (A–C as applicable, I for a notification channel's secret) →
+`git filter-repo --replace-text …` on a fresh clone → coordinate a force-push of affected branches → ask the host to
+purge cached views and forks → rescan with `gitleaks` → add the pattern to the scanning rules → record the incident.
+
+**I. A notification channel's secret exposed** (a Slack webhook's URL, a webhook channel's signing key, the relay's
+credential; C2-16): revoke it where it is honoured first - remove the webhook in the Slack app, drop the key at the
+receiver, change the relay's password -, then set a new one (docs/Operations.md §7.4, item 5); the channel's messages
+fail meanwhile and are recorded so. Then look for what the holder sent: a message in the Slack channel, or at the
+receiver, that no `notification.sent` of the channel accounts for (Events page; a webhook's `webhook-id` is the
+event's `key`) did not come from the control plane.
 
 ---
 
@@ -1030,12 +1096,14 @@ rescan with `gitleaks` → add the pattern to the scanning rules → record the 
 | Hooks: an admin's catalog, no credential in a hook's context, its output redacted, HTTPS webhooks (SDD §23.3) | `test_only_an_admin_registers_a_hook`, `test_a_playbook_hook_gets_the_context_and_no_credential`, `test_a_hooks_output_is_redacted`, `test_a_webhook_hook_needs_https` | control-plane suite |
 | The DNS swap: a compare-and-swap, no TSIG key in a log line (SDD §8.4) | `test_a_swap_that_finds_another_address_changes_nothing`, `test_no_tsig_key_reaches_a_log_line` | control-plane suite |
 | No TLS container read by the member helper (SDD §8.5) | `test_tls_containers_are_mapped_never_read` | control-plane suite |
+| Notifications: write-only channel secrets, no Slack URL or signing key in an event, a log line or an answer, names escaped, email over TLS alone, signed webhooks, one message a second (SDD §24, C2-14–C2-19) | `test_a_channels_secret_is_write_only_and_named_after_it`, `test_the_slack_url_reaches_no_event_no_log_line_and_no_answer`, `test_the_signing_key_never_leaves_the_control_plane`, `test_slack_values_are_escaped_so_no_name_mentions_a_channel`, `test_an_email_subject_holds_no_control_character`, `test_a_relay_without_starttls_gets_nothing_in_clear_text`, `test_a_webhook_is_signed_as_standard_webhooks_specify`, `test_a_channel_sends_at_most_one_message_a_second` | control-plane suite |
 
 External and manual checks (commands in [QASuite.md](QASuite.md) §10): secret scanning (`gitleaks`),
 dependency audit (`pip-audit`, `npm audit`), image scan and SBOM (`trivy`), manifest linting
 (`kubeconform`, `trivy config`, `shellcheck`, `yamllint`), API baseline scan (OWASP ZAP in safe mode
 against the demo stack), the RBAC matrix against a live stack, NBD exposure checks on a hypervisor (§6.1),
-host-key and security-group review of the conversion hosts, and the AI-safety cases S-14…S-16.
+host-key and security-group review of the conversion hosts, the AI-safety cases S-14…S-16, and the notification
+channels' search for their secrets after the live smoke (S-35).
 
 **Release gate:** no open SEC finding of severity High; no secret-scan findings; no Critical/High dependency
 or image vulnerabilities without a documented exception; every control above green; §12 checklist signed off

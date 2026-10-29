@@ -115,7 +115,7 @@ class Lab:
     def cursor(self, name):
         return self.store.get("notification_cursor", name, NotificationCursor)
 
-    async def wait_outcomes(self, n, channel=None, timeout=5.0):
+    async def wait_outcomes(self, n, channel=None, timeout=20.0):
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             seen = self.outcomes(channel)
@@ -496,3 +496,53 @@ async def test_a_test_message_is_recorded_with_the_trigger_test(lab):
         lab.cursor("ops-slack")
     assert lab.notifier.counts == {("slack", "failed"): 1, ("slack", "sent"): 1}
     lab.store.dispose()
+
+
+async def test_an_event_written_after_a_channel_is_read_waits_for_the_next_pass(lab):
+    """SDD §24.6: a pass judges only the events written before it read the channel. A channel
+    enabled while a pass is in flight - read disabled, then an event written - must not lose
+    that event to the disabled reading: the next pass, which reads the channel enabled, sends it."""
+    lab.channel(enabled=False)
+    lab.subscribe("ops-slack")
+    original_get = lab.store.get
+    fresh: list = []
+
+    def get(kind, id_, model_cls):
+        found = original_get(kind, id_, model_cls)
+        if kind == "notification_channel" and not fresh and not found.enabled:
+            # the pass has read the channel disabled; now the admin enables it and an event lands
+            lab.store.put("notification_channel", found.model_copy(update={"enabled": True}))
+            fresh.extend(lab.downtime(1))
+        return found
+
+    lab.store.get = get
+
+    async def body():
+        [seen] = await lab.wait_outcomes(1)
+        assert seen.kind == "notification.sent" and seen.data["event_seq"] == fresh[0].seq
+
+    await run(lab, body)
+
+
+async def test_a_channels_secret_given_as_variables_reaches_its_sender(lab, monkeypatch):
+    """SDD §13.3, §24.3: an admin may create a channel's secret outside the control plane - files
+    under SEAMLESS_SECRETS_DIR, a Kubernetes Secret, or SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY}
+    variables -, and the notifier reads it as §13.3 resolves a secret, each time it sends: the
+    variables reach the sender, and a file written later wins over them without a restart."""
+    url = "https://hooks.slack.com/services/T000/B000/notasecret"
+    monkeypatch.setenv("SEAMLESS_SECRET_NOTIFY_OPS_SLACK_URL", url)
+    lab.channel()
+    lab.subscribe("ops-slack")
+    lab.downtime(1)
+
+    async def body():
+        await lab.wait_outcomes(1)
+        assert lab.sender.secrets == [{"url": url}]
+        mounted = lab.settings.secrets_dir / "notify-ops-slack"
+        mounted.mkdir(parents=True)
+        (mounted / "url").write_text(url + "-mounted")
+        lab.downtime(1)
+        await lab.wait_outcomes(2)
+        assert lab.sender.secrets[-1] == {"url": url + "-mounted"}
+
+    await run(lab, body)

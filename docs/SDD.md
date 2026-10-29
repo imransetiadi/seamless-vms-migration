@@ -3102,17 +3102,32 @@ route waits for it.
 * **Senders.** A sender per channel kind (`Sender`: `send(channel, message, key, secret) -> SendResult`) answers
   `sent`, `failed` (final) or `retry` (a timeout, a connection or TLS error, HTTP 408, 429 or 5xx, a temporary SMTP
   4yz reply), with a reason, an optional `Retry-After` and an email's refused count. The notifier reads the channel's
-  secret (`notify-{name}`, §13.3) each time it sends, so a rotation needs no restart. Plan tasks NT6–NT8 bring the
+  secret (`notify-{name}`) each time it sends, as §13.3 resolves a secret - files under `SEAMLESS_SECRETS_DIR`,
+  the Kubernetes store, then `SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY}` variables -, so a rotation needs no restart; an
+  email channel has no secret of its own. Plan tasks NT6–NT8 bring the
   email, Slack and webhook senders; until a kind's sender lands, its messages fail with the reason `no_sender`.
 * **The email sender** (plan task NT6; §24.3, §24.5): `smtplib` in at most two threads of the notifier's own, never
   asyncio's default pool; `SEAMLESS_SMTP_SECURITY` `starttls` opens the session in plain text, requires the STARTTLS
   extension (a relay without it fails the message with `no_starttls`, and nothing but EHLO went in clear text) and
   upgrades before anything else; `tls` connects with implicit TLS. The relay's certificate is verified against the
   system's CAs or `SEAMLESS_SMTP_CA_FILE`; a failed verification is a TLS error, retried, and sends nothing. AUTH
-  (`SEAMLESS_SMTP_SECRET`'s `username` and `password`) only after TLS. A 4yz reply is `retry` and a 5yz reply `failed`,
+  only after TLS, with the `username` and `password` of `SEAMLESS_SMTP_SECRET`, which the sender reads as §13.3
+  resolves a secret each time it sends (a rotation needs no restart); a named secret that cannot be read, or holds no
+  `username`, fails the message with `no_secret`, final, and nothing is sent. A 4yz reply is `retry` and a 5yz reply `failed`,
   each with its code as the reason; recipients the relay refused while it accepted others count as `refused`, and the
   message is sent; all refused is `failed` (or `retry` when every reply was 4yz). The message is §24.5's email: the
   sender's domain in the `Message-ID`, the key before it. A session has 30 s. No relay configured is `no_relay`.
+* **The Slack sender** (plan task NT7; §24.3, §24.5, §24.6): `httpx`'s asynchronous client with the 15 s timeout of
+  §24.6 and no redirect followed; one POST of §24.5's Slack payload, as JSON, to the `url` of the channel's secret
+  (`notify-{name}`, §13.3), which is the request's address and nothing else. The outcome classes: 200 is `sent`; 429
+  is `retry` with the answer's `Retry-After` in seconds, honoured by the notifier; 408, 5xx, a timeout, a connection
+  or a TLS error are `retry`, with the status or the error's class as the reason; Slack's final answers
+  `invalid_payload`, `channel_not_found`, `channel_is_archived`, `no_service` and any other 4xx are `failed` with the
+  answer's text as the reason when it is one word of at most 64 characters, as Slack writes them, else the status; a
+  3xx is `failed` with its status, since no redirect is followed; a missing secret, or one whose `url` does not begin
+  with `https://hooks.slack.com/services/`, is `failed` with `no_secret`, and nothing is sent. The URL reaches no
+  event, no log line, no exception message and no API answer: a reason is a status, one word of Slack's or an error's
+  class, and the answer's body is never kept.
 * **The webhook sender** (plan task NT8; §24.3, §24.5, §24.6): `httpx`'s asynchronous client with 15 s for the
   request and no redirect followed POSTs §24.5's Standard Webhooks document (`webhook_document`, §8.6) to the
   channel's `url` with `Content-Type: application/json` and the three headers: `webhook-id` the message's key,
@@ -4361,6 +4376,9 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * `Authorization` headers and bearer tokens;
 * API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
   and Slack tokens;
+* Slack incoming webhook URLs (`hooks.slack.com/services/…`, with or without its scheme), a Slack channel's
+  credential (§24.3): the path after `/services/` is removed, to the URL's end - white space, a quote, a bracket or
+  a delimiter -, so one in an error or a log line is gone (§24.8, plan task NT7);
 * OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
 * PEM blocks - and a block a cut fell inside, an END line with no BEGIN line before it (a console's last lines, §7.5),
   from the text's start to that END line (review RV52-X1, PR #58 review);
@@ -7195,7 +7213,7 @@ Two event data additions close the gap of §24.1 (plan task NT4; binding in §4.
   * the downtime, the estimate and the SLO, in seconds.
 
 The topics, the triggers, the messages and the formats above are binding in §8.6 since plan task NT4, and
-`SEAMLESS_PUBLIC_URL` in §15.1. The webhook document as the body the webhook sender signs and POSTs is binding in §8.7
+`SEAMLESS_PUBLIC_URL` in §15.1. The sender that POSTs the Slack format is binding in §8.7 since plan task NT7. The webhook document as the body the webhook sender signs and POSTs is binding in §8.7
 and §13.3 since plan task NT8.
 
 ### 24.6 Delivery
@@ -7249,11 +7267,16 @@ and §13.3 since plan task NT8.
   last `seq`.
 * **New and disabled channels.** A new channel starts at its own `channel.created` event, so it never receives the
   history. A disabled channel's cursor follows the events, and nothing is queued for it.
+  A pass judges only the events written before it read the channel: an event written after - while an admin
+  enables the channel - waits for the next pass, which reads the channel enabled and sends it (§8.7, plan task NT7's
+  review: the race lost such an event).
 * **Timeouts.** An HTTP request has 15 s (Standard Webhooks recommends 15 to 30 s), and an SMTP session 30 s.
 * **A partly refused email.** When the relay accepts some recipients and refuses others, the message counts as sent.
   Its event gives the number refused, never their addresses.
 
-The notifier above is binding in §8.7 since plan task NT5, with its test route in §12 and its metric in §18. A
+The notifier above is binding in §8.7 since plan task NT5, with its test route in §12 and its metric in §18. The Slack
+sender's outcome classes - the retry classes, Slack's final answers, the 3xx and the missing secret -, its 15 s timeout
+and its `Retry-After` are binding in §8.7 since plan task NT7. A
 webhook's delivery - the 15 s request, no redirect followed, its retry classes with `Retry-After`, 410 final and a new
 timestamp and signature for each try under the same `webhook-id` - is binding in §8.7 and §13.3 since plan task NT8.
 
@@ -7295,10 +7318,10 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
 * **A channel may send ids instead of names** (`redact_names`, owner decision 8): a channel outside the organization
   whose VM and plan names are confidential.
 * **Recipients are personal data.** The API shows them to an admin alone (§24.3), no event names one, and an erasure
-  request reaches them (MEMORY.md §5, plan task NT11).
+  request reaches them (MEMORY.md §3.5, plan task NT11).
 * Nothing of a notification reaches Jev or agentmemory (§13.4).
 * `redact()` learns Slack incoming webhook URLs (`hooks.slack.com/services/…`), so one in an error or a log line is
-  removed (§13.4, plan task NT7).
+  removed; binding in §13.4, with the Slack sender in §8.7, since plan task NT7.
 * The NetworkPolicy gains egress to the relay's port, 587 or 465, beside 443 (§17, plan task NT6).
 
 ### 24.9 Dashboard and demo

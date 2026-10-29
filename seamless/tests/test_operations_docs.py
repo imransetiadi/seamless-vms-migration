@@ -8,7 +8,12 @@ import re
 import subprocess
 
 from seamless_migrate.config import find_repo_root
-from seamless_migrate.domain.models import AdvisorRecommendation, Migration
+from seamless_migrate.domain.models import (
+    AdvisorRecommendation,
+    Migration,
+    NotificationChannel,
+    NotificationSubscription,
+)
 
 ROOT = find_repo_root()
 
@@ -49,11 +54,15 @@ def test_operations_md_applies_a_jev_setting_with_up_which_recreates_the_sidecar
 
 
 def test_the_erasure_bullet_names_every_l2_field_that_records_a_user():
-    """MEMORY.md §5 (reviews RV37B-12, RV38B-12): an erasure request reaches every L2 field that
-    records who acted - a recommendation's requested_by among them - and the reasons and messages
-    that name the person."""
+    """MEMORY.md §3.5 (reviews RV37B-12, RV38B-12; plan task NT11): an erasure request reaches
+    every L2 field that records who acted - a recommendation's requested_by and a notification
+    subscription's created_by among them -, the reasons and messages that name the person, and the
+    addresses an email notification channel sends to: its recipients are personal data
+    (SDD §24.8)."""
     assert "requested_by" in AdvisorRecommendation.model_fields
     assert "cutover_requested_by" in Migration.model_fields
+    assert "recipients" in NotificationChannel.model_fields
+    assert "created_by" in NotificationSubscription.model_fields
     memory = (ROOT / "docs" / "MEMORY.md").read_text(encoding="utf-8")
     bullet = memory[memory.index("* **Erasure requests:**") :]
     bullet = bullet[: bullet.index("\n* **", 5)]
@@ -65,5 +74,7 @@ def test_the_erasure_bullet_names_every_l2_field_that_records_a_user():
         "`requested_by`",
         "updated_by",
         "Force cutover by",
+        "`recipients`",
+        "`created_by`",
     ):
         assert field in bullet, field

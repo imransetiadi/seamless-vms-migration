@@ -302,6 +302,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{22,}"), REDACTED),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), REDACTED),
     (re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"), REDACTED),
+    # Slack incoming webhook URLs, a Slack channel's credential (SDD §13.4, §24.3, §24.8, plan task
+    # NT7): the path after /services/, to white space, a quote, a bracket, a backslash (a JSON
+    # string's escape) or a delimiter; a [REDACTED] an earlier pass wrote is left as it is
+    (
+        re.compile(
+            r"(?i)\b((?:https?://)?hooks\.slack\.com/services/)(?!\[REDACTED\])"
+            r"[^\s\"'<>\\\[\](){},;]+"
+        ),
+        r"\1" + REDACTED,
+    ),
     # Ceph keys (SDD §13.4, §28.8): a keyring's `key = <base64>` line, whole after its `=`, and a
     # bare CephX key as `ceph auth get-key` prints it - AQ, 36 base64 characters and == (28 bytes)
     (re.compile(r"(?im)^([ \t]*key[ \t]*=[ \t]*)\S+"), r"\1" + REDACTED),
