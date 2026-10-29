@@ -3952,7 +3952,9 @@ deployments, URL `postgresql+psycopg://user:pass@host:5432/seamless`, driver `ps
 SQLite (`sqlite:///{data_dir}/seamless.db`, the default when `SEAMLESS_DB_URL` is unset) is kept
 for unit tests and quick local runs only. The same Core code serves both; JSON columns use
 `sqlalchemy.JSON` (JSONB variant on PostgreSQL). The schema is created idempotently at startup
-(`Store.create_schema()`); the test suite runs the store tests against SQLite always and against
+(`Store.create_schema()`), under the cross-process lock `schema` (§5.4): two replicas creating it at once would race on
+PostgreSQL's catalog, where concurrent `CREATE TABLE` of one name fails (§25.10); the second waits for the first and
+finds the schema complete. The test suite runs the store tests against SQLite always and against
 PostgreSQL when `SEAMLESS_TEST_PG_URL` is set. Tables:
 
 ```text
@@ -3960,6 +3962,7 @@ documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at
   + expression indexes ix_documents_{plan_id,phase,wave_id,status,role} on (kind, data->>field)
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
   + indexes ix_events_plan_id (plan_id), ix_events_migration_id (migration_id), ix_events_kind_seq (kind, seq)
+leases(name TEXT PK, holder TEXT, address TEXT, epoch INTEGER, acquired_at, renewed_at, expires_at, health JSON)
 ```
 
 `ix_events_kind_seq` serves the `kinds` filter (`GET /events?audit=true`, its `before` pages): audit events are
@@ -3972,7 +3975,9 @@ usage pattern is the application role's own, first in its `search_path` and hold
 SQLite), so a complete schema takes no DDL at all.
 PostgreSQL lets only a table's owner run `CREATE INDEX`, even for an index that exists, so this is what lets a role
 that does not own the tables start the control plane — the application role of Security.md §9.4, for which
-`events` is insert-only — once the owner role created or upgraded the schema.
+`events` is insert-only — once the owner role created or upgraded the schema. The owner role creates `leases` as it
+creates the indexes; the application role needs `SELECT`, `INSERT` and `UPDATE` on it (§25.9) - PostgreSQL asks for
+`UPDATE` to read a row `FOR KEY SHARE` too.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
 `advisor_policy` (§14.6), `user` (§13.1), `hook` (§23.3, its id its name), `notification_channel` (§24.3, its id its
@@ -4017,6 +4022,35 @@ before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WA
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
 callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
+
+**The lease** (§25.3, plan task HA2). `leases` holds one row, `orchestrator`: `holder` - the replica's host name and 8
+random hex digits, new at each process start -, `address` - its host name's address and its port, where the other
+replicas reach its API (the host name itself when it resolves to no address) -, `epoch` - an integer that each
+takeover increases -, `acquired_at`, `renewed_at`, `expires_at`, and `health` (§25.6; null until a leader writes it).
+`seamless_migrate.lease` sets and compares every one of its times on the database's clock alone - `now()` on
+PostgreSQL, `'now'` on SQLite - and sends none, so the replicas' clocks may disagree by any amount. A lease is
+expired once `now()` reaches `expires_at`.
+* *Campaign.* A replica reads the row. When there is none it inserts it with epoch 1 (`ON CONFLICT DO NOTHING`: of
+  two at once, one takes it). When it reads the lease expired it locks the row `FOR UPDATE` and, in the same
+  transaction, takes it where it is still expired: `epoch + 1`, its `holder` and `address`, `acquired_at` and
+  `renewed_at` `now()`, `expires_at` `now()` plus the lease (`SEAMLESS_LEADER_LEASE_S`, §15.1). A `lock_timeout` of
+  the retry period (2 s; on SQLite the wait for its write lock) keeps a candidate from queueing behind the row - a try
+  that times out takes nothing -, and a valid lease is never locked.
+* *Renewal.* `renewed_at = now()` and `expires_at = now()` plus the lease, where `holder` and `epoch` are the
+  replica's own; a renewal that updates no row - the lease was taken - renews nothing.
+* *Release.* `expires_at = now()` where `holder` and `epoch` are the replica's own: another replica takes the lease at
+  its next try.
+
+**The fence** (§25.4 layer 1, plan task HA2). A server process's store - the one the API builds for itself when it is
+given none, `Store(url, fenced=True)` (§15) - begins each write transaction (`put`, `put_with_event`,
+`put_all_with_events`, `append_event`, `delete`, `delete_with_events`, `prune_events`, `delete_events_before`,
+`create_user`) by reading the lease's `epoch` under a key-share lock: `SELECT … FOR KEY SHARE` on PostgreSQL, and on
+SQLite after `BEGIN IMMEDIATE`, which takes the database's write lock. When that epoch is not the one the process took
+(`Store.epoch`, `None` until it took one), the write raises `Fenced` - a `StoreError` that carries both epochs -,
+nothing of it is written, and the store logs the refusal with both epochs. A takeover locks the row `FOR UPDATE`,
+which waits for every key-share lock, so a write of the old epoch commits before the takeover or not at all; a
+renewal changes no key column, so renewals and writes never wait for each other. `auth.denied` is written without the
+check: the replica that refuses a request records it (§13.1). The CLI's store holds no lease and checks none (§15).
 
 **What PostgreSQL cannot hold.** PostgreSQL stores no NUL character - psycopg refuses one in a text parameter and
 JSONB refuses `\u0000` -, no lone surrogate, half of a UTF-16 pair and no Unicode text (SQLite cannot encode one
@@ -4814,6 +4848,15 @@ The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `
 `EstimatorParams.link_bps`, the plan default of 131,072,000 B/s (125 MiB/s, about 1,048.6 Mbit/s); `--link-mbps 1000` is
 125,000,000 B/s.
 
+`serve` takes the orchestrator's lease (§11) before it runs the demo seed and starts its orchestrator, trying again
+every 2 s while another server holds a valid one, and releases it once its orchestrator stopped; its store checks
+the lease's epoch in every write (§11). The elector that renews the lease is §25.3's (plan task HA3): until it lands,
+a server's lease lapses `SEAMLESS_LEADER_LEASE_S` after it took it, and a second server against the same PostgreSQL
+database then takes it over and fences the first one's writes (`Fenced`). On SQLite, `serve` first takes an exclusive
+`flock` on `{database}.server.lock` and exits 1 (`error: another server runs against this database`) while another
+server holds it: SQLite in WAL mode serves one host's processes, so it never has a second replica (§25.3). The other
+commands open the store without a lease and check none: their writes are a person's (`actor: cli`).
+
 `plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
@@ -4864,6 +4907,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook; a storage handover's call in flight returns first, §7.3), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
+| `SEAMLESS_LEADER_LEASE_S` | `30` | the orchestrator lease's length in seconds (§11, §25.3): a lease that is not renewed for this long expires, and another server takes it over |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
@@ -4876,7 +4920,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 The numeric variables are bounded; a value outside its bounds refuses to start the control plane
 (`error: …`, exit 1): `SEAMLESS_PORT` 1…65535; `SEAMLESS_TICK_S` (0 would spin), `SEAMLESS_DEMO_SPEED` (a
 divisor) and `SEAMLESS_JEV_TIMEOUT_S` above 0; `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and
-`SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
+`SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_LEADER_LEASE_S` at least 10 (§25.3: the renew deadline is
+two thirds of it, and the retry period 2 s); `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
 disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`
 0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
 `SEAMLESS_JEV_MIN_CONFIDENCE` 0…1. Each entry of `SEAMLESS_CORS_ORIGINS` is one origin as a browser sends it -
@@ -7558,8 +7603,10 @@ that answer reads themselves (decision 4); the run directories' state in the dat
   replica, so the replicas' clocks may disagree by any amount.
 * **Campaign.** Every retry period, a replica that does not lead reads the row. When there is none it inserts it with
   epoch 1. When it reads the lease expired, it locks the row `FOR UPDATE` and, in the same transaction, takes it with
-  `epoch + 1` where `expires_at < now()` (§25.4). A `lock_timeout` of the retry period keeps a candidate from queueing
-  behind the row, and a valid lease is never locked.
+  `epoch + 1` where `expires_at <= now()` (§25.4; amended with plan task HA2 from `<`: a released lease, whose
+  `expires_at` is the release's `now()`, is then taken at the next try, also on SQLite, whose clock reads
+  milliseconds). A `lock_timeout` of the retry period keeps a candidate from queueing behind the row, and a valid
+  lease is never locked.
 * **Renewal.** The leader renews every retry period: `expires_at = now() + lease` where `holder` and `epoch` are its
   own. It notes its monotonic clock *before* it sends a renewal, and one that succeeds sets its deadline to that time
   plus the renew deadline. A renewal that updates no row (the lease was taken) deposes it at once.
@@ -7589,6 +7636,11 @@ that answer reads themselves (decision 4); the run directories' state in the dat
   takes an exclusive `flock` on `{database}.server.lock` and exits 1 ("another server runs against this database")
   while another holds it. SQLite in WAL mode serves one host's processes only, so it never has a second replica.
 
+The row, the database's clock, the campaign's, the renewal's and the release's statements, `SEAMLESS_LEADER_LEASE_S`
+and SQLite's server lock are binding in §11, §15.1 and §15 since plan task HA2, where `serve` takes the lease once at
+its start and releases it after its orchestrator stopped. The thread, the renewals' schedule, the deadline, the
+watchdog and the renewals only while the tick loop is healthy stay proposed (HA3).
+
 ### 25.4 Fencing
 
 A deposed leader may not know it yet: its process paused, its network cut, its loop stuck. Three layers keep it from
@@ -7606,6 +7658,11 @@ acting.
    * The CLI's store holds no lease and checks none: its writes are a person's (`actor: cli`, §15), as today.
    * The application role runs with an `idle_in_transaction_session_timeout` of 10 s, so a leader cut off inside a
      write holds its key-share lock no longer than that (§25.7).
+
+   Layer 1 is binding in §11 since plan task HA2 - the epoch read under a key-share lock at the start of each write,
+   the takeover's `FOR UPDATE`, the renewal that changes no key column, `Fenced`, `auth.denied` aside, the refusals
+   logged with both epochs, the CLI's store unfenced -, but for the deposition on a `Fenced` write (HA3) and the
+   application role's `idle_in_transaction_session_timeout` (HA6).
 2. **Actions on the clouds start only while the lease holds.** Before a step's attempt, a hook, a floating IP move, a
    DNS swap or an Octavia member change (§8, §8.2–§8.5), the orchestrator checks its deadline and reads the epoch in
    the lease row. A pause between this check and the action defeats it (Kleppmann); layer 3 and the margin cover that.
@@ -7806,7 +7863,7 @@ The owner took each default as written on 2026-10-23 (D2):
 | Change | Where | Task |
 |---|---|---|
 | PRD: FR-27's priority and acceptance criteria, the 0.2.0 row as delivered, a 0.5.0 row; D2 decided | PRD, §20 | HA1 |
-| the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 | HA2 |
+| the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 (binding) | HA2 |
 | the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 | HA3 |
 | the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
