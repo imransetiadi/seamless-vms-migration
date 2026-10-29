@@ -1089,6 +1089,98 @@ async def test_two_handover_steps_reaching_a_provider_at_once_share_one_connecti
     assert first is second and built == [SRC.id]
 
 
+class Reached:
+    """A cloud as one credential reaches it (SDD §27.5, §27.10): each call of its services recorded
+    in ``used`` with that credential - the provider's id, or ``{provider id}/{project id}``."""
+
+    def __init__(self, cloud, credential, used):
+        self._cloud, self._credential, self._used = cloud, credential, used
+
+    def __getattr__(self, name):
+        target = getattr(self._cloud, name)
+        if name not in ("compute", "block_storage", "network"):
+            return target
+        credential, used = self._credential, self._used
+
+        class Service:
+            def __getattr__(self, attr):
+                call = getattr(target, attr)
+                if not callable(call):
+                    return call
+
+                def recorded(*args, **kwargs):
+                    used.append((credential, f"{name}.{attr}"))
+                    return call(*args, **kwargs)
+
+                return recorded
+
+        return Service()
+
+
+def _project_handover(tmp_path):
+    """setup()'s handover of a plan with projects - tenant-a's at the source, tenant-c's at the
+    destination (SDD §4.2, §27.5) - whose connections record the credential of each call."""
+    from tests.credential_support import of_project, own, project_credentials, tenant_project
+
+    _, calls, clouds, plan, mig, settings = setup(tmp_path)
+    a, c = tenant_project(), tenant_project()
+    used: list[tuple[str, str]] = []
+
+    def connect(provider, project_id=None):
+        credential = own(provider) if project_id is None else of_project(provider, project_id)
+        return Reached(clouds[provider.cloud], credential, used)
+
+    executor = HandoverExecutor(settings, conn_factory=connect, poll_s=0)
+    src = SRC.model_copy(update={"project_credentials": project_credentials(SRC.id, a)})
+    dst = DST.model_copy(update={"project_credentials": project_credentials(DST.id, c)})
+    plan = plan.model_copy(update={"source_project": a, "destination_project": c})
+    credentials = NS(src=own(src), dst=of_project(dst, c), src_project=of_project(src, a))
+    return executor, calls, clouds, plan, mig, settings, src, dst, used, credentials
+
+
+async def test_a_handover_into_a_project_manages_and_creates_with_its_credential(tmp_path):
+    """SDD §7.3, §27.5, §27.6 (plan task TC5): the destination half of a handover into a project -
+    step 0's reads, the manage, the ports and the server, and on rollback their deletion and
+    unmanage - acts with the plan's destination credential, so the server and its volumes land in
+    the plan's destination project; never with the destination provider's own."""
+    executor, calls, clouds, plan, mig, settings, src, dst, used, cred = _project_handover(tmp_path)
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    assert result.destination_server_id
+    destination = {op for credential, op in used if credential == cred.dst}
+    assert {"block_storage.post", "compute.create_server"} <= destination, destination
+    assert not [op for credential, op in used if credential == DST.id]
+    used.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert {credential for credential, op in used if credential.startswith(DST.id)} == {cred.dst}
+
+    # a destination that holds no credential for the plan's project: refused before any call,
+    # never with the provider's own instead (§27.5 "No fallback")
+    used.clear()
+    unheld = dst.model_copy(update={"project_credentials": {}})
+    with pytest.raises(PermanentStepError, match="holds no credential for project"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, unheld, settings)[0])
+    assert not [op for credential, op in used if credential.startswith(DST.id)]
+
+
+async def test_a_handover_into_a_project_acts_at_the_source_with_the_providers_credential(
+    tmp_path,
+):
+    """SDD §7.3, §27.5, §27.6 (plan task TC5): the source half of a handover - the reads of the
+    source server and its volumes, the stop, delete_on_termination, the deletion, the unmanage,
+    and on rollback the source's restore - acts by id with the source provider's own credential,
+    its admin, whatever the plan's source_project names: no call of it is made with the source
+    project's credential."""
+    executor, calls, clouds, plan, mig, settings, src, dst, used, cred = _project_handover(tmp_path)
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    source = {op for credential, op in used if credential == cred.src}
+    assert {"compute.stop_server", "compute.delete_server"} <= source, source
+    assert ("src", "delete_server", "srv-1") in calls
+    assert not [op for credential, op in used if credential == cred.src_project]
+    used.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert {credential for credential, op in used if credential.startswith(SRC.id)} == {cred.src}
+
+
 async def test_handover_rollback_reverses_order(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)

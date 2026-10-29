@@ -50,6 +50,15 @@ from seamless_migrate.executors.base import PermanentStepError, StepName, Transi
 from seamless_migrate.planning.gpu import PCI_ALIAS, gpu_requests
 from seamless_migrate.planning.preflight import DestinationInventory, flavor_prestaged
 from seamless_migrate.providers.base import ProviderError
+from seamless_migrate.security.secrets import remove_quietly
+from tests.credential_support import (
+    Credentialed,
+    of_project,
+    own,
+    project_credentials,
+    tenant_project,
+    write_application_credential,
+)
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
 from tests.fake_ansible import install, read_log
@@ -214,6 +223,12 @@ class FakeImpl:
             if volume["id"] == volume_id:
                 volume["metadata"] = {**volume["metadata"], **metadata}
 
+    async def grant_flavor_access(self, name, project_id):
+        """Nova's access for the project to the private flavor of the name (SDD §10): True when the
+        flavor is private (``registry.private_flavors``), a public one left as it is."""
+        self.calls.append(("grant_flavor_access", name, project_id))
+        return name in self.registry.private_flavors
+
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2), and its flavors -
         those that ask for a GPU listed again with their requests, as the provider lists them
@@ -293,9 +308,24 @@ class FakeRegistry:
         self.addresses: dict[str, str] = {}
         self.consoles: dict[str, str] = {}
         self.lookup_errors: set[str] = set()
+        # the destination's private flavors by name (SDD §10 grant_flavor_access)
+        self.private_flavors: set[str] = set()
+        # each call with the credential it came with: (credential, method) (SDD §27.5, §27.10)
+        self.credential_calls: list[tuple[str, str]] = []
 
-    def get(self, provider):
-        return FakeImpl(self)
+    def get(self, provider, project_id=None):
+        """The provider's double as its own credential reaches it, or - with ``project_id`` - its
+        credential for that project; one it holds none for is a provider error (SDD §27.5)."""
+        if project_id is None:
+            return Credentialed(FakeImpl(self), own(provider), self.credential_calls)
+        if project_id not in provider.project_credentials:
+            raise ProviderError(f"{provider.id}: it holds no credential for project {project_id}")
+        credential = of_project(provider, project_id)
+        return Credentialed(FakeImpl(self), credential, self.credential_calls)
+
+    def used(self, method):
+        """The credentials ``method`` was called with, in order."""
+        return [credential for credential, called in self.credential_calls if called == method]
 
     @staticmethod
     def created() -> list[str]:
@@ -506,6 +536,149 @@ async def test_secrets_file_0600_and_deleted_after_run(env, monkeypatch):
         await env.executor.run(StepName.SYNC, ctx)
     assert not (run_dir(env) / "secrets.yml").exists()
     assert not (run_dir(env) / "osm" / "clouds.yaml").exists()
+
+
+def _projects(env):
+    """SRC and DST each holding a made-up tenant project's application credential, its secret in
+    the files store (SDD §13.3, §27.4), and the plan's fields naming them (plan task TC5)."""
+    a, c = tenant_project(), tenant_project()
+    return SimpleNamespace(
+        a=a,
+        c=c,
+        source=SRC.model_copy(update={"project_credentials": project_credentials(SRC.id, a)}),
+        destination=DST.model_copy(update={"project_credentials": project_credentials(DST.id, c)}),
+        ids={
+            "src": write_application_credential(env.settings.secrets_dir, SRC.id, a),
+            "dst": write_application_credential(env.settings.secrets_dir, DST.id, c),
+        },
+        plan_kw={"source_project": a, "destination_project": c},
+    )
+
+
+def _project_ctx(env, t, strategy=Strategy.warm, **options):
+    """ctx_for's run of a plan whose projects ``t`` names (SDD §27.5)."""
+    ctx, rec = ctx_for(env, strategy=strategy, source=t.source, destination=t.destination)
+    ctx.plan = ctx.plan.model_copy(update=t.plan_kw)
+    ctx.options.update(options)
+    return ctx, rec
+
+
+def _run_secrets(call) -> dict:
+    """The secrets.yml a playbook ran with, as Ansible reads it."""
+    return load_ansible_yaml(call["raw"]["secrets.yml"])
+
+
+def _signed_in(call) -> dict:
+    """Who a playbook's secrets.yml signs in as, per side - its application credential's id, else
+    its user - with its auth's keys, URL, type and region; never a secret, so a failing assertion
+    on it prints none (pytest shows the values it subscripts, SDD §27.8)."""
+    held = _run_secrets(call)
+    who: dict = {}
+    for side in ("src", "dst"):
+        auth = held[f"os_migrate_{side}_auth"]
+        who[side] = auth.get("application_credential_id") or auth.get("username")
+        who[f"{side}_keys"] = sorted(auth)
+        who[f"{side}_url"] = auth.get("auth_url")
+        who[f"{side}_type"] = held.get(f"os_migrate_{side}_auth_type")
+        who[f"{side}_region"] = held.get(f"os_migrate_{side}_region_name")
+    return who
+
+
+def _rolled_back() -> None:
+    """The destination server the fake playbooks created is gone, as a rollback deletes it."""
+    remove_quietly(Path(os.environ["ANSIBLE_FAKE_CREATED"]))
+
+
+async def test_each_step_of_a_plan_with_projects_runs_with_its_project_credentials(env):
+    """SDD §7.2, §27.5 (plan task TC5): each run of a plan with projects - a warm pre-copy, a sync,
+    its cutover and its rollback, a cold cutover, a finalize - holds the plan's two project
+    credentials in its secrets.yml, application credentials that sign in where the providers' own
+    do, and the executor's own calls of the run - the destination's inventory, the destination
+    server's lookups, the finalize's deletion of the source - act with them too: none with a
+    provider's own credential. A plan that names no project keeps the providers' own."""
+    t = _projects(env)
+    warm, _ = _project_ctx(env, t)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    warm.migration.sync_passes.append(first.sync_pass)
+    await env.executor.run(StepName.SYNC, warm)
+    await env.executor.run(StepName.CUTOVER, warm)
+    await env.executor.run(StepName.ROLLBACK, warm)
+    _rolled_back()
+    cold, _ = _project_ctx(env, t, Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    finalize, _ = _project_ctx(env, t, Strategy.cold, delete_source=True)
+    assert (await env.executor.run(StepName.FINALIZE, finalize)).details["source_deleted"]
+    calls = read_log(env.log)
+    assert {"import_workloads_precopy.yml", "import_workloads_cutover.yml"} <= {
+        c["playbook"] for c in calls
+    }
+    for call in calls:
+        who = _signed_in(call)
+        assert (who["src"], who["dst"]) == (t.ids["src"], t.ids["dst"]), call["playbook"]
+        assert (who["src_url"], who["dst_type"], who["dst_region"]) == (
+            "https://src/v3",
+            "v3applicationcredential",
+            "regionTwo",
+        )
+    src, dst = of_project(t.source, t.a), of_project(t.destination, t.c)
+    assert set(env.registry.used("inventory")) == {dst}
+    assert env.registry.used("find_server") and set(env.registry.used("find_server")) == {dst}
+    assert env.registry.used("delete_server") == [src]
+    assert {c for c, _ in env.registry.credential_calls} <= {src, dst}
+
+    # the same runs of a plan that names no project: the providers' own credentials (0.4.0)
+    env.registry.credential_calls.clear()
+    _rolled_back()
+    before = len(read_log(env.log))
+    plain, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, plain)
+    for call in read_log(env.log)[before:]:
+        who = _signed_in(call)
+        assert who["dst"] == "du", call["playbook"]  # the provider's own user
+    assert {c for c, _ in env.registry.credential_calls} <= {own(SRC), own(DST)}
+
+
+async def test_no_run_file_of_a_project_step_holds_the_providers_credential(env):
+    """SDD §7.2, §27.8 (plan task TC5): the run files of a step of a plan with projects -
+    secrets.yml, vars.yml, the inventory, the clouds.yaml os-migrate writes - hold no provider's
+    own credential: a stolen run directory reaches the plan's projects alone. A project
+    credential that cannot be read fails the run before any playbook, never replaced by the
+    provider's own."""
+    t = _projects(env)
+    for strategy, steps in (
+        (Strategy.warm, (StepName.PRECOPY, StepName.CUTOVER, StepName.ROLLBACK)),
+        (Strategy.cold, (StepName.CUTOVER, StepName.ROLLBACK)),
+    ):
+        for step in steps:
+            ctx, _ = _project_ctx(env, t, strategy)
+            await env.executor.run(step, ctx)
+        _rolled_back()
+    calls = read_log(env.log)
+    assert calls
+    for call in calls:
+        files = "\n".join(call["raw"].values())
+        # the providers' own passwords (the env's clouds.yaml) are in no run file
+        leaked = [word for word in ("spw", "dpw") if word in files]  # never the files' text
+        assert leaked == [], call["playbook"]
+        who = _signed_in(call)
+        application_credential = [
+            "application_credential_id",
+            "application_credential_secret",
+            "auth_url",
+        ]
+        assert who["src_keys"] == who["dst_keys"] == application_credential, call["playbook"]
+    assert not (run_dir(env) / "secrets.yml").exists()
+    assert not (run_dir(env) / "osm" / "clouds.yaml").exists()
+
+    # the destination project's secret gone from the store: the run fails before any playbook
+    gone = env.settings.secrets_dir / t.destination.project_credentials[t.c].secret
+    shutil.rmtree(gone)
+    before = len(calls)
+    ctx, _ = _project_ctx(env, t, Strategy.cold)
+    with pytest.raises(PermanentStepError, match="credentials unavailable") as failed:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert len(read_log(env.log)) == before
+    assert "dpw" not in str(failed.value)
 
 
 async def test_cutover_cold_sets_stop_before_migration(env):
@@ -2086,6 +2259,99 @@ async def test_prestage_scopes_flavors_to_the_plan(env):
         ]
 
 
+async def test_the_flavor_import_alone_runs_with_the_destination_providers_credential(env):
+    """SDD §7.2, §27.5, §27.8 (plan task TC5): creating a flavor is an admin's call, so the flavor
+    import of a plan with projects runs on its own, in its place among the plan's resources, its
+    secrets.yml holding the destination provider's own credential beside the plan's source
+    credential; every other run of the pre-staging - the flavor export, the resources before and
+    after, the conversion hosts' deploy - holds the plan's two project credentials alone."""
+    t = _projects(env)
+    resources = ["networks", "flavors", "security_groups"]
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=resources, **t.plan_kw)
+    await env.executor.prestage(plan, t.source, t.destination, prestage_flavors=["m1.custom"])
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_networks.yml",
+        "import_networks.yml",
+        "export_flavors.yml",
+        "import_flavors.yml",
+        "export_security_groups.yml",
+        "import_security_groups.yml",
+        "deploy_conversion_hosts.yml",
+    ]
+    for call in calls:
+        who = _signed_in(call)
+        assert who["src"] == t.ids["src"], call["playbook"]
+        if call["playbook"] == "import_flavors.yml":
+            assert who["dst"] == "du"  # the provider's own user
+            assert who["dst_type"] != "v3applicationcredential"
+        else:
+            assert who["dst"] == t.ids["dst"], call["playbook"]
+            providers_password = "dpw" in call["raw"]["secrets.yml"]  # never the file's text
+            assert not providers_password, call["playbook"]
+    plan_osm = env.settings.data_dir / "plans" / "plan-00c0ffee" / "osm"
+    assert not (plan_osm.parent / "secrets.yml").exists()
+
+
+async def test_a_private_flavor_pre_staged_for_a_project_is_shared_with_it(env):
+    """SDD §7.2, §27.5, §27.6 (plan task TC5): after the flavor import each pre-staged flavor is
+    given access for the plan's destination project, with the destination provider's own
+    credential - os-migrate's import gives none, and a member could use no private flavor
+    without it. The OpenStack provider gives it to a private flavor alone (Nova's
+    addTenantAccess; access the project holds already is no error) and leaves a public one as it
+    is. A plan without a destination project shares nothing."""
+    import openstack.exceptions
+
+    from seamless_migrate.providers.openstack import OpenStackProvider
+
+    t = _projects(env)
+    env.registry.private_flavors = {"m1.custom"}
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["flavors"], **t.plan_kw)
+    await env.executor.prestage(
+        plan,
+        t.source,
+        t.destination,
+        deploy_conversion_hosts=False,
+        prestage_flavors=["c4.public", "m1.custom"],
+    )
+    assert [c for c in env.registry.calls if c[0] == "grant_flavor_access"] == [
+        ("grant_flavor_access", "c4.public", t.c),
+        ("grant_flavor_access", "m1.custom", t.c),
+    ]
+    assert env.registry.used("grant_flavor_access") == [own(t.destination)] * 2
+    env.registry.calls.clear()
+    plain = make_plan(id="plan-00c0ffee", prestage_resources=["flavors"])
+    await env.executor.prestage(
+        plain, SRC, DST, deploy_conversion_hosts=False, prestage_flavors=["m1.custom"]
+    )
+    assert not [c for c in env.registry.calls if c[0] == "grant_flavor_access"]
+
+    # the OpenStack provider: Nova's access for the private flavor alone
+    added: list[tuple[str, str]] = []
+    listed = [
+        SimpleNamespace(id="f-1", name="m1.custom", is_public=False),
+        SimpleNamespace(id="f-2", name="c4.public", is_public=True),
+    ]
+
+    class Compute:
+        def flavors(self, details=True, **query):
+            return list(listed)
+
+        def flavor_add_tenant_access(self, flavor, tenant):
+            added.append((flavor.id, tenant))
+            if len(added) > 1:  # Nova: "Flavor access already exists"
+                raise openstack.exceptions.ConflictException("HTTP 409")
+
+    conn = SimpleNamespace(compute=Compute(), close=lambda: None)
+    nova = OpenStackProvider(DST, env.settings, connect_fn=lambda *a, **kw: conn)
+    assert await nova.grant_flavor_access("m1.custom", t.c) is True
+    assert await nova.grant_flavor_access("c4.public", t.c) is False
+    assert await nova.grant_flavor_access("m1.custom", t.c) is True  # it holds access already
+    assert added == [("f-1", t.c), ("f-1", t.c)]
+    with pytest.raises(ProviderError, match="no flavor named"):
+        await nova.grant_flavor_access("m9.gone", t.c)
+
+
 async def test_prestage_scopes_keypairs_to_the_plan(env):
     """SDD §7.2: keypairs are scoped like flavors - only the key_names the orchestrator names;
     without any, the keypair playbooks are skipped."""
@@ -2099,6 +2365,35 @@ async def test_prestage_scopes_keypairs_to_the_plan(env):
     before = len(calls)
     await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False)
     assert read_log(env.log)[before:] == []
+
+
+async def test_the_conversion_hosts_of_a_plan_with_projects_are_deployed_in_its_projects(env):
+    """SDD §7.2, §27.5, §27.6 (plan task TC5): a plan with projects deploys its conversion hosts in
+    those projects - the deploy runs with the plan's two project credentials, so the role finds
+    and creates each host by name in its side's project - and, with host keys checked (§26.3),
+    each host is looked up where the deploy reaches it, with its side's project credential; a plan
+    that names no project deploys and looks them up with the providers' own credentials."""
+    t = _projects(env)
+    checking = AnsibleExecutor(
+        env.settings.model_copy(update={"ansible_host_key_checking": True}),
+        providers=env.registry,
+        poll_s=0.02,
+    )
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=[], **t.plan_kw)
+    await checking.prestage(plan, t.source, t.destination)
+    [deploy] = read_log(env.log)
+    assert deploy["playbook"] == "deploy_conversion_hosts.yml"
+    who = _signed_in(deploy)
+    assert (who["src"], who["dst"]) == (t.ids["src"], t.ids["dst"])
+    assert env.registry.used("find_server") == [
+        of_project(t.source, t.a),
+        of_project(t.destination, t.c),
+    ]
+    env.registry.credential_calls.clear()
+    await checking.prestage(make_plan(id="plan-00c0ffee", prestage_resources=[]), SRC, DST)
+    assert env.registry.used("find_server") == [own(SRC), own(DST)]
+    who = _signed_in(read_log(env.log)[-1])
+    assert who["dst"] == "du"  # the provider's own user
 
 
 def _plan_ctx(env, plan_id, strategy):

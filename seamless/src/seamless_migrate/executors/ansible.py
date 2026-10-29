@@ -32,7 +32,8 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..conversion_key import installation_key, run_key
-from ..domain.enums import ProviderKind, Strategy, SyncPassKind
+from ..credentials import Step, credential_project, for_step
+from ..domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
 from ..domain.fsm import source_stopped
 from ..domain.models import (
     Mappings,
@@ -72,6 +73,7 @@ from ..security.secret_store import ceph_key_secret_name
 from ..security.secrets import (
     SecretNotFound,
     openstack_cloud_entry,
+    openstack_project_cloud_entry,
     read_secret,
     remove_quietly,
     resolve,
@@ -1000,10 +1002,39 @@ def build_inventory(ctx: StepContext, trust: _Trust | None = None) -> str:
     return _inventory()
 
 
+#: the pre-staging's flavor import, the one playbook it runs with the destination provider's own
+#: credential (SDD §7.2, §27.5)
+FLAVOR_IMPORT = "import_flavors.yml"
+
+
+def _prestage_runs(
+    playbooks: Sequence[_Playbook], plan: Plan
+) -> list[tuple[tuple[str | None, str | None], list[_Playbook]]]:
+    """The pre-staging's playbooks in their order, those of one credential pair in a row in one run
+    (SDD §7.2, §27.5): the flavor import with the plan's source credential and the destination
+    provider's own (§27.5's flavors row), every other with the plan's two (its pre-staging row) - a
+    plan that names no project runs them all at once, as before."""
+    runs: list[tuple[tuple[str | None, str | None], list[_Playbook]]] = []
+    for playbook in playbooks:
+        step = Step.FLAVORS if playbook.name == FLAVOR_IMPORT else Step.PRESTAGE
+        projects = AnsibleExecutor._projects(step, plan)
+        if runs and runs[-1][0] == projects:
+            runs[-1][1].append(playbook)
+        else:
+            runs.append((projects, [playbook]))
+    return runs
+
+
 def build_secret_vars(
-    source: Provider, destination: Provider, settings: Settings
+    source: Provider,
+    destination: Provider,
+    settings: Settings,
+    projects: tuple[str | None, str | None] = (None, None),
 ) -> dict[str, Any]:
-    """Credentials for ``secrets.yml`` (resolved from clouds.yaml / the secrets dir)."""
+    """Credentials for ``secrets.yml`` (resolved from clouds.yaml / the secrets dir): the run's two
+    credentials alone - each side's project credential of ``projects`` (source, destination), the
+    provider's own where it is None (SDD §7.2, §27.5); a VMware run's dst_cloud is the destination
+    provider's own (§27.9)."""
     try:
         if source.kind == ProviderKind.vmware:
             if not source.credentials_secret:
@@ -1025,8 +1056,15 @@ def build_secret_vars(
                 out["vcenter_datacenter"] = creds["datacenter"]
             return out
         out = {}
-        for side, provider in (("src", source), ("dst", destination)):
-            entry = openstack_cloud_entry(provider, settings)
+        for side, provider, project in (
+            ("src", source, projects[0]),
+            ("dst", destination, projects[1]),
+        ):
+            entry = (
+                openstack_cloud_entry(provider, settings)
+                if project is None
+                else openstack_project_cloud_entry(provider, project, settings)
+            )
             out[f"os_migrate_{side}_auth"] = entry["auth"]
             if entry.get("auth_type"):
                 out[f"os_migrate_{side}_auth_type"] = entry["auth_type"]
@@ -1512,6 +1550,25 @@ class AnsibleExecutor:
     def supports(self, strategy: Strategy) -> bool:
         return Strategy(strategy) in OPENSTACK | VMWARE
 
+    # -- credentials (SDD §7.2, §27.5, plan task TC5) ------------------------------------------
+    @staticmethod
+    def _step_of(ctx: StepContext) -> Step:
+        """The row of §27.5's table a migration's run is: the migration kit's for a VMware
+        strategy, else a migration's."""
+        return Step.KIT if Strategy(ctx.migration.strategy) in VMWARE else Step.MIGRATION
+
+    def _client(self, ctx: StepContext, provider: Provider) -> Any:
+        """What the run's own calls reach ``provider`` with: its run's credential there."""
+        return for_step(self.providers, self._step_of(ctx), provider, ctx.plan)
+
+    @staticmethod
+    def _projects(step: Step, plan: Plan) -> tuple[str | None, str | None]:
+        """The projects whose credentials a run of ``step`` holds, source and destination."""
+        return (
+            credential_project(step, ProviderRole.source, plan),
+            credential_project(step, ProviderRole.destination, plan),
+        )
+
     # -- prestage ------------------------------------------------------------------------------
     async def prestage(
         self,
@@ -1589,8 +1646,12 @@ class AnsibleExecutor:
                 host = provider.conversion_host
                 managed = host.manage if host is not None else True
                 creates = _host_key_file(pdir, side) if managed else None
+                # looked up where the deploy reaches it: the plan's project there (§27.5)
+                client = for_step(self.providers, Step.PRESTAGE, provider, plan)
                 hosts.append(
-                    await self._host_of(side, provider, SIDE_ALIASES[side], book, creates=creates)
+                    await self._host_of(
+                        side, provider, SIDE_ALIASES[side], book, creates=creates, client=client
+                    )
                 )
             trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
         injecting = trust is not None and bool(trust.secrets())
@@ -1599,20 +1660,28 @@ class AnsibleExecutor:
             # a run whose role reaches no server task leaves an earlier run's report (SDD §6.5)
             await asyncio.to_thread(remove_quietly, report)
         trace = _RunTrace()
+        # one run per credential pair, in the playbooks' order: the flavor import alone holds the
+        # destination provider's own credential (SDD §7.2, §27.5, §27.8); the conversion hosts'
+        # deploy is in the last run, which alone checks their keys
+        runs = _prestage_runs(playbooks, plan) or [(self._projects(Step.PRESTAGE, plan), [])]
         try:
-            await self._execute(
-                pdir,
-                osm,
-                variables,
-                source,
-                destination,
-                _inventory(),
-                playbooks,
-                None,
-                None,
-                trace=trace,
-                trust=trust,
-            )
+            for i, (projects, run) in enumerate(runs):
+                await self._execute(
+                    pdir,
+                    osm,
+                    variables,
+                    source,
+                    destination,
+                    _inventory(),
+                    run,
+                    None,
+                    None,
+                    trace=trace,
+                    trust=trust if i == len(runs) - 1 else None,
+                    projects=projects,
+                )
+                if any(playbook.name == FLAVOR_IMPORT for playbook in run):
+                    await self._share_flavors(plan, destination, prestage_flavors or [])
         except BaseException as exc:
             if injecting:
                 # a server the role created before the failure holds the key: pinned all the same
@@ -1634,6 +1703,25 @@ class AnsibleExecutor:
             refusal = await self._pin_created(trust, report, book)
             if refusal is not None:
                 raise PermanentStepError(refusal)
+
+    async def _share_flavors(
+        self, plan: Plan, destination: Provider, flavors: Sequence[str]
+    ) -> None:
+        """Each pre-staged flavor the import left private given access for the plan's destination
+        project, with the destination provider's own credential - os-migrate's import gives none
+        (SDD §7.2, §27.5, §27.6); nothing for a plan without a destination project."""
+        project = plan.destination_project
+        if project is None:
+            return
+        nova = for_step(self.providers, Step.FLAVORS, destination, plan)
+        for name in flavors:
+            try:
+                await nova.grant_flavor_access(name, project)
+            except ProviderError as exc:
+                raise PermanentStepError(
+                    f"could not give project {project} access to the flavor {name} the "
+                    f"pre-staging imported into {destination.label}: {exc}"
+                ) from exc
 
     async def _pin_created(self, trust: _Trust, report: Path, book: HostKeys) -> str | None:
         """After a pre-staging's run, whatever its outcome (SDD §7.2, §26.3, §26.4): the role's
@@ -1717,7 +1805,9 @@ class AnsibleExecutor:
         book = ctx.host_keys or NoHostKeys()
         rollback = ctx.log if step == StepName.ROLLBACK else None
         hosts = [
-            await self._host_of(side, provider, alias, book, rollback=rollback)
+            await self._host_of(
+                side, provider, alias, book, rollback=rollback, client=self._client(ctx, provider)
+            )
             for side, provider, alias in reached
         ]
         return _Trust(rdir / KNOWN_HOSTS_FILE, hosts)
@@ -1731,6 +1821,7 @@ class AnsibleExecutor:
         *,
         rollback: Callable[[str], Awaitable[None]] | None = None,
         creates: Path | None = None,
+        client: Any = None,
     ) -> _Host:
         """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
         keys, else the pin of the server it resolves to - looked up as the provider check finds
@@ -1742,7 +1833,10 @@ class AnsibleExecutor:
         fails is logged: the host then resolves to no server, and no pin applies. Given
         ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by its
         name alone, as the role looks it up, and one the role will create - no server bears its
-        name - gets a key injected, its private half to wait at ``creates`` (§26.3)."""
+        name - gets a key injected, its private half to wait at ``creates`` (§26.3). ``client``
+        looks the host up: the run's credential on its side, in the plan's project when it names
+        one (§7.2, §27.5), else the provider's own."""
+        client = client if client is not None else self.providers.get(provider)
         host = provider.conversion_host
         declared = tuple(host.ssh_host_keys) if host is not None else ()
         name = _host_label(provider, side)
@@ -1750,12 +1844,12 @@ class AnsibleExecutor:
             return _Host(side, alias, provider, name, None, KnownHost(alias, None, declared))
         try:
             if creates is None:
-                name, server = await self._find_conversion_host(provider, side)
+                name, server = await self._find_conversion_host(provider, side, client)
             else:
                 # the role looks its server up by its exact name, and creates it when none bears
                 # it (SDD §6.5)
                 name = (host.name if host is not None else None) or SIDE_ALIASES[side]
-                found = await self.providers.get(provider).find_server(name)
+                found = await client.find_server(name)
                 if found is None:
                     known = KnownHost(alias, None)
                     return _Host(side, alias, provider, name, None, known, private=creates)
@@ -1785,12 +1879,14 @@ class AnsibleExecutor:
             )
         return checked
 
-    async def _find_conversion_host(self, provider: Provider, side: str) -> tuple[str, str | None]:
+    async def _find_conversion_host(
+        self, provider: Provider, side: str, impl: Any
+    ) -> tuple[str, str | None]:
         """The server the side's conversion host resolves to, as the provider check finds it
-        (SDD §10): by its name - its side's alias when it has none -, else by its address; with
-        what found it, or what names it when nothing did. Raises ProviderError."""
+        (SDD §10) - with ``impl``, the run's credential there (§27.5): by its name - its side's
+        alias when it has none -, else by its address; with what found it, or what names it when
+        nothing did. Raises ProviderError."""
         host = provider.conversion_host
-        impl = self.providers.get(provider)
         name = (host.name if host is not None else None) or SIDE_ALIASES[side]
         server = await impl.find_server(name)
         if server is not None:
@@ -2009,7 +2105,7 @@ class AnsibleExecutor:
             return
         name = destination_server_name(m)
         try:
-            existing = await self.providers.get(ctx.destination).find_server(name)
+            existing = await self._client(ctx, ctx.destination).find_server(name)
         except ProviderError as exc:
             # an unanswered lookup is not "no such server": refuse before anything is stopped
             # (a duplicate name is a lookup error too)
@@ -2039,7 +2135,7 @@ class AnsibleExecutor:
             return []
         where = ctx.destination.label
         try:
-            volumes = kit_volumes(m.vm.name, await self.providers.get(ctx.destination).volumes())
+            volumes = kit_volumes(m.vm.name, await self._client(ctx, ctx.destination).volumes())
         except ProviderError as exc:
             # an unanswered lookup is not "no such volume": refuse before the kit runs
             raise TransientStepError(
@@ -2050,7 +2146,7 @@ class AnsibleExecutor:
             return volumes
         if source_stopped(m) and all(_marked(v, "converted") for v in stale):
             try:
-                vm = await self.providers.get(ctx.source).get_vm(m.vm.source_id)
+                vm = await self._client(ctx, ctx.source).get_vm(m.vm.source_id)
             except ProviderError as exc:
                 raise TransientStepError(
                     f"could not read {m.vm.name} from {ctx.source.label}: {exc}"
@@ -2059,7 +2155,7 @@ class AnsibleExecutor:
                 # off now - and not run since the clock opened? vCenter's events say; its power
                 # state alone does not, a VM run and shut down again reads off too (review RV30-03)
                 try:
-                    ran = await self.providers.get(ctx.source).powered_on_since(
+                    ran = await self._client(ctx, ctx.source).powered_on_since(
                         m.vm.source_id, m.downtime_started_at
                     )
                 except ProviderError as exc:
@@ -2099,7 +2195,7 @@ class AnsibleExecutor:
         inside the outage keeps them (reviews RV32A-01, RV32A-02). The destination's conversion host
         holding one - a killed run's - lets go of it first, of a copy kept too (review RV32A-03);
         one another server holds stays."""
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         host: list[str | None] = []  # looked up once, for the first copy held
         try:
             for volume in volumes:
@@ -2145,9 +2241,9 @@ class AnsibleExecutor:
         if not converted:
             return False
         try:
-            if await self.providers.get(ctx.destination).find_server(destination_server_name(m)):
+            if await self._client(ctx, ctx.destination).find_server(destination_server_name(m)):
                 return False
-            keys = await self.providers.get(ctx.source).disk_keys(m.vm.source_id)
+            keys = await self._client(ctx, ctx.source).disk_keys(m.vm.source_id)
         except ProviderError as exc:
             # an unanswered read is no answer: nothing deleted, nothing run (SDD §7.2)
             raise TransientStepError(
@@ -2162,7 +2258,7 @@ class AnsibleExecutor:
         one, which no CBT sync undoes -, and in a rollback once a server booted from them. Each
         one marked is added to ``marked``. Raises ProviderError; each caller fails its attempt as
         transient."""
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
             if _marked(volume, "seamless_copied"):
                 await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
@@ -2174,7 +2270,7 @@ class AnsibleExecutor:
         volume: the copies it marked 'cutover' are completed copies still, marked so again for the
         retry's CBT sync. A marking back that fails is logged and leaves the rest 'cutover' (SDD
         §7.2, review RV34A-02)."""
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         for index, volume_id in enumerate(marked):
             try:
                 await dst.set_volume_metadata(volume_id, dict(COPIED))
@@ -2191,7 +2287,7 @@ class AnsibleExecutor:
         not converted and that no server holds: its copy completed, and a later run keeps it for
         its CBT sync (SDD §7.2, review RV30-01). A marking that fails fails the pass as
         transient: its retry copies the unmarked volumes in full."""
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         try:
             for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
                 if (
@@ -2296,7 +2392,7 @@ class AnsibleExecutor:
         server and goes on."""
         vm, where = ctx.migration.vm, ctx.destination.label
         try:
-            return await self.providers.get(ctx.destination).inventory()
+            return await self._client(ctx, ctx.destination).inventory()
         except ProviderError as exc:
             gpu = bool(vm_gpus(vm, declared_gpu_profile(vm, ctx.source)))
             if gpu and deferred is None:
@@ -2343,7 +2439,7 @@ class AnsibleExecutor:
         token roles of the network map, and the flavors a GPU VM's mapping must still apply to (SDD
         §7.2, §22.4). One that cannot be read is a transient failure, before the kit runs."""
         try:
-            return await self.providers.get(ctx.destination).inventory()
+            return await self._client(ctx, ctx.destination).inventory()
         except ProviderError as exc:
             raise TransientStepError(
                 f"could not read the networks of {ctx.destination.label}: {exc}"
@@ -2363,7 +2459,7 @@ class AnsibleExecutor:
         ``deferred`` (a pre-copy or sync run, in which the kit makes no port), the network the
         credential may not use and the held MAC or address are added there instead and the NIC is
         mapped, and ports that cannot be read are logged."""
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         networks = list(getattr(inventory, "network_details", None) or [])
         subnets = list(getattr(inventory, "subnets", None) or [])
         # the token's roles read now with the inventory, as the handover's step 0 and the
@@ -2557,7 +2653,7 @@ class AnsibleExecutor:
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         name = destination_server_name(ctx.migration)
         try:
-            return await self.providers.get(ctx.destination).find_server(name)
+            return await self._client(ctx, ctx.destination).find_server(name)
         except ProviderError as exc:
             await ctx.log(
                 f"could not look up the server named {name} in {ctx.destination.label}: {exc}"
@@ -2571,7 +2667,7 @@ class AnsibleExecutor:
             return await self._vmware_cancel_cleanup(ctx)
         rdir = run_dir(self.settings, ctx.plan.id, m.id)
         try:
-            dst = self.providers.get(ctx.destination)
+            dst = self._client(ctx, ctx.destination)
             recorded = m.destination_server_id
             named = None
             # what an earlier attempt kept of a server it then deleted (review RV30-05); a record
@@ -2622,7 +2718,7 @@ class AnsibleExecutor:
             # a stretched network -, and the destination's clean-up never keeps it stopped - the
             # kit's ports and volumes matter only to the next attempt, which a failure there
             # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
-            source = self.providers.get(ctx.source)
+            source = self._client(ctx, ctx.source)
 
             async def power_on_and_close() -> None:
                 await source.power_on(vm.source_id)
@@ -2671,7 +2767,7 @@ class AnsibleExecutor:
         host it cannot look up leaves each held volume one of a holder it could not tell
         (`unsure_volumes`), named with the error (`unsure_why`), never unnamed (review RV45B-02)."""
         server_id = ctx.migration.destination_server_id
-        dst = self.providers.get(ctx.destination)
+        dst = self._client(ctx, ctx.destination)
         if server_id:
             try:
                 await dst.delete_server(server_id)
@@ -2722,7 +2818,7 @@ class AnsibleExecutor:
                 }
             )
         try:
-            await self.providers.get(ctx.source).delete_server(ctx.migration.vm.source_id)
+            await self._client(ctx, ctx.source).delete_server(ctx.migration.vm.source_id)
         except ProviderError as exc:
             raise TransientStepError(f"finalize: {exc}") from exc
         return StepResult(details={"source_deleted": True})
@@ -2754,10 +2850,17 @@ class AnsibleExecutor:
         *,
         trace: _RunTrace | None = None,
         trust: _Trust | None = None,
+        projects: tuple[str | None, str | None] | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped. What the
         output showed is kept in ``trace``; ``trust``, while host keys are checked, is what the
-        run checks its conversion hosts' keys against (SDD §7.2)."""
+        run checks its conversion hosts' keys against (SDD §7.2). ``secrets.yml`` holds the run's
+        two credentials: those of ``projects`` (source, destination), else the migration step's
+        (SDD §7.2, §27.5)."""
+        if projects is None:
+            projects = (
+                self._projects(self._step_of(ctx), ctx.plan) if ctx is not None else (None, None)
+            )
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -2787,7 +2890,7 @@ class AnsibleExecutor:
                 control.mkdir(mode=0o700)
             write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
-            secret_vars = build_secret_vars(source, destination, self.settings)
+            secret_vars = build_secret_vars(source, destination, self.settings, projects)
             write_secret_file(secrets_path, ansible_yaml(secret_vars))
             for path, content in ceph_files:
                 write_secret_file(path, content)
