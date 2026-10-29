@@ -20,6 +20,7 @@ from seamless_migrate.planning.selector import (
     select_strategy,
     tie_set,
 )
+from tests.credential_support import tenant_project
 from tests.factories import make_disk, make_plan, make_vm
 
 OK_CAPS = {"admin": True, "conversion_host": True}
@@ -138,6 +139,57 @@ def test_handover_requires_backend_map_and_admin():
     disabled = make_plan(handover=HandoverConfig(enabled=False, backend_map={"ceph-ssd": "x"}))
     assert eligibility(vm, ProviderKind.openstack, disabled, OK_CAPS, OK_CAPS, [])[
         Strategy.storage_handover
+    ]
+
+
+def test_storage_handover_into_a_project_needs_admin_in_its_credential():
+    """SDD §9.2, §27.5, §27.6 (owner decision 8, plan task TC6): a handover into a project manages
+    the volumes and creates the server with that project's credential, so for a plan with a
+    destination project storage_handover needs admin among the roles of the project's entry of
+    the destination's check report - the provider's own admin neither stands in for it nor is
+    needed -, and the reason names the provider and the project. Roles not read count as none; the
+    source keeps its provider's own admin; a plan without a destination project is as before."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    project = tenant_project()
+    plan = make_plan(
+        handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}),
+        destination_project=project,
+    )
+    vm = make_vm(disks=[make_disk(volume_type="ceph-ssd")])
+
+    def reasons(own_admin, roles, plan=plan, entry=True, src=OK_CAPS):
+        checked = {"status": "ok", "project_name": "tenant-c", "roles": roles}
+        dst = {
+            "admin": own_admin,
+            "conversion_host": True,
+            "projects": {project: checked} if entry else {},
+        }
+        return eligibility(vm, ProviderKind.openstack, plan, src, dst, [], name)
+
+    lacking = (
+        f"admin rights are required on {name} in the credential of project tenant-c ({project}), "
+        "which manages the volumes and creates the server"
+    )
+    assert reasons(True, ["member", "reader"])[Strategy.storage_handover] == [lacking]
+    assert reasons(True, None)[Strategy.storage_handover] == [lacking]
+    assert reasons(False, ["admin", "member", "reader"])[Strategy.storage_handover] == []
+    # a project the check holds no entry for is named by its id
+    assert reasons(True, None, entry=False)[Strategy.storage_handover] == [
+        f"admin rights are required on {name} in the credential of project {project}, which "
+        "manages the volumes and creates the server"
+    ]
+    # the source half acts by id with the source provider's own admin, whatever the project
+    assert reasons(False, ["admin"], src={"admin": False, "conversion_host": True})[
+        Strategy.storage_handover
+    ] == ["admin rights are required on the source cloud"]
+    # cold and warm keep their eligibility
+    judged = reasons(True, ["member"])
+    assert judged[Strategy.cold] == [] and judged[Strategy.warm] == []
+    # a plan without a destination project: the provider's own admin, as before
+    plain = plan.model_copy(update={"destination_project": None})
+    assert reasons(True, ["member"], plain)[Strategy.storage_handover] == []
+    assert reasons(False, ["admin"], plain)[Strategy.storage_handover] == [
+        f"admin rights are required on {name}"
     ]
 
 

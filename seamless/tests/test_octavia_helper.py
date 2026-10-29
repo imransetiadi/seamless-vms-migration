@@ -290,7 +290,9 @@ async def test_the_member_helper_acts_with_each_sides_project_credential(tmp_pat
     from tests.orch_support import DST_PROVIDER, SRC_PROVIDER
 
     h, plan, source, destination, log = await lb_setup(tmp_path, store)
-    registry, t = with_projects(h, plan)
+    # a plan that maps Octavia pools needs load-balancer_member in each side's project credential
+    # (SDD §9.3 PROJECT_CREDENTIAL_ROLE_MISSING, §27.5, plan task TC6)
+    registry, t = with_projects(h, plan, roles=("load-balancer_member", "member", "reader"))
     await run_plan(h, t.plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
     await h.wait_phase(mid, P.completed)
