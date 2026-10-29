@@ -32,7 +32,7 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..conversion_key import installation_key, run_key
-from ..credentials import Step, credential_project, for_step
+from ..credentials import Step, credential_project, for_step, host_pin, implementation
 from ..domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
 from ..domain.fsm import source_stopped
 from ..domain.models import (
@@ -1477,6 +1477,9 @@ class _Host:
     injected: str | None = None
     #: the server the role reported it created with that key
     created: str | None = None
+    #: the project whose credential the run reaches it with - None for its provider's own -,
+    #: whose pin is its (SDD §26.4, §27.5)
+    project: str | None = None
 
     @property
     def keys(self) -> list[str]:
@@ -1656,11 +1659,12 @@ class AnsibleExecutor:
                 host = provider.conversion_host
                 managed = host.manage if host is not None else True
                 creates = _host_key_file(pdir, side) if managed else None
-                # looked up where the deploy reaches it: the plan's project there (§27.5)
-                client = for_step(self.providers, Step.PRESTAGE, provider, plan)
+                # looked up where the deploy reaches it - the plan's project there - and checked
+                # against that credential's pin (§26.4, §27.5)
+                project = credential_project(Step.PRESTAGE, side, plan)
                 hosts.append(
                     await self._host_of(
-                        side, provider, SIDE_ALIASES[side], book, creates=creates, client=client
+                        side, provider, SIDE_ALIASES[side], book, creates=creates, project=project
                     )
                 )
             trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
@@ -1738,7 +1742,8 @@ class AnsibleExecutor:
         report read, each server it created with the key the run injected is pinned with it
         through ``book`` - source injected, with conversion_host.key_pinned. A server it found
         instead does not hold that key and is never pinned with it: the refusal of such a host
-        is returned - a host without a key -, unless the provider's pin is that server's."""
+        is returned - a host without a key -, unless the side's pin - its credential's (§26.4) -
+        is that server's."""
         created, found = await asyncio.to_thread(_read_hosts_report, report)
         refusal = None
         for host in trust.hosts:
@@ -1748,7 +1753,7 @@ class AnsibleExecutor:
                 host.created = created[host.alias]
                 await book.pin_injected(host.provider, host.side, host.created, [host.injected])
                 continue
-            pin = host.provider.conversion_host_pin
+            pin = host_pin(host.provider, host.project)
             server = found.get(host.alias)
             if server is not None and (pin is None or pin.server_id != server) and not refusal:
                 refusal = (
@@ -1816,7 +1821,12 @@ class AnsibleExecutor:
         rollback = ctx.log if step == StepName.ROLLBACK else None
         hosts = [
             await self._host_of(
-                side, provider, alias, book, rollback=rollback, client=self._client(ctx, provider)
+                side,
+                provider,
+                alias,
+                book,
+                rollback=rollback,
+                project=credential_project(self._step_of(ctx), side, ctx.plan),
             )
             for side, provider, alias in reached
         ]
@@ -1831,7 +1841,7 @@ class AnsibleExecutor:
         *,
         rollback: Callable[[str], Awaitable[None]] | None = None,
         creates: Path | None = None,
-        client: Any = None,
+        project: str | None = None,
     ) -> _Host:
         """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
         keys, else the pin of the server it resolves to - looked up as the provider check finds
@@ -1843,15 +1853,17 @@ class AnsibleExecutor:
         fails is logged: the host then resolves to no server, and no pin applies. Given
         ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by its
         name alone, as the role looks it up, and one the role will create - no server bears its
-        name - gets a key injected, its private half to wait at ``creates`` (§26.3). ``client``
-        looks the host up: the run's credential on its side, in the plan's project when it names
-        one (§7.2, §27.5), else the provider's own."""
-        client = client if client is not None else self.providers.get(provider)
+        name - gets a key injected, its private half to wait at ``creates`` (§26.3). ``project``
+        is the project whose credential the run reaches the host with - in the plan's project
+        when it names one there, else None for the provider's own (§7.2, §27.5) -: that
+        credential looks the host up, and its pin is the host's (``host_pin``, §26.4)."""
+        client = implementation(self.providers, provider, project)
         host = provider.conversion_host
         declared = tuple(host.ssh_host_keys) if host is not None else ()
         name = _host_label(provider, side)
         if declared:
-            return _Host(side, alias, provider, name, None, KnownHost(alias, None, declared))
+            known = KnownHost(alias, None, declared)
+            return _Host(side, alias, provider, name, None, known, project=project)
         try:
             if creates is None:
                 name, server = await self._find_conversion_host(provider, side, client)
@@ -1862,7 +1874,9 @@ class AnsibleExecutor:
                 found = await client.find_server(name)
                 if found is None:
                     known = KnownHost(alias, None)
-                    return _Host(side, alias, provider, name, None, known, private=creates)
+                    return _Host(
+                        side, alias, provider, name, None, known, private=creates, project=project
+                    )
                 server = str(found)
         except ProviderError as exc:
             failure = f"could not look up the {side} conversion host {name} in {provider.label}"
@@ -1870,13 +1884,14 @@ class AnsibleExecutor:
                 raise TransientStepError(f"{failure}: {exc}") from exc
             await rollback(f"{failure} ({exc}): no pin applies to it in this run")
             server = None
-        if rollback is None and server is not None and provider.conversion_host_pin is None:
+        pin = host_pin(provider, project)
+        if rollback is None and server is not None and pin is None:
             # a host without a pin: its console, read once, pins what it shows (SDD §26.8)
             provider = await book.pin_from_console(provider)
-        pin = provider.conversion_host_pin
+            pin = host_pin(provider, project)
         declared = tuple(provider.conversion_host.ssh_host_keys) if provider.conversion_host else ()
         known = KnownHost(alias, server, declared, pin)
-        checked = _Host(side, alias, provider, name, server, known)
+        checked = _Host(side, alias, provider, name, server, known, project=project)
         if rollback is None and not checked.keys:
             if pin is not None and server is not None and pin.server_id != server:
                 raise PermanentStepError(

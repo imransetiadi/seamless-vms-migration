@@ -2,9 +2,9 @@
 rule of the control plane. ``credential_project`` reads §27.5's table and a plan's
 ``source_project`` and ``destination_project``, and answers the Keystone project whose credential
 a step acts with on a side, or None for the provider's own; ``implementation`` hands what acts
-with it from the provider registry. No executor, helper or route picks a credential on its own,
-and a project credential the plan names is never replaced by the provider's own (§27.5, "No
-fallback")."""
+with it from the provider registry, and ``host_pin`` the pin of the conversion host it reaches
+(§26.4). No executor, helper or route picks a credential, or a pin, on its own, and a project
+credential the plan names is never replaced by the provider's own (§27.5, "No fallback")."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from .domain.enums import ProviderRole
-from .domain.models import Provider
+from .domain.models import HostKeyPin, Provider
 from .planning.networks import policy_profile_of
 from .planning.preflight import FIP_ADDRESS_ROLES
 from .providers.base import ProviderError
@@ -105,6 +105,31 @@ def implementation(registry: Any, provider: Provider, project_id: str | None) ->
 def for_step(registry: Any, step: Step, provider: Provider, plan: HasProjects | None) -> Any:
     """What acts on ``provider`` - its side its role - for ``step`` of ``plan`` (SDD §27.5)."""
     return implementation(registry, provider, credential_project(step, provider.role, plan))
+
+
+def host_pin(provider: Provider, project_id: str | None) -> HostKeyPin | None:
+    """The pin of the conversion host the credential of ``project_id`` reaches on ``provider``'s
+    side (SDD §4.2, §10, §26.4; the owner's decision of 2026-10-29, after plan task TC5): the
+    provider's own pin for its own credential (None), else that project credential's own - none
+    for a project the provider holds no credential for, never the provider's."""
+    if project_id is None:
+        return provider.conversion_host_pin
+    held = provider.project_credentials.get(project_id)
+    return held.conversion_host_pin if held is not None else None
+
+
+def with_host_pin(provider: Provider, project_id: str | None, pin: HostKeyPin) -> Provider | None:
+    """``provider`` with ``pin`` as the pin of the credential of ``project_id`` (SDD §26.4): its
+    own pin for None, else that project credential's, every other pin as it was; None for a
+    project the provider no longer holds a credential for - its pin went with it (§12)."""
+    if project_id is None:
+        return provider.model_copy(update={"conversion_host_pin": pin})
+    held = provider.project_credentials.get(project_id)
+    if held is None:
+        return None
+    entry = held.model_copy(update={"conversion_host_pin": pin})
+    credentials = {**provider.project_credentials, project_id: entry}
+    return provider.model_copy(update={"project_credentials": credentials})
 
 
 class _Placement:

@@ -219,7 +219,9 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
                                                        # set by the provider check (§10, §26.4); returned by the
-                                                       # API and never written through it (§12)
+                                                       # API and never written through it (§12). The host its own
+                                                       # credential reaches: a project's host has its own pin, on
+                                                       # that project's credential (ProjectCredential, §26.4)
            project_credentials: dict[str, ProjectCredential] = {},
                                                        # server-owned: an application credential per Keystone
                                                        # project, by project id (1-64 letters, digits, - or _),
@@ -246,7 +248,15 @@ CephAccess { fsid: str,                      # the cluster's fsid, a UUID; a poo
 
 ProjectCredential { secret: str,             # its secret's name, provider-{id}.project-<h> (§13.3), never
                                              # a value
-                    updated_at: datetime }   # when an admin wrote it
+                    updated_at: datetime,    # when an admin wrote it
+                    conversion_host_pin: HostKeyPin|null = null }
+                                             # server-owned with its entry: the pinned host keys of the
+                                             # project's conversion host, which a plan with the project
+                                             # deploys and reaches with this credential (§7.2, §26.4,
+                                             # §27.5; the owner's decision of 2026-10-29, after plan task
+                                             # TC5); returned by the API and never written through it,
+                                             # kept when an admin writes the credential again, gone with
+                                             # it (§12)
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -2354,18 +2364,21 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     `conversion_host`. A host without declared keys is looked up as the provider check finds it (§10): by its name
     (`conversion_host.name`, else its side's alias), else by its address. A lookup that fails fails the run as
     transient, a rollback's excepted, which logs it. A plan with a project on a side looks its host up there with the
-    plan's credential, where the deploy created it (above, §27.5); a provider holds one pin (§4.2), so the hosts of
-    two projects of one provider replace each other's pin as each project's pre-staging creates its own, and a run
-    that meets the other's pin is refused ("conversion host replaced", below) - pins per project wait for an owner
-    decision (`TODO(OWNER)`, plan task TC5).
+    plan's credential, where the deploy created it (above, §27.5), and that host - another server than the provider's
+    own - has its own pin, on the project's credential (`ProjectCredential.conversion_host_pin`, §4.2; the owner's
+    decision of 2026-10-29, after plan task TC5). A run reads and writes the pin of the credential it reaches the host
+    with (`credentials.host_pin`, §26.4): the provider's own pin for its own credential, a project's for that
+    project's credential, never another's - so two projects of one provider each keep their own host's pin, and
+    neither run meets the other's.
   * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
     `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
     resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
     `ANSIBLE_HOST_KEY_CHECKING=True`, and gives the VMware inventory's `conversion_host` entry what
     `conv_host_inventory.yml` gives an OpenStack host (§6.5): `ansible_ssh_common_args` with §26.4's options,
     `HostKeyAlias=conversion_host` and the pinned keys' `HostKeyAlgorithms`, and `ansible_ssh_host_key_checking: true`.
-  * **A host without a pin** - no declared keys, no pin - has its console read once and pinned by the provider check's
-    path (§10, §26.8: `conversion_host.key_pinned`, source `console`). A pre-staging, pre-copy, sync or cutover then
+  * **A host without a pin** - no declared keys, no pin of the credential the run reaches it with - has its console
+    read once with that credential and pinned as that credential's pin by the provider check's path (§10, §26.8:
+    `conversion_host.key_pinned`, source `console`). A pre-staging, pre-copy, sync or cutover then
     refuses before any playbook, as a permanent failure, a host it has no key for: "host key unknown: no key is pinned
     or declared for the {side} conversion host {name}", and one whose pin belongs to another server than the one it
     resolves to: "conversion host replaced: {name} is now server {new id}; its pin belongs to server {old id}" ({name}
@@ -2377,9 +2390,10 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
     `dst`), 0600 with its final newline, passed as `os_migrate_{side}_conversion_host_key_private_path` and removed
     after the run whatever its outcome, never logged; its public half under the side's alias in the run's
     `known_hosts`. The role's report (`osm/conversion/hosts.json`, §6.5) is removed before the run and read after it,
-    also after a failure: a server under `created` of a side that got a key is pinned with it (source `injected`,
-    `conversion_host.key_pinned`); one under `found` does not hold it and is not pinned - a run that succeeded is
-    refused for it "host key unknown: ...", unless the provider's pin is that server's. A run whose output refuses the
+    also after a failure: a server under `created` of a side that got a key is pinned with it as the pin of the side's
+    credential (source `injected`, `conversion_host.key_pinned`) - not pinned when that credential went meanwhile, its
+    pin going with it (§12); one under `found` does not hold it and is not pinned - a run that succeeded is refused
+    for it "host key unknown: ...", unless the side's pin is that server's. A run whose output refuses the
     key of a server it created fails "the conversion host {name}, created with an injected host key, does not present
     it: check its image's cloud-init".
   * **A refusal in the output** - the collection's "host key refused: " and "link refused by the source conversion
@@ -3430,7 +3444,11 @@ strategy ineligible):
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
-  `dst_caps["admin"]` truthy, and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
+  `dst_caps["admin"]` truthy - for a plan with a `destination_project`, `admin` among the roles of that project's entry
+  of the destination's check report (`dst_caps["projects"]`, §10; roles not read count as none) instead of
+  `dst_caps["admin"]`: that project's credential manages the volumes and creates the server, and the provider's own
+  acts in no part of the destination half (§7.3, §27.5, §27.6), so the reason names the project (plan task TC6) -,
+  and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
   it (step 3's `delete_on_termination` update goes to the source server; the destination never receives it, §21.4);
   for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
@@ -3467,7 +3485,9 @@ source=None, destination=None) -> list[Finding]` — `all_vms` are the plan's se
 names, cumulative quotas), `source`/`destination` the providers (conversion-host check). Where a finding's message
 means the destination cloud it names the destination provider (`destination.name`, "the destination" when
 `run_preflight` has none); its remediation, fixed by the catalog, says "the destination" (§1 naming, plan T6).
-Finding catalog (code — severity — condition):
+Validation also gives it both providers' check reports as its checks just read them (`src_caps`, `dst_caps`), its
+clock (`now`) and the keys of its VMs' keypairs (`keypair_fingerprints`, below) for the credential rows (plan task
+TC6). Finding catalog (code — severity — condition):
 
 | Code | Severity | Condition |
 |---|---|---|
@@ -3492,7 +3512,11 @@ Finding catalog (code — severity — condition):
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume). The free quota is the limit less what is in use, so each VM counts what a cutover will still create (review PL-02): all of it with no migration yet or one in `pending`, `validating`, `blocked`, `ready`, `failed` or `rolled_back` (it runs, or runs again, from `ready`) - but one of these that holds the destination volumes an earlier attempt created, which the next attempt uses again (a failed or rolled-back warm attempt, or one a Retry put back in `ready`; its workload record's destination volumes - an unreadable record counts as holding them -, and where no record tells - the demo, the VMware kit - recorded passes of a `warm` migration (its rollback keeps them for every later attempt), or passes a `vmware_warm` one recorded since the kit last released its copies (a pass that started once the attempt after its last `cutover` entered `precopy`, every pass when no `cutover` ran, none when its last attempt ran one) - the strategy being the one of the attempt whose copies remain: while the migration waits for its next attempt (`pending`, `validating`, `blocked`, `ready`), the retried attempt's, whatever a validation or `PUT …/strategy` chose since (the VMware kit keeps no record, so a `vmware_warm` migration switched to `vmware_cold` still holds the kit's copies, review RV40-06) -: the kit's rollback deletes its copies after a cutover, or marks them `cutover`, and a later attempt's first copy cut off - no copy completed - is deleted too, while the copies an attempt with no cutover completed stay, marked, and the next attempt's first run syncs them by CBT - cut off, it keeps them (§7.2, reviews RV40-05, RV41B-02) -; a `cold`, `vmware_cold` or `storage_handover` rollback keeps no copy), counts its server alone (reviews RV38A-01, RV39-02); its server alone (cores, ram, instances) in `precopy`, `syncing`, `awaiting_cutover` or `cutover` (its destination volumes exist or are being created); nothing in `verifying`, `completed`, `finalized`, `rolling_back` or `cancelled` (what it holds is in use, or being released). A VM's cores and ram are those of the destination flavor its server is created with - a GPU VM's GPU flavor (§22.4), a VMware VM's included; else the mapped one, else the same-named or automatically matched one (`MAP_FLAVOR_AUTO`) -, and its own for a flavor pre-staging creates with the source's size, for a VMware VM without a GPU flavor (the migration kit chooses the flavor, §7.2) and when no destination flavor resolves (review PL-01) |
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
-| `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
+| `DST_KEYPAIR_KEY_MISMATCH` | blocker | an OpenStack VM's `key_name` names a keypair that both the source credential's user and the destination credential's user hold (both inventories list it, §10), and their keys differ: validation reads each public key with the plan's credential on its side (`keypair_public_key`, §10; §27.5's inventory row) and compares their SHA256 fingerprints as `ssh-keygen -l` prints them - the key's type and its key, never its comment. Keypairs belong to users (§27.6): the server is created as the destination credential's user and would boot with that user's key of the name, not the source's - a key name two tenants use is one keypair for two project credentials of one user. The message names the key name and both fingerprints with their providers; a key validation could not read, or one that is no OpenSSH public key (an x509 certificate), is not judged (plan task TC6) |
+| `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge). Its remediation names `plan.mappings.projects` and the plan's `destination_project`, the project where a plan with one lands its VMs (§27.4, §27.6, plan task TC6) |
+| `PROJECT_CREDENTIAL_EXPIRING` | warning | a project credential the plan uses - its `source_project`'s on the source provider, its `destination_project`'s on the destination (§27.4) - expires, by the `expires_at` of its entry of that provider's check report as validation's check just read it (`projects`, §10), within 7 days of the validation or before the plan's `cutover_window` ends (owner decision 9, §27.7). One finding per credential: the message names the provider, the plan's side, the project (its name and id), the expiry and which of the two holds. A credential that never expires (`expires_at` null) is not judged, nor are the providers' own credentials, whose check reads no expiry; one that has expired is refused before any finding (§8, plan task TC6) |
+| `PROJECT_CREDENTIAL_UNRESTRICTED` | warning | a project credential the plan uses is an unrestricted application credential (its entry's `restricted` false, §10): it may create other application credentials and trusts (§27.8). One finding per credential, naming the provider, the plan's side and the project; `restricted` null is not judged (plan task TC6) |
+| `PROJECT_CREDENTIAL_ROLE_MISSING` | blocker | a project credential the plan uses lacks, among the roles of its entry (`roles`, §10), `member` - a token lists the roles its roles imply, so `manager` and `admin` carry it (`TODO(LAB): confirm` that, and the legacy profile, whose rules take any role on the project) -, or, for a plan that maps Octavia pools (`network_cutover.lb_pools`), `load-balancer_member`, which the member helper acts with on both sides (§8.5, §27.5). One finding per credential, naming the provider, the plan's side, the project, each role it lacks and the roles its token holds; roles not read are not judged (plan task TC6) |
 | `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - the source's compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead (§9.2) |
 | `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or the detected range contradicts its declared `release` (`declared_outside_range`, §10.1; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
 | `DST_DNS_INTEGRATION_MISSING` | warning | an OpenStack VM's NIC is published in DNS by Neutron's DNS integration at the source (`Nic.dns_name` and `Nic.dns_domain`, §4.2), and the destination lacks it: its Neutron lists no `dns-integration` extension, or its Designate holds no zone of that domain for the destination credential (`DestinationInventory.dns`, §10; a domain is compared lower case with its trailing dot) - the migrated port is not published (§23.5). A destination whose extensions could not be read is not judged, nor its zones when Designate could not be read |
@@ -3500,7 +3524,7 @@ Finding catalog (code — severity — condition):
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | a VM's NIC goes to a RHOSO network name (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name, §7.2) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A VMware NIC's IPv4 guest addresses (the migration kit sends only those, with one subnet per NIC, §7.2) must all be host addresses of one subnet of its resolved network. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
-| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` and `policy_profile` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
+| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` of the plan's destination credential - for a plan with a `destination_project` that project's entry of the destination's check report (`projects`, §10), else the provider's own `roles` (plan task TC6) - and the destination's `policy_profile`, as validation's check reports them; when no `roles` are reported, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails, and the project whose credential it judges for a plan with a destination project |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `NET_PREFIX_SPLIT` | warning | the source or the destination provider declares `announces_tenant_networks` (§4.2, §23.6), and the plan's waves put the VMs of one source network into more than one wave: while one wave is cut over and the next is not, the network's prefix has an origin in each cloud, and its tenant routes cannot be correct. The message names the network, its waves by name and the declaring provider; nothing is judged before the waves are planned |
 | `NET_LB_POOL_SPLIT` | warning | the VM is a member of an Octavia pool of the source (a membership as `SRC_VM_LB_MEMBER` reads it, of a pool the plan maps too: the member helper moves each member with its own VM's cutover, §8.5), and the plan's waves put the pool's members among the plan's VMs into more than one wave: while one wave is cut over and the next is not, the pool's members are in both clouds, and its load balancer reaches only those not yet cut over (§23.7). A member that is no VM of the plan, or a VM of the plan in no wave, is not counted. The message names each such pool with its load balancer, its waves by name in their order and the source provider; nothing is judged before the waves are planned |
@@ -3508,7 +3532,7 @@ Finding catalog (code — severity — condition):
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | the plan's `network_cutover.floating_ips` is `"auto"` (under `"keep_address"` the move of §8.3 keeps the address, and `DST_FIP_ADDRESS_UNAVAILABLE` judges it) and an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
 | `NET_DNS_TTL_LONG` | warning | the plan names a DNS target for the VM (`network_cutover.dns_targets`, §4.2) whose record validation read (§8.4, §10: Designate's recordset with the destination provider's credential, or a TSIG-signed query to the RFC 2136 server) and its TTL is longer than the plan's `downtime_slo_s`: after the swap, clients may reach the old address for up to that TTL. The message names the record, its TTL and the SLO; a record that cannot be read is not judged |
-| `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the token lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
+| `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the credential that reserves it (§8.3) lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`) -: for a plan with a `destination_project`, the credential §8.3's reservation names (`credentials.reservation`, §27.6): its project credential when that one's roles may choose the address, else the destination provider's own, which reserves for the project and so needs `admin` whatever the profile (plan task TC6); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
 | `VM_PCI_PASSTHROUGH` | blocker | the VM has a passthrough device - an entry of kind `passthrough` in its `gpus` (§22.2): an OpenStack flavor's `pci_passthrough:alias`, a VMware `VirtualPCIPassthrough` device that is no vGPU (plan task G2) - and no GPU mapping applies to it, as for `VM_VGPU`; for a VMware device without ids, the message says that no mapping can name it (§22.4, plan task G4) |
 | `VM_VGPU` | blocker | the VM has a vGPU - an entry of kind `vgpu` in its `gpus` (§22.2): an OpenStack flavor's `resources:VGPU`, bare or in its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08), or a custom resource class its source declares a profile for (§22.3); a VMware vGPU device (plan task G2) - and no GPU mapping applies to it (§22.4): no mapping names it (the message names the GPU key or the flavor to map), its mapping's flavor asks for no GPU (the message names the mapping and says the server would lose its GPU), or its GPUs' keys map to different flavors (plan task G4) |
 | `MAP_GPU_FLAVOR` | info; **warning** when the GPU flavor gives fewer vCPUs, less RAM or a smaller local root disk than the VM | a GPU mapping applies (§22.4): the message names the VM's GPUs, the GPU flavor with its size and GPU requests, and that GPU migration is a Technology Preview (§22.1) |
@@ -3561,6 +3585,17 @@ pairs, floating IPs and DNS names (§4.2, §10) - and the destination's floating
 reads the plan's waves and the providers' `announces_tenant_networks`, and `NET_LB_POOL_SPLIT` (§23.7) the plan's waves
 and the source's `lb_members` for each VM of the plan. None of them blocks: each warns of what the migration does not
 carry or its waves split, and its remediation says what the operator does about it.
+
+The credential rows (plan task TC6, §27.7) judge the plan's project credentials as validation's checks just read them
+(§8, §10): the entry of its `source_project` in the source's check report and of its `destination_project` in the
+destination's (`projects`: `roles`, `restricted`, `expires_at`), with validation's clock. A side whose project is
+null - the provider's own credential, 0.4.0's rule - is not judged, and a plan whose project credential is missing,
+failed its check or has expired never reaches them (400, §8). Each such finding is about one credential and its
+message names the project, which a findings list shows (§16). The role halves of `NET_PORT_NOT_PERMITTED` and
+`DST_FIP_ADDRESS_UNAVAILABLE`, and the handover's eligibility (§9.2), read the plan's destination credential's roles
+from the same entry. `DST_KEYPAIR_KEY_MISMATCH` reads `keypair_fingerprints`: for each key name of the plan's
+OpenStack VMs that both inventories list, the fingerprints of the source's and the destination's keys as validation
+read them - null for one it could not read, which is not judged.
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -4033,13 +4068,17 @@ series}`; `pool_name(resource_class, traits, forbidden_traits) -> str` names a p
 (plan task G4).
 
 **Host key pins** (`seamless_migrate.security.host_keys`, plan task ST2; §26.3, §26.4). A provider's conversion
-host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone writes:
+host's pin is `Provider.conversion_host_pin` (§4.2), and the host each of its project credentials reaches - a plan
+with that project's (§7.2, §27.5) - has its own, `ProjectCredential.conversion_host_pin` (the owner's decision of
+2026-10-29, after plan task TC5). The server alone writes them, and each reader takes the pin of the credential that
+reaches the host, never another's (`credentials.host_pin(provider, project_id)`: the provider's own for its own
+credential, None, else that project credential's - none for a project it holds no credential for):
 * **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
   of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
-  looks the host's server up: by its name, `conversion_host.name`, else its side's name as the executor names the host
-  (`os_migrate_conv_src` for a source, `os_migrate_conv_dst` for a destination, §7.2), with `find_server`; else by
-  `conversion_host.address`, with `server_of_address`. No server, or a lookup that fails (logged by its provider
-  error), pins nothing. Then:
+  looks the host's server up with its own credential: by its name, `conversion_host.name`, else its side's name as the
+  executor names the host (`os_migrate_conv_src` for a source, `os_migrate_conv_dst` for a destination, §7.2), with
+  `find_server`; else by `conversion_host.address`, with `server_of_address`. No server, or a lookup that fails
+  (logged by its provider error), pins nothing. Then, its own pin (`conversion_host_pin`):
   * **no pin:** the check reads the server's whole console (`console_log(server_id, None)`) and pins what the parser
     keeps of it - `{server_id, keys, source: "console", pinned_at}` -, written with the check's own write and
     `conversion_host.key_pinned` (§4.3) in one transaction. A console that gives no key pins nothing, and the next
@@ -4054,6 +4093,16 @@ host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone wri
   Its destinations declare their conversion hosts' keys instead (`ssh_host_keys`, plan task ST7): one synthetic
   ed25519 key each, made up from the host's name - no private half exists -, as an operator reads a brought host's
   key out of band, so no demo plan meets `CONV_HOST_KEY_UNKNOWN` while keys are checked (§9.3).
+* **A project's host** (the owner's decision of 2026-10-29, after plan task TC5). After each project credential's
+  sign-in that answered `ok` ("The check of project credentials", below), a credential that holds a pin has its
+  project's host looked up with it, as a run of a plan with the project finds the host (§7.2): by its name, else its
+  address, as above. A host that resolves to another server than the pin's is reported in that project's entry of
+  the report (`projects`): its `message` the words above, its `status` staying `ok`. The check reads no console of a
+  project's host and pins nothing for a project: a project's host is pinned by the pre-staging that creates it, with
+  the key it injects, or by a run that meets it without a pin (§7.2, §26.8). A credential without a pin, or whose
+  sign-in failed, is not looked up; a lookup that fails is logged by its provider error and reports nothing.
+  Validation's `CONV_HOST_KEY_UNKNOWN` (§9.3) judges a side where the plan names a project by that project's pin and
+  this report, in place of the provider's own pin and `status_message` (§26.5).
 * **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
   `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
   that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
@@ -4092,7 +4141,9 @@ credential has expired.
   ProjectCheck { status: "ok"|"error",
                  message: str|null,           # why an error is one, in Seamless's words with an HTTP status or a
                                               # failure's kind - never a message Keystone wrote, never a
-                                              # credential's value
+                                              # credential's value; on an ok entry null, or the report of
+                                              # its project's conversion host found replaced ("Host key
+                                              # pins", above)
                  project_name: str|null,      # its token's project
                  domain: str|null,            # that project's domain: its name, else its id
                  user_id: str|null,           # its token's user (the credential's)
@@ -4404,16 +4455,16 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` - its projects' pins with it - ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pins - its own and its project credentials' -, each of which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
-| PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`; that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
-| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
+| PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`, its `conversion_host_pin` kept: a credential written again reaches the same project's host, whose pin belongs to its server (§26.4); that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
+| DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry - its project's conversion host pin with it, so a later credential for the project starts without one (§26.4) - and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
-| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
+| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin of another server reported in that project's entry of `projects`, no console of a project's host read, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
 | POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
 | GET | `/hooks/{name}` | viewer | — | `Hook` |
@@ -5333,6 +5384,14 @@ is no origin a browser sends (review RV31-03).
   `EXTENT_TRACKING_MISSED` (§28.9) - carries a "Technology Preview" badge as the GPU elements do, its detail
   "Technology Preview, validated in simulation: changed-extent tracking has not yet run on the lab's Ceph
   clusters." (§28.11), until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (plan task CE13).
+* The credential findings (§27.7, from 0.5.0, plan task TC6): the dashboard's finding catalog holds
+  `PROJECT_CREDENTIAL_EXPIRING`, `PROJECT_CREDENTIAL_UNRESTRICTED`, `PROJECT_CREDENTIAL_ROLE_MISSING` and
+  `DST_KEYPAIR_KEY_MISMATCH` as the API's (severity, strategies, remediation; the shared `finding_catalog.json`). A
+  credential finding is about one project, which its message names with its provider: a plan's findings list groups
+  each of the three `PROJECT_CREDENTIAL_*` codes by its message, so each entry names its project above its VMs - two
+  projects' findings of one code are two entries, never one whose projects only its VMs' details name -, and a
+  migration's list shows each message. The offline mock's pre-flight gives none of the four: its providers hold no
+  project credential (plan tasks TC8, TC9).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -8304,7 +8363,9 @@ host's entry, the gate, the probe before the stop, the forward to `127.0.0.1`, t
 removed), the content install's sshd settings and R-02 (the helper script's private directory and its SHA-256 check) -
 in §6.2, §6.4, §6.5, §6.6 and §7.2 since that task; plan task ST7's - the two findings, the setting's default `true`,
 `GET /me`'s `host_key_checking` and the dashboard's host keys, its warning and the form's declared keys - in §9.3, §12,
-§15.1 and §16 since that task. The facts
+§15.1 and §16 since that task; the owner's decision of 2026-10-29, after plan task TC5 (§26.10, decision 11) - a pin
+per project credential, the one rule that selects a step's pin, the check's report of a project's replaced host and
+the project credential routes' rules for its pin - in §4.2, §7.2, §10 and §12 since it. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -8418,8 +8479,25 @@ decision 10).
   until the operator declares its keys, or deletes it and a pre-staging creates and pins it again (LAB-SSH08). The
   provider check does not pin the new server from its console; it reports the replacement (§10), since a host
   replaced behind Seamless's back is a change an operator should see, not one to take in silence.
-* **Why per host.** A conversion host serves every plan of its provider, so a plan's pre-staging data would hold one
-  pin per plan for one host. The database also keeps the pin when the data volume is lost or moved.
+* **A pin per project** (owner decision 11; binding in §4.2, §7.2, §10 and §12 since it). A plan with a project on a
+  side deploys and reaches its conversion host in that project, with the project's credential (§27.5): another
+  server than the provider's own host, one per project that plans name. Each project credential so holds its
+  project's host's pin (`ProjectCredential.conversion_host_pin`), beside the provider's own pin for its own
+  credential. Whatever reads or writes a pin - a run, a pre-staging and its book of keys, the provider check,
+  validation's finding - takes the pin of the credential that reaches the host there, the one §27.5's selection names
+  (`credentials.credential_project`, then `credentials.host_pin`): a plan without a project on that side keeps the
+  provider's own pin, as before, and a plan with one reads and writes its project's alone. Two tenants' hosts never
+  replace each other's pin, and a run never meets another project's. A project's pin is server-owned with its entry
+  (`PATCH /providers/{id}` refuses `project_credentials`, `POST /providers` ignores it), returned with it, kept when
+  an admin writes the credential again - the same project's host, whose pin is its server's - and gone with the
+  credential's deletion: a later credential for the project starts without one, and its host is pinned again from
+  its console by a run, or created and pinned with an injected key by a pre-staging; no pin outlives the credential
+  that reached its host (§12). The provider check reports a project's host found replaced in that project's entry of
+  its report and reads no project host's console (§10). Declared keys (`conversion_host.ssh_host_keys`) stay the
+  provider's and win over every pin, a project's too (§26.3).
+* **Why per host.** A conversion host serves every plan of the project its credential reaches - its provider's own,
+  or a project credential's -, so a plan's pre-staging data would hold one pin per plan for one host. The database
+  also keeps the pin when the data volume is lost or moved.
 * **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
   else the pins, of the hosts it uses: one hashed entry per key under the host's alias - its inventory name,
   `os_migrate_conv_src` or `os_migrate_conv_dst`, or the group's name, `conversion_host`, for a VMware destination's
@@ -8475,7 +8553,8 @@ decision 10).
 * **Findings** (proposed for §9.3, for `cold`, `warm`, `vmware_cold` and `vmware_warm`):
   * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
     keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
-    to another server than the one the provider's host resolves to;
+    to another server than the one the provider's host resolves to - for a plan with a project on that side, the
+    project's pin and the check's report of the project's host (§10, owner decision 11);
   * CONV_HOST_KEYS_UNCHECKED, a warning while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`: the plan's data path
     authenticates no conversion host.
 
@@ -8608,6 +8687,25 @@ The owner took each default as written on 2026-10-23 (D8):
 9. **The two events and the two findings** of §26.5: a refused key is a security event an operator should see.
 10. **R-02 joined to the gate's task:** the gate runs the helper script by its path, so the private 0700 directory and
     the SHA-256 check before `sudo python3` (C3-07) belong with it.
+11. **Pins per (provider, project)**, decided by the owner on 2026-10-29, after plan task TC5 and before TC6 and TC7.
+    TC5 deploys a plan's conversion hosts in its projects (§27.5), so a provider's hosts are as many servers as the
+    projects its plans name; with one pin per provider, two tenants' pre-stagings replaced each other's pin and each
+    refused the other's runs ("conversion host replaced") - safe, but it serialized the tenants. Each project
+    credential now holds its project's host's pin, and every step reads and writes the pin of the credential it acts
+    with (§26.4); a plan without a project keeps the provider's own pin, unchanged.
+    * **On the credential's entry** (`ProjectCredential.conversion_host_pin`), not in a map of pins by project beside
+      it: server-owned and returned with the entry, so no route takes a new field; read where the step's credential is
+      selected; a write changes the registry's fingerprint of that project's connection and of the provider's own
+      alone, where a map on the provider is in every project's (§10); and no pin outlives its credential, where a map
+      would keep pins of projects no credential reaches.
+    * **Rotation keeps it, deletion takes it:** a credential an admin writes again reaches the same project's host,
+      whose pin is its server's, as the provider's own pin outlives a rewrite of its credential (§12); a deleted
+      credential takes its pin along, so a later credential for the project trusts no pin that no credential held
+      meanwhile - its host is pinned again from its console by a run, or, where the console lost its block, deleted
+      and created again by a pre-staging (§26.8).
+    * **The check reports, never pins:** a project's host is one Seamless creates (§27.5), pinned with the key its
+      pre-staging injects; the check reports a project's host found replaced in that project's entry, as it reports
+      its own in `status_message`, and reads no project host's console (§10).
 
 ### 26.11 Contract changes (each binding from its plan task)
 
@@ -8622,6 +8720,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, its warning while keys are not checked (`GET /me` `host_key_checking`), the form's declared keys, the findings' catalog | §9.3, §12, §15.1, §16 (binding) | ST7 |
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
+| a pin per project credential (`ProjectCredential.conversion_host_pin`); the one rule that selects a step's pin (`credentials.host_pin`); the check's report of a project's replaced host; the project credential routes' rules for its pin (owner decision 11) | §4.2, §7.2, §10, §12 (binding) | after TC5 |
 
 ## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
@@ -8642,7 +8741,10 @@ and `project`, in §10 and §21.5 since that task; plan task TC4's `VMRef.projec
 the plan's `source_project` and `destination_project` with their edit rules in §4.2, §10 and §12 since that task; plan
 task TC5's selection of §27.5 and §27.6 - validation's reads and refusals, the pre-staging with its flavor access, the
 executors, the helpers, no fallback and the registry's fingerprint - in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since
-that task. The
+that task; plan task TC6's findings of §27.7 - `PROJECT_CREDENTIAL_EXPIRING`, `PROJECT_CREDENTIAL_UNRESTRICTED`,
+`PROJECT_CREDENTIAL_ROLE_MISSING` and `DST_KEYPAIR_KEY_MISMATCH` -, the role halves of `NET_PORT_NOT_PERMITTED` and
+`DST_FIP_ADDRESS_UNAVAILABLE`, the handover's eligibility reason, `DST_PROJECT_MISSING`'s remediation and the
+findings lists in §9.2, §9.3 and §16 since that task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -8747,7 +8849,7 @@ of the migration kit (§27.9); Keystone trusts (§27.8); Cinder's volume transfe
 
 Binding in §7.2, §7.3, §8, §8.1, §8.3-§8.5 and §10 since plan task TC5, but the executors' sign-in before a step
 (below: "a step whose credential cannot sign in fails before it changes anything"), which comes with plan task TC7
-(§7.1), and the storage handover's `admin` and the findings' role halves, which come with plan task TC6 (§9.2, §9.3).
+(§7.1); the storage handover's `admin` and the findings' role halves are binding in §9.2 and §9.3 since plan task TC6.
 
 A plan's **source** and **destination credentials** are the project credentials its `source_project` and
 `destination_project` name, else the providers' own. The provider's own credential acts in its own project, and in
@@ -8780,7 +8882,10 @@ another only where a service lets an admin act by id or on the project's behalf.
   confirm`).
 * **Conversion hosts** of a plan with a project are deployed in that project with its credential (`manage` true): the
   import finds each by name in its credential's project (`roles/import_workloads`). An existing host (`manage` false)
-  serves its provider's own project alone: validation refuses (400) a plan that names a project on such a side.
+  serves its provider's own project alone: validation refuses (400) a plan that names a project on such a side. Each
+  project's host keeps its own pin, on its project credential, which the plan's steps read and write as they act with
+  that credential (§26.4, §26.10 decision 11; binding in §4.2, §7.2, §10 and §12 since the owner's decision of
+  2026-10-29).
 * **A rotated credential** is used from the next step on: the registry's connection fingerprint holds each project
   credential's `updated_at`, as it holds the provider's (§10, §13.3). **Hooks** still get no credential (§23.3).
 
@@ -8797,8 +8902,8 @@ another only where a service lets an admin act by id or on the project's behalf.
   * two project credentials of one user share its keypairs: a key name two tenants use is one key there, and the
     second tenant's VM would get the first tenant's public key wherever its guest takes keys again on a new instance
     id (`TODO(LAB): confirm` per image). A VM whose key name's destination keypair has another fingerprint than its
-    source keypair is a blocker (proposed DST_KEYPAIR_KEY_MISMATCH), and Operations.md asks for a user per project
-    credential (owner decision 3).
+    source keypair is a blocker (`DST_KEYPAIR_KEY_MISMATCH`, §9.3, since plan task TC6), and Operations.md asks for a
+    user per project credential (owner decision 3).
 * **The storage handover** manages the volumes and creates the server with the destination credential (§7.3), so into a
   project that credential is the project's, with `admin`, since Cinder's manage is an admin's call. Its source half
   acts by id with the source provider's admin: the stop, `delete_on_termination`, the deletion and the unmanage
@@ -8821,7 +8926,8 @@ another only where a service lets an admin act by id or on the project's behalf.
   neither the provider's check nor another project's.
 * **Validation** refuses (400) a plan whose project credential is missing, failed or expired, naming the provider and
   the project, before any finding.
-* **Findings** (proposed; each enters §9.3 with TC6, with its catalog entry, its tests and the mock):
+* **Findings** (binding in §9.3 since plan task TC6, each with its catalog entry, its tests and the dashboard's
+  catalog, §16):
   * PROJECT_CREDENTIAL_EXPIRING, warning: a credential the plan uses expires within 7 days, or before the plan's
     `cutover_window` ends (owner decision 9);
   * PROJECT_CREDENTIAL_UNRESTRICTED, warning: an application credential the plan uses may create other application

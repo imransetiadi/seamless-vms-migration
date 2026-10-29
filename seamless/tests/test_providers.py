@@ -5485,6 +5485,102 @@ async def test_the_provider_check_reports_a_pin_of_another_server(tmp_path, stor
     assert (await h.orch.check_provider("src-osp", "alice")).status_message is None
 
 
+async def test_the_provider_check_reports_a_projects_replaced_host_in_its_entry(tmp_path, store):
+    """SDD §10 "Host key pins", §26.4, §26.5 (§26.10 decision 11): after a project credential's
+    sign-in that answered, the check looks the project's host up with that credential when the
+    credential holds a pin. A host that resolves to another server than the project's pin is
+    reported in that project's entry - the check's words, its status ok -, while the provider's
+    own status message stays its own host's; a host on its pin's server reports nothing. The
+    check reads no project host's console and pins nothing for a project: every pin stays as it
+    was, and no conversion_host.key_pinned. A credential without a pin, and one whose sign-in
+    failed, have their hosts not looked up."""
+    from seamless_migrate.domain.models import HostKeyPin
+    from tests.credential_support import CredentialRegistry, of_project, own
+    from tests.key_support import bare
+    from tests.orch_support import SRC_PROVIDER, build_harness
+
+    h = build_harness(tmp_path, store, [])
+    a, b, c, d = (_made_up_id() for _ in range(4))
+    names = {a: "tenant-a", b: "tenant-b", c: "tenant-c", d: "tenant-d"}
+
+    def pin(server, seed):
+        key = bare(public_key(seed, "root@conv-src"))
+        return HostKeyPin(server_id=server, keys=[key], source="injected", pinned_at=utcnow())
+
+    pins = {a: pin("srv-a-1", 1), b: pin("srv-b-1", 2), c: None, d: pin("srv-d-1", 4)}
+    held = {
+        project: ProjectCredential(
+            secret=project_secret_name("src-osp", project),
+            updated_at=utcnow(),
+            conversion_host_pin=pins[project],
+        )
+        for project in names
+    }
+    own_pin = pin("srv-own", 9)
+    provider = SRC_PROVIDER.model_copy(
+        update={"conversion_host_pin": own_pin, "project_credentials": held}
+    )
+    store.put("provider", provider)
+    own_cloud = ConsoleCloud(_host_console(), servers={"conv-src": "srv-own"})
+
+    async def check_project(project_id):
+        if project_id == d:
+            raise ProviderError("src-osp: the sign-in failed: HTTP 401")
+        return {
+            "project_id": project_id,
+            "project_name": names[project_id],
+            "domain": "Default",
+            "user_id": f"user-{names[project_id]}",
+            "roles": ["member"],
+            "restricted": True,
+            "expires_at": None,
+        }
+
+    own_cloud.check_project = check_project
+    clouds = {
+        a: ConsoleCloud(_host_console(public_key(5)), servers={"conv-src": "srv-a-2"}),
+        b: ConsoleCloud(_host_console(public_key(6)), servers={"conv-src": "srv-b-1"}),
+        c: ConsoleCloud(_host_console(public_key(7)), servers={"conv-src": "srv-c-1"}),
+        d: ConsoleCloud(_host_console(public_key(8)), servers={"conv-src": "srv-d-2"}),
+    }
+    registry = CredentialRegistry(own_cloud, None)
+    for project, cloud in clouds.items():
+        registry.by_credential[of_project(provider, project)] = cloud
+    h.orch.providers = registry
+
+    checked = await h.orch.check_provider("src-osp", "alice")
+    report = checked.capabilities["projects"]
+    assert (checked.status, checked.status_message) == ("ok", None)
+    replaced = (
+        "conversion host replaced: conv-src is now server srv-a-2; its pin belongs to server "
+        "srv-a-1"
+    )
+    assert {p: (report[p]["status"], report[p]["message"]) for p in (a, b, c)} == {
+        a: ("ok", replaced),
+        b: ("ok", None),
+        c: ("ok", None),
+    }
+    assert report[d]["status"] == "error" and "replaced" not in report[d]["message"]
+    # each pinned project's host looked up with its own credential, in the order of the ids
+    assert registry.used("find_server") == [
+        own(provider),
+        *(of_project(provider, p) for p in sorted((a, b))),
+    ]
+    assert registry.used("console_log") == []
+    assert own_cloud.reads == [] and [p for p, cloud in clouds.items() if cloud.reads] == []
+    stored = store.get("provider", "src-osp", Provider)
+    assert stored.conversion_host_pin == own_pin
+    assert {p: e.conversion_host_pin for p, e in stored.project_credentials.items()} == pins
+    assert "conversion_host.key_pinned" not in [e.kind for e in store.events(since_seq=0)]
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "provider.checked"]
+    assert event.data == {"provider_id": "src-osp", "status": "ok", "message": None}
+
+    # the project's host on its pin's server again: nothing to report
+    clouds[a].servers["conv-src"] = "srv-a-1"
+    again = await h.orch.check_provider("src-osp", "alice")
+    assert again.capabilities["projects"][a]["message"] is None
+
+
 async def test_openstack_reads_a_whole_console_without_logging_it(caplog):
     """SDD §10, §13.4, §26.3: the pin's read of a whole console is a raw os-getConsoleOutput
     without length, sent unlogged - keystoneauth would write the guest's text at DEBUG; a refusal
