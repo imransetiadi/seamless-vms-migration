@@ -1,13 +1,16 @@
 """Provider management from the dashboard (SDD §4.2, §12, §13.3): PATCH, write-only credentials
-and the conversion-host key in the platform secret store, distributions, secret resolution."""
+and the conversion-host key in the platform secret store, distributions, secret resolution, and a
+provider's credentials per Keystone project (§27.4)."""
 
 import base64
 import contextlib
 import errno
+import hashlib
 import inspect
 import json
 import logging
 import os
+import secrets
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,17 +18,19 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from seamless_migrate.api import routes_providers
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import PlanStatus, Role
+from seamless_migrate.domain.enums import Phase, PlanStatus, Role
 from seamless_migrate.domain.models import HostKeyPin, Plan, Provider
 from seamless_migrate.security import secret_store as secret_store_module
 from seamless_migrate.security.secret_store import (
     FileSecretStore,
     KubernetesSecretStore,
     SecretStoreError,
+    kubernetes_name,
 )
 from seamless_migrate.security.secrets import (
     SecretNotFound,
@@ -33,10 +38,11 @@ from seamless_migrate.security.secrets import (
     read_secret,
     resolve,
     resolve_private_key,
+    valid_secret_name,
 )
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings
-from tests.factories import make_plan, make_provider
+from tests.factories import make_migration, make_plan, make_provider
 from tests.key_support import bare, ecdsa_key, other_key, public_key, rsa_key
 
 KEY = (
@@ -1318,3 +1324,503 @@ def test_the_ceph_key_time_is_server_owned(api):
     assert moved.status_code == 200, moved.text
     assert moved.json()["ceph"]["monitors"] == ["mon3.example"]
     assert moved.json()["ceph"]["key_updated_at"] == written
+
+
+# --------------------------------------------------------------------------------------------
+# a provider's credentials per Keystone project (SDD §4.2, §4.3, §12, §13.3, §27.4; plan task TC2).
+# Synthetic: project ids of 32 hex digits and application credentials are generated here. No
+# assertion holds a credential in its expression, and secret values are compared into a bool
+# first, so a failing test's message never prints one (pytest explains a call by its arguments).
+
+#: the keys a project credential's secret holds (SDD §13.3)
+APP_CREDENTIAL_KEYS = ["application_credential_id", "application_credential_secret"]
+
+
+def _project_id() -> str:
+    """A Keystone project's id as Keystone writes one: 32 hex digits, made up for the test."""
+    return secrets.token_hex(16)
+
+
+def _app_credential() -> dict[str, str]:
+    """An application credential's id and secret, generated for the test."""
+    return {
+        "application_credential_id": secrets.token_hex(16),
+        "application_credential_secret": secrets.token_urlsafe(32),
+    }
+
+
+def _project_secret(provider_id: str, project_id: str) -> str:
+    """The name SDD §13.3 gives a project credential's secret, computed here on its own."""
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:16]
+    return f"provider-{provider_id}.project-{digest}"
+
+
+def _project_path(provider_id: str, project_id: str) -> str:
+    return f"/api/v1/providers/{provider_id}/projects/{project_id}/credentials"
+
+
+def _write(api, provider_id: str, project_id: str) -> int:
+    """Writes a generated credential for the project; the answer's status alone."""
+    return put(api, _project_path(provider_id, project_id), _app_credential()).status_code
+
+
+def _delete(api, path: str):
+    return api.client.delete(path, headers=api.h(Role.admin))
+
+
+def _leaks(values, **texts) -> list[str]:
+    """The names of the texts that hold any of ``values``: what a failing assertion may print."""
+    return sorted(name for name, text in texts.items() if any(v in text for v in values))
+
+
+def test_a_project_credential_is_write_only(api, caplog):
+    """SDD §12, §13.3, §27.4: PUT …/projects/{project_id}/credentials stores an application
+    credential in the secret store, 0600 in a 0700 directory, and the provider records its secret's
+    name and the time alone; no answer, listing, event or log line carries its id or its secret."""
+    tenant_a, credential = _project_id(), _app_credential()
+    with caplog.at_level(logging.DEBUG):
+        res = put(api, _project_path("src-osp", tenant_a), credential)
+    assert res.status_code == 200, res.text
+    entry = res.json()["project_credentials"][tenant_a]
+    assert entry["secret"] == _project_secret("src-osp", tenant_a)
+    assert entry["updated_at"] is not None
+    directory = api.settings.secrets_dir / entry["secret"]
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert sorted(p.name for p in directory.iterdir()) == APP_CREDENTIAL_KEYS
+    assert {stat.S_IMODE(p.stat().st_mode) for p in directory.iterdir()} == {0o600}
+    stored = read_secret(entry["secret"], api.settings) == credential
+    assert stored
+    assert api.get("/api/v1/providers/src-osp").json()["project_credentials"] == {tenant_a: entry}
+    events = str([e.model_dump() for e in api.store.events(since_seq=0, limit=100000)])
+    leaks = _leaks(
+        credential.values(),
+        answer=res.text,
+        provider=api.get("/api/v1/providers/src-osp").text,
+        listing=api.get("/api/v1/providers").text,
+        events=events,
+        log=caplog.text,
+    )
+    assert leaks == []
+    # a viewer sees the record, never a value; an operator may not write one
+    viewed = api.get("/api/v1/providers/src-osp", Role.viewer)
+    assert viewed.json()["project_credentials"] == {tenant_a: entry}
+    res = put(api, _project_path("src-osp", tenant_a), credential, Role.operator)
+    assert res.status_code == 403
+
+
+def test_a_project_credential_is_an_application_credential(api):
+    """SDD §12, §27.4, §27.8 (owner decision 3): the body is an application credential's id and
+    secret alone - a password signs in to every project its user has a role in, and an auth_url
+    would send the secret elsewhere - neither blank, for a project id of 1-64 letters, digits, - or
+    _ (422 otherwise), judged before the provider is looked up; nothing is stored or recorded."""
+    tenant_a, credential = _project_id(), _app_credential()
+    path = _project_path("src-osp", tenant_a)
+    password = {"username": "svc-tenant-a", "password": secrets.token_urlsafe(16)}
+    for body, needle in (
+        ({**password, "project_name": "tenant-a"}, "password"),
+        ({**credential, **password}, "username"),
+        ({**credential, "auth_url": "https://keystone.elsewhere.example/v3"}, "auth_url"),
+        ({**credential, "interface": "internal"}, "interface"),
+        ({"application_credential_id": "ac-only"}, "application_credential_secret"),
+        ({"application_credential_secret": "secret-only"}, "application_credential_id"),
+        ({**credential, "application_credential_secret": "   "}, "application_credential_secret"),
+        ({**credential, "application_credential_id": " "}, "application_credential_id"),
+    ):
+        res = put(api, path, body)
+        refused = res.status_code == 422 and needle in res.json()["error"]["message"]
+        assert refused, (needle, res.status_code)
+        # the body alone is judged first: a provider it does not know answers the same
+        res = put(api, _project_path("nope-1", tenant_a), body)
+        assert res.status_code == 422, needle
+    for bad in ("a" * 65, "tenant.a", "tenant%20a", "tenant%0A"):
+        res = put(api, _project_path("src-osp", bad), credential)
+        refused = res.status_code == 422 and "project_id" in res.json()["error"]["message"]
+        assert refused, (bad, res.status_code)
+        res = put(api, _project_path("nope-1", bad), credential)
+        assert res.status_code == 422, bad
+        assert _delete(api, _project_path("src-osp", bad)).status_code == 422, bad
+    res = put(api, _project_path("nope-1", tenant_a), credential)
+    assert res.status_code == 404
+    assert api.get("/api/v1/providers/src-osp").json()["project_credentials"] == {}
+    assert read_secret(_project_secret("src-osp", tenant_a), api.settings) == {}
+    assert "provider.credentials_updated" not in api.kinds()
+    # the model keys its entries by the same rule (SDD §4.2)
+    entry = {"secret": _project_secret("src-osp", "x" * 65), "updated_at": "2026-10-29T08:00:00Z"}
+    with pytest.raises(ValidationError, match="project_credentials"):
+        Provider.model_validate({**SOURCE, "project_credentials": {"x" * 65: entry}})
+    longest = {"x" * 64: {**entry, "secret": _project_secret("src-osp", "x" * 64)}}
+    held = Provider.model_validate({**SOURCE, "project_credentials": longest}).project_credentials
+    assert set(held) == set(longest)
+    # its two keys alone are stored, the id stripped as the provider's own credential's is - the
+    # file itself: the files store strips what it reads, a Kubernetes Secret is read as written
+    padded = {
+        **credential,
+        "application_credential_id": f"  {credential['application_credential_id']}\n",
+    }
+    res = put(api, path, padded)
+    assert res.status_code == 200, res.text
+    stored = read_secret(_project_secret("src-osp", tenant_a), api.settings) == credential
+    assert stored
+    written = api.settings.secrets_dir / _project_secret("src-osp", tenant_a)
+    stripped = (written / "application_credential_id").read_text(encoding="utf-8") == (
+        credential["application_credential_id"]
+    )
+    assert stripped
+    # the widest id: 64 letters of either case, digits, - and _
+    widest = "Tenant_A-" + "0" * 55
+    res = put(api, _project_path("src-osp", widest), _app_credential())
+    assert res.status_code == 200, res.text
+    assert widest in res.json()["project_credentials"]
+
+
+def test_a_project_credential_is_stored_under_its_providers_project_secret_name(api):
+    """SDD §13.3, §27.4: the secret is provider-{id}.project-<h>, <h> the first 16 hex digits of the
+    SHA-256 of the project id - lower case and at most 97 characters, a name both stores hold - one
+    per project, which the project's next write replaces whole."""
+    from seamless_migrate.security.secret_store import project_secret_name
+
+    tenant_a, tenant_b = _project_id(), _project_id()
+    name_a, name_b = _project_secret("src-osp", tenant_a), _project_secret("src-osp", tenant_b)
+    assert project_secret_name("src-osp", tenant_a) == name_a
+    longest = project_secret_name("p" * 63, "X" * 64)
+    assert len(longest) == 97 and kubernetes_name(longest) and valid_secret_name(longest)
+    first, second, other = _app_credential(), _app_credential(), _app_credential()
+    for project, credential in ((tenant_a, first), (tenant_b, other)):
+        res = put(api, _project_path("src-osp", project), credential)
+        assert res.status_code == 200, res.text
+    names = sorted(
+        p.name for p in api.settings.secrets_dir.iterdir() if ".project-" in p.name and p.is_dir()
+    )
+    assert names == sorted([name_a, name_b])
+    res = put(api, _project_path("src-osp", tenant_a), second)
+    assert res.status_code == 200, res.text
+    replaced = read_secret(name_a, api.settings) == second
+    kept = read_secret(name_b, api.settings) == other
+    assert replaced and kept
+    recorded = api.get("/api/v1/providers/src-osp").json()["project_credentials"]
+    assert {project: entry["secret"] for project, entry in recorded.items()} == {
+        tenant_a: name_a,
+        tenant_b: name_b,
+    }
+
+
+def test_a_project_credential_whose_secret_name_another_project_holds_is_refused(api):
+    """SDD §13.3, §27.4: an entry records its project id, so a write whose secret's name another
+    project's entry holds - two project ids whose SHA-256 begin with the same 64 bits - is refused
+    (409) and never written over. No such pair can be found here: the other project's entry is
+    stored holding this project's name, as a collision would leave it."""
+    from seamless_migrate.domain.models import ProjectCredential, utcnow
+
+    tenant_a, tenant_b = _project_id(), _project_id()
+    name = _project_secret("src-osp", tenant_a)
+    held = _app_credential()
+    FileSecretStore(api.settings.secrets_dir).write(name, held, {})
+    stored = api.store.get("provider", "src-osp", Provider)
+    holder = {tenant_b: ProjectCredential(secret=name, updated_at=utcnow())}
+    api.store.put("provider", stored.model_copy(update={"project_credentials": holder}))
+    res = put(api, _project_path("src-osp", tenant_a), _app_credential())
+    assert res.status_code == 409, res.text
+    message = res.json()["error"]["message"]
+    assert tenant_b in message and name in message
+    untouched = read_secret(name, api.settings) == held
+    assert untouched
+    assert set(api.get("/api/v1/providers/src-osp").json()["project_credentials"]) == {tenant_b}
+    assert "provider.credentials_updated" not in api.kinds()
+
+
+def test_a_vmware_provider_takes_no_project_credential(api):
+    """SDD §4.2, §27.9: vCenter has no Keystone projects, so a vmware provider holds no project
+    credential: a write is refused (422) and nothing is stored or recorded."""
+    assert api.post("/api/v1/providers", json=VCENTER).status_code == 201
+    tenant_a = _project_id()
+    res = put(api, _project_path("vc-dc2", tenant_a), _app_credential())
+    assert res.status_code == 422 and "vmware" in res.json()["error"]["message"], res.text
+    assert read_secret(_project_secret("vc-dc2", tenant_a), api.settings) == {}
+    assert api.get("/api/v1/providers/vc-dc2").json()["project_credentials"] == {}
+    assert _delete(api, _project_path("vc-dc2", tenant_a)).status_code == 404
+    assert "provider.credentials_updated" not in api.kinds()
+
+
+def test_an_id_that_would_read_another_providers_project_secret_is_refused(api):
+    """SDD §13.3 (audit AP-04): the SEAMLESS_SECRET_ variables read `.` and `-` alike, so a provider
+    'src-osp-project-<16 hex>' would read a project secret of src-osp as its credentials: refused
+    both ways, as -ssh and -ceph are."""
+    suffix = "-project-" + secrets.token_hex(8)
+    clash = api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp" + suffix})
+    assert clash.status_code == 409, clash.text
+    assert "src-osp" in clash.json()["error"]["message"]
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-c" + suffix}).status_code == 201
+    refused = api.post("/api/v1/providers", json={**VCENTER, "id": "vc-c"})
+    assert refused.status_code == 409 and "vc-c" + suffix in refused.json()["error"]["message"]
+    # ids that only look alike are free: 15 or 17 hex digits, a letter no hex digit, no such prefix
+    for free in (
+        "src-osp-project-" + "a" * 15,
+        "src-osp-project-" + "a" * 17,
+        "src-osp-project-" + "a" * 15 + "g",
+        "src-osp-projects-" + "a" * 16,
+        "vc-nope" + suffix,
+    ):
+        made = api.post("/api/v1/providers", json={**VCENTER, "id": free})
+        assert made.status_code == 201, (free, made.text)
+
+
+def _project_check(name: str, checked_at: str) -> dict:
+    """A project's entry of the check report as plan task TC3 writes it (SDD §27.7)."""
+    return {"status": "ok", "message": None, "project_name": name, "checked_at": checked_at}
+
+
+def test_a_project_credential_write_drops_only_its_projects_check(api, monkeypatch):
+    """SDD §12, §27.4, §27.7: a project credential's write drops that project's entry of the check
+    report, which tested the credential it replaces; the provider's status, the rest of its report
+    and the other projects' entries stay. A check that lands while the write is recorded keeps its
+    report, less that project's entry."""
+    tenant_a, tenant_b = _project_id(), _project_id()
+    report = {
+        "release_range": ["2023.1", "2026.2"],
+        "projects": {
+            tenant_a: _project_check("tenant-a", "2026-10-29T08:00:00Z"),
+            tenant_b: _project_check("tenant-b", "2026-10-29T08:00:00Z"),
+        },
+    }
+    stored = api.store.get("provider", "src-osp", Provider)
+    api.store.put(
+        "provider",
+        stored.model_copy(
+            update={
+                "status": "degraded",
+                "status_message": "one pool unreadable",
+                "capabilities": report,
+                "last_checked_at": datetime(2026, 10, 29, 8, 0, tzinfo=UTC),
+            }
+        ),
+    )
+    res = put(api, _project_path("src-osp", tenant_a), _app_credential())
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["capabilities"] == {
+        "release_range": ["2023.1", "2026.2"],
+        "projects": {tenant_b: _project_check("tenant-b", "2026-10-29T08:00:00Z")},
+    }
+    assert (body["status"], body["status_message"], body["last_checked_at"]) == (
+        "degraded",
+        "one pool unreadable",
+        "2026-10-29T08:00:00Z",
+    )
+    # a check that lands between the record's read and its write: its report stays, less the
+    # entry of the project whose credential the write replaced
+    from seamless_migrate.store import AsyncStore
+
+    db_put = AsyncStore.put
+    raced: list[int] = []
+    fresh_report = {
+        "projects": {
+            tenant_a: _project_check("tenant-a", "2026-10-29T09:00:00Z"),
+            tenant_b: _project_check("tenant-b", "2026-10-29T09:00:00Z"),
+        }
+    }
+
+    async def put_after_a_check(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None and not raced:
+            raced.append(expected_version)
+            fresh = api.store.get("provider", model.id, Provider)
+            api.store.put(
+                "provider", fresh.model_copy(update={"status": "ok", "capabilities": fresh_report})
+            )
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", put_after_a_check)
+    res = put(api, _project_path("src-osp", tenant_a), _app_credential())
+    assert res.status_code == 200 and raced, res.text
+    assert res.json()["status"] == "ok"
+    assert res.json()["capabilities"] == {
+        "projects": {tenant_b: _project_check("tenant-b", "2026-10-29T09:00:00Z")}
+    }
+    assert set(res.json()["project_credentials"]) == {tenant_a}
+
+
+class _PlanNamingProjects(Plan):
+    """A plan as plan task TC4 stores one, naming its projects by id (SDD §4.2 with TC4, §27.4):
+    until TC4 adds the fields to Plan, the deletion reads plans stored with them through this."""
+
+    source_project: str | None = None
+    destination_project: str | None = None
+
+
+def test_a_project_credential_a_plan_needs_cannot_be_deleted(api, monkeypatch):
+    """SDD §12, §27.4: DELETE …/projects/{project_id}/credentials answers 409 while a plan needs the
+    project, judged as DELETE /providers/{id} judges a provider - a plan that names the project on
+    the provider's side and has not completed, or completed with a VM not finalized - each named; a
+    plan that names the same id on its other provider, or no project, does not. Then the secret,
+    the entry and the project's entry of the check report go, and an unknown project is a 404."""
+    monkeypatch.setattr(routes_providers, "Plan", _PlanNamingProjects)
+    tenant_a, tenant_b, tenant_c = _project_id(), _project_id(), _project_id()
+    for provider_id, project in (
+        ("src-osp", tenant_a),
+        ("dst-rhoso", tenant_b),
+        ("src-osp", tenant_c),
+    ):
+        assert _write(api, provider_id, project) == 200
+
+    def store_plan(status, **projects):
+        data = {**make_plan(status=status).model_dump(), **projects}
+        plan = _PlanNamingProjects.model_validate(data)
+        api.store.put("plan", plan)
+        return plan
+
+    moving_a = store_plan(PlanStatus.draft, source_project=tenant_a)
+    elsewhere_a = store_plan(PlanStatus.draft, destination_project=tenant_a)
+    no_project = store_plan(PlanStatus.validated)
+    into_b = store_plan(PlanStatus.failed, destination_project=tenant_b)
+    elsewhere_b = store_plan(PlanStatus.draft, source_project=tenant_b)
+    refused = _delete(api, _project_path("src-osp", tenant_a))
+    assert refused.status_code == 409, refused.text
+    message = refused.json()["error"]["message"]
+    assert moving_a.id in message and "draft" in message
+    assert elsewhere_a.id not in message and no_project.id not in message
+    assert into_b.id not in message
+    # a failed plan can start again: it still needs its destination project
+    refused = _delete(api, _project_path("dst-rhoso", tenant_b))
+    assert refused.status_code == 409 and into_b.id in refused.json()["error"]["message"]
+    assert elsewhere_b.id not in refused.json()["error"]["message"]
+    # a cancelled plan needs it no more; the plans that name it elsewhere, or none, never did
+    api.store.put("plan", moving_a.model_copy(update={"status": PlanStatus.cancelled}))
+    stored = api.store.get("provider", "src-osp", Provider)
+    report = {"projects": {tenant_a: _project_check("tenant-a", "2026-10-29T08:00:00Z")}}
+    api.store.put("provider", stored.model_copy(update={"capabilities": report}))
+    assert _delete(api, _project_path("src-osp", tenant_a)).status_code == 204
+    after = api.get("/api/v1/providers/src-osp").json()
+    assert set(after["project_credentials"]) == {tenant_c}
+    assert after["capabilities"] == {"projects": {}}
+    assert read_secret(_project_secret("src-osp", tenant_a), api.settings) == {}
+    assert _delete(api, _project_path("src-osp", tenant_a)).status_code == 404
+    # a completed plan needs it while a VM is not finalized
+    done_c = store_plan(PlanStatus.completed, source_project=tenant_c)
+    migration = make_migration(plan_id=done_c.id, phase=Phase.completed)
+    api.store.put("migration", migration)
+    refused = _delete(api, _project_path("src-osp", tenant_c))
+    assert refused.status_code == 409, refused.text
+    assert f"{done_c.id} (" in refused.json()["error"]["message"]
+    assert "1 VM not finalized" in refused.json()["error"]["message"]
+    api.store.put("migration", migration.model_copy(update={"phase": Phase.finalized}))
+    assert _delete(api, _project_path("src-osp", tenant_c)).status_code == 204
+    assert read_secret(_project_secret("src-osp", tenant_c), api.settings) == {}
+
+
+def test_a_project_credential_the_store_cannot_delete_answers_503_and_stays(api, monkeypatch):
+    """SDD §12, §13.3: a deletion deletes the secret first, so a store that cannot answers 503 and
+    the entry stays - nothing the store may still hold goes unrecorded - and no deletion is
+    audited; sent again once the store can, it goes through."""
+    tenant_a = _project_id()
+    assert _write(api, "src-osp", tenant_a) == 200
+    monkeypatch.setattr(routes_providers, "secret_store", _unbuildable_store)
+    res = _delete(api, _project_path("src-osp", tenant_a))
+    assert res.status_code == 503 and res.json()["error"]["code"] == "unavailable", res.text
+    assert "ServiceAccount" in res.json()["error"]["message"]
+    assert set(api.get("/api/v1/providers/src-osp").json()["project_credentials"]) == {tenant_a}
+    kept = read_secret(_project_secret("src-osp", tenant_a), api.settings) != {}
+    assert kept
+    deletions = api.store.events(kinds=["provider.credentials_updated"])
+    assert [e.data for e in deletions if e.data.get("deleted")] == []
+    monkeypatch.undo()
+    assert _delete(api, _project_path("src-osp", tenant_a)).status_code == 204
+    assert read_secret(_project_secret("src-osp", tenant_a), api.settings) == {}
+
+
+def test_deleting_a_provider_deletes_its_project_credentials(api):
+    """SDD §12, §13.3: DELETE /providers/{id} deletes its project credentials' secrets with its
+    other managed secrets - each one tried, one the store cannot remove named in provider.deleted
+    (audit AA-03)."""
+    assert api.post("/api/v1/providers", json={**SOURCE, "id": "src-two"}).status_code == 201
+    tenants = [_project_id(), _project_id()]
+    for tenant in tenants:
+        assert _write(api, "src-two", tenant) == 200
+    names = [_project_secret("src-two", tenant) for tenant in tenants]
+    assert [name for name in names if not read_secret(name, api.settings)] == []
+    assert _delete(api, "/api/v1/providers/src-two").status_code == 204
+    assert [name for name in names if read_secret(name, api.settings)] == []
+    [deleted] = [e for e in api.store.events() if e.kind == "provider.deleted"]
+    assert deleted.data == {"provider_id": "src-two"}
+    if os.geteuid() == 0:
+        return  # root writes a directory of mode 0500
+    assert api.post("/api/v1/providers", json={**SOURCE, "id": "src-three"}).status_code == 201
+    tenant = _project_id()
+    assert _write(api, "src-three", tenant) == 200
+    root = api.settings.secrets_dir
+    os.chmod(root, 0o500)  # the store's root turned read-only
+    try:
+        res = _delete(api, "/api/v1/providers/src-three")
+    finally:
+        os.chmod(root, 0o700)
+    assert res.status_code == 204, res.text
+    last = [e for e in api.store.events() if e.kind == "provider.deleted"][-1]
+    assert last.data == {
+        "provider_id": "src-three",
+        "secrets_left": [_project_secret("src-three", tenant)],
+    }
+
+
+def test_a_project_credential_is_audited_by_project_never_by_value(api, caplog):
+    """SDD §4.3, §27.8: provider.credentials_updated names the provider, the project, the secret and
+    its keys' names - a deletion `deleted` true instead of key names -, its actor the Seamless
+    principal; no event and no log line carries the credential's id or its secret."""
+    tenant_a, credential = _project_id(), _app_credential()
+    name = _project_secret("src-osp", tenant_a)
+    with caplog.at_level(logging.DEBUG):
+        res = put(api, _project_path("src-osp", tenant_a), credential)
+        assert res.status_code == 200, res.text
+        assert _delete(api, _project_path("src-osp", tenant_a)).status_code == 204
+    written, deleted = api.store.events(kinds=["provider.credentials_updated"])
+    assert written.data == {
+        "provider_id": "src-osp",
+        "project_id": tenant_a,
+        "secret": name,
+        "keys": APP_CREDENTIAL_KEYS,
+    }
+    assert deleted.data == {
+        "provider_id": "src-osp",
+        "project_id": tenant_a,
+        "secret": name,
+        "deleted": True,
+    }
+    assert written.actor == deleted.actor == "admin-user"
+    assert tenant_a in written.message and tenant_a in deleted.message
+    events = str([e.model_dump() for e in api.store.events(since_seq=0, limit=100000)])
+    leaks = _leaks(credential.values(), events=events, log=caplog.text)
+    assert leaks == []
+
+
+def test_project_credentials_are_server_owned(api):
+    """SDD §4.2, §12, §27.4: project_credentials is the server's - POST ignores it, PATCH refuses
+    it (422) - and what changes the rest of the provider keeps it: an edit, the provider's own
+    credentials and a check."""
+    tenant_a = _project_id()
+    forged = {
+        tenant_a: {
+            "secret": _project_secret("src-two", tenant_a),
+            "updated_at": "2026-10-23T08:00:00Z",
+        }
+    }
+    created = api.post(
+        "/api/v1/providers", json={**SOURCE, "id": "src-two", "project_credentials": forged}
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["project_credentials"] == {}
+    assert api.get("/api/v1/providers/src-two").json()["project_credentials"] == {}
+    for value in (forged, {}):
+        refused = patch(api, "/api/v1/providers/src-osp", {"project_credentials": value})
+        assert refused.status_code == 422, refused.text
+        assert "fields cannot be changed: project_credentials" in refused.text
+    assert _write(api, "src-osp", tenant_a) == 200
+    recorded = api.get("/api/v1/providers/src-osp").json()["project_credentials"]
+    assert set(recorded) == {tenant_a}
+    renamed = patch(api, "/api/v1/providers/src-osp", {"name": "RHOSP 17.1 (renamed)"})
+    assert renamed.status_code == 200 and renamed.json()["project_credentials"] == recorded
+    own = {
+        "username": "svc-migrate",
+        "password": secrets.token_urlsafe(16),
+        "project_name": "admin",
+    }
+    rewritten = put(api, "/api/v1/providers/src-osp/credentials", own)
+    assert rewritten.status_code == 200 and rewritten.json()["project_credentials"] == recorded
+    checked = api.post("/api/v1/providers/src-osp/check", Role.operator)
+    assert checked.status_code == 200 and checked.json()["project_credentials"] == recorded
