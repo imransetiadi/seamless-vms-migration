@@ -463,29 +463,32 @@ def test_a_cluster_stop_and_scale_zero_leave_postgresql_running(tmp_path, platfo
 
 #: the read of seamless-data's access modes, from its claim's spec (SDD §17.2)
 DATA_MODES = "get pvc/seamless-data -o jsonpath={.spec.accessModes[*]}"
-#: the ways to two replicas a claim that is not ReadWriteMany refuses: (argv, HA component, claim)
+#: the ways to two replicas a claim that is not ReadWriteMany refuses - the HA component in the
+#: overlay, which scale 2 takes too (test_a_cluster_scale_two_needs_the_ha_component): (argv, claim)
 NOT_SHARED = [
-    (["scale", "2"], False, ["ReadWriteOnce"]),
-    (["scale", "2"], False, None),  # a claim it cannot read
-    (["start"], True, ["ReadWriteOnce"]),
-    (["up"], True, ["ReadWriteOnce"]),  # before its apply: a claim's access modes never change
+    (["scale", "2"], ["ReadWriteOnce"]),
+    (["scale", "2"], None),  # a claim it cannot read
+    (["start"], ["ReadWriteOnce"]),
+    (["up"], ["ReadWriteOnce"]),  # before its apply: a claim's access modes never change
 ]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
 @pytest.mark.parametrize(
-    ("argv", "ha", "claim"), NOT_SHARED, ids=["scale 2", "scale 2 no claim", "start", "up"]
+    ("argv", "claim"), NOT_SHARED, ids=["scale 2", "scale 2 no claim", "start", "up"]
 )
 def test_a_cluster_scale_two_needs_a_readwritemany_data_volume(
-    tmp_path, platform, tool, overlay, argv, ha, claim
+    tmp_path, platform, tool, overlay, argv, claim
 ):
     """SDD §17.2, §25.7: two replicas run on two nodes, and the new leader reads the run
     directories the old one wrote - scale 2, and up and start restoring the HA component's 2,
     take a seamless-data claim that asks for ReadWriteMany, read from its spec (a class that binds
     at the first consumer leaves a new claim unbound until a pod uses it). One that does not, or
     one it cannot read, is refused with 2 before anything changed, naming why; up refuses it
-    before its apply, which could not change it. With a ReadWriteMany claim, scale 2 runs two."""
+    before its apply, which could not change it. With a ReadWriteMany claim, scale 2 runs two -
+    the HA component in the overlay, as each run here has it."""
     shared = fake_kube.cluster(replicas=1, data_modes=("ReadWriteMany",))
+    _overlays(tmp_path / "shared", overlay.split("/")[1])
     proc, calls, _ = _run(tmp_path / "shared", platform, "scale", "2", cluster=shared)
     after = _cluster_after(tmp_path / "shared")
     assert proc.returncode == 0, proc.stderr
@@ -497,7 +500,7 @@ def test_a_cluster_scale_two_needs_a_readwritemany_data_volume(
     state = fake_kube.cluster(replicas=0 if argv == ["start"] else 1, postgres=0)
     state["pvc"] = None if claim is None else {"accessModes": claim}
     run = tmp_path / "refused"
-    _overlays(run, overlay.split("/")[1] if ha else None)
+    _overlays(run, overlay.split("/")[1])
     proc, calls, _ = _run(run, platform, *argv, cluster=state)
     assert proc.returncode == 2, proc.stderr
     assert _cluster_after(run) == state  # nothing changed
@@ -507,6 +510,66 @@ def test_a_cluster_scale_two_needs_a_readwritemany_data_volume(
     else:
         assert "ReadWriteMany" in proc.stderr and "it is ReadWriteOnce" in proc.stderr, proc.stderr
         assert "nothing was changed" in proc.stderr, proc.stderr
+
+
+#: where an installation enabled the HA component, and whether the platform's overlay then has it
+#: - its own kustomization lists it, or for Kubernetes the deploy/openshift it builds -, read as
+#: the count up and start restore is (SDD §17.2)
+HA_FOR_SCALE = [
+    ("openshift", None, False),
+    ("openshift", "kubernetes", False),  # the Kubernetes overlay's, never OpenShift's
+    ("openshift", "openshift", True),
+    ("kubernetes", None, False),
+    ("kubernetes", "kubernetes", True),
+    ("kubernetes", "openshift", True),  # in deploy/openshift, which the Kubernetes overlay builds
+]
+
+
+@pytest.mark.parametrize(("platform", "enabled_in", "listed"), HA_FOR_SCALE)
+def test_a_cluster_scale_two_needs_the_ha_component(tmp_path, platform, enabled_in, listed):
+    """SDD §17.2, §25.6, §25.7 (the owner's decisions of 2026-10-30): without the HA component's
+    NetworkPolicy the replicas cannot reach each other's API port - the relay is blocked, and every
+    request a follower relays gets 503 no_leader. So scale 2 takes the component in the overlay,
+    read from the overlay's files as the count up and start restore is, never from the cluster:
+    without it, refused with 2 before anything ran - its dry run too, which reads the same files -,
+    naming how to enable it, whatever the claim; with it, two replicas run, and its dry run prints
+    the commands and runs none. scale 1 turns HA off: one replica runs on the ReadWriteMany claim,
+    the component left in place."""
+    overlay = f"deploy/{platform}/kustomization.yaml"
+    for dry in (False, True):
+        state = fake_kube.cluster(replicas=1, data_modes=("ReadWriteMany",))
+        run = tmp_path / f"two-{dry}"
+        _overlays(run, enabled_in)
+        argv = ["scale", "2", *(["--dry-run"] if dry else [])]
+        proc, calls, tree = _run(run, platform, *argv, cluster=state)
+        after = _cluster_after(run)
+        if listed:
+            assert proc.returncode == 0, proc.stderr
+            assert after["deployment"]["replicas"] == (1 if dry else 2), proc.stdout
+            assert (calls == []) == dry, calls
+            continue
+        assert proc.returncode == 2, proc.stderr
+        assert calls == [] and after == state  # nothing ran, nothing changed
+        said = " ".join(proc.stderr.split())
+        assert "the HA component" in said and "503 no_leader" in said, said
+        assert f"uncomment the two components: lines of {overlay}" in said, said
+        assert f"scripts/seamless-ctl.sh {platform} up" in said, said
+        assert "nothing was changed" in said, said
+        assert str(tree) not in said  # the overlay named as the repository names it
+    state = fake_kube.cluster(replicas=2, data_modes=("ReadWriteMany",))
+    state["deployment"]["pods"].append(dict(state["deployment"]["pods"][0], name="seamless-2"))
+    run = tmp_path / "one"
+    _overlays(run, enabled_in)
+    component = (run / "tree" / "deploy" / "openshift" / "ha" / "kustomization.yaml").read_text()
+    proc, _, _ = _run(run, platform, "scale", "1", cluster=state)
+    after = _cluster_after(run)
+    assert proc.returncode == 0, proc.stderr
+    assert after["deployment"]["replicas"] == 1, proc.stderr
+    assert len([p for p in fake_kube.running(after) if not p.get("terminating")]) == 1
+    assert after["pvc"] == {"accessModes": ["ReadWriteMany"]}  # the claim stays as it is
+    assert (run / "tree" / "deploy" / "openshift" / "ha" / "kustomization.yaml").read_text() == (
+        component
+    )
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -879,6 +942,8 @@ def test_a_cluster_dry_run_calls_no_tool_and_changes_nothing(tmp_path, platform,
     passed every test. Every cluster action, a drain's and resume's API calls too: no tool runs,
     and a stopped stack with PostgreSQL scaled out stays as it was."""
     state = fake_kube.cluster(replicas=0, postgres=2)
+    if argv == ["scale", "2"]:  # two replicas take the HA component in the overlay (SDD §17.2)
+        _overlays(tmp_path, platform)
     proc, calls, _ = _run(tmp_path, platform, *argv, "--dry-run", cluster=state)
     assert proc.returncode == 0, proc.stderr
     assert calls == []

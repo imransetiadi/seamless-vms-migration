@@ -25,12 +25,13 @@ ACTION
                      cluster with the overlay's replicas
   restart            restart the control plane from its current configuration - after a change
   scale 0|1|2        the control plane's replicas: 0 stops it, 1 starts one; 2 runs two on a
-                     cluster, on two nodes, one of which leads - only with a ReadWriteMany
-                     seamless-data (SDD §25.7); docker and podman run one
+                     cluster, on two nodes, one of which leads - only with the HA component and a
+                     ReadWriteMany seamless-data (SDD §25.7); docker and podman run one
   capacity           scale the one control plane up or down: --max-migrations N, --max-cutovers N,
                      and on a cluster --cpu C, --memory M (its limits); then a restart
   status             what runs, and the API's health - on a cluster with --url, the leading pod
-  logs               follow the control plane's log
+  logs               follow the control plane's log - on a cluster with two replicas one pod's,
+                     not necessarily the leader's: status names the leading pod
   resume PLAN_ID...  start again the plans a --drain paused (needs --token-file)
 
 OPTIONS
@@ -469,10 +470,26 @@ lists_ha() {
     listed && /^[ \t]*-[ \t]*([^ \t#]*\/)?ha\/?[ \t]*(#.*)?$/ { found = 1 }
     END { exit !found }' "$1"
 }
+# Whether the overlay includes the HA component: its kustomization lists it, or for Kubernetes that of the
+# deploy/openshift it builds (SDD §17.2).
+overlay_has_ha() {
+  lists_ha "$ROOT/$OVERLAY/kustomization.yaml" ||
+    { [ "$OVERLAY" != deploy/openshift ] && lists_ha "$ROOT/deploy/openshift/kustomization.yaml"; }
+}
+# Two replicas take the HA component: without its NetworkPolicy the replicas cannot reach each other's API port, so
+# the relay is blocked and every request a follower relays gets 503 no_leader (SDD §17.2, §25.6, §25.7; the owner's
+# decisions of 2026-10-30). Read from the overlay's files, as its count is - by a dry run too -, before anything ran.
+ha_for_two() {
+  overlay_has_ha && return 0
+  check_failed "scale 2 takes the HA component, which $OVERLAY/kustomization.yaml does not include: without its" \
+    "NetworkPolicy the replicas cannot reach each other's API port, so the relay is blocked and every request a" \
+    "follower relays gets 503 no_leader (SDD §17.2, §25.7). Enable it, on a ReadWriteMany seamless-data: uncomment" \
+    "the two components: lines of $OVERLAY/kustomization.yaml, then run scripts/seamless-ctl.sh $PLATFORM up, which" \
+    "starts its two replicas (docs/Operations.md §4.7); nothing was changed"
+}
 overlay_replicas() {
   local count=''
-  lists_ha "$ROOT/$OVERLAY/kustomization.yaml" ||
-    { [ "$OVERLAY" != deploy/openshift ] && lists_ha "$ROOT/deploy/openshift/kustomization.yaml"; } || return 0
+  overlay_has_ha || return 0
   [ ! -f "$ROOT/$HA_COMPONENT/kustomization.yaml" ] || count=$(awk '
     /^[ \t]*(-[ \t]*)?count:/ { sub(/^[ \t]*(-[ \t]*)?count:[ \t]*/, ""); sub(/[ \t]*(#.*)?$/, ""); print }' \
     "$ROOT/$HA_COMPONENT/kustomization.yaml")
@@ -777,6 +794,8 @@ the new ones"
 }
 
 cluster() {
+  # scale 2's component, read from files: before the tool, the cluster and the claim (SDD §17.2)
+  [ "$ACTION" != scale ] || [ "${ARGS[0]}" != 2 ] || ha_for_two
   need "$KUBE" "install it and log in to the cluster"
   case $ACTION in
     up)
