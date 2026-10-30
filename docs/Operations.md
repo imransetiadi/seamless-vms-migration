@@ -15,8 +15,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [ARGUMENTS] [OPTIONS]
 | `openshift` | the manifests in `deploy/openshift/` (OpenShift 4.16+) | `oc` |
 
 The binding description is [SDD §17.2](SDD.md); `scripts/seamless-ctl.sh --help` prints the same options.
-On a cluster, sections 4.7–4.11 run two replicas of the control plane: the HA control plane of 0.5.0, a Technology
-Preview (SDD §25).
+On a cluster, sections 4.7–4.13 run two replicas of the control plane: the HA control plane of 0.5.0, a Technology
+Preview (SDD §25) - how to enable it, which replica leads, a failover, scraping each replica, and turning it off.
 Section 7 also sets up what 0.5.0 adds: the conversion hosts' host keys (7.2), changed-extent tracking (7.3) and
 notifications (7.4). Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
 Designate zones and Manila shares (SDD §23.2).
@@ -40,9 +40,9 @@ A deployment has two parts:
 So **scaling** has two meanings here:
 
 * **Scale between 0 and 1 - or 2 on a cluster.** `scale 0` stops the control plane (PostgreSQL keeps running),
-  `scale 1` starts one replica, and on a cluster `scale 2` starts two, only while `seamless-data` is ReadWriteMany
-  (section 4.8). The script refuses any other count. A second replica adds availability, not capacity: the
-  leader's orchestrator still drives every migration.
+  `scale 1` starts one replica, and on a cluster `scale 2` starts two, only with the HA component (section 4.7) and
+  while `seamless-data` is ReadWriteMany (section 4.8). The script refuses any other count. A second replica adds
+  availability, not capacity: the leader's orchestrator still drives every migration.
 * **Capacity: scale the one control plane up or down.** `capacity` changes how much work it takes on at once -
   `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` (default 10) and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (default 3) - and, on a
   cluster, its CPU and memory limits. Each concurrent migration needs about 250 MiB (an `ansible-playbook`
@@ -71,7 +71,7 @@ Compose, deleting the namespace or its PVCs on a cluster.
 | `stop` | stop the control plane alone | `make seamless-stop` | control plane to 0 replicas |
 | `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone (by its pods, also when the count already reads 1), its PVC kept -, then the control plane at the overlay's count |
 | `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pods end before the new ones start); a stopped control plane is started with one replica instead |
-| `scale 0` / `scale 1` / `scale 2` | the control plane's replicas | `stop` / `start`; 2 is refused: one control plane per host | `stop` / `start` with one replica / with two, only while `seamless-data` is ReadWriteMany (section 4.8) |
+| `scale 0` / `scale 1` / `scale 2` | the control plane's replicas | `stop` / `start`; 2 is refused: one control plane per host | `stop` / `start` with one replica - with the HA component, HA turned off (section 4.13) / with two, only with the HA component and while `seamless-data` is ReadWriteMany (sections 4.7, 4.8) |
 | `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a limit the API server refuses changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout; a failed patch or rollout - a LimitRange or quota refusing the new pod - is rolled back, the settings put back |
 | `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ with `--url` the health and the leading pod) |
 | `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f`: one pod's, not necessarily the leader's (section 4.9) |
@@ -221,12 +221,14 @@ scripts/seamless-ctl.sh openshift logs      # one pod's log: with two replicas, 
 scripts/seamless-ctl.sh kubernetes stop      # = scale 0: the control plane's pods end; PostgreSQL keeps running
 scripts/seamless-ctl.sh kubernetes start     # the overlay's count, 1 or 2; PostgreSQL first when a down left it at 0
 scripts/seamless-ctl.sh kubernetes scale 1   # one replica, until the next up or start restores the overlay's count
-scripts/seamless-ctl.sh kubernetes scale 2   # two replicas on two nodes: a ReadWriteMany seamless-data (section 4.8)
+scripts/seamless-ctl.sh kubernetes scale 2   # two replicas on two nodes: the HA component and a ReadWriteMany claim
 ```
 
-`scale 2` without the HA component runs two replicas without what the component adds - the relay's NetworkPolicy,
-without which a follower reaches no leader, the anti-affinity, the disruption budget and `FORWARDED_ALLOW_IPS`
-(section 4.7) -: enable the component instead.
+`scale 2` takes the HA component (section 4.7): without its NetworkPolicy the replicas cannot reach each other's API
+port, so the relay is blocked and every request a follower relays gets 503 `no_leader`. Without it in the overlay,
+`scale 2` is refused (exit 2) before anything changed - a `--dry-run` too, as the script reads the overlay's files -,
+naming the overlay's two `components:` lines to uncomment. With the component, `scale 1` turns HA off and leaves the
+component in place (section 4.13).
 
 ### 4.4 After a change
 
@@ -291,6 +293,8 @@ host keeps one control plane (section 1).
   evicts one replica at a time, and a replica that is not ready never blocks it;
 * `seamless-data` ReadWriteMany: the new leader reads the run directories the old one wrote;
 * the NetworkPolicy `seamless-allow-relay`: the replicas reach each other's API port, TCP 8080, and nothing else;
+* the NetworkPolicy `seamless-allow-ingress-from-monitoring`: the cluster's monitoring stack reaches each replica's
+  API port, TCP 8080, alone, so that each replica is scraped on its own (section 4.12);
 * `FORWARDED_ALLOW_IPS`, the cluster's pod network, so the leader's lockout and audit count the caller of a relayed
   request, never the follower.
 
@@ -315,6 +319,9 @@ host keeps one control plane (section 1).
   since 1.27; on NFR-10's 1.28 it is to be confirmed in the lab.
 * **A database clock that slews**, never stepping forward by more than 10 s: the lease's times are the database's,
   and a larger step defeats the margin that keeps a deposed leader from acting beside the new one (SDD §25.4).
+* **The monitoring stack's namespace** in `seamless-allow-ingress-from-monitoring`: OpenShift's
+  `openshift-user-workload-monitoring`, which the component names, or on Kubernetes the namespace your Prometheus runs
+  in, `monitoring` unless you set another in `deploy/kubernetes/ha` (section 4.12).
 
 **Enabling it**, on a new installation or once `/data` moved (section 4.8):
 1. Uncomment the two `components:` lines of the overlay you apply - `deploy/openshift/kustomization.yaml` on
@@ -329,7 +336,8 @@ host keeps one control plane (section 1).
 2. Unless the cluster's default class serves ReadWriteMany, uncomment the `storageClassName` patch of
    `deploy/openshift/ha/kustomization.yaml` and name the class.
 3. Check `FORWARDED_ALLOW_IPS` against the pod network: in `deploy/openshift/ha/kustomization.yaml`, or in
-   `deploy/kubernetes/ha/kustomization.yaml` on Kubernetes.
+   `deploy/kubernetes/ha/kustomization.yaml` on Kubernetes - there also the monitoring stack's namespace (section
+   4.12).
 4. Apply it, then see which pod leads:
 
    ```bash
@@ -338,7 +346,8 @@ host keeps one control plane (section 1).
    ```
 
 From then on `up` and `start` bring the control plane back to the component's two replicas, and `scale 1` runs one
-until the next `up` or `start`.
+until the next `up` or `start` - HA turned off, the component kept (section 4.13). Without the component in the
+overlay, `scale 2` is refused (section 4.3).
 
 ### 4.8 Moving `/data` to a ReadWriteMany claim
 
@@ -446,7 +455,8 @@ Where to see which replica leads:
   the notice above every page says that migrations wait until one takes over.
 * **The metrics:** `seamless_leader` is 1 on the replica that leads and 0 on a follower, and `seamless_leader_epoch`
   the lease's epoch as the replica read it, whose increases are the changes of leader (Performance.md §10.1). Each
-  replica answers for itself, and a scrape through the Route reaches one of them at a time.
+  replica answers for itself, and a scrape through the Route reaches one of them at random: scrape each pod (section
+  4.12).
 * **The events:** `leader.acquired` - the new holder and epoch, the previous ones, its `cause` (`first`, `released`
   or `expired`) and how many migrations it `resumes` - and `leader.released`, on the Events page under Security.
 * **The logs:** `scripts/seamless-ctl.sh openshift logs` follows one pod of the Deployment, not necessarily the
@@ -515,6 +525,120 @@ Check them as that role, over TCP: `SHOW tcp_keepalives_idle;` and `SHOW idle_in
 the two-role model of Security.md §9.4, the application role also needs `SELECT`, `INSERT` and `UPDATE` on `leases`
 once the owner role created the table - the owner's first start of 0.5.0 does -: without them no replica takes the
 lease, and no migration advances.
+
+### 4.12 Scraping each replica's metrics
+
+Each replica answers `/api/v1/metrics` for itself: the same store figures, and its own `seamless_leader` - 1 on the
+leader, 0 on a follower (SDD §18). A scrape through the Route reaches one replica at random, so `seamless_leader`
+would alternate between 1 and 0 from one scrape to the next: scrape each pod instead. With the HA component the
+NetworkPolicy `seamless-allow-ingress-from-monitoring` lets the cluster's monitoring stack do so - ingress from one
+namespace to each replica's API port, TCP 8080, alone (SDD §17):
+* **OpenShift:** `openshift-user-workload-monitoring`, where the Prometheus that monitors user-defined projects runs.
+  A cluster admin enables that monitoring once (`enableUserWorkload: true` in the ConfigMap `cluster-monitoring-config`
+  of `openshift-monitoring`), and creating the PodMonitor below takes the `monitoring-edit` role in
+  `seamless-migrate`. The platform's own Prometheus in `openshift-monitoring` monitors OpenShift's namespaces
+  and is not admitted. That the user-workload Prometheus reaches the pods from its namespace is to be confirmed in
+  the lab (QASuite §7.2).
+* **Kubernetes:** `monitoring` (kube-prometheus's) by default. Set the namespace your Prometheus runs in - a Helm
+  release of kube-prometheus-stack runs in the one it was installed into - in `deploy/kubernetes/ha/kustomization.yaml`,
+  the patch of `seamless-allow-ingress-from-monitoring`, before you apply the overlay.
+
+The endpoint asks for a viewer's token unless `SEAMLESS_METRICS_PUBLIC=true` (Performance.md §10.1): give the scrape
+one of its own - `seamless token create --name prometheus --role viewer` prints it with its entry for the
+`seamless-tokens` Secret, or add a dashboard user with the viewer role -, kept in a Secret beside the control plane,
+never on a command line, then point a PodMonitor at the pods' `http` port, one target per pod:
+
+```bash
+read -rs TOKEN && printf '%s' "$TOKEN" |
+  kubectl -n seamless-migrate create secret generic seamless-metrics-token --from-file=token=/dev/stdin; unset TOKEN
+kubectl -n seamless-migrate apply -f - <<'YAML'
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: seamless
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  podMetricsEndpoints:
+    - port: http
+      path: /api/v1/metrics
+      authorization:
+        credentials:
+          name: seamless-metrics-token
+          key: token
+YAML
+```
+
+On Kubernetes your Prometheus must select PodMonitors of `seamless-migrate` (its `podMonitorSelector` and
+`podMonitorNamespaceSelector`) and may read that namespace's pods. Then, with both replicas scraped:
+
+```text
+# replicas that lead: 1, and 0 during a failover (section 4.10)
+sum(seamless_leader)
+
+# the replicas scraped: 2 while both run
+count(seamless_leader)
+
+# the lease's epoch, the same on every replica: each increase is a change of leader
+max(seamless_leader_epoch)
+```
+
+The policy opens the API port, not only `/api/v1/metrics` - a NetworkPolicy cannot tell paths apart -, to that one
+namespace: every route asks there for the token it asks for through the Route. And that namespace's pods are in the
+pod network `FORWARDED_ALLOW_IPS` trusts, so the address one of them writes in `X-Forwarded-For` is taken as its
+caller's ([Security.md](Security.md) C1-13): name no namespace but your monitoring stack's. Without the component the
+one replica is reached through the Route, which the base's policies admit alone.
+
+### 4.13 Turning HA off, and removing the component
+
+**Turning HA off** is `scale 1` - or the platform's own scale of the Deployment -, and the component stays (SDD §17.2):
+
+```bash
+scripts/seamless-ctl.sh openshift scale 1     # or: oc -n seamless-migrate scale deployment/seamless --replicas=1
+```
+
+One replica runs on the ReadWriteMany `seamless-data` as it runs on any claim, with the disruption budget and both
+NetworkPolicies in place: nothing moves. It leads alone, with no follower to take over, so a lost node waits until
+Kubernetes replaces the pod again (section 4.7). `up` and `start` restore the component's two replicas; to keep one
+through them, set the `count` under the component's `replicas:` to 1 in `deploy/openshift/ha/kustomization.yaml`,
+which the script reads. HA is on again with `scale 2`, or with the count back at 2 and `up`.
+
+**Removing the component** moves `/data` back to a ReadWriteOnce claim first. A claim's access modes never change:
+with the component's `components:` lines commented again, the overlay asks for a ReadWriteOnce `seamless-data`, and
+`up`'s apply fails on the ReadWriteMany one - `The PersistentVolumeClaim "seamless-data" is invalid: spec: Forbidden:
+spec is immutable after creation ...` - after it applied the rest. Move it as section 4.8 moved it, the other way
+round, with the control plane stopped. No lab has run this procedure yet: rehearse it in a namespace of its own first.
+
+1. **Drain and stop the control plane** (section 5):
+   `scripts/seamless-ctl.sh openshift stop --drain ~/.seamless/operator.token --url https://seamless.apps.example.com`.
+2. **Back up** the database and snapshot `seamless-data` (section 4.8).
+3. **Copy `/data` to a temporary claim, make `seamless-data` again as ReadWriteOnce, and copy it back**, with section
+   4.8's `NS`, `IMAGE`, `SIZE`, `POD_SC`, `claim` and `copy`, and `CLASS` the class of the base's `pvc.yaml` - empty
+   for the cluster's default:
+
+   ```bash
+   CLASS=
+   claim seamless-data-move ReadWriteOnce && copy seamless-data seamless-data-move &&
+     kubectl -n "$NS" delete pvc/seamless-data &&     # its data is in seamless-data-move, and in the snapshot
+     claim seamless-data ReadWriteOnce "$CLASS" && copy seamless-data-move seamless-data && echo "/data moved back"
+   ```
+
+4. **Comment the two `components:` lines of the overlay again**, and delete what only the component made - an apply
+   deletes nothing:
+
+   ```bash
+   kubectl -n seamless-migrate delete pdb/seamless networkpolicy/seamless-allow-relay \
+     networkpolicy/seamless-allow-ingress-from-monitoring
+   ```
+
+5. **Start it:** `scripts/seamless-ctl.sh openshift up` applies the overlay - the Deployment loses the anti-affinity
+   and `FORWARDED_ALLOW_IPS`, which the base leaves you to set to the router's addresses (Security.md §12) - and
+   starts one replica. Check that `status` names the leading pod, resume the plans the drain paused (section 5),
+   and once the migrations run, delete the temporary claim: `kubectl -n seamless-migrate delete pvc/seamless-data-move`.
+
+A per-pod scrape (section 4.12) goes with the component: scrape the one replica through the Route, or keep a policy of
+your own for it.
 
 ---
 
@@ -610,9 +734,11 @@ the old version's pod before the new one starts, so 0.4.0's unfenced orchestrato
 | Message | Meaning and fix |
 |---|---|
 | `scale takes 0 or 1 on docker ...` / `scale takes 0, 1 or 2 on kubernetes ...` | The single host runs one control plane, and a cluster one replica or two - one leads, the other relays to it (section 4.7): a further replica adds no capacity. To scale up, use `capacity`. |
+| `scale 2 takes the HA component, which deploy/.../kustomization.yaml does not include ...` | `scale 2` on a cluster whose overlay does not include the HA component: without its NetworkPolicy the replicas cannot reach each other's API port, so the relay is blocked and every request a follower relays gets 503 `no_leader`. Enable the component - on a ReadWriteMany `seamless-data` (section 4.8) - by the two `components:` lines the message names, then `up` (section 4.7); one replica needs none: `scale 1`. Nothing was changed. |
 | `two replicas share seamless-data from two nodes ... and it is ReadWriteOnce: move /data to a ReadWriteMany claim first ...` | `up` with the HA component, `start` restoring its two replicas, or `scale 2` found `seamless-data` ReadWriteOnce, which no apply can change: move `/data` (section 4.8). Nothing was changed. |
 | `cannot read pvc/seamless-data in namespace ..., whose access modes two replicas need ...` | `kubectl` or `oc` cannot read the claim - an expired login, a mistyped `--namespace`, no access: nothing was changed. |
-| `the HA component's replicas, the count up and start restore, must be 1 or 2 in deploy/openshift/ha/kustomization.yaml, not '...'` | The component's `replicas` count was edited: set it back to 2. Nothing was changed. |
+| `the HA component's replicas, the count up and start restore, must be 1 or 2 in deploy/openshift/ha/kustomization.yaml, not '...'` | The component's `replicas` count was edited: set it back to 2 - or to 1, which keeps HA off through `up` and `start` (section 4.13). Nothing was changed. |
+| `The PersistentVolumeClaim "seamless-data" is invalid: spec: Forbidden: spec is immutable after creation ...` | `up` applied an overlay without the HA component over a ReadWriteMany `seamless-data`, whose access modes no apply can change: the apply refused the claim after it applied the rest of the overlay, and the script stopped (exit 1). Uncomment the component's two lines again and `up`, or remove the component as section 4.13 does, `/data` moved back to a ReadWriteOnce claim first. |
 | `no replica leads: migrations wait until one takes over` | `status` found no replica holding the lease: a failover is under way (about 35 s, section 4.10), or no replica can take the lease - its log says why: the database out of reach, or the application role without its grants on `leases` (section 4.11). |
 | `no_leader` (HTTP 503, `Retry-After: 2`) from the API | The replica that answered does not lead, and no replica leads or the leader does not answer: a failover is under way (section 4.10). Try again after two seconds. |
 | `error: another server runs against this database` | A second `seamless serve` against one SQLite file: SQLite serves one server per database (SDD §25.3). Stop the other one, or use PostgreSQL. |
