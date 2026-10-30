@@ -322,4 +322,58 @@ describe('Inventory', () => {
     });
     expect(await screen.findByRole('status')).toHaveTextContent(/reading inventory/i);
   });
+
+  it('filters the inventory by project', async () => {
+    // the mock cloud's projects the RHOSP 17.1 source holds credentials for (mockData MOCK_CLOUD_PROJECTS; SDD §27.4)
+    const SHOP = '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6';
+    const user = userEvent.setup({ delay: null });
+    function Where() {
+      const location = useLocation();
+      return <output data-testid="where">{location.pathname + location.search}</output>;
+    }
+    renderWithApp(
+      <Routes>
+        <Route
+          element={
+            <>
+              <Layout />
+              <NavigationType />
+              <Where />
+            </>
+          }
+        >
+          <Route path="/inventory/:providerId" element={<Inventory />} />
+        </Route>
+      </Routes>,
+      { route: '/inventory/rhosp17-dc1', token: 'viewer' },
+    );
+    const table = await screen.findByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ });
+    expect(within(table).getByRole('row', { name: /mq-broker-01/ })).toBeInTheDocument();
+    const select = screen.getByRole('combobox', { name: 'Project credential' });
+    expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual([
+      "Its own credential's project: finance (project-finance)",
+      'platform (8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3)',
+      `shop (${SHOP})`,
+    ]);
+    // the Technology Preview badge (SDD §16, §27.10)
+    expect(within(select.closest('div.field, div') as HTMLElement).getByText('Technology Preview')).toBeInTheDocument();
+    // read with the project's credential: its VMs alone, in place, kept in the address (SDD §12, §16)
+    select.focus();
+    await user.selectOptions(select, SHOP);
+    await waitFor(() => expect(within(screen.getByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ })).queryByRole('row', { name: /mq-broker-01/ })).not.toBeInTheDocument());
+    const shop = screen.getByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ });
+    expect(within(shop).getByRole('row', { name: /web-01/ })).toBeInTheDocument();
+    expect(screen.getByTestId('where')).toHaveTextContent(`/inventory/rhosp17-dc1?project=${SHOP}`);
+    expect(screen.getByTestId('navigation-type')).toHaveTextContent('REPLACE');
+    expect(select).toHaveFocus();
+    // its own credential reads without the query; another provider drops it
+    await user.selectOptions(select, '');
+    await waitFor(() => expect(screen.getByTestId('where')).toHaveTextContent(/^\/inventory\/rhosp17-dc1$/));
+    await user.selectOptions(select, SHOP);
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Provider' }), 'vcenter-hq');
+    await screen.findByRole('table', { name: /^VMs on vCenter HQ/ });
+    expect(screen.getByTestId('where')).toHaveTextContent(/^\/inventory\/vcenter-hq$/);
+    // vCenter has no Keystone projects (SDD §27.9)
+    expect(screen.queryByRole('combobox', { name: 'Project credential' })).not.toBeInTheDocument();
+  });
 });

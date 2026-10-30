@@ -246,6 +246,12 @@ export interface ProviderCredentials {
   datacenter?: string;
 }
 
+/** `PUT /providers/{id}/projects/{project_id}/credentials`: an application credential, write-only (SDD §12, §27.4). */
+export interface ProjectCredentialsBody {
+  application_credential_id: string;
+  application_credential_secret: string;
+}
+
 export interface Disk {
   id: string;
   name: string | null;
@@ -294,6 +300,8 @@ export interface VMRef {
   source_id: string;
   name: string;
   project: string | null;
+  /** OpenStack: its Keystone project's id; null for VMware and a VM recorded before (SDD §4.2, §27.4). Older answers omit it. */
+  project_id?: string | null;
   flavor: string | null;
   vcpus: number;
   ram_mb: number;

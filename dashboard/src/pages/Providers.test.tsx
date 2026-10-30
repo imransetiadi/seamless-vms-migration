@@ -668,7 +668,8 @@ describe('Providers page', () => {
     renderPage('admin');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
     const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
-    const remove = within(card).getByRole('button', { name: /^delete /i });
+    // the provider's own Delete, beside its project credentials' (SDD §16)
+    const remove = within(card).getByRole('button', { name: 'Delete RHOSP 17.1 — DC1' });
     await waitFor(() => expect(remove).toHaveAttribute('aria-disabled', 'true'));
     // as the API refuses it: the plans neither completed nor cancelled, a completed one whose VMs are not finalized
     expect(remove).toHaveAccessibleDescription(
@@ -777,7 +778,9 @@ describe("Providers: a destination's GPU capacity (SDD §16, §22.11; plan task 
     expect(within(staging).getByText('Last checked', { selector: 'dt' }).nextElementSibling).not.toHaveTextContent('Never');
     expect(server.providers.find((p) => p.id === 'rhoso-staging')?.capabilities.gpu_capacity).toMatchObject({ status: 'ok', pools: [] });
     expect(within(staging).queryByRole('group', { name: 'GPU capacity' })).not.toBeInTheDocument();
-    expect(staging).not.toHaveTextContent(/GPU|Technology Preview/);
+    expect(staging).not.toHaveTextContent(/GPU/);
+    // its one Technology Preview badge is its Projects' (SDD §16, §27.10)
+    expect(within(staging).getAllByText('Technology Preview').map((badge) => badge.closest('[role="group"]'))).toEqual([within(staging).getByRole('group', { name: /^projects/i })]);
     // a source has none, and only the GPU destination checked since 0.3.0 shows one
     for (const name of ['RHOSP 17.1 — DC1', 'vCenter HQ', 'OpenStack Lab (2023.1)', 'Kolla Edge (Bobcat)', hibiscus.name]) {
       expect(within(screen.getByRole('article', { name })).queryByRole('group', { name: 'GPU capacity' }), name).not.toBeInTheDocument();
@@ -932,5 +935,146 @@ describe("Providers: a conversion host's host keys (SDD §16, §26.4; plan task 
     renderPage('viewer');
     await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
     expect(screen.queryByText(/Host keys are not checked/)).not.toBeInTheDocument();
+  });
+});
+
+describe("Providers: a provider's project credentials (SDD §16, §27.4; plan task TC8)", () => {
+  // the mock cloud's projects (mockData MOCK_CLOUD_PROJECTS): shop and platform hold credentials, analytics none yet
+  const SHOP = '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6';
+  const PLATFORM = '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3';
+  const ANALYTICS = 'c41a7e9b3d2f48a6b1e5c9d0f7a3b2e8';
+  // synthetic, made up for the test (plan TC rules)
+  const APP_ID = 'ac0ffee0ac0ffee0ac0ffee0ac0ffee0';
+  const APP_SECRET = 'synthetic-secret-typed-in-the-test'; // gitleaks:allow
+
+  const projectsOf = async (name = 'RHOSP 17.1 — DC1') => {
+    const card = await screen.findByRole('article', { name });
+    return { card, group: within(card).getByRole('group', { name: /^projects/i }) };
+  };
+
+  it('lists each project credential with its project, roles, expiry and status', async () => {
+    const server = createTestServer();
+    // one written that no check read yet: its id alone, not checked since written (SDD §16, §27.7)
+    const source = server.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    source.project_credentials![ANALYTICS] = { secret: 'provider-rhosp17-dc1.project-0123456789abcdef', updated_at: new Date(TEST_NOW).toISOString() };
+    // the expiries by the browser's clock, which the card judges them at (SDD §16)
+    const report = source.capabilities.projects as Record<string, { expires_at: string | null }>;
+    report[SHOP]!.expires_at = new Date(Date.now() + 60 * 24 * 3600_000).toISOString();
+    report[PLATFORM]!.expires_at = new Date(Date.now() + 3 * 24 * 3600_000).toISOString();
+    renderPage('viewer', server);
+    const { group } = await projectsOf();
+    // the Technology Preview badge (SDD §16, §27.10)
+    expect(within(group).getByText('Technology Preview')).toBeInTheDocument();
+    expect(group).toHaveTextContent('Own credential: finance (project-finance)');
+    const rows = within(within(group).getByRole('list', { name: 'Project credentials' })).getAllByRole('listitem');
+    expect(rows.map((r) => r.querySelector('h5')?.textContent)).toEqual([ANALYTICS, `platform (${PLATFORM})`, `shop (${SHOP})`]);
+    const [analytics, platform, shop] = rows as [HTMLElement, HTMLElement, HTMLElement];
+    expect(shop).toHaveTextContent('Checked');
+    expect(shop).toHaveTextContent('Roles: member, reader');
+    expect(shop).toHaveTextContent(/Expires .+/);
+    expect(shop).toHaveTextContent('Restricted');
+    expect(shop).toHaveTextContent(/Written .+ ago/);
+    // what an earlier check read is no fact about a credential written since: nothing but its status
+    expect(analytics).toHaveTextContent('Not checked since written');
+    expect(analytics).not.toHaveTextContent(/Roles|Expires|Restricted/);
+    expect(platform).toHaveTextContent('Checked');
+    expect(platform).toHaveTextContent('Roles: load-balancer_member, member, reader');
+    // within 7 days, and unrestricted: in the warning tone, as the findings warn (SDD §27.7)
+    expect(within(platform).getByText(/^Expires .+, within 7 days$/)).toHaveClass('text-status-warning');
+    expect(within(shop).getByText(/^Expires /)).not.toHaveTextContent('within 7 days');
+    expect(within(platform).getByText('Unrestricted: it may create application credentials and trusts')).toHaveClass('text-status-warning');
+    // never its secret's name (SDD §16, §13.3)
+    expect(group).not.toHaveTextContent('provider-rhosp17-dc1.project-');
+    // a vCenter has no Keystone projects (SDD §27.9); a provider without one says so
+    expect(within(await screen.findByRole('article', { name: 'vCenter HQ' })).queryByRole('group', { name: /^projects/i })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })).getByRole('group', { name: /^projects/i })).toHaveTextContent('No project credential yet.');
+  });
+
+  it('writes a project credential and never shows it again', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage('admin');
+    const { group } = await projectsOf();
+    await user.click(within(group).getByRole('button', { name: 'Add project credential to RHOSP 17.1 — DC1' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Add project credential' });
+    // refused before anything is sent, as the API refuses it (SDD §12)
+    await user.type(within(dialog).getByLabelText(/^project id/i), 'not an id');
+    await user.click(within(dialog).getByRole('button', { name: /save and check/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/3 fields need attention/i);
+    await user.clear(within(dialog).getByLabelText(/^project id/i));
+    await user.type(within(dialog).getByLabelText(/^project id/i), ANALYTICS);
+    await user.type(within(dialog).getByLabelText(/^application credential id/i), APP_ID);
+    const secret = within(dialog).getByLabelText(/^application credential secret/i);
+    expect(secret).toHaveAttribute('type', 'password');
+    await user.type(secret, APP_SECRET);
+    await user.click(within(dialog).getByRole('button', { name: /save and check/i }));
+    // written, then checked, as the provider dialog does (SDD §16)
+    const outcome = await screen.findByRole('dialog', { name: `analytics (${ANALYTICS}) is checked` });
+    await waitFor(() => expect(within(outcome).getByRole('heading', { name: `analytics (${ANALYTICS}) is checked` })).toHaveFocus());
+    expect(server.events.map((e) => e.kind)).toEqual(expect.arrayContaining(['provider.credentials_updated', 'provider.checked']));
+    expect(document.body).not.toHaveTextContent(APP_SECRET);
+    expect(document.querySelector(`input[value="${APP_SECRET}"]`)).toBeNull();
+    await user.click(within(outcome).getByRole('button', { name: 'Done' }));
+    const rows = within(within(group).getByRole('list', { name: 'Project credentials' })).getAllByRole('listitem');
+    expect(rows.map((r) => r.querySelector('h5')?.textContent)).toContain(`analytics (${ANALYTICS})`);
+    // opened again, the form is empty: the secret was never kept (SDD §16)
+    await user.click(within(group).getByRole('button', { name: 'Add project credential to RHOSP 17.1 — DC1' }));
+    const again = await screen.findByRole('dialog', { name: 'Add project credential' });
+    expect(within(again).getByLabelText(/^application credential secret/i)).toHaveValue('');
+    expect(JSON.stringify(server.events)).not.toContain(APP_SECRET);
+    expect(JSON.stringify(server.providers)).not.toContain(APP_SECRET);
+  });
+
+  it("keeps a refused project credential's project and id, never its secret, and shows the API's reason (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const refusal = { error: { code: 'conflict', message: 'the credential of project tenant-a holds the secret provider-rhosp17-dc1.project-0123456789abcdef' } };
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) =>
+      init?.method === 'PUT' && String(input).includes('/projects/')
+        ? new Response(JSON.stringify(refusal), { status: 409, headers: { 'Content-Type': 'application/json' } })
+        : fetchImpl(input, init);
+    renderWithApp(<Providers />, { route: '/providers', path: '/providers', token: 'admin', wrapFetch });
+    const { group } = await projectsOf();
+    await user.click(within(group).getByRole('button', { name: 'Add project credential to RHOSP 17.1 — DC1' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Add project credential' });
+    await user.type(within(dialog).getByLabelText(/^project id/i), ANALYTICS);
+    await user.type(within(dialog).getByLabelText(/^application credential id/i), APP_ID);
+    await user.type(within(dialog).getByLabelText(/^application credential secret/i), APP_SECRET);
+    await user.click(within(dialog).getByRole('button', { name: /save and check/i }));
+    expect(await within(dialog).findByText(/holds the secret/)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^project id/i)).toHaveValue(ANALYTICS);
+    expect(within(dialog).getByLabelText(/^application credential id/i)).toHaveValue(APP_ID);
+    expect(within(dialog).getByLabelText(/^application credential secret/i)).toHaveValue('');
+  });
+
+  it('keeps Delete of a project credential unavailable while a plan needs it, naming the plan', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const rollout = server.plans.find((p) => p.name === 'DC1 → RHOSO production rollout')!;
+    rollout.source_project = SHOP;
+    renderPage('admin', server);
+    const { group } = await projectsOf();
+    const shop = within(group).getByRole('button', { name: `Delete the credential of shop (${SHOP})` });
+    await waitFor(() => expect(shop).toHaveAttribute('aria-disabled', 'true'));
+    expect(shop).toHaveAccessibleDescription(
+      'A plan still needs it: “DC1 → RHOSO production rollout” (running). A plan needs its projects until it completes and its VMs are finalized.',
+    );
+    await user.click(shop);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    // no plan names platform: its credential goes, after its id is typed
+    await user.click(within(group).getByRole('button', { name: `Delete the credential of platform (${PLATFORM})` }));
+    const dialog = await screen.findByRole('alertdialog', { name: /delete the credential of platform/i });
+    await user.type(within(dialog).getByLabelText(new RegExp(`type ${PLATFORM} to confirm`, 'i')), PLATFORM);
+    await user.click(within(dialog).getByRole('button', { name: /^delete credential$/i }));
+    await waitFor(() => expect(within(group).queryByRole('heading', { name: `platform (${PLATFORM})` })).not.toBeInTheDocument());
+    expect(server.providers.find((p) => p.id === 'rhosp17-dc1')!.project_credentials).not.toHaveProperty(PLATFORM);
+    await waitFor(() => expect(within(group).getByRole('heading', { name: /^projects/i })).toHaveFocus());
+  });
+
+  it('shows the project credentials to non-admins without their write actions', async () => {
+    renderPage('operator');
+    const { group } = await projectsOf();
+    expect(within(within(group).getByRole('list', { name: 'Project credentials' })).getAllByRole('listitem')).toHaveLength(2);
+    expect(within(group).queryByRole('button', { name: /add project credential/i })).not.toBeInTheDocument();
+    expect(within(group).queryByRole('button', { name: /^delete/i })).not.toBeInTheDocument();
+    expect(group).toHaveTextContent('Adding and deleting project credentials requires the admin role.');
   });
 });

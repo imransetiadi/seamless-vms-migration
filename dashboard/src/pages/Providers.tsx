@@ -10,6 +10,7 @@ import { PlatformMark, ProviderDialog } from '../components/ProviderDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
+import { ProjectCredentials } from '../components/ProjectCredentials';
 import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
@@ -462,6 +463,8 @@ function ProviderCard({
 
       {provider.role === 'destination' && provider.kind !== 'vmware' && <GpuCapacitySummary provider={provider} />}
       {provider.ceph && <CephAccessSummary provider={provider} />}
+      {/* a project credential per Keystone project; vCenter has none (SDD §16, §27.4, §27.9) */}
+      {provider.kind !== 'vmware' && <ProjectCredentials provider={provider} canEdit={canEdit} onAnnounce={onAnnounce} />}
 
       <Capabilities capabilities={provider.capabilities} />
 

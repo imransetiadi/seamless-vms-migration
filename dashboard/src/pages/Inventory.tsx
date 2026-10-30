@@ -19,6 +19,7 @@ import { VmTable } from '../components/VmTable';
 import { formatBytes, formatDateTime, formatNumber } from '../lib/format';
 import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuLabel, poolFreeText, poolLabel } from '../lib/gpu';
 import { holdersOf } from '../lib/holds';
+import { projectChoices } from '../lib/projectCredentials';
 import { providerLabel } from '../lib/providerUse';
 import { KEEP_FOCUS } from '../lib/navigation';
 import { hasRole } from '../lib/roles';
@@ -331,10 +332,13 @@ function providerOption(p: Provider): string {
 export default function Inventory() {
   usePageTitle('Inventory');
   const { providerId } = useParams();
-  const wanted = useSearchParams()[0].get('vm');
+  const [search] = useSearchParams();
+  const wanted = search.get('vm');
+  // whose credential reads it: a project's, kept in the address, else the provider's own (SDD §12, §16, §27.4)
+  const project = search.get('project') || null;
   const navigate = useNavigate();
   const providers = useProviders();
-  const inventory = useInventory(providerId);
+  const inventory = useInventory(providerId, project);
   const role = useRole();
   const listState = useListState('inventory-selection');
   const [selected, setSelected] = listState.field<{ providerId: string; ids: Set<string> }>('selection', { providerId: '', ids: new Set() });
@@ -380,14 +384,33 @@ export default function Inventory() {
         }
         meta={provider ? <ProviderStatusBadge status={provider.status} /> : undefined}
         actions={
-          <SelectField
-            label="Provider"
-            className="w-full sm:w-80"
-            value={providerId}
-            // switches the inventory in place: focus stays here and the address is replaced (WCAG 3.2.2, SDD §16)
-            onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
-            options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerOption(p) }))}
-          />
+          <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:flex-wrap sm:items-end">
+            <SelectField
+              label="Provider"
+              className="w-full sm:w-80"
+              value={providerId}
+              // switches the inventory in place: focus stays here and the address is replaced, a project dropped (WCAG 3.2.2, SDD §16)
+              onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
+              options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerOption(p) }))}
+            />
+            {provider && provider.kind !== 'vmware' && (Object.keys(provider.project_credentials ?? {}).length > 0 || project) && (
+              <SelectField
+                label="Project credential"
+                aside={<TechPreviewBadge feature="credentials" />}
+                className="w-full sm:w-80"
+                value={project ?? ''}
+                // in place, as the Provider select: the address keeps the project (SDD §16)
+                onChange={(e) =>
+                  navigate(`/inventory/${provider.id}${e.target.value ? `?project=${encodeURIComponent(e.target.value)}` : ''}`, { replace: true, state: KEEP_FOCUS })
+                }
+                options={[
+                  ...projectChoices(provider),
+                  // a project an old address names that the provider holds no credential for: read as the API answers it
+                  ...(project && !projectChoices(provider).some((c) => c.value === project) ? [{ value: project, label: `${project} (no credential)` }] : []),
+                ]}
+              />
+            )}
+          </div>
         }
       />
 

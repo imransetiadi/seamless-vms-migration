@@ -1153,6 +1153,7 @@ describe('mock API', () => {
       'cutover_window',
       'default_strategy',
       'description',
+      'destination_project',
       'destination_provider_id',
       'downtime_slo_s',
       'estimator_overrides',
@@ -1172,6 +1173,7 @@ describe('mock API', () => {
       'require_approval',
       'require_distinct_approver',
       'selection_policy',
+      'source_project',
       'source_provider_id',
       'strategy_overrides',
       'verification',
@@ -3340,7 +3342,11 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     // the seeded providers a check reported on carry them too
     const checked = server.providers.filter((p) => p.kind !== 'vmware' && Object.keys(p.capabilities).length);
     expect(checked.map((p) => p.id)).toEqual(expect.arrayContaining(['rhosp17-dc1', 'rhoso-prod', 'hibiscus-dc3']));
-    for (const p of checked) expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : [])].sort());
+    // and `projects` while it holds a project credential, as the API's check (SDD §10, §27.7)
+    for (const p of checked) {
+      const projects = Object.keys(p.project_credentials ?? {}).length ? ['projects'] : [];
+      expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : []), ...projects].sort());
+    }
   });
 
   it('the mock destination check reports its GPU capacity', () => {
@@ -4364,5 +4370,99 @@ describe('mock notifications: the catalog an admin keeps and the subscriptions (
     expect(server.events.filter((e) => e.kind === 'channel.deleted').map((e) => e.data)).toEqual([{ name: 'team-slack', kind: 'slack' }]);
     // the catalog's events carry no URL, recipient or secret (SDD §24.7)
     expect(JSON.stringify(server.events.filter((e) => e.kind.startsWith('channel.') || e.kind.startsWith('notification.')))).not.toMatch(/example\.com|notasecret|whsec_/);
+  });
+});
+
+describe("the mock's project credentials (SDD §12, §16, §27.4, §27.7, plan task TC8)", () => {
+  // synthetic: a project id of 32 hex digits and an application credential made up here (plan TC rules)
+  const TENANT = 'c41a7e9b3d2f48a6b1e5c9d0f7a3b2e8';
+  const UNKNOWN = '0123456789abcdef0123456789abcdef';
+  const APP = { application_credential_id: 'f'.repeat(32), application_credential_secret: 'synthetic-app-secret-for-the-test' }; // gitleaks:allow
+  const secretOf = (provider: string, project: string) => `provider-${provider}.project-${sha256Hex(project).slice(0, 16)}`;
+
+  it('answers a provider with two project credentials and their check', async () => {
+    let now = NOW;
+    const server = new MockServer({ now: () => now, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+    const source = await client.get<Provider>('/providers/rhosp17-dc1');
+    // two project credentials, each its secret's name and its time, never a value (SDD §4.2, §13.3)
+    const held = Object.keys(source.project_credentials ?? {}).sort();
+    expect(held).toHaveLength(2);
+    for (const project of held) {
+      expect(source.project_credentials![project]).toMatchObject({ secret: secretOf('rhosp17-dc1', project), updated_at: expect.any(String) });
+    }
+    // their check: each project's entry, and the provider credential's own project (SDD §10, §27.7)
+    const report = source.capabilities.projects as Record<string, Record<string, unknown>>;
+    expect(Object.keys(report).sort()).toEqual(held);
+    for (const project of held) {
+      expect(Object.keys(report[project]!).sort()).toEqual(['checked_at', 'domain', 'expires_at', 'message', 'project_name', 'restricted', 'roles', 'status', 'user_id']);
+      expect(report[project]).toMatchObject({ status: 'ok', message: null, project_name: expect.any(String), roles: expect.arrayContaining(['member']) });
+    }
+    expect(source.capabilities.project).toEqual({ id: 'project-finance', name: 'finance', domain: 'Default' });
+    // a check signs in with each again, at its time
+    now += 60_000;
+    const checked = await client.post<Provider>('/providers/rhosp17-dc1/check');
+    for (const project of held) expect((checked.capabilities.projects as Record<string, { checked_at: string }>)[project]!.checked_at).toBe(new Date(now).toISOString());
+
+    // a write: stored under its project's secret name, its check entry dropped until a check reads it (SDD §12)
+    const written = await client.put<Provider>(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`, APP);
+    expect(written.project_credentials![TENANT]).toEqual({ secret: secretOf('rhosp17-dc1', TENANT), updated_at: new Date(now).toISOString() });
+    expect(written.capabilities.projects).not.toHaveProperty(TENANT);
+    expect(JSON.stringify(written)).not.toContain(APP.application_credential_secret);
+    expect(JSON.stringify(written)).not.toContain(APP.application_credential_id);
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated').at(-1)?.data).toEqual({
+      provider_id: 'rhosp17-dc1',
+      project_id: TENANT,
+      secret: secretOf('rhosp17-dc1', TENANT),
+      keys: ['application_credential_id', 'application_credential_secret'],
+    });
+    expect(JSON.stringify(server.events)).not.toContain(APP.application_credential_secret);
+    const rechecked = await client.post<Provider>('/providers/rhosp17-dc1/check');
+    expect((rechecked.capabilities.projects as Record<string, unknown>)[TENANT]).toMatchObject({ status: 'ok', project_name: 'analytics' });
+    // a project the mock cloud does not have fails its own check alone (SDD §27.7)
+    await client.put(`/providers/rhosp17-dc1/projects/${UNKNOWN}/credentials`, APP);
+    const failing = await client.post<Provider>('/providers/rhosp17-dc1/check');
+    expect((failing.capabilities.projects as Record<string, unknown>)[UNKNOWN]).toMatchObject({ status: 'error', message: expect.any(String), project_name: null, roles: null });
+    expect(failing.status).toBe('ok');
+
+    // the refusals, as the API's (SDD §12, §27.4)
+    await expect(client.put(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`, { ...APP, auth_url: 'https://elsewhere.example.com' })).rejects.toMatchObject({ status: 422 });
+    await expect(client.put(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`, { username: 'u', password: 'p' })).rejects.toMatchObject({ status: 422 });
+    await expect(client.put(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`, { ...APP, application_credential_secret: ' ' })).rejects.toMatchObject({ status: 422, message: 'missing: application_credential_secret' });
+    await expect(client.put('/providers/rhosp17-dc1/projects/not%20an%20id/credentials', APP)).rejects.toMatchObject({ status: 422 });
+    await expect(client.put(`/providers/vcenter-hq/projects/${TENANT}/credentials`, APP)).rejects.toMatchObject({ status: 422 });
+    await expect(client.put(`/providers/nowhere/projects/${TENANT}/credentials`, APP)).rejects.toMatchObject({ status: 404 });
+    const operator = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    await expect(operator.put(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`, APP)).rejects.toMatchObject({ status: 403 });
+    await expect(operator.delete(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`)).rejects.toMatchObject({ status: 403 });
+
+    // the inventory of a project is read with its credential: its VMs alone, each with its project's id (SDD §10, §12)
+    const all = await client.get<VMRef[]>('/providers/rhosp17-dc1/inventory');
+    const tenant = await client.get<VMRef[]>(`/providers/rhosp17-dc1/inventory?project=${TENANT}`);
+    expect(tenant.length).toBeGreaterThan(0);
+    expect(tenant.length).toBeLessThan(all.length);
+    for (const vm of tenant) expect(vm).toMatchObject({ project: 'analytics', project_id: TENANT });
+    expect(await client.get<VMRef[]>('/providers/rhosp17-dc1/inventory?project=project-finance')).toHaveLength(all.length);
+    await expect(client.get(`/providers/rhoso-prod/inventory?project=${TENANT}`)).rejects.toMatchObject({ status: 404 });
+
+    // a plan names its projects: refused for a VMware source; its project's credential cannot go while it needs it
+    const vmwarePlan = { name: 'From vCenter', source_provider_id: 'vcenter-hq', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    await expect(client.post('/plans', { ...vmwarePlan, source_project: TENANT })).rejects.toMatchObject({ status: 422 });
+    await expect(client.post('/plans', { ...vmwarePlan, destination_project: TENANT })).rejects.toMatchObject({ status: 422 });
+    const plan = await client.post<Plan>('/plans', { name: 'Analytics', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [], source_project: TENANT });
+    expect(plan).toMatchObject({ source_project: TENANT, destination_project: null });
+    await expect(client.delete(`/providers/rhosp17-dc1/projects/${TENANT}/credentials`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining(plan.id) });
+    // the other project's credential goes: its entry, its check and its secret, announced
+    expect((await client.delete(`/providers/rhosp17-dc1/projects/${UNKNOWN}/credentials`)) ?? null).toBeNull();
+    const after = await client.get<Provider>('/providers/rhosp17-dc1');
+    expect(after.project_credentials).not.toHaveProperty(UNKNOWN);
+    expect(after.capabilities.projects).not.toHaveProperty(UNKNOWN);
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated').at(-1)?.data).toEqual({
+      provider_id: 'rhosp17-dc1',
+      project_id: UNKNOWN,
+      secret: secretOf('rhosp17-dc1', UNKNOWN),
+      deleted: true,
+    });
+    await expect(client.delete(`/providers/rhosp17-dc1/projects/${UNKNOWN}/credentials`)).rejects.toMatchObject({ status: 404 });
   });
 });

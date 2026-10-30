@@ -1216,3 +1216,52 @@ describe('changed-extent tracking in the plan form (SDD §16, §28.9, plan task 
     expect(server.plans.find((p) => p.name === 'Track the finance disks')!.extent_tracking).toBe(true);
   });
 });
+
+describe("Plans: the plan's project pair (SDD §16, §27.4; plan task TC8)", () => {
+  // the mock cloud's projects the RHOSP 17.1 source holds credentials for (mockData MOCK_CLOUD_PROJECTS)
+  const SHOP = '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6';
+  const PLATFORM = '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3';
+  const optionsOf = (select: HTMLElement) => within(select).getAllByRole('option').map((o) => [(o as HTMLOptionElement).value, o.textContent]);
+
+  it("offers the provider's own project and its credentials' projects for the plan's project pair", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'Shop tenant', 'rhosp17-dc1');
+    const source = within(dialog).getByRole('combobox', { name: /^source project/i });
+    const destination = within(dialog).getByRole('combobox', { name: /^destination project/i });
+    // its own credential's project first, sent as none; then its credentials' projects by name (SDD §16)
+    expect(optionsOf(source)).toEqual([
+      ['', "Its own credential's project: finance (project-finance)"],
+      [PLATFORM, `platform (${PLATFORM})`],
+      [SHOP, `shop (${SHOP})`],
+    ]);
+    expect(optionsOf(destination)).toEqual([['', "Its own credential's project: demo (project-demo)"]]);
+    expect((source as HTMLSelectElement).value).toBe('');
+    // with the Technology Preview badge (SDD §16, §27.10)
+    expect(within(source.closest('[role="group"]') as HTMLElement).getByText('Technology Preview')).toBeInTheDocument();
+    // another source takes that side back to its own project
+    await user.selectOptions(source, SHOP);
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'kolla-edge');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    expect((within(dialog).getByRole('combobox', { name: /^source project/i }) as HTMLSelectElement).value).toBe('');
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: /^source project/i }), SHOP);
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Shop tenant')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'Shop tenant')!;
+    expect(created).toMatchObject({ source_project: SHOP, destination_project: null });
+  });
+
+  it('offers no project for a VMware source', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'From vCenter', 'vcenter-hq');
+    expect(within(dialog).queryByRole('combobox', { name: /^source project/i })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole('combobox', { name: /^destination project/i })).not.toBeInTheDocument();
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select vm-erp-app-01' }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'From vCenter')).toBe(true));
+    // both sent none: a VMware plan names no project (SDD §27.9)
+    expect(server.plans.find((p) => p.name === 'From vCenter')).toMatchObject({ source_project: null, destination_project: null });
+  });
+});

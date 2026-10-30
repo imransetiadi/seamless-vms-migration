@@ -11,6 +11,7 @@ import { declaredProfileOf, destinationGpuFlavors, gpuFlavorRows, gpuKeyRows, vm
 import { heldElsewhere, holdersOf } from '../lib/holds';
 import { cutoverBody, cutoverProblem, type CutoverDraft } from '../lib/cutover';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
+import { projectChoices } from '../lib/projectCredentials';
 import { providerLabel } from '../lib/providerUse';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
@@ -38,6 +39,9 @@ interface FormState {
   description: string;
   sourceId: string;
   destinationId: string;
+  /** The plan's project pair, by project id; '' is the provider's own credential, sent null (SDD §4.2, §27.4). */
+  sourceProject: string;
+  destinationProject: string;
   vmIds: Set<string>;
   defaultStrategy: Strategy | 'auto';
   /** Per-VM strategy, keyed by the VM's source id (SDD §4.2 strategy_overrides); only selected VMs are sent. */
@@ -114,6 +118,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     description: '',
     sourceId,
     destinationId: '',
+    sourceProject: '',
+    destinationProject: '',
     vmIds: new Set(vmIds),
     defaultStrategy: 'auto',
     overrides: {},
@@ -216,6 +222,8 @@ function formFromPlan(plan: Plan): FormState {
     name: plan.name,
     description: plan.description ?? '',
     destinationId: plan.destination_provider_id,
+    sourceProject: plan.source_project ?? '',
+    destinationProject: plan.destination_project ?? '',
     defaultStrategy: plan.default_strategy,
     overrides: { ...plan.strategy_overrides },
     policy: plan.selection_policy,
@@ -298,6 +306,15 @@ function flavorMappingsGpuHint(rows: ReadonlyArray<{ flavor: string; vms: Readon
 /** `aria-describedby` for a field shown read-only; nothing otherwise, so the field keeps its own hint and error. */
 function readOnlyReason(editable: boolean, reasonId: string): { 'aria-describedby'?: string } {
   return editable ? {} : { 'aria-describedby': reasonId };
+}
+
+/**
+ * A project picker's choices (SDD §16): the provider's own credential's project, then its credentials' projects, and the
+ * plan's project when the provider no longer holds a credential for it, marked so - validation refuses it (§27.7).
+ */
+function projectOptions(provider: Parameters<typeof projectChoices>[0], chosen: string): Array<{ value: string; label: string }> {
+  const choices = projectChoices(provider);
+  return chosen && !choices.some((c) => c.value === chosen) ? [...choices, { value: chosen, label: `${chosen} (no credential)` }] : choices;
 }
 
 function Fieldset({ legend, aside, children }: { legend: string; aside?: ReactNode; children: ReactNode }) {
@@ -587,6 +604,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         description: f.description.trim() || null,
         source_provider_id: f.sourceId,
         destination_provider_id: f.destinationId,
+        // the provider's own credential is none; a VMware plan names no project (SDD §27.4, §27.9)
+        source_project: source?.kind === 'vmware' ? null : f.sourceProject || null,
+        destination_project: source?.kind === 'vmware' ? null : f.destinationProject || null,
         vm_ids: [...f.vmIds],
         default_strategy: f.defaultStrategy,
         // a VM taken out of the plan takes its override with it
@@ -787,7 +807,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Source provider"
                 required
                 value={form.sourceId}
-                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto', overrides: {}, gpuMappings: {} }))}
+                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, sourceProject: '', vmIds: new Set(), defaultStrategy: 'auto', overrides: {}, gpuMappings: {} }))}
                 disabled={editing}
                 hint={editing ? 'The source of an existing plan stays the same; create a new plan for another source.' : undefined}
                 error={errors.source}
@@ -801,7 +821,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Destination provider"
                 required
                 value={form.destinationId}
-                onChange={(e) => set('destinationId', e.target.value)}
+                onChange={(e) => setForm((f) => ({ ...f, destinationId: e.target.value, destinationProject: '' }))}
                 disabled={destinationLocked}
                 hint={destinationLocked ? destinationReason : undefined}
                 error={errors.destination}
@@ -811,6 +831,41 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 ]}
               />
             </div>
+            {source && source.kind !== 'vmware' && (
+              // the plan's project pair, for an OpenStack or RHOSO source alone (SDD §16, §27.4, §27.9)
+              <div role="group" aria-labelledby={id('projects-heading')} className="flex min-w-0 flex-col gap-2">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <h3 id={id('projects-heading')} className="text-sm font-medium text-foreground">
+                    Project pair
+                  </h3>
+                  <TechPreviewBadge feature="credentials" />
+                </div>
+                <p id={id('projects-hint')} className="text-xs text-muted-foreground">
+                  The plan&apos;s steps act in each project with its credential. An admin adds project credentials on the Providers page.
+                </p>
+                {/* a row each: a project's name with its 32-digit id needs the width (screenshot critique) */}
+                <div className="grid gap-3">
+                  <SelectField
+                    id={id('source-project')}
+                    label="Source project"
+                    value={form.sourceProject}
+                    onChange={(e) => set('sourceProject', e.target.value)}
+                    disabled={destinationLocked}
+                    hint={destinationLocked ? destinationReason : undefined}
+                    options={projectOptions(source, form.sourceProject)}
+                  />
+                  <SelectField
+                    id={id('destination-project')}
+                    label="Destination project"
+                    value={form.destinationProject}
+                    onChange={(e) => set('destinationProject', e.target.value)}
+                    disabled={destinationLocked || !destination}
+                    hint={destinationLocked ? destinationReason : !destination ? 'Choose the destination first.' : undefined}
+                    options={destination ? projectOptions(destination, form.destinationProject) : [{ value: '', label: "Its own credential's project" }]}
+                  />
+                </div>
+              </div>
+            )}
           </Fieldset>
 
           <fieldset className="flex min-w-0 flex-col gap-2" aria-describedby={errors.vms ? id('vms-error') : undefined}>

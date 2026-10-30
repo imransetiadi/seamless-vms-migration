@@ -30,8 +30,23 @@ export function plansThatNeed(providerId: string, plans: readonly Plan[]): Provi
   });
 }
 
-/** Why Delete is unavailable while plans still need the provider, three by name at most (SDD §16); null when none does. */
-export function deleteRefusal(users: readonly ProviderUser[], shown = 3): string | null {
+/**
+ * The plans that still need a provider's project, as the API judges a project credential's deletion (SDD §12, §27.4): those
+ * of `plansThatNeed` that name the project on the provider's side - a source's `source_project`, a destination's
+ * `destination_project`.
+ */
+export function plansThatNeedProject(providerId: string, projectId: string, plans: readonly Plan[]): ProviderUser[] {
+  const naming = plans.filter(
+    (p) => (p.source_provider_id === providerId && p.source_project === projectId) || (p.destination_provider_id === providerId && p.destination_project === projectId),
+  );
+  return plansThatNeed(providerId, naming);
+}
+
+/**
+ * Why Delete is unavailable while plans still need the provider - or, with `what` "projects", its project's credential -,
+ * three by name at most (SDD §16); null when none does.
+ */
+export function deleteRefusal(users: readonly ProviderUser[], shown = 3, what: 'providers' | 'projects' = 'providers'): string | null {
   if (!users.length) return null;
   const names = users
     .slice(0, shown)
@@ -39,7 +54,7 @@ export function deleteRefusal(users: readonly ProviderUser[], shown = 3): string
     .map((u) => `“${u.plan.name}” (${u.why})`)
     .join(', ');
   const more = users.length > shown ? ` and ${users.length - shown} more` : '';
-  return `${users.length === 1 ? 'A plan still needs' : 'Plans still need'} it: ${names}${more}. A plan needs its providers until it completes and its VMs are finalized.`;
+  return `${users.length === 1 ? 'A plan still needs' : 'Plans still need'} it: ${names}${more}. A plan needs its ${what} until it completes and its VMs are finalized.`;
 }
 
 /**

@@ -33,6 +33,7 @@ import type {
   Phase,
   PhaseChange,
   Plan,
+  ProjectCheck,
   Provider,
   ProviderKind,
   ProviderRole,
@@ -441,6 +442,59 @@ const DEMO_OWN_PROJECTS = {
   source: { id: 'project-finance', name: 'finance', domain: 'Default' },
   destination: { id: 'project-demo', name: 'demo', domain: 'Default' },
 } as const;
+
+/** A Keystone project of a mock cloud that a project credential may be scoped to (SDD §27.4), with what its check reads. */
+export interface MockCloudProject {
+  name: string;
+  domain: string;
+  /** The user its application credential acts as: a user per project credential (§27.6, owner decision 3). */
+  user_id: string;
+  roles: string[];
+  restricted: boolean;
+  /** Milliseconds from the mock's clock to its application credential's expiry; null when it never expires. */
+  expires_in: number | null;
+}
+
+/**
+ * The Keystone projects each mock cloud has beside its credential's own (SDD §27.4, plan task TC8), by project id - 32
+ * hex digits, as Keystone makes them. A project credential the mock is given for any other id fails its check, as one
+ * Keystone refuses does (§27.7); the inventory of a project lists the source's VMs of that name (§10, §12).
+ */
+export const MOCK_CLOUD_PROJECTS: Readonly<Record<string, Readonly<Record<string, MockCloudProject>>>> = {
+  'rhosp17-dc1': {
+    '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6': { name: 'shop', domain: 'Default', user_id: '0b6d2a4f8e1c43579a2d6f0e8b4c1a37', roles: ['member', 'reader'], restricted: true, expires_in: 60 * 24 * 3600_000 },
+    '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3': { name: 'platform', domain: 'Default', user_id: '7e3a9c1d5b2f48e6a0c4d8b2f6e1a953', roles: ['load-balancer_member', 'member', 'reader'], restricted: false, expires_in: 5 * 24 * 3600_000 },
+    c41a7e9b3d2f48a6b1e5c9d0f7a3b2e8: { name: 'analytics', domain: 'Default', user_id: '2c8f4e6a0b1d47c39e5a7d3b1f8c6e24', roles: ['member', 'reader'], restricted: true, expires_in: null },
+  },
+};
+
+/** The project credentials the mock seeds (SDD §16, plan task TC8): the RHOSP 17.1 source's for shop and platform. */
+const SEEDED_PROJECT_CREDENTIALS: Readonly<Record<string, readonly string[]>> = {
+  'rhosp17-dc1': ['5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6', '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3'],
+};
+
+/** A project credential's secret name, `provider-{id}.project-<h>`: the first 16 hex digits of its project id's SHA-256 (SDD §13.3). */
+export function projectSecretName(providerId: string, projectId: string): string {
+  return `provider-${providerId}.project-${sha256Hex(projectId).slice(0, 16)}`;
+}
+
+/**
+ * A project credential's entry of its provider's check report at `checkedAt` (SDD §10, §27.7): what its token and record
+ * read on the mock cloud, or an error with nothing read for a project the cloud does not have.
+ */
+export function projectCheckOf(providerId: string, projectId: string, checkedAt: string): ProjectCheck {
+  const project = MOCK_CLOUD_PROJECTS[providerId]?.[projectId];
+  if (!project) {
+    return { status: 'error', message: `${providerId}: Keystone refused the application credential (HTTP 401)`, project_name: null, domain: null, user_id: null, roles: null, restricted: null, expires_at: null, checked_at: checkedAt };
+  }
+  const expires = project.expires_in === null ? null : new Date(Date.parse(checkedAt) + project.expires_in).toISOString();
+  return { status: 'ok', message: null, project_name: project.name, domain: project.domain, user_id: project.user_id, roles: [...project.roles], restricted: project.restricted, expires_at: expires, checked_at: checkedAt };
+}
+
+/** The check report's `projects` of the provider's credentials at `checkedAt`, by project id (SDD §10, §27.7). */
+export function projectsReport(providerId: string, projectIds: readonly string[], checkedAt: string): Record<string, ProjectCheck> {
+  return Object.fromEntries([...projectIds].sort().map((id) => [id, projectCheckOf(providerId, id, checkedAt)]));
+}
 
 /** The vGPU profiles the demo's GPU destinations declare for their two vGPU flavors (`gpu_profiles`, SDD §22.3, §22.10). */
 const DEMO_GPU_PROFILES: Readonly<Record<string, string>> = { 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' };
@@ -1064,7 +1118,15 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
       // the demo cluster's Ceph access, its key as written (SDD §10, §28.4, plan task CE11)
       ceph: { fsid: DEMO_CEPH_FSID, monitors: ['ceph-mon-0.dc1.example.com', 'ceph-mon-1.dc1.example.com'], client: 'seamless', key_updated_at: iso(now - 30 * 24 * 60 * 60_000) },
-      capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }, iso(now - 4 * 60_000)),
+      capabilities: {
+        ...checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }, iso(now - 4 * 60_000)),
+        // its project credentials' check, by project id (SDD §10, §27.7, plan task TC8)
+        projects: projectsReport('rhosp17-dc1', SEEDED_PROJECT_CREDENTIALS['rhosp17-dc1']!, iso(now - 4 * 60_000)),
+      },
+      // an application credential per project, written by an admin two days ago (SDD §4.2, §27.4, plan task TC8)
+      project_credentials: Object.fromEntries(
+        SEEDED_PROJECT_CREDENTIALS['rhosp17-dc1']!.map((id) => [id, { secret: projectSecretName('rhosp17-dc1', id), updated_at: iso(now - 2 * 24 * 3600_000) }]),
+      ),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -2050,6 +2112,9 @@ export function defaultPlanFields(now: number) {
     mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
     default_strategy: 'auto' as const,
     extent_tracking: false,
+    // the provider's own credentials (SDD §4.2, §27.4)
+    source_project: null,
+    destination_project: null,
     strategy_overrides: {},
     selection_policy: 'min_downtime' as const,
     downtime_slo_s: 600,

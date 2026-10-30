@@ -397,3 +397,38 @@ test("a GPU VM through its mapping, the gate's wait and its cutover", async ({ p
   await expect(page.getByRole('list', { name: 'Migration lifecycle' })).toBeVisible();
   await expect(page.locator('header').getByText(/^(Cutover|Verifying|Completed)$/)).toBeVisible();
 });
+
+test("an admin adds a project credential, an operator plans in that project and reads its inventory (SDD §16, plan task TC8)", async ({ page }) => {
+  // the mock cloud's analytics project; the application credential is synthetic
+  const ANALYTICS = 'c41a7e9b3d2f48a6b1e5c9d0f7a3b2e8';
+  await signIn(page, 'admin');
+  await page.goto('/providers');
+  const card = page.getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+  const projects = card.getByRole('group', { name: /^projects/i });
+  await projects.getByRole('button', { name: 'Add project credential to RHOSP 17.1 — DC1' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Add project credential' });
+  await dialog.getByLabel(/^project id/i).fill(ANALYTICS);
+  await dialog.getByLabel(/^application credential id/i).fill('e'.repeat(32));
+  await dialog.getByLabel(/^application credential secret/i).fill('synthetic-e2e-secret'); // gitleaks:allow
+  await dialog.getByRole('button', { name: /save and check/i }).click();
+  const outcome = page.getByRole('dialog', { name: `analytics (${ANALYTICS}) is checked` });
+  await expect(outcome).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('synthetic-e2e-secret');
+  await outcome.getByRole('button', { name: 'Done' }).click();
+  await expect(projects.getByRole('heading', { name: `analytics (${ANALYTICS})` })).toBeVisible();
+  // the inventory read with its credential lists its VMs alone: in-app navigation keeps the in-browser mock's state
+  await page.getByRole('link', { name: 'Inventory' }).first().click();
+  await page.getByRole('combobox', { name: 'Provider' }).selectOption('rhosp17-dc1');
+  await page.getByRole('combobox', { name: 'Project credential' }).selectOption(ANALYTICS);
+  await expect(page).toHaveURL(new RegExp(`/inventory/rhosp17-dc1\\?project=${ANALYTICS}$`));
+  await expect(page.getByRole('row', { name: /analytics-node-1/ })).toBeVisible();
+  await expect(page.getByRole('row', { name: /web-01/ })).toHaveCount(0);
+  // the plan form offers it for the source side
+  await page.getByRole('link', { name: 'Plans' }).first().click();
+  await page.getByRole('button', { name: /new plan/i }).first().click();
+  const plan = page.getByRole('dialog', { name: /new migration plan/i });
+  await plan.getByLabel(/source provider/i).selectOption('rhosp17-dc1');
+  await plan.getByLabel(/destination provider/i).selectOption('rhoso-prod');
+  await plan.getByRole('combobox', { name: /^source project/i }).selectOption(ANALYTICS);
+  await expect(plan.getByRole('combobox', { name: /^source project/i })).toHaveValue(ANALYTICS);
+});

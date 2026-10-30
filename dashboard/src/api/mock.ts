@@ -50,6 +50,9 @@ import {
   type StrategyDecision,
   checkOf,
   flavorContext,
+  MOCK_CLOUD_PROJECTS,
+  projectCheckOf,
+  projectSecretName,
   emptyDestinationInventory,
   readDestinationGpus,
   quotaShare,
@@ -186,6 +189,53 @@ function refuseCredentialBody(route: 'credentials' | 'conversion-key', input: Re
   const known = new Set(fields.map(([key]) => key));
   for (const key of Object.keys(input)) if (!known.has(key)) problems.push(`${key}: Extra inputs are not permitted`);
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
+/** The check report less the project's entry of its `projects` (SDD §12, §27.7); the rest of the report stays. */
+function withoutProjectCheck(capabilities: Record<string, unknown>, projectId: string): Record<string, unknown> {
+  const projects = capabilities.projects;
+  if (!projects || typeof projects !== 'object' || !Object.hasOwn(projects, projectId)) return capabilities;
+  return { ...capabilities, projects: Object.fromEntries(Object.entries(projects).filter(([k]) => k !== projectId)) };
+}
+
+/** A Keystone project's id as a project credential and a plan's project take it (SDD §4.2, §12), as the API's PROJECT_ID_RULE. */
+const PROJECT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const PROJECT_ID_RULE = "a Keystone project's id, 1-64 letters, digits, '-' or '_'";
+
+/**
+ * A project credential's body as the API's ProjectCredentialsRequest reads it (SDD §12, §27.4): an application
+ * credential's id and secret, both required strings, nothing else - no password, no `auth_url` -; then blank values.
+ */
+function projectCredentialValues(input: Record<string, unknown>): Record<string, string> {
+  const fields = [['application_credential_id', 256], ['application_credential_secret', 4096]] as const;
+  const problems: string[] = [];
+  for (const [key, longest] of fields) {
+    const value = input[key];
+    if (!Object.hasOwn(input, key)) problems.push(`${key}: Field required`);
+    else if (typeof value !== 'string') problems.push(`${key}: Input should be a valid string`);
+    else if ([...value].length > longest) problems.push(`${key}: String should have at most ${longest} characters`);
+  }
+  for (const key of Object.keys(input)) if (!fields.some(([known]) => known === key)) problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+  const values = { application_credential_id: pyStrip(input.application_credential_id as string), application_credential_secret: input.application_credential_secret as string };
+  const blank = Object.entries(values).filter(([, v]) => !pyStrip(v)).map(([k]) => k);
+  if (blank.length) throw new HttpError(422, 'validation_error', `missing: ${blank.join(', ')}`);
+  return values;
+}
+
+/** A plan's projects: each a project id, and none for a VMware source, as the API refuses them (SDD §4.2, §12, §27.9). */
+function refusePlanProjects(spec: Record<string, unknown>, source: Provider | undefined): void {
+  const fields = ['source_project', 'destination_project'] as const;
+  const bad = fields.filter((f) => spec[f] !== undefined && spec[f] !== null && (typeof spec[f] !== 'string' || !PROJECT_ID.test(spec[f] as string)));
+  if (bad.length) throw new HttpError(422, 'validation_error', bad.map((f) => `${f}: ${PROJECT_ID_RULE}`).join('; '));
+  const named = fields.filter((f) => spec[f] !== undefined && spec[f] !== null);
+  if (named.length && source?.kind === 'vmware') {
+    throw new HttpError(
+      422,
+      'validation_error',
+      `${named.join(', ')}: a VMware plan names no project: vCenter has no Keystone projects, and the migration kit acts with its providers' own credentials`,
+    );
+  }
 }
 
 /**
@@ -2043,7 +2093,10 @@ export class MockServer {
         const provider = this.providers.find((p) => p.id === id);
         if (!provider) {
           // like the API (SDD §12, §13.2): the route's role first, then the lookup
-          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key' || sub === 'ceph-key') && method === 'PUT');
+          const writes =
+            (!sub && (method === 'PATCH' || method === 'DELETE')) ||
+            ((sub === 'credentials' || sub === 'conversion-key' || sub === 'ceph-key') && method === 'PUT') ||
+            (sub === 'projects' && seg[4] === 'credentials' && (method === 'PUT' || method === 'DELETE'));
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
           if (!sub && method === 'PATCH') this.refusePatchBody(input);
@@ -2054,6 +2107,10 @@ export class MockServer {
         if (!sub && method === 'GET') {
           this.require(token, 'viewer', path);
           return ok(provider);
+        }
+        if (sub === 'projects' && subsub && seg[4] === 'credentials' && seg.length === 5 && (method === 'PUT' || method === 'DELETE')) {
+          const me = this.require(token, 'admin', path);
+          return method === 'PUT' ? this.setProjectCredentials(me, provider, subsub, input) : this.deleteProjectCredentials(me, provider, subsub);
         }
         if (!sub && method === 'PATCH') return this.patchProvider(this.require(token, 'admin', path), provider, input);
         if (sub === 'credentials' && method === 'PUT') return this.setCredentials(this.require(token, 'admin', path), provider, input);
@@ -2102,6 +2159,11 @@ export class MockServer {
             const { gpu_capacity } = readDestinationGpus(this.inventories[provider.id], provider.gpu_profiles, provider.last_checked_at);
             provider.capabilities = { ...provider.capabilities, gpu_capacity };
           }
+          // it signs in with each project credential too, one project's failure failing no other (SDD §10, §27.7)
+          const held = Object.keys(provider.project_credentials ?? {});
+          if (held.length && provider.kind !== 'vmware') {
+            provider.capabilities = { ...provider.capabilities, projects: Object.fromEntries(held.sort().map((pid) => [pid, projectCheckOf(provider.id, pid, provider.last_checked_at!)])) };
+          }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
           return ok(provider);
         }
@@ -2111,6 +2173,22 @@ export class MockServer {
           // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10), and reads its GPU
           // flavors with the profiles its provider declares now, and their capacity, live (§22.3)
           const inventory = this.inventories[provider.id] ?? (provider.role === 'source' ? [] : emptyDestinationInventory());
+          // with `project`, read with that project's credential: its VMs alone, or its view (SDD §10, §12, §27.4)
+          const project = query.get('project');
+          if (project !== null) {
+            if (!PROJECT_ID.test(project)) throw new HttpError(422, 'validation_error', `project: ${PROJECT_ID_RULE}`);
+            const own = (provider.capabilities.project as { id?: unknown } | undefined)?.id;
+            if (Object.hasOwn(provider.project_credentials ?? {}, project)) {
+              const name = MOCK_CLOUD_PROJECTS[provider.id]?.[project]?.name;
+              if (Array.isArray(inventory)) return ok(inventory.filter((vm) => name !== undefined && vm.project === name).map((vm) => ({ ...vm, project_id: project })));
+            } else if (project !== own) {
+              throw new HttpError(
+                404,
+                'not_found',
+                `provider ${provider.id} holds no credential for project ${project}, nor is it the project of its own credential, as its last check names it`,
+              );
+            }
+          }
           if (Array.isArray(inventory)) return ok(inventory);
           return ok({ ...inventory, ...readDestinationGpus(inventory, provider.gpu_profiles, new Date(this.now()).toISOString()) });
         }
@@ -2539,6 +2617,62 @@ export class MockServer {
     provider.ceph = { ...provider.ceph, key_updated_at: new Date(this.now()).toISOString() };
     this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `ceph key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['key'] } });
     return ok(provider);
+  }
+
+  /**
+   * PUT /providers/{id}/projects/{project_id}/credentials: write-only, as the API (SDD §12, §13.3, §27.4) - the mock keeps
+   * no value, only the secret's name and the time; that project's entry of the check report goes.
+   */
+  private setProjectCredentials(me: User, provider: Provider, projectId: string, input: Record<string, unknown>): MockResponse {
+    const values = projectCredentialValues(input);
+    if (!PROJECT_ID.test(projectId)) throw new HttpError(422, 'validation_error', `project_id: ${PROJECT_ID_RULE}`);
+    if (provider.kind === 'vmware') throw new HttpError(422, 'validation_error', 'a vmware provider takes no project credential: vCenter has no Keystone projects');
+    const secret = projectSecretName(provider.id, projectId);
+    const held = provider.project_credentials ?? {};
+    const holder = Object.keys(held).find((other) => other !== projectId && held[other]!.secret === secret);
+    if (holder !== undefined) {
+      throw new HttpError(409, 'conflict', `the credential of project ${holder} holds the secret ${secret}, which project ${projectId} would be stored as`);
+    }
+    provider.project_credentials = { ...held, [projectId]: { secret, updated_at: new Date(this.now()).toISOString() } };
+    provider.capabilities = withoutProjectCheck(provider.capabilities, projectId);
+    this.emit({
+      kind: 'provider.credentials_updated',
+      plan_id: null,
+      migration_id: null,
+      actor: me.name,
+      message: `credentials of project ${projectId} of provider ${provider.id} updated`,
+      data: { provider_id: provider.id, project_id: projectId, secret, keys: Object.keys(values).sort() },
+    });
+    return ok(provider);
+  }
+
+  /** DELETE /providers/{id}/projects/{project_id}/credentials (SDD §12, §27.4): 409 while a plan needs the project. */
+  private deleteProjectCredentials(me: User, provider: Provider, projectId: string): MockResponse {
+    if (!PROJECT_ID.test(projectId)) throw new HttpError(422, 'validation_error', `project_id: ${PROJECT_ID_RULE}`);
+    const held = provider.project_credentials ?? {};
+    const credential = Object.hasOwn(held, projectId) ? held[projectId] : undefined;
+    if (!credential) throw new HttpError(404, 'not_found', `provider ${provider.id} holds no credential for project ${projectId}`);
+    const users = this.plansThatNeed(provider.id, projectId);
+    if (users.length) {
+      const rest = users.length - 10;
+      throw new HttpError(
+        409,
+        'conflict',
+        `project ${projectId} of provider ${provider.id} is used by plan(s) that still need it: ${users.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+          'a plan needs its projects until it completes and its VMs are finalized',
+      );
+    }
+    provider.project_credentials = Object.fromEntries(Object.entries(held).filter(([k]) => k !== projectId));
+    provider.capabilities = withoutProjectCheck(provider.capabilities, projectId);
+    this.emit({
+      kind: 'provider.credentials_updated',
+      plan_id: null,
+      migration_id: null,
+      actor: me.name,
+      message: `credentials of project ${projectId} of provider ${provider.id} deleted`,
+      data: { provider_id: provider.id, project_id: projectId, secret: credential.secret, deleted: true },
+    });
+    return { status: 204 };
   }
 
   /** PUT /providers/{id}/credentials: the mock keeps no values, only the "stored" stamp. */
@@ -3030,6 +3164,7 @@ export class MockServer {
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
     refuseExtentTracking(input, source);
+    refusePlanProjects(input, source);
     this.refuseUnknownHooks(input);
     const now = this.now();
     const plan: Plan = {
@@ -3055,9 +3190,14 @@ export class MockServer {
    * kept its copied data: its warm rollback kept the destination volumes for a retry, and a cancel cleans them up
    * with both providers (§5.1).
    */
-  private plansThatNeed(providerId: string): string[] {
+  private plansThatNeed(providerId: string, projectId?: string): string[] {
+    // with a project, those that name it on the provider's side alone (SDD §12, §27.4)
+    const names = (p: Plan) =>
+      projectId === undefined ||
+      (p.source_provider_id === providerId && p.source_project === projectId) ||
+      (p.destination_provider_id === providerId && p.destination_project === projectId);
     const plans = this.plans
-      .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
+      .filter((p) => (p.source_provider_id === providerId || p.destination_provider_id === providerId) && names(p))
       .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return plans.flatMap((p) => {
       // a cancelled plan's migrations are all cancelled, and the mock's cleanup after a cancel ends at once: none is
@@ -3093,20 +3233,22 @@ export class MockServer {
     this.refuseInFlight(plan, 'editing the plan');
     // like the API (SDD §12): a failed migration's rollback acts on the clouds its attempt used
     const providers = ['source_provider_id', 'destination_provider_id'] as const;
-    if (providers.some((field) => field in input && input[field] !== plan[field])) {
+    const projects = ['source_project', 'destination_project'] as const;
+    const changes = (field: string) => field in input && (input[field] ?? null) !== ((plan as unknown as Record<string, unknown>)[field] ?? null);
+    const providerChange = providers.some(changes);
+    if (providerChange || projects.some(changes)) {
       const failed = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'failed').map((m) => m.vm.name);
       if (failed.length) {
         const noun = failed.length === 1 ? 'migration' : 'migrations';
-        throw new HttpError(
-          409,
-          'conflict',
-          `roll back or cancel the failed ${noun} (${failed.slice(0, 10).join(', ')}) before changing the plan's providers: its rollback acts on the clouds its attempt used`,
-        );
+        // its projects too: its rollback acts with its attempt's credentials (SDD §12, §27.4)
+        const [changing, why] = providerChange ? ['providers', 'its rollback acts on the clouds its attempt used'] : ['projects', "its rollback acts with its attempt's credentials"];
+        throw new HttpError(409, 'conflict', `roll back or cancel the failed ${noun} (${failed.slice(0, 10).join(', ')}) before changing the plan's ${changing}: ${why}`);
       }
     }
     // like the API (SDD §12): the plan it would store is checked, kept fields included
     refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
     refuseExtentTracking({ ...(plan as unknown as Record<string, unknown>), ...input }, this.providers.find((p) => p.id === (input.source_provider_id ?? plan.source_provider_id)));
+    refusePlanProjects({ ...(plan as unknown as Record<string, unknown>), ...input }, this.providers.find((p) => p.id === (input.source_provider_id ?? plan.source_provider_id)));
     this.refuseUnknownHooks({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';
