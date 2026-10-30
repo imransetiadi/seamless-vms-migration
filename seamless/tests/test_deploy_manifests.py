@@ -261,13 +261,14 @@ def _component_patch(path: Path, kind: str, name: str):
     return yaml.safe_load(patch)
 
 
-def _component_object(kind: str) -> dict:
-    """The one object of ``kind`` among the HA component's resources."""
+def _component_object(kind: str, name: str | None = None) -> dict:
+    """The one object of ``kind`` - named ``name`` when given - among the HA component's
+    resources."""
     (found,) = [
         doc
-        for name in _component(HA)["resources"]
-        for doc in yaml.safe_load_all((HA / name).read_text())
-        if doc and doc["kind"] == kind
+        for resource in _component(HA)["resources"]
+        for doc in yaml.safe_load_all((HA / resource).read_text())
+        if doc and doc["kind"] == kind and name in (None, doc["metadata"]["name"])
     ]
     return found
 
@@ -353,8 +354,7 @@ def test_the_replicas_reach_each_other_on_the_api_port_alone():
     config = yaml.safe_load((ROOT / "deploy" / "openshift" / "configmap.yaml").read_text())
     assert str(http["containerPort"]) == config["data"]["SEAMLESS_PORT"]
     api_port = [{"protocol": "TCP", "port": http["containerPort"]}]
-    relay = _component_object("NetworkPolicy")
-    assert relay["metadata"]["name"] == "seamless-allow-relay"
+    relay = _component_object("NetworkPolicy", "seamless-allow-relay")
     assert relay["spec"]["podSelector"] == pods
     assert sorted(relay["spec"]["policyTypes"]) == ["Egress", "Ingress"]
     assert relay["spec"]["ingress"] == [{"from": [{"podSelector": pods}], "ports": api_port}]
@@ -379,6 +379,65 @@ def test_the_replicas_reach_each_other_on_the_api_port_alone():
     assert VANILLA_PODS in vanilla
     assert _trusted_proxies(HA) == OPENSHIFT_PODS
     assert _trusted_proxies(HA_KUBERNETES) == VANILLA_PODS
+
+
+#: the HA component's NetworkPolicy for the monitoring stack's scrape of each replica (SDD §17, §18)
+SCRAPE = "seamless-allow-ingress-from-monitoring"
+#: the namespace whose Prometheus scrapes it: OpenShift's monitoring of user-defined projects, and
+#: the Kubernetes overlay's default, kube-prometheus's - never OpenShift's platform monitoring
+USER_WORKLOAD_MONITORING = "openshift-user-workload-monitoring"
+VANILLA_MONITORING = "monitoring"
+
+
+def _from_namespace(name: str) -> list[dict]:
+    """A NetworkPolicy peer list: the pods of the namespace named ``name``, by the name the API
+    server gives every namespace as its label."""
+    return [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": name}}}]
+
+
+def test_the_monitoring_stack_scrapes_each_replica_on_the_api_port_alone():
+    """SDD §17, §18, §25.7, §25.9 (the owner's decisions of 2026-10-30): a scrape through the Route
+    reaches one replica at random, so seamless_leader would alternate. The HA component lets the
+    cluster's monitoring stack reach each replica's API port, ingress alone and no other port, from
+    one namespace named by the label the API server sets: OpenShift's user-workload monitoring -
+    never the platform's openshift-monitoring - and, through deploy/kubernetes/ha's patch, the
+    Kubernetes overlay's monitoring. Without the component nothing admits it: the policy is the
+    component's alone, and no base policy names a monitoring namespace."""
+    deployment = _deployment()
+    pods = deployment["spec"]["selector"]
+    (container,) = deployment["spec"]["template"]["spec"]["containers"]
+    (http,) = [p for p in container["ports"] if p["name"] == "http"]
+    api_port = [{"protocol": "TCP", "port": http["containerPort"]}]
+    scrape = _component_object("NetworkPolicy", SCRAPE)
+    assert scrape["spec"]["podSelector"] == pods
+    assert scrape["spec"]["policyTypes"] == ["Ingress"] and "egress" not in scrape["spec"]
+    (rule,) = scrape["spec"]["ingress"]
+    assert rule == {"from": _from_namespace(USER_WORKLOAD_MONITORING), "ports": api_port}
+    ops = _component_patch(HA_KUBERNETES, "NetworkPolicy", SCRAPE)
+    assert [op["path"] for op in ops] == ["/spec/ingress/0/from"]
+    assert _value(ops, "/spec/ingress/0/from") == _from_namespace(VANILLA_MONITORING)
+    # the component's alone: the overlays list it only by their commented components: lines
+    defined = sorted(
+        str(path.relative_to(ROOT))
+        for path in (ROOT / "deploy").rglob("*.yaml")
+        for doc in yaml.safe_load_all(path.read_text())
+        if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == SCRAPE
+    )
+    assert defined == ["deploy/openshift/ha/networkpolicy.yaml"]
+    base = [
+        p
+        for p in yaml.safe_load_all((ROOT / "deploy/openshift/networkpolicy.yaml").read_text())
+        if p
+    ]
+    admitted = {
+        peer["namespaceSelector"]["matchLabels"].get("kubernetes.io/metadata.name")
+        for policy in base
+        for rule in policy["spec"].get("ingress", [])
+        for peer in rule.get("from", [])
+        if "namespaceSelector" in peer
+    }
+    monitoring = {USER_WORKLOAD_MONITORING, VANILLA_MONITORING, "openshift-monitoring"}
+    assert not admitted & monitoring, admitted
 
 
 def _compose_files(**make_vars: str) -> list[str]:

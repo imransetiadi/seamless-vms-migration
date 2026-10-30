@@ -1,7 +1,10 @@
-# The relay (SDD 25.6, 25.9): a follower relays the API and the event stream to the leader's pod on its API port, in
-# plain HTTP inside the namespace, the caller's bearer token included. The control plane's pods reach each other there,
-# in and out, and nothing else between them: default-deny-all and ../networkpolicy.yaml stay as they are, and its
-# external egress keeps the pod network out.
+# The HA component's NetworkPolicies (SDD 17, 25.6, 25.9): the relay between the replicas, and the monitoring stack's
+# scrape of each replica - both on the API port alone. default-deny-all and ../networkpolicy.yaml stay as they are, and
+# its external egress keeps the pod network out.
+#
+# The relay: a follower relays the API and the event stream to the leader's pod on its API port, in plain HTTP inside
+# the namespace, the caller's bearer token included. The control plane's pods reach each other there, in and out, and
+# nothing else between them.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -28,6 +31,33 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: seamless
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# The scrape (SDD 17, 18): each replica answers /api/v1/metrics for itself - seamless_leader is 1 on the leader alone -,
+# and a scrape through the Route reaches one replica at random, so the monitoring stack scrapes each pod (a PodMonitor
+# or ServiceMonitor, docs/Operations.md). It reaches the API port alone, from one namespace, named by the label the API
+# server sets: OpenShift's monitoring of user-defined projects - not the platform's openshift-monitoring, which
+# monitors OpenShift's own namespaces. Its pods are in the pod network FORWARDED_ALLOW_IPS trusts (SDD 25.9): admit no
+# other namespace. ADJUST when your Prometheus runs elsewhere; ../../kubernetes/ha sets the Kubernetes overlay's.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-ingress-from-monitoring
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-user-workload-monitoring
       ports:
         - protocol: TCP
           port: 8080

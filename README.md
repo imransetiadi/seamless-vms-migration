@@ -406,8 +406,9 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
   a Technology Preview, runs two replicas on two nodes: the leader runs the orchestrator, and the other relays the
   API and the event stream to it and takes over within about 35 s when the leader is lost
   ([docs/Operations.md](docs/Operations.md) §4.7). So `scale` takes 0 or 1 on the single host and 0, 1 or 2 on a
-  cluster - 2 only with a ReadWriteMany `seamless-data` -; a second replica adds availability, not capacity: scale
-  up with `capacity` instead.
+  cluster - 2 only with the HA component and a ReadWriteMany `seamless-data`, while `scale 1` turns HA off and
+  keeps the component (Operations.md §4.13) -; a second replica adds availability, not capacity: scale up with
+  `capacity` instead.
 * **Stopping is safe.** Running steps end within the stop grace and every migration resumes from its checkpoint
   when the control plane runs again. Before planned maintenance, `--drain FILE` pauses the running plans and
   waits until no cutover is in flight, and `resume` starts them again afterwards (the operator's token is read

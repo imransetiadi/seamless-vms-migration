@@ -14,10 +14,15 @@
 #   * strategy Recreate, kept;
 #   * pdb.yaml: a disruption budget of one, which a replica that is not ready never blocks;
 #   * seamless-data ReadWriteMany: the new leader reads the run directories the old one wrote;
-#   * networkpolicy.yaml: the relay between the replicas, on the API port alone;
+#   * networkpolicy.yaml: the relay between the replicas, and the monitoring stack's scrape of each replica - each
+#     on the API port alone;
 #   * FORWARDED_ALLOW_IPS: the pod network, where the replicas are, so the leader's lockout and audit count the
 #     caller of a relayed request, never the follower (SDD 13.1, 25.9).
 # No Kubernetes RBAC: the lease is the database's.
+#
+# Turning HA off is scripts/seamless-ctl.sh scale 1: this component stays, and one replica runs on its ReadWriteMany
+# claim; up and start restore the count below, which 1 keeps at one. Removing the component moves /data back to a
+# ReadWriteOnce claim first - commenting its lines again makes the apply fail on the claim (docs/Operations.md).
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

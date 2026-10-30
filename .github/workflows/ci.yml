@@ -308,6 +308,10 @@ jobs:
           if grep -q '^kind: PodDisruptionBudget' /tmp/manifests.yaml /tmp/k8s.yaml; then
             echo "the base overlays carry the HA component's budget"; exit 1
           fi
+          # the monitoring stack's scrape of each replica is the component's alone (SDD 17, 18)
+          if grep -q 'name: seamless-allow-ingress-from-monitoring' /tmp/manifests.yaml /tmp/k8s.yaml; then
+            echo "the base overlays carry the HA component's scrape policy"; exit 1
+          fi
           for overlay in openshift kubernetes; do
             work=$(mktemp -d) && cp -R deploy "$work/"
             kustomization="$work/deploy/$overlay/kustomization.yaml"
@@ -343,7 +347,10 @@ jobs:
           python - <<'PY'
           import yaml
 
-          for overlay, pod_network in (("openshift", "10.128.0.0/14"), ("kubernetes", "10.244.0.0/16")):
+          for overlay, pod_network, monitoring in (
+              ("openshift", "10.128.0.0/14", "openshift-user-workload-monitoring"),
+              ("kubernetes", "10.244.0.0/16", "monitoring"),
+          ):
               docs = [d for d in yaml.safe_load_all(open(f"/tmp/ha-{overlay}.yaml")) if d]
               found = {(d["kind"], d["metadata"]["name"]): d for d in docs}
               spaces = {d["metadata"].get("namespace") for d in docs if d["kind"] != "Namespace"}
@@ -361,6 +368,12 @@ jobs:
               assert budget["maxUnavailable"] == 1, overlay
               assert budget["unhealthyPodEvictionPolicy"] == "AlwaysAllow", overlay
               assert ("NetworkPolicy", "seamless-allow-relay") in found, overlay
+              # each replica's API port alone, to the overlay's monitoring namespace alone (SDD 17, 18)
+              scrape = found["NetworkPolicy", "seamless-allow-ingress-from-monitoring"]["spec"]
+              assert scrape["policyTypes"] == ["Ingress"] and "egress" not in scrape, overlay
+              peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": monitoring}}}]
+              ports = [{"protocol": "TCP", "port": 8080}]
+              assert scrape["ingress"] == [{"from": peers, "ports": ports}], (overlay, scrape["ingress"])
               assert found["StatefulSet", "seamless-postgres"]["spec"]["replicas"] == 1, overlay
               print(f"{overlay}: every object and patch of the HA component is there")
           PY

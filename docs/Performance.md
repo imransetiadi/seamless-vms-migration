@@ -730,9 +730,10 @@ leader's, still drives every migration (§9.3).
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. With the HA component each replica answers for itself - the same store figures, and its own
-`seamless_leader` -: a scrape through the Route reaches one replica at a time, so to see both, scrape each pod,
-which needs a NetworkPolicy that admits your Prometheus to the API port (the shipped ones admit only the router and
-the other replica). Neither leadership gauge carries a label, so no replica's host name leaves through them.
+`seamless_leader` -: a scrape through the Route reaches one replica at random, so `seamless_leader` would alternate.
+Scrape each pod instead: the component's NetworkPolicy `seamless-allow-ingress-from-monitoring` admits the cluster's
+monitoring stack to each replica's API port (SDD §17, §18; a PodMonitor in docs/Operations.md §4.12). Neither
+leadership gauge carries a label, so no replica's host name leaves through them.
 Queries:
 
 ```text

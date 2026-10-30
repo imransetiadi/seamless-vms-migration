@@ -1,7 +1,8 @@
 # The HA component on Kubernetes (SDD 17, 25.7): deploy/openshift/ha - read it for what it sets - with this overlay's
-# pod network for FORWARDED_ALLOW_IPS, as ../kustomization.yaml puts it into the NetworkPolicies' except ranges.
-# Enable it with the two commented components: lines of ../kustomization.yaml - there, not in deploy/openshift, whose
-# component would bring OpenShift's pod network.
+# pod network for FORWARDED_ALLOW_IPS, as ../kustomization.yaml puts it into the NetworkPolicies' except ranges, and
+# the namespace of this cluster's monitoring stack for the scrape of each replica. Enable it with the two commented
+# components: lines of ../kustomization.yaml - there, not in deploy/openshift, whose component would bring OpenShift's
+# pod network and monitoring namespace.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 
@@ -27,3 +28,16 @@ patches:
                 env:
                   - name: FORWARDED_ALLOW_IPS
                     value: 10.244.0.0/16
+  # ADJUST to the namespace your Prometheus runs in (kube-prometheus: monitoring; a Helm release of
+  # kube-prometheus-stack: the one it was installed into): its pods alone reach each replica's API port, to scrape
+  # /api/v1/metrics (SDD 17, 18) - and, in the pod network above, are trusted with X-Forwarded-For (SDD 25.9)
+  - target:
+      kind: NetworkPolicy
+      name: seamless-allow-ingress-from-monitoring
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from
+        value:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: monitoring
