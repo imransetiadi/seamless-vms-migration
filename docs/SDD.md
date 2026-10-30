@@ -6198,7 +6198,7 @@ is no origin a browser sends (review RV31-03).
   — the pod's pause process is PID 1 and reaps what Ansible leaves behind, the ssh `ControlPersist` masters,
   as `init: true` does in Compose; `seamless serve` would leave them as zombies — liveness
   `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only - and,
-  with the HA component, from the other replica on the API port alone -;
+  with the HA component, from the other replica and the cluster's monitoring stack, each on the API port alone -;
   egress to cloud APIs - the OpenStack services the control plane calls on their community and RHOSP 17.1 public
   ports, Placement (§22.3), Heat, Octavia (§10, §8.5) and Designate (§8.4) among them, RHOSO 18.0's on 443 -,
   vCenter, conversion hosts, Jev, agentmemory, an RFC 2136 DNS target's server on TCP 53 (§8.4), a webhook hook's
@@ -6243,11 +6243,21 @@ is no origin a browser sends (review RV31-03).
   * the NetworkPolicy `seamless-allow-relay`: ingress from and egress to the control plane's own pods on the API
     port, TCP 8080, alone - the relay of §25.6 - and nothing else between the replicas. No Kubernetes RBAC is
     added: the lease is the database's;
+  * the NetworkPolicy `seamless-allow-ingress-from-monitoring` (the owner's decisions of 2026-10-30): ingress from
+    the cluster's monitoring stack to each replica's API port, TCP 8080, alone - no other port, no egress -, so
+    that a Prometheus scrapes each pod's `/api/v1/metrics` on its own (§18). Its namespace is selected by its
+    `kubernetes.io/metadata.name`: on OpenShift `openshift-user-workload-monitoring` alone, whose Prometheus monitors
+    user-defined projects - the platform's in `openshift-monitoring` monitors OpenShift's own namespaces and is not
+    admitted (`TODO(LAB): confirm` that the user-workload Prometheus reaches the pods from that namespace) -; in
+    `deploy/kubernetes/ha` the namespace the cluster's Prometheus runs in, `monitoring` by default (kube-prometheus's),
+    which the operator sets;
   * uvicorn's `FORWARDED_ALLOW_IPS`: the cluster's pod network, where the replicas are - and, on the default
     networks, the router's or ingress controller's hop -, so the leader's lockout and audit count the caller, never
     the follower (§13.1, §25.9): OpenShift's default `10.128.0.0/14`, and in `deploy/kubernetes/ha` the Kubernetes
     overlay's `10.244.0.0/16`, each adjusted with the NetworkPolicies' ranges. It relies on the NetworkPolicies,
-    which admit only the router and the other replica to the API port.
+    which admit only the router, the other replica and the monitoring stack's namespace to the API port: a pod of
+    that namespace is in the pod network too, so what it writes in `X-Forwarded-For` is taken as its caller's
+    address (§25.9).
 
   CI renders both overlays with the component enabled as an installation enables it, validates them with
   kubeconform as without it, and asserts what each of its patches must produce.
@@ -6360,15 +6370,20 @@ PVCs stays a manual act.
 | `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its running pod gone |
 | `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to the overlay's count (below), both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, and so is a count of 2 while `seamless-data` is not ReadWriteMany (below), all with 2 before anything changed (review RV44A-08) |
 | `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited; a control plane at 0 replicas (`stop`) is scaled to one instead, as the single host's restart creates and starts it (review RV38B-04) |
-| `scale N` | `N` 0 is `stop`, 1 is `start` | `N` 0 is `stop`; 1 and 2 are `start` with that count instead of the overlay's, 2 only while `seamless-data` is ReadWriteMany (below) |
+| `scale N` | `N` 0 is `stop`, 1 is `start` | `N` 0 is `stop`; 1 and 2 are `start` with that count instead of the overlay's, 2 only with the HA component in the overlay and while `seamless-data` is ReadWriteMany (below) |
 | `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | `--cpu` and `--memory` first checked by a server-side dry run of the Deployment's patch (a limit below the requests changes nothing, review RV38B-02), then the settings patched into the ConfigMap `seamless-config`, then one patch of the pod template - the limits and a restart annotation, so the pod restarts once and reads the settings even when the limits stay as they are (review RV38B-01) -, awaited. When that patch fails, or its rollout does - a LimitRange or a quota refusing the new pod's limits, which the Deployment's dry run cannot see (admission judges the pod) -, the settings the ConfigMap held are put back and the template rolled back (`rollout undo`, after the put-back so the pod it starts reads the settings as they were, awaited by the Deployment becoming `Available`: its `Progressing` condition keeps a passed deadline after an undo, review RV42A-07) - a put-back that fails still has the template rolled back, its failure named with what the settings then need: put back by hand, and after an undo done a restart once the undo's pod is available - that pod read the new ones (reviews RV42A-03, RV43A-03) -; after an undo that failed, put back first, as the pod of the rollback by hand reads them, and no restart (review RV44A-07) -, so the control plane runs again as it was, and the script exits 1 naming what failed and anything it could not put back, never advising a second undo: an undo done whose pod is not `Available` within `--timeout` is named as such - the template is back, and its pod's refusal shows in the ReplicaSet's events -, and only an undo that failed names the revision to roll back to (reviews RV41A-06, RV41A-07, RV43A-02); the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
 | `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given, then the leading pod: the host name of the health's `leader.holder` (§12) - the holder without the 8 hex digits of its process, and a pod's host name is its name -, or that no replica leads while `holder` is null on a replica that does not lead |
-| `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
+| `logs` | `make seamless-logs` for the control plane | the control plane's log, followed - with two replicas one pod's, not necessarily the leader's: `status` names the leading pod, whose own log `kubectl logs` or `oc logs` follows by its name (the owner's decisions of 2026-10-30) |
 
 * **Scale.** On the single host `scale` takes 0 or 1: it runs one control plane, since two containers on one host
-  fail with it (§25.7). On a cluster it takes 0, 1 or 2, and 2 only while `seamless-data` is ReadWriteMany - its
-  claim's `spec.accessModes` -, since the two replicas run on two nodes and the new leader reads the run directories
-  the old one wrote (§17, §25.7); a claim that is not is refused, naming why, before anything changed. Any other count
+  fail with it (§25.7). On a cluster it takes 0, 1 or 2. A count of 2 takes the HA component in the overlay - read
+  from the overlay's files as its count is (below), never from the cluster, and by a dry run too -: without the
+  component's NetworkPolicy the replicas cannot reach each other's API port, so the relay is blocked and every
+  request a follower relays gets 503 `no_leader` (§25.6). A `scale 2` without it is refused, naming how to enable
+  it: the two `components:` lines the overlay's kustomization carries commented, then `up` (the owner's decisions of
+  2026-10-30). A count of 2 also takes a ReadWriteMany `seamless-data` - its claim's `spec.accessModes` -, since the
+  two replicas run on two nodes and the new leader reads the run directories the old one wrote (§17, §25.7); a claim
+  that is not is refused, naming why. Each is refused before anything changed, the component first. Any other count
   is refused. Two replicas run one orchestrator, the lease's leader's, and the other relays the API to it (§25.6): a
   second replica adds availability, not capacity. Scaling up is capacity - concurrency slots and CPU and memory for
   the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -, while the conversion
@@ -6379,6 +6394,16 @@ PVCs stays a manual act.
   `deploy/openshift` it builds), else 1 (§17). A count it cannot read, or one other than 1 or 2, is refused before
   anything changed. `restart` - a rollout ends both replicas, and a control plane at 0 replicas starts with one -,
   `capacity`, `--drain` and `resume` are unchanged: a drain's calls reach the leader through the relay.
+* **Turning HA off** is `scale 1`, or the platform's own scale of the Deployment to one replica (the owner's
+  decisions of 2026-10-30). The component stays in place, with its ReadWriteMany claim, its budget and its
+  NetworkPolicies, and one replica runs on that claim as it runs on any other. `up` and `start` restore the overlay's
+  count, the component's 2: one replica lasts until the next of them, or for good once the component's `replicas`
+  count is 1, which they then restore.
+* **Removing the component** is a procedure of its own (Operations.md): `/data` moves back to a ReadWriteOnce claim,
+  once, with the control plane stopped, as it moved to a ReadWriteMany one (§17). A claim's access modes never
+  change, so an overlay whose `components:` lines are commented again asks for a ReadWriteOnce `seamless-data`, and
+  its apply fails on the ReadWriteMany claim; and an apply deletes nothing, so the objects only the component makes -
+  its budget and its two NetworkPolicies - are deleted by hand.
 * **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
   without `SEAMLESS_DEMO` in their environment or in `.env` - whether `.env` sets it is read as Compose reads it
   (below, review RV41A-04) - they read it from the running or stopped container, so a demo stack comes back a demo
@@ -6457,7 +6482,10 @@ replica leads, that is while it holds the orchestrator's lease and its renew dea
 and `seamless_leader_epoch` — the epoch in the lease's row as this replica reads it at each scrape, 0 while nobody
 took the lease: its increases are the changes of leader. Neither carries a label, so no replica's host name leaves
 through them. Each replica answers `/metrics` with the same store figures, and `seamless_leader` tells which one
-drives.
+drives. So each replica is scraped on its own - a scrape through the Route reaches one replica at random, and
+`seamless_leader` would alternate between 1 and 0 -: with the HA component the NetworkPolicy
+`seamless-allow-ingress-from-monitoring` admits the cluster's monitoring stack to each pod's API port alone (§17; the
+owner's decisions of 2026-10-30).
 
 ---
 
@@ -8251,7 +8279,9 @@ orchestrator indicator are binding in §12, §13.1 and §16 since plan task HA4.
     confirm` the class and its encryption in transit). An installation copies `/data` to the new volume once, with
     the control plane stopped (Operations.md, HA7);
   * NetworkPolicy rules that let the replicas reach each other's API port (the relay), and nothing else between them.
-    No Kubernetes RBAC is added: the lease is the database's.
+    No Kubernetes RBAC is added: the lease is the database's;
+  * a NetworkPolicy that lets the cluster's monitoring stack reach each replica's API port, and no other port, so that
+    each replica is scraped on its own (owner decision 14, §18).
 * **PostgreSQL** (owner decision 10). Two nodes help only with a database that outlives a node; the bundled StatefulSet
   stays one pod, and while its node is down nobody leads. The database must drop a vanished client within about a
   minute, or a cut-off leader's VM-claim lock (§5.4) outlives it by hours: `tcp_keepalives_idle` 10 s,
@@ -8261,14 +8291,22 @@ orchestrator indicator are binding in §12, §13.1 and §16 since plan task HA4.
 * **Compose and Podman** stay one replica (owner decision 8): two containers on one host fail with it, and
   `restart: unless-stopped` already restarts a crashed container. The lease runs there too, so a second server
   started against the same database waits as a follower.
-* **`seamless-ctl.sh`** (§17.2) on a cluster: `scale` takes 0, 1 or 2, and 2 only while `seamless-data` is
-  ReadWriteMany (refused otherwise, naming why); `up` and `start` restore the overlay's count (1, or 2 with the HA
-  component) instead of 1; `status` names the leading pod. `restart`, `capacity`, `--drain` and `resume` are
-  unchanged: a rollout ends both replicas, and a drain's calls reach the leader through the relay. `docker` and
-  `podman` keep `scale` 0 or 1.
+* **`seamless-ctl.sh`** (§17.2) on a cluster: `scale` takes 0, 1 or 2, and 2 only with the HA component in the
+  overlay (owner decision 13) and while `seamless-data` is ReadWriteMany (refused otherwise, naming why); `up` and
+  `start` restore the overlay's count (1, or 2 with the HA component) instead of 1; `status` names the leading pod,
+  while `logs` follows one pod's log, not necessarily the leader's (owner decision 15). `restart`, `capacity`,
+  `--drain` and `resume` are unchanged: a rollout ends both replicas, and a drain's calls reach the leader through
+  the relay. `docker` and `podman` keep `scale` 0 or 1.
+* **Turning HA off, and removing the component** (owner decision 12): `scale 1` turns HA off and leaves the component
+  in place, its ReadWriteMany claim included, as one replica runs on such a claim as on any other; removing the
+  component moves `/data` back to a ReadWriteOnce claim with the control plane stopped, a procedure of its own,
+  since an apply cannot change the claim's access modes (§17.2, Operations.md).
 
 The HA component, the PostgreSQL settings and `seamless-ctl.sh`'s cluster `scale` of 0, 1 or 2, the count `up` and
-`start` restore and `status`'s leading pod are binding in §17 and §17.2 since plan task HA6.
+`start` restore and `status`'s leading pod are binding in §17 and §17.2 since plan task HA6. Turning HA off with
+`scale 1`, the component's removal as a procedure of its own, `scale 2` only with the component, the scrape's
+NetworkPolicy and `logs` following one pod are binding in §17, §17.2 and §18 since the owner's decisions of
+2026-10-30.
 
 ### 25.8 Observability
 
@@ -8296,6 +8334,11 @@ lease that expired by the database's clock.
   router's hop to the pod does today (edge TLS, §17). The NetworkPolicy admits only the replicas on that port.
 * uvicorn's `FORWARDED_ALLOW_IPS` lists the replicas' pod network beside the router's addresses; otherwise every
   relayed caller shares the follower's address in the lockout (§13.1).
+* The scrape's NetworkPolicy (owner decision 14) admits the monitoring stack's namespace to the API port, which a
+  NetworkPolicy cannot narrow to `/api/v1/metrics`: each route asks for the same token there as through the Route
+  (§12, §13.1), `/metrics` a viewer's unless `SEAMLESS_METRICS_PUBLIC`. That namespace's pods are in the pod network
+  `FORWARDED_ALLOW_IPS` lists, so the address one of them writes in `X-Forwarded-For` is taken as its caller's: the
+  policy admits that one namespace, the monitoring stack's, which is trusted as the router is.
 * The application role needs SELECT, INSERT and UPDATE on `leases`; the owner role creates the table, as it creates
   the indexes (§11).
 * On a ReadWriteMany volume the run's secret files (§7.2) cross the storage network while a playbook runs, and a dead
@@ -8328,7 +8371,8 @@ lease that expired by the database's clock.
 
 ### 25.11 Owner decisions
 
-The owner took each default as written on 2026-10-23 (D2), and decided the eleventh on 2026-10-29:
+The owner took each default as written on 2026-10-23 (D2), decided the eleventh on 2026-10-29, and the twelfth to
+the fifteenth on 2026-10-30, after plan task HA7:
 
 1. **The release: 0.5.0, as a Technology Preview** until LAB-HA01–LAB-HA05 pass. PRD §9 put HA in 0.2.0 and no
    release delivered it; 0.4.0 is at its release candidate, and HA needs nothing it still changes. Only real nodes can
@@ -8365,6 +8409,19 @@ The owner took each default as written on 2026-10-23 (D2), and decided the eleve
     its own lapsed lease only once the lease has been expired for three retry periods (6 s) by the database's clock,
     so a healthy follower takes the lease first and a replica whose tick loop keeps stalling cannot keep it; a lone
     replica takes its lease again after the pause (§8, §11, §25.3, §25.5).
+12. **Turning HA off is `scale 1`; removing the component is its own procedure** (2026-10-30): the component and its
+    ReadWriteMany `seamless-data` stay in place, one replica running on that claim as on any other; removing the
+    component moves `/data` back to a ReadWriteOnce claim, since a claim's access modes never change and an apply of
+    the overlay without the component fails on the claim (§17.2).
+13. **`scale 2` takes the HA component** (2026-10-30): `seamless-ctl.sh` refuses it unless the overlay includes the
+    component, read from the files as the overlay's count is, and says how to enable it: without the component's
+    NetworkPolicy the relay is blocked, and every request a follower relays gets 503 `no_leader` (§17.2, §25.6).
+14. **Each replica scraped on its own** (2026-10-30): the component adds a NetworkPolicy that admits the cluster's
+    monitoring stack to each pod's API port alone - on OpenShift the user-workload monitoring's namespace, on
+    Kubernetes the namespace the operator sets, `monitoring` by default -, since a scrape through the Route reaches
+    one replica at random and `seamless_leader` alternates (§17, §18).
+15. **`logs` follows one pod** (2026-10-30): with two replicas, `seamless-ctl.sh logs` follows one pod's log, not
+    necessarily the leader's (§17.2).
 
 ### 25.12 Contract changes (each binding from its plan task)
 
@@ -8377,6 +8434,7 @@ The owner took each default as written on 2026-10-23 (D2), and decided the eleve
 | `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 (binding) | HA5 |
 | a deposed replica's pause before its own lapsed lease (decision 11) | §8, §11, §15 (binding) | the owner, 2026-10-29 |
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 (binding) | HA6 |
+| turning HA off with `scale 1` and the component's removal as a procedure of its own; `scale 2` only with the component; the scrape's NetworkPolicy; `logs` following one pod (decisions 12-15) | §17, §17.2, §18 (binding) | the owner, 2026-10-30 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
 
