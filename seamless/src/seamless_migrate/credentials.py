@@ -11,13 +11,19 @@ fallback")."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
-from .domain.enums import ProviderRole
+from .domain.enums import ProviderRole, Strategy
 from .domain.models import HostKeyPin, Provider
 from .planning.networks import policy_profile_of
-from .planning.preflight import FIP_ADDRESS_ROLES
+from .planning.preflight import (
+    FIP_ADDRESS_ROLES,
+    credential_hold,
+    project_check,
+    project_words,
+)
 from .providers.base import ProviderError
 
 
@@ -108,6 +114,64 @@ def implementation(registry: Any, provider: Provider, project_id: str | None) ->
 def for_step(registry: Any, step: Step, provider: Provider, plan: HasProjects | None) -> Any:
     """What acts on ``provider`` - its side its role - for ``step`` of ``plan`` (SDD §27.5)."""
     return implementation(registry, provider, credential_project(step, provider.role, plan))
+
+
+def run_row(strategy: Strategy | str) -> Step:
+    """The row of §27.5 a migration's run of ``strategy`` is (SDD §7.2, §7.3): the storage
+    handover's, the migration kit's for a VMware strategy, else a migration's."""
+    strategy = Strategy(strategy)
+    if strategy == Strategy.storage_handover:
+        return Step.HANDOVER
+    if strategy in (Strategy.vmware_cold, Strategy.vmware_warm):
+        return Step.KIT
+    return Step.MIGRATION
+
+
+def cutover_projects(
+    plan: HasProjects | None, strategy: Strategy | str
+) -> list[tuple[ProviderRole, str]]:
+    """The project credentials a cutover of ``strategy`` and its rollback act with, by side, the
+    source's first (SDD §5.4 rule 6, §27.5, §27.7, plan task TC7): each project the selection names
+    for the rows they act in - the run's (a storage handover's two halves, the migration kit's),
+    the network cut-over's floating IPs and Octavia members, the DNS swap and the verification's
+    read of the destination -, whatever the plan moves. The providers' own credentials are none of
+    them: their check reads no expiry."""
+    run = run_row(strategy)
+    rows = {
+        ProviderRole.source: (run, Step.NETWORK),
+        ProviderRole.destination: (run, Step.NETWORK, Step.DNS, Step.MIGRATION),
+    }
+    out: list[tuple[ProviderRole, str]] = []
+    for side, steps in rows.items():
+        for step in steps:
+            project = credential_project(step, side, plan)
+            if project is not None and (side, project) not in out:
+                out.append((side, project))
+    return out
+
+
+def cutover_hold(
+    plan: HasProjects,
+    strategy: Strategy | str,
+    source: Provider,
+    destination: Provider,
+    now: datetime,
+) -> str | None:
+    """Why rule 6 of the cutover gate holds a cutover of ``strategy`` at ``now`` (SDD §5.4, §27.7,
+    plan task TC7): the first of ``cutover_projects`` whose credential its provider's record says
+    may not last the cutover and a rollback (``planning/preflight.credential_hold``), in words that
+    name its project, its provider and the plan's side, never the credential; None when none
+    holds it - a plan that names no project among them."""
+    for side, project_id in cutover_projects(plan, strategy):
+        provider = source if side == ProviderRole.source else destination
+        why = credential_hold(provider, project_id, now)
+        if why is not None:
+            words = project_words(project_id, project_check(provider.capabilities, project_id))
+            return (
+                f"the credential of project {words} at {provider.label}, the plan's {side} "
+                f"project, {why}"
+            )
+    return None
 
 
 def host_pin(provider: Provider, project_id: str | None) -> HostKeyPin | None:

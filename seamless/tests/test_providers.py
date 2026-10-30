@@ -5199,6 +5199,70 @@ async def test_a_failing_project_credential_fails_neither_its_provider_nor_anoth
     assert held_back == []
 
 
+async def test_a_project_sign_in_keystone_cannot_answer_is_unreachable(tmp_path, monkeypatch):
+    """SDD §7.1, §10 (the owner's decision of 2026-10-30, plan task TC7): through keystoneauth,
+    check_project raises ProviderUnreachable - a ProviderError - when Keystone cannot be reached
+    or answers 5xx: a connection refused, a TLS handshake that failed, a request that timed out,
+    the call's bound, a 500 or a 503 to the sign-in, a 503 or a connection reset at the record's
+    read. A credential Keystone rejects - a wrong secret (401), a 403, a record it no longer has
+    (404) - stays a plain ProviderError. Both keep the check's words: an HTTP status or a
+    failure's kind."""
+    import requests
+
+    from seamless_migrate.providers import openstack as openstack_provider
+    from seamless_migrate.providers.base import ProviderUnreachable
+
+    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 1.0)
+    cloud = InProcessCloud(tmp_path / "cloud")
+    answers = {
+        "refused": requests.exceptions.ConnectionError("[Errno 61] Connection refused"),
+        "tls": requests.exceptions.SSLError("[SSL: WRONG_VERSION_NUMBER] handshake failure"),
+        "slow": requests.exceptions.ReadTimeout("read timed out"),
+        "erring": 500,
+        "down": 503,
+        "forbidden": 403,
+    }
+    names = (*answers, "rejected", "held", "lost", "cut", "gone")
+    tenants = {name: _tenant(cloud, name) for name in names}
+    for name, answer in answers.items():
+        cloud.app_credentials[tenants[name].credential_id]["sign_in"] = answer
+    cloud.app_credentials[tenants["rejected"].credential_id]["secret"] = secrets.token_urlsafe(32)
+    release = threading.Event()
+    cloud.app_credentials[tenants["held"].credential_id]["hold"] = release
+    cloud.app_credentials[tenants["lost"].credential_id]["record"] = 503
+    cut = requests.exceptions.ConnectionError("Connection reset by peer")
+    cloud.app_credentials[tenants["cut"].credential_id]["record"] = cut
+    cloud.app_credentials[tenants["gone"].credential_id]["record"] = 404
+    impl = OpenStackProvider(_holding(*tenants.values()), cloud.settings, connect_fn=cloud.connect)
+    outcomes = {}
+    try:
+        for name, tenant in tenants.items():
+            try:
+                await impl.check_project(tenant.project_id)
+                outcomes[name] = "ok"
+            except ProviderUnreachable as exc:
+                outcomes[name] = ("unreachable", str(exc))
+            except ProviderError as exc:
+                outcomes[name] = ("rejected", str(exc))
+    finally:
+        release.set()
+    signed = "src-osp: the sign-in failed:"
+    record = "src-osp: the application credential's record was not read:"
+    assert outcomes == {
+        "refused": ("unreachable", f"{signed} ConnectFailure"),
+        "tls": ("unreachable", f"{signed} SSLError"),
+        "slow": ("unreachable", f"{signed} ConnectTimeout"),
+        "erring": ("unreachable", f"{signed} HTTP 500"),
+        "down": ("unreachable", f"{signed} HTTP 503"),
+        "forbidden": ("rejected", f"{signed} HTTP 403"),
+        "rejected": ("rejected", f"{signed} HTTP 401"),
+        "held": ("unreachable", "src-osp: call timed out after 1 s"),
+        "lost": ("unreachable", f"{record} HTTP 503"),
+        "cut": ("unreachable", f"{record} ConnectFailure"),
+        "gone": ("rejected", f"{record} HTTP 404"),
+    }
+
+
 class _NoProjectSignIn:
     """A provider whose check answers and that cannot sign in with a project credential - or whose
     sign-in fails with ``refusal``."""

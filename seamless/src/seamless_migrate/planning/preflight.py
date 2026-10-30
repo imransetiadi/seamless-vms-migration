@@ -2966,6 +2966,46 @@ def _expiry(value: Any) -> datetime | None:
         return None
 
 
+#: how long each project credential a cutover and a rollback would act with must still last, as
+#: the last check read it, for the cutover to start (SDD §5.4 rule 6, §27.7, owner decision 9)
+CUTOVER_CREDENTIAL_MARGIN = timedelta(hours=24)
+
+
+def credential_hold(provider: Provider, project_id: str, now: datetime) -> str | None:
+    """Why the provider's credential for ``project_id`` holds a cutover at ``now`` (SDD §5.4 rule
+    6, §27.7, plan task TC7), as the provider's record holds it: written since its last check - no
+    entry of the check report, or one checked before the credential's updated_at -, until a check
+    reads it; its last check failed, as an expiry not read never stands for none; or it expires
+    sooner than 24 hours after ``now``, or at a time that is no time. None while it lasts, never
+    expires, or the provider holds no credential for the project: no step acts with that one, and
+    a step's sign-in fails it before it changes anything (§7.1). Never a secret or a credential's
+    id: the record holds neither."""
+    held = provider.project_credentials.get(project_id)
+    if held is None:
+        return None
+    report = provider.capabilities.get("projects")
+    entry = report.get(project_id) if isinstance(report, Mapping) else None
+    written = utc_text(held.updated_at)
+    if not isinstance(entry, Mapping):
+        return f"was written at {written} and no check has read it since"
+    checked = _expiry(entry.get("checked_at"))
+    if checked is None or checked < held.updated_at:
+        return f"was written at {written}, after its last check"
+    if entry.get("status") != "ok":
+        return f"failed its last check, at {utc_text(checked)}: its expiry was not read"
+    expires = entry.get("expires_at")
+    if expires is None:
+        return None
+    expiry = _expiry(expires)
+    if expiry is None:
+        return "has an expiry its last check read that is no time"
+    if expiry <= to_utc(now):
+        return f"expired at {utc_text(expiry)}"
+    if expiry < to_utc(now) + CUTOVER_CREDENTIAL_MARGIN:
+        return f"expires at {utc_text(expiry)}, within 24 hours"
+    return None
+
+
 def _credential_findings(
     plan: Plan, credentials: Sequence[_PlanCredential], now: datetime
 ) -> list[Finding]:

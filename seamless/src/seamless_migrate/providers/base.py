@@ -21,6 +21,13 @@ class ProviderConflict(ProviderError):
     in PENDING_* (SDD §8.5, §10), which the change may be sent again after."""
 
 
+class ProviderUnreachable(ProviderError):
+    """A sign-in Keystone could not answer (SDD §7.1, §10; the owner's decision of 2026-10-30): a
+    connection refused or reset, a name that does not resolve, a TLS handshake that failed, a
+    timeout, the call's bound, or a 5xx answer - the executors' transient sign-in failure, where a
+    credential Keystone rejects stays a plain ProviderError."""
+
+
 @runtime_checkable
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]:

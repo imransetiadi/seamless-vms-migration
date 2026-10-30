@@ -4815,6 +4815,308 @@ async def test_a_validation_judges_its_project_credentials_and_its_vms_keypair_k
     assert registry.used("keypair_public_key") == [own(SRC_PROVIDER), own(DST_PROVIDER)]
 
 
+# -- the cutover gate's sixth rule: the plan's credentials (SDD §5.4 rule 6, §27.7, task TC7) -----
+
+
+def _write_credential(store, provider_id: str, project_id: str) -> Provider:
+    """An admin writes the provider's credential for the project anew, as PUT
+    /providers/{id}/projects/{project_id}/credentials does (SDD §12): its updated_at moves, and
+    the project's entry of the check report goes."""
+    provider = store.get("provider", provider_id, Provider)
+    entry = provider.project_credentials[project_id].model_copy(update={"updated_at": utcnow()})
+    report = {k: v for k, v in provider.capabilities["projects"].items() if k != project_id}
+    written = provider.model_copy(
+        update={
+            "project_credentials": {**provider.project_credentials, project_id: entry},
+            "capabilities": {**provider.capabilities, "projects": report},
+        }
+    )
+    store.put("provider", written)
+    return written
+
+
+async def _stays_at_its_gate(h, mid: str) -> Migration:
+    """The migration after ten more ticks, never in cutover meanwhile (SDD §5.4): its gate holds
+    it, its source running."""
+    from seamless_migrate.domain import fsm
+
+    ticks = h.orch.tick_stats["count"]
+    deadline = asyncio.get_running_loop().time() + 5
+    while h.orch.tick_stats["count"] < ticks + 10:
+        assert asyncio.get_running_loop().time() < deadline, "the orchestrator does not tick"
+        await asyncio.sleep(0.01)
+    m = await h.migration(mid)
+    assert P.cutover not in h.history(m) and m.phase in fsm.CUTOVER_WAIT_PHASES, h.history(m)
+    assert m.downtime_started_at is None
+    return m
+
+
+async def test_the_gate_holds_a_cutover_whose_credentials_expire_within_a_day(tmp_path, store):
+    """SDD §5.4 rule 6, §27.7 (owner decision 9, plan task TC7): a cutover starts only while each
+    project credential its step and a rollback would use expires no sooner than 24 hours after the
+    tick's clock, as the last check read it: the destination's, 23 hours on, holds a warm
+    migration's cutover, whatever auto_cutover and no approval allow - it keeps its keep-warm
+    passes meanwhile, its source running -, and the check that reads 25 hours lets it start.
+    Exactly 24 hours on lets it start, a moment less holds it; the providers' own credentials and
+    a plan that names no project are not judged."""
+    plan_kw = {"default_strategy": Strategy.warm, "keep_warm_interval_s": 900}
+    h, plan, registry, t = _tenant_plan(tmp_path, store, [vm(1)], plan_kw)
+    names = {t.c: "tenant-c", t.d: "tenant-d"}
+    _signs_in(h.destination, [], names, expires_at=_ago(-23 * 3600))
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.awaiting_cutover)
+    m = await _stays_at_its_gate(h, mid)
+    # the keep-warm passes go on while the gate holds it
+    passes = len(m.sync_passes)
+    h.clock.advance(901)
+    deadline = asyncio.get_running_loop().time() + 5
+    while len((await h.migration(mid)).sync_passes) == passes:
+        assert asyncio.get_running_loop().time() < deadline, "no keep-warm pass while held"
+        await asyncio.sleep(0.01)
+    await h.wait_phase(mid, P.awaiting_cutover)
+    await _stays_at_its_gate(h, mid)
+    # the check that reads an expiry 25 hours on lets the cutover start
+    _signs_in(h.destination, [], names, expires_at=_ago(-25 * 3600))
+    await h.orch.check_provider(DST_PROVIDER.id, "alice")
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert h.history(m).count(P.cutover) == 1
+
+    # the bound itself, as the rule reads the records at a clock of its own
+    from seamless_migrate.credentials import cutover_hold
+
+    stored = await h.plan(plan.id)
+    source = store.get("provider", SRC_PROVIDER.id, Provider)
+    destination = store.get("provider", DST_PROVIDER.id, Provider)
+    expires = destination.capabilities["projects"][t.c]["expires_at"]
+    expiry = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+
+    def hold(now, plan=stored, source=source, destination=destination):
+        return cutover_hold(plan, Strategy.warm, source, destination, now)
+
+    def expiring(provider, project_id, at):
+        """``provider`` whose last check read ``at`` as the project credential's expiry."""
+        report = {**provider.capabilities["projects"]}
+        report[project_id] = {**report[project_id], "expires_at": at}
+        return provider.model_copy(
+            update={"capabilities": {**provider.capabilities, "projects": report}}
+        )
+
+    assert hold(expiry - timedelta(hours=25)) is None
+    assert hold(expiry - timedelta(hours=24)) is None
+    held = hold(expiry - timedelta(hours=24) + timedelta(microseconds=1))
+    assert held is not None and "within 24 hours" in held
+    assert t.c in held and "tenant-c" in held and DST_PROVIDER.label in held
+    assert "destination project" in held and t.a not in held
+    assert hold(expiry - timedelta(hours=23)) == held
+    # one that expired already, and one whose expiry is no time, hold it too
+    assert "expired at" in (hold(expiry + timedelta(seconds=1)) or "")
+    unread = hold(expiry - timedelta(hours=25), destination=expiring(destination, t.c, "soon"))
+    assert unread is not None and "no time" in unread
+    # the source's credential is judged as well; one that never expires is never held
+    soon, lasting = expiring(source, t.a, expires), expiring(destination, t.c, None)
+    at_source = hold(expiry - timedelta(hours=23), source=soon, destination=lasting)
+    assert at_source is not None and t.a in at_source and SRC_PROVIDER.label in at_source
+    assert "source project" in at_source and t.c not in at_source
+    assert hold(expiry + timedelta(days=365), destination=lasting) is None
+    # the other project credentials of a provider, and a plan that names no project, are not
+    # judged: the providers' own credentials have no expiry to read
+    other = stored.model_copy(update={"destination_project": None})
+    assert hold(expiry - timedelta(hours=23), plan=other) is None
+    none = stored.model_copy(update={"source_project": None, "destination_project": None})
+    assert hold(expiry - timedelta(hours=23), plan=none, source=soon) is None
+    # and the gate reads no provider for a plan that names no project: it behaves as before
+    read: dict = {}
+    assert await h.orch._cutover_held(m, none, expiry - timedelta(hours=23), read) is None
+    assert read == {}
+    assert await h.orch._cutover_held(m, stored, expiry - timedelta(hours=23), read) == held
+    assert set(read) == {SRC_PROVIDER.id, DST_PROVIDER.id}
+
+
+async def test_a_credential_written_since_the_last_check_holds_the_cutover_until_a_check(
+    tmp_path, store
+):
+    """SDD §5.4 rule 6, §12, §27.7 (plan task TC7): a credential written since its last check
+    holds the cutover until a check reads it - whether the write dropped its entry of the check
+    report, or a check that began before the write left one older than the credential -,
+    whatever expiry an earlier check read, and under the locks too; the check that reads it lets
+    the cutover start. A credential its provider no longer holds is not judged by the gate."""
+    from seamless_migrate.domain.models import utc_text
+
+    plan_kw = {"default_strategy": Strategy.cold, "auto_cutover": False}
+    h, plan, registry, t = _tenant_plan(tmp_path, store, [vm(1)], plan_kw)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    checked = store.get("provider", SRC_PROVIDER.id, Provider).capabilities["projects"][t.a]
+    # an admin writes the source project's credential anew: the write drops its entry (SDD §12)
+    written = _write_credential(store, SRC_PROVIDER.id, t.a)
+    await h.orch.request_cutover(mid, "sari", force_window=False)
+    m = await _stays_at_its_gate(h, mid)
+    assert m.phase == P.ready
+    # a step begun on a snapshot taken before the write starts nothing (SDD §8)
+    assert await h.orch._begin(mid, {P.ready}, P.cutover, "cutover gate open") is False
+    # a check that began before the write and ended after it: its entry is older than the
+    # credential, and holds it as well
+    before = written.project_credentials[t.a].updated_at - timedelta(seconds=1)
+    stale = {**checked, "checked_at": utc_text(before)}
+    report = {**written.capabilities["projects"], t.a: stale}
+    store.put(
+        "provider",
+        written.model_copy(update={"capabilities": {**written.capabilities, "projects": report}}),
+    )
+    await _stays_at_its_gate(h, mid)
+    assert await h.orch._begin(mid, {P.ready}, P.cutover, "cutover gate open") is False
+    # the check that reads it lets the cutover start
+    await h.orch.check_provider(SRC_PROVIDER.id, "alice")
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert h.history(m).count(P.cutover) == 1
+
+    # a credential the provider no longer holds (written around the API): not judged, no step can
+    # act with it (SDD §5.4, §7.1)
+    from seamless_migrate.credentials import cutover_hold
+
+    stored = await h.plan(plan.id)
+    source = store.get("provider", SRC_PROVIDER.id, Provider)
+    destination = store.get("provider", DST_PROVIDER.id, Provider)
+    gone = source.model_copy(update={"project_credentials": {}})
+    assert cutover_hold(stored, Strategy.cold, gone, destination, utcnow()) is None
+    # one whose entry the write dropped holds it, whatever the other entries say
+    dropped = _write_credential(store, SRC_PROVIDER.id, t.a)
+    held = cutover_hold(stored, Strategy.cold, dropped, destination, utcnow())
+    assert held is not None and t.a in held and SRC_PROVIDER.label in held
+    # a check at the very time of the write read it: "since" is after, never at
+    same = {**checked, "checked_at": utc_text(dropped.project_credentials[t.a].updated_at)}
+    report = {**dropped.capabilities["projects"], t.a: same}
+    read = dropped.model_copy(update={"capabilities": {**dropped.capabilities, "projects": report}})
+    assert cutover_hold(stored, Strategy.cold, read, destination, utcnow()) is None
+
+
+async def test_a_new_credential_with_a_later_expiry_releases_a_held_cutover(tmp_path, store):
+    """SDD §5.4 rule 6, §27.7 (plan task TC7): a warm cutover held by a destination credential
+    that expires within a day waits, its source running; an admin writes a new credential - still
+    held, until a check reads it -, and the check that reads its later expiry releases the cutover,
+    whose steps act with the plan's credential, never the provider's own. A credential whose last
+    check failed holds a cutover as well: an expiry not read never stands for none."""
+    plan_kw = {"default_strategy": Strategy.warm}
+    h, plan, registry, t = _tenant_plan(tmp_path, store, [vm(1)], plan_kw)
+    names = {t.c: "tenant-c", t.d: "tenant-d"}
+    _signs_in(h.destination, [], names, expires_at=_ago(-12 * 3600))
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.awaiting_cutover)
+    await _stays_at_its_gate(h, mid)
+    # the new credential, written: still held until a check reads it
+    _write_credential(store, DST_PROVIDER.id, t.c)
+    _signs_in(h.destination, [], names, expires_at=_ago(-30 * 86400))
+    await _stays_at_its_gate(h, mid)
+    # a check that cannot read it holds it still
+    _signs_in(h.destination, [], names, refused={t.c})
+    await h.orch.check_provider(DST_PROVIDER.id, "alice")
+    entry = store.get("provider", DST_PROVIDER.id, Provider).capabilities["projects"][t.c]
+    assert entry["status"] == "error"
+    await _stays_at_its_gate(h, mid)
+    # the check that reads its later expiry releases the cutover
+    _signs_in(h.destination, [], names, expires_at=_ago(-30 * 86400))
+    await h.orch.check_provider(DST_PROVIDER.id, "alice")
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert h.history(m).count(P.cutover) == 1
+    assert "get_server" in registry.methods(of_project(DST_PROVIDER, t.c))
+    assert "get_server" not in registry.methods(own(DST_PROVIDER))
+
+
+async def test_a_cutover_its_credentials_hold_starts_no_gpu_capacity_read(tmp_path, store):
+    """SDD §5.4 rules 5 and 6, §22.7 (plan task TC7): rule 6 is judged before rule 5, so a GPU VM
+    whose destination credential expires within a day starts no GPU capacity read and records no
+    wait while it holds; once a check reads a later expiry, the read comes and the cutover
+    starts."""
+    from seamless_migrate.domain.models import Mappings
+
+    dst = GateDestination()
+    a, c = tenant_project(), tenant_project()
+    plan_kw = {
+        "default_strategy": Strategy.cold,
+        "mappings": Mappings(flavors={"g1.vgpu": GATE_FLAVOR}),
+        "source_project": a,
+        "destination_project": c,
+    }
+    h, plan = await setup(tmp_path, store, [gate_vm(1)], plan_kw, destination=dst)
+    for provider, project in ((SRC_PROVIDER, a), (DST_PROVIDER, c)):
+        credentials = project_credentials(provider.id, project)
+        store.put("provider", provider.model_copy(update={"project_credentials": credentials}))
+    _signs_in(h.source, [], {a: "tenant-a"})
+    _signs_in(dst, [], {c: "tenant-c"}, expires_at=_ago(-12 * 3600))
+    h.orch.providers = CredentialRegistry(h.source, dst)
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    dst.reads.clear()  # the validation's own read of the capacity (SDD §8)
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await _stays_at_its_gate(h, mid)
+    assert (dst.reads, m.gpu_wait, m.phase) == ([], None, P.ready)
+    _signs_in(dst, [], {c: "tenant-c"}, expires_at=_ago(-30 * 86400))
+    await h.orch.check_provider(DST_PROVIDER.id, "alice")
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert dst.reads and h.history(m).count(P.cutover) == 1
+
+
+async def test_a_sign_in_whose_keystone_cannot_be_reached_is_retried_and_a_rejected_one_is_not(
+    tmp_path, store
+):
+    """SDD §7.1, §8 (the owner's decision of 2026-10-30, plan task TC7): a step whose sign-in finds
+    Keystone unreachable fails as transient, and the orchestrator tries it again as it tries its
+    other transient failures - the next attempt signs in anew, and the migration completes; a
+    sign-in Keystone rejects fails the migration at once, its source never stopped."""
+    from seamless_migrate.executors.base import sign_in
+    from seamless_migrate.providers.base import ProviderUnreachable
+
+    def cold_plan(path, i):
+        cold = {"default_strategy": Strategy.cold}
+        h, plan, registry, t = _tenant_plan(path, store, [vm(i)], cold)
+        failures: list[Exception] = []
+        signs_in = h.destination.check_project
+
+        async def keystone(project_id):
+            if failures:
+                raise failures.pop(0)
+            return await signs_in(project_id)
+
+        async def cutover(ctx):
+            # an executor's cutover: its sign-in first (SDD §7.1)
+            project = ctx.plan.destination_project
+            await sign_in(h.orch.providers, ctx.destination, project, "destination")
+            return await h.executor.sim.run(StepName.CUTOVER, ctx)
+
+        h.destination.check_project = keystone
+        h.executor.hooks[StepName.CUTOVER] = cutover
+        return h, plan, failures
+
+    h, plan, failures = cold_plan(tmp_path, 1)
+    await h.orch.validate_plan(plan.id, "alice")
+    failures.append(ProviderUnreachable("dst-rhoso: the sign-in failed: HTTP 503"))
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert [step for i, step in h.executor.calls if i == mid].count(StepName.CUTOVER) == 2
+    assert failures == [] and m.error is None
+
+    h, plan, failures = cold_plan(tmp_path / "rejected", 2)
+    await h.orch.validate_plan(plan.id, "alice")
+    failures.append(ProviderError("dst-rhoso: the sign-in failed: HTTP 401"))
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-2")).id
+    m = await h.wait_phase(mid, P.failed)
+    await h.orch.stop()
+    assert [step for i, step in h.executor.calls if i == mid].count(StepName.CUTOVER) == 1
+    assert "HTTP 401" in (m.error or "") and m.downtime_started_at is None
+
+
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
     """A provider deleted while its check ran is not re-inserted by the check's write."""
     h, plan = await setup(tmp_path, store, [vm(1)])
