@@ -1125,11 +1125,15 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
     await user.click(await actionButton(/^edit plan$/i));
     const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
-    const destination = within(dialog).getByLabelText(/^destination/i);
+    const destination = within(dialog).getByLabelText(/^destination provider/i);
     expect(destination).toBeDisabled();
-    expect(destination).toHaveAccessibleDescription(
-      `The failed migration of ${failed.vm.name} still needs this destination for its rollback: roll it back or cancel it first.`,
-    );
+    const why = `The failed migration of ${failed.vm.name} still needs this destination for its rollback: roll it back or cancel it first.`;
+    expect(destination).toHaveAccessibleDescription(why);
+    // and the plan's projects, whose credentials its rollback acts with (SDD §12, §16, §27.4)
+    for (const side of [/^source project/i, /^destination project/i]) {
+      expect(within(dialog).getByLabelText(side)).toBeDisabled();
+      expect(within(dialog).getByLabelText(side)).toHaveAccessibleDescription(why);
+    }
     // the rest stays editable, to fix the cause before a retry
     expect(within(dialog).getByLabelText(/downtime slo/i)).toBeEnabled();
   });

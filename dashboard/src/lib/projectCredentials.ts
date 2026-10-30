@@ -106,3 +106,73 @@ export function cutoverHolds(
   }
   return holds;
 }
+
+/** The project its own credential's token is scoped to, as its last check names it (`project`, SDD §10, §27.7); null until one does. */
+export function ownProject(provider: Pick<Provider, 'capabilities'>): { id: string; name: string | null } | null {
+  const project = provider.capabilities['project'];
+  if (!project || typeof project !== 'object') return null;
+  const { id, name } = project as { id?: unknown; name?: unknown };
+  if (typeof id !== 'string' || !id) return null;
+  return { id, name: typeof name === 'string' && name.trim() ? name : null };
+}
+
+/** The provider's own project as the card and the pickers name it (SDD §16): "finance (project-finance)", or null. */
+export function ownProjectWords(provider: Pick<Provider, 'capabilities'>): string | null {
+  const own = ownProject(provider);
+  return own ? projectWords(own.id, { project_name: own.name }) : null;
+}
+
+/** A project credential as the dashboard shows it (SDD §16): its project's words and what its last check read. */
+export interface ProjectCredentialRow {
+  projectId: string;
+  /** "shop (5f0c…)", its id alone while no check read a name. */
+  project: string;
+  updatedAt: string;
+  /** Its check's entry, unless it was written since. */
+  check: ProjectCheck | null;
+  /** "Checked", "Check failed" or "Not checked since written" (SDD §16). */
+  status: 'ok' | 'error' | 'unchecked';
+}
+
+/**
+ * The provider's project credentials in the order of their projects' names (SDD §16), each with its last check's entry -
+ * none while the report holds none for it or one checked before it was written - and the name that entry read.
+ */
+export function projectCredentialRows(provider: Pick<Provider, 'capabilities' | 'project_credentials'>): ProjectCredentialRow[] {
+  return Object.entries(provider.project_credentials ?? {})
+    .map(([projectId, credential]) => {
+      const entry = projectCheckOf(provider, projectId);
+      const written = timeOf(credential.updated_at);
+      const checked = entry ? timeOf(entry.checked_at) : null;
+      const current = entry && checked !== null && (written === null || checked >= written) ? entry : null;
+      return {
+        projectId,
+        project: projectWords(projectId, entry),
+        updatedAt: credential.updated_at,
+        check: current,
+        status: current ? (current.status === 'ok' ? 'ok' : 'error') : 'unchecked',
+      } satisfies ProjectCredentialRow;
+    })
+    .sort((a, b) => a.project.localeCompare(b.project) || (a.projectId < b.projectId ? -1 : 1));
+}
+
+/** How long before an expiry the dashboard warns, as PROJECT_CREDENTIAL_EXPIRING does (SDD §27.7): 7 days. */
+export const EXPIRY_WARNING_MS = 7 * 24 * 3_600_000;
+
+/** A project choice of the plan form's pickers and the Inventory's select (SDD §16): '' is the provider's own credential. */
+export interface ProjectChoice {
+  value: string;
+  label: string;
+}
+
+/**
+ * The projects a plan or a read may act in on a provider (SDD §16, §27.4): first its own credential's project, sent as
+ * none, then each project it holds a credential for, by name with its id.
+ */
+export function projectChoices(provider: Pick<Provider, 'capabilities' | 'project_credentials'>): ProjectChoice[] {
+  const own = ownProjectWords(provider);
+  return [
+    { value: '', label: own ? `Its own credential's project: ${own}` : "Its own credential's project" },
+    ...projectCredentialRows(provider).map((row) => ({ value: row.projectId, label: row.project })),
+  ];
+}

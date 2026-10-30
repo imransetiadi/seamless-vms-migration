@@ -54,6 +54,7 @@ import type {
   Provider,
   ProviderCreate,
   ProviderCredentials,
+  ProjectCredentialsBody,
   ProviderPatch,
   ProviderInventory,
   RecommendationListQuery,
@@ -83,7 +84,8 @@ export const queryKeys = {
   health: ['health'] as const,
   providers: ['providers'] as const,
   provider: (id: string) => ['providers', id] as const,
-  inventory: (id: string) => ['inventory', id] as const,
+  /** A provider's inventory; with `project`, read with that project's credential (SDD §12, §27.4), under its provider's key. */
+  inventory: (id: string, project?: string | null) => (project ? (['inventory', id, project] as const) : (['inventory', id] as const)),
   plans: ['plans'] as const,
   plan: (id: string) => ['plans', id] as const,
   migrations: (query: MigrationListQuery = {}) => ['migrations', query] as const,
@@ -176,11 +178,13 @@ export function useProviders() {
   });
 }
 
-export function useInventory(providerId: string | undefined) {
+/** GET /providers/{id}/inventory; with `project`, `?project=` reads it with that project's credential (SDD §12, §27.4). */
+export function useInventory(providerId: string | undefined, project?: string | null) {
   const api = useApi();
   return useApiQuery({
-    queryKey: queryKeys.inventory(providerId ?? ''),
-    queryFn: ({ signal }) => api.get<ProviderInventory>(`/providers/${enc(providerId ?? '')}/inventory`, { signal }),
+    queryKey: queryKeys.inventory(providerId ?? '', project),
+    queryFn: ({ signal }) =>
+      api.get<ProviderInventory>(`/providers/${enc(providerId ?? '')}/inventory${project ? `?project=${encodeURIComponent(project)}` : ''}`, { signal }),
     enabled: Boolean(providerId),
     retry: noRetryOnClientErrors,
     staleTime: 60_000,
@@ -590,6 +594,33 @@ export function useCheckAllProviders() {
     },
     // each checked provider's inventory too, as one Check does: a check refreshes its capabilities
     onSettled: (result) => invalidateAll(queryClient, [queryKeys.providers, ...(result?.checked ?? []).map((p) => queryKeys.inventory(p.id))]),
+  });
+}
+
+/** PUT /providers/{id}/projects/{project_id}/credentials (admin, write-only; SDD §12, §27.4, plan task TC8). */
+export function useSetProjectCredentials() {
+  return useProviderWrite((api, { id, projectId, credentials }: { id: string; projectId: string; credentials: ProjectCredentialsBody }) =>
+    api.put<Provider>(`/providers/${enc(id)}/projects/${enc(projectId)}/credentials`, credentials),
+  );
+}
+
+/** DELETE /providers/{id}/projects/{project_id}/credentials (admin; SDD §12, §27.4, plan task TC8): the provider read again. */
+export function useDeleteProjectCredentials() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, projectId }: { id: string; projectId: string }) => api.delete(`/providers/${enc(id)}/projects/${enc(projectId)}/credentials`),
+    onSuccess: (_result, { id, projectId }) => {
+      queryClient.setQueryData<Provider[]>(queryKeys.providers, (old) =>
+        old?.map((p) => {
+          if (p.id !== id || !p.project_credentials) return p;
+          const { [projectId]: _gone, ...rest } = p.project_credentials;
+          return { ...p, project_credentials: rest };
+        }),
+      );
+      queryClient.removeQueries({ queryKey: queryKeys.inventory(id, projectId) });
+      invalidateAll(queryClient, [queryKeys.providers]);
+    },
   });
 }
 

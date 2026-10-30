@@ -488,4 +488,50 @@ describe('changed-extent tracking (SDD §16, §28, plan task CE10)', () => {
     expect(screen.getByRole('list', { name: 'Disks' })).toHaveTextContent(/Extents/);
     expect(await violations()).toEqual([]);
   }, 30_000);
+
+  it("a provider's project credentials: the Add dialog refused, its failed check and the Delete confirmation (SDD §16, plan task TC8)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/providers', 'admin');
+    await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
+    await settled();
+    const card = screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    await user.click(within(card).getByRole('button', { name: 'Add project credential to RHOSP 17.1 — DC1' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Add project credential' });
+    await user.click(within(dialog).getByRole('button', { name: /save and check/i }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+    // a project the mock cloud does not have: written, its check failed (synthetic values)
+    await user.type(within(dialog).getByLabelText(/^project id/i), '0123456789abcdef0123456789abcdef');
+    await user.type(within(dialog).getByLabelText(/^application credential id/i), 'a'.repeat(32));
+    await user.type(within(dialog).getByLabelText(/^application credential secret/i), 'synthetic-a11y-secret'); // gitleaks:allow
+    await user.click(within(dialog).getByRole('button', { name: /save and check/i }));
+    const outcome = await screen.findByRole('dialog', { name: /was written, but its check did not pass/i });
+    expect(await violations()).toEqual([]);
+    await user.click(within(outcome).getByRole('button', { name: 'Done' }));
+    await user.click(within(card).getByRole('button', { name: /^Delete the credential of platform/ }));
+    await screen.findByRole('alertdialog');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("the plan form's project pair and a project's inventory (SDD §16, plan task TC8)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/plans', 'operator');
+    await screen.findByRole('heading', { level: 1, name: 'Plans' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: /^source project/i }), '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a project's inventory, read with its credential (SDD §16, plan task TC8)", async () => {
+    renderAt('/inventory/rhosp17-dc1?project=5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6', 'viewer');
+    await screen.findByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ }, { timeout: 8_000 });
+    await settled();
+    expect(screen.getByRole('combobox', { name: 'Project credential' })).toHaveValue('5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
 });
+

@@ -5513,8 +5513,14 @@ is no origin a browser sends (review RV31-03).
   credential finding is about one project, which its message names with its provider: a plan's findings list groups
   each of the three `PROJECT_CREDENTIAL_*` codes by its message, so each entry names its project above its VMs - two
   projects' findings of one code are two entries, never one whose projects only its VMs' details name -, and a
-  migration's list shows each message. The offline mock's pre-flight gives none of the four: its providers hold no
-  project credential (plan tasks TC8, TC9).
+  migration's list shows each message. The offline mock's pre-flight gives none of the four: its plans name no project
+  (plan tasks TC8, TC9).
+* Per-tenant credentials (§27, from 0.5.0, plan task TC8): every project credential element - the provider card's
+  Projects, the Add project credential dialog, the plan form's project pickers and the Inventory's Project credential
+  select - carries a "Technology Preview" badge as the GPU elements do, its detail "Technology Preview, validated in
+  simulation: per-tenant credentials have not yet run on the lab's clouds." (§27.10), until LAB-TC01–LAB-TC06 pass
+  (plan task TC11). No element shows a project credential's secret, its secret's name or its application credential's
+  id: what the dashboard writes it never reads back (§13.3).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -5682,7 +5688,18 @@ is no origin a browser sends (review RV31-03).
   bar ("11 of 21 done, 1 cancelled, downtime SLO 15m 00s"), none when no migration was cancelled; the list reads no migration —, clouds,
   SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
-  scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
+  scrolls sideways; New plan opens the plan form: name, clouds — and, for an OpenStack or RHOSO source, the plan's
+  project pair (plan task TC8, §27.4) with the Technology Preview badge: a Source project and a Destination project
+  select under their providers, each offering first the provider's own project, "Its own credential's project:
+  {name} ({id})" as its check names it (`project`, §10; "Its own credential's project" while no check names one),
+  sent `null`, then each project its provider holds a credential for, "{name} ({id})" as its last check read the name
+  (its id alone while none did), sent as its id; a new plan's read its own, an edited plan's its `source_project` and
+  `destination_project`, and one the provider no longer holds a credential for stays selected, marked "no
+  credential" (validation refuses it, §27.7); choosing another provider takes that side back to its own project; the
+  hint says that the plan's steps act in the project with its credential (§27.5) and that an admin adds project
+  credentials on the Providers page; unavailable with the destination's reason while a migration of the plan is
+  `failed`, as the API refuses a change of either (§12); a VMware source shows neither and sends both `null` (§27.9) —,
+  VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
@@ -5988,7 +6005,35 @@ is no origin a browser sends (review RV31-03).
   check reads the host's console."; each fingerprint as `ssh-keygen -l` prints it (`SHA256:` and the unpadded base64
   of the key's SHA-256), computed in the browser. While host keys are not checked (`GET /me` `host_key_checking`
   false, §12) the page warns once above the cards that no conversion host's key is checked and names
-  SEAMLESS_ANSIBLE_HOST_KEY_CHECKING; the form
+  SEAMLESS_ANSIBLE_HOST_KEY_CHECKING; an OpenStack or RHOSO card shows its project credentials (§27.4; plan task TC8)
+  under "Projects" with the Technology Preview badge: the provider's own credential's project as its check names it
+  (`project`, §10: "Own credential: {name} ({id})", else "Own credential: not named yet - a check names its
+  project"), then each project credential in the order of its project's name, by that name as its last check read it
+  with its id (its id alone while none did) - its status ("Checked" with the check's time when its entry is `ok`,
+  "Check failed" with the entry's message, "Not checked since written" while the report holds no entry for it or one
+  checked before its `updated_at`), its roles ("none read" for an empty list), its expiry ("Never expires",
+  "Expires {time}", in the warning tone within 7 days as `PROJECT_CREDENTIAL_EXPIRING` warns, "Expired {time}" in the
+  danger tone once passed), its restricted flag ("Restricted", or "Unrestricted: it may create application
+  credentials and trusts" in the warning tone, as `PROJECT_CREDENTIAL_UNRESTRICTED` warns) and when an admin wrote it
+  ("Written 3 days ago") -, or "No project credential yet." without one. For an admin, Add project credential opens
+  a dialog that takes the project's id (the API's rule: 1-64 letters, digits, `-` or `_`), the application
+  credential's id and its secret (a password field), each required and refused before anything is sent as the API
+  refuses it, each in the error summary with a link to its field; a project the provider already holds a credential
+  for gets the new one, which its hint says (a rotation). It writes them with
+  `PUT /providers/{id}/projects/{project_id}/credentials`, clears the secret from the form whatever the answer, then
+  checks the provider (`POST /providers/{id}/check`), as the provider dialog does, and shows that project's entry of
+  the check - its name, status and message -, the credential staying written when the check fails, said so with
+  Check again; a refused write keeps the project and id typed and shows the API's reason (a project whose secret
+  name another project's credential holds, §13.3). Each credential's Delete (named for assistive technology "Delete
+  the credential of {project}") asks in a `ConfirmDialog` that types the project's id and says that the secret goes
+  from the secret store and that nothing changes in the cloud, `DELETE /providers/{id}/projects/{project_id}/
+  credentials`; it is unavailable while a plan needs the project, naming each with why as the provider's Delete does,
+  judged by the plans that name the project on the provider's side - a source's `source_project`, a destination's
+  `destination_project` (§12) -, and a refused one shows the API's 409, its plans named. Any other role reads the
+  list without Add or Delete, and is told that adding and deleting project credentials requires the admin role. A
+  vCenter's card shows no Projects (§27.9). The offline mock holds the RHOSP 17.1 source with two project
+  credentials and answers both routes and their check with §12's rules, its plans naming no project (plan task TC9
+  seeds the demo's); the form
   takes, for an OpenStack or RHOSO provider with a conversion host, its declared host keys (`conversion_host.
   ssh_host_keys`, §4.2) under "Host keys" as a text area of one OpenSSH public key per line (blank lines dropped), and
   refuses before anything is sent a line that is no ed25519, ECDSA or RSA public key, naming its line number - never
@@ -6097,6 +6142,13 @@ is no origin a browser sends (review RV31-03).
   source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
+  for an OpenStack or RHOSO provider that holds a project credential, a Project credential select beside it (plan
+  task TC8, §27.4) with the Technology Preview badge chooses whose credential reads the inventory - the provider's own
+  first, then each credential's project, as the plan form's pickers name them -, reading
+  `GET /providers/{id}/inventory?project=<project id>` for a project credential and the inventory without the query
+  for its own, kept in the address (`?project=`) and switched in place as the Provider select
+  switches the provider, which drops it; a project the provider holds no credential for, as an old address may name,
+  reads as the API answers it (404); the VM table's Project filter stays a filter of the rows read;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
   a GPU column — each of the VM's GPUs as the API reads them (`vm_gpus`, §22.2), on a line of its own: its kind, then
   what names it, "×n" for n identical ones, and for an OpenStack request " · " and what it asks for, its class and
@@ -9016,7 +9068,8 @@ that task; plan task TC6's findings of §27.7 - `PROJECT_CREDENTIAL_EXPIRING`, `
 `DST_FIP_ADDRESS_UNAVAILABLE`, the handover's eligibility reason, `DST_PROJECT_MISSING`'s remediation and the
 findings lists in §9.2, §9.3 and §16 since that task; plan task TC7's cutover gate rule 6, the executors' sign-in
 before a step and the migration page's naming of the credential that holds a cutover in §5.4, §7.1 and §16 since that
-task. The
+task; plan task TC8's dashboard - the provider card's Projects with Add and Delete, the plan form's project pickers and
+the Inventory's Project credential select - in §16 since that task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -9327,7 +9380,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 (binding) | TC5 |
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure; the migration page's naming of the credential that holds a cutover | §5.4, §7.1, §16 (binding) | TC7 |
-| the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 | TC8 |
+| the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 (binding) | TC8 |
 | the demo's tenant projects and its plan with a project pair | §10 | TC9 |
 | QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
 | the lab; the Technology Preview label goes when LAB-TC01–LAB-TC06 pass | QASuite §13 | TC11 |
