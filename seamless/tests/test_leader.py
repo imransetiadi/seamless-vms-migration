@@ -3,7 +3,8 @@ plan task HA3).
 
 Two replicas run in one test process, each with a store, a bus and an orchestrator of its own, on
 one SQLite file and, with SEAMLESS_TEST_PG_URL, on PostgreSQL. Their leases last two seconds - the
-renew deadline 1.33 s, the last third the margin -, a deposed replica's pause three tries of a tenth
+renew deadline 1.33 s, the last third the margin; the two servers', taken over after a release
+alone, production's thirty -, a deposed replica's pause three tries of a tenth
 of a second, and they expire by the database's clock, which no test fakes. A playbook here is a real
 process group: a shell in a session of its own with a `sleep` child. Replicas are seamless-a to
 seamless-c, their addresses in 192.0.2.0/24 (RFC 5737).
@@ -177,17 +178,19 @@ def gone(pid: int) -> bool:
 
 
 def server_settings(tmp_path, url: str) -> Settings:
-    """A server's settings on ``url`` with a lease of two seconds - below the variable's bound,
-    which a test may set past (SDD §15.1)."""
-    settings = Settings(
+    """A server's settings on ``url`` with production's lease of thirty seconds (SDD §15.1): its
+    leader is taken over after a release, never by expiry, and on a two-second lease a renewal a
+    loaded runner delayed past the renew deadline of 1.33 s would depose it (the relay tests' CI
+    flakes of PR 175 and 176)."""
+    return Settings(
         data_dir=tmp_path / "data",
         db_url=url,
         secrets_dir=tmp_path / "secrets",
         auth_disabled=True,
         dashboard_dir=None,
         tick_s=0.05,
+        leader_lease_s=30.0,
     )
-    return settings.model_copy(update={"leader_lease_s": SHORT_LEASE_S})
 
 
 async def test_only_the_replica_that_leads_runs_the_orchestrator(any_store, tmp_path, monkeypatch):
