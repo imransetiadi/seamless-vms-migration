@@ -11,7 +11,9 @@ deadline passes; so do a renewal that renewed nothing, a write the fence refused
 an action on a cloud that read another epoch, and a takeover whose start failed. A deposition sets
 the store's epoch to None - the replica writes nothing more -, kills its playbooks' process groups
 from the deposing thread and schedules the stop of its orchestrator on the event loop; the replica
-campaigns again once that stop ended.
+campaigns again once that stop ended, and takes its own lapsed lease only once it has been expired
+for the pause (``lease.PAUSE_PERIODS`` retry periods), so a follower takes it first (the owner's
+decision of 2026-10-29).
 
 :class:`Leadership` is the event loop's side: a takeover runs the start hooks - the demo seed with
 its restore of the fake clouds -, the orchestrator's ``start()`` and the notifier; a deposition

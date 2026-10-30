@@ -7,8 +7,10 @@ a server's writes (``Store(fenced=True)``, §25.4). A server's elector (``seamle
 §8; plan task HA3) campaigns and renews on a schedule, on an engine of its own (``lease_engine``),
 and writes ``leader.acquired`` and ``leader.released`` in the transactions that take and release
 the lease; the leader writes its orchestrator's health into the row with each renewal and, while its
-tick loop is unhealthy, alone, and a takeover clears it (§12, §25.6; plan task HA4). No statement
-sends RETURNING, which RHEL 9's SQLite (3.34.1) does not have.
+tick loop is unhealthy, alone, and a takeover clears it (§12, §25.6; plan task HA4). A replica takes
+a lapsed lease that names itself - the term a deposition let lapse - only once it has been expired
+for the pause, three retry periods, so the other replicas take it first (§8, §11; the owner's
+decision of 2026-10-29). No statement sends RETURNING, which RHEL 9's SQLite (3.34.1) does not have.
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ log = logging.getLogger(__name__)
 #: how often a replica that does not lead tries the lease, and how long one try waits for a lock
 #: held on its row (SDD §11, §25.3)
 RETRY_S = 2.0
+#: how many retry periods a lapsed lease that names the replica itself must have been expired before
+#: it takes the lease again (SDD §8, §11): a follower, trying every retry period, takes it first
+PAUSE_PERIODS = 3
 
 #: SQLite's clock to the millisecond, in the one format every time of the lease is written in, so
 #: that two of them compare as text as they compare as times
@@ -75,7 +80,8 @@ def _postgresql_later(element: Any, compiler: Any, **kw: Any) -> str:
 @compiles(db_later, "sqlite")
 def _sqlite_later(element: Any, compiler: Any, **kw: Any) -> str:
     seconds = compiler.process(element.clauses, **kw)
-    return _SQLITE_CLOCK.format(f", printf('+%.3f seconds', {seconds})")
+    # the sign always written: SQLite reads '+-0.300 seconds' as no time at all
+    return _SQLITE_CLOCK.format(f", printf('%+.3f seconds', {seconds})")
 
 
 def _aware(value: datetime) -> datetime:
@@ -209,10 +215,22 @@ class Lease:
         self.address = address
         self.lease_s = float(lease_s)
         self.retry_s = RETRY_S if retry_s is None else float(retry_s)
+        #: how long its own lapsed lease must have been expired before it takes it again (SDD §11)
+        self.pause_s = PAUSE_PERIODS * self.retry_s
         self.name = name
 
-    def _expired(self) -> Any:
-        return _expired()
+    def _takeable(self) -> Any:
+        """Whether a campaign takes the lease (SDD §11): once it expired - and once it has been
+        expired for the pause where it names this replica, which only a deposition leaves it to
+        campaign for (§8): a replica that stops campaigns no more, and a process starts as a new
+        holder."""
+        return sa.and_(
+            _expired(),
+            sa.or_(
+                leases.c.holder != self.holder,
+                leases.c.expires_at <= db_later(sa.literal(-self.pause_s, sa.Float())),
+            ),
+        )
 
     def _later(self) -> Any:
         return db_later(sa.literal(self.lease_s, sa.Float()))
@@ -225,20 +243,21 @@ class Lease:
         """One try for the lease: the epoch this replica took, else None (SDD §11). With no row it
         inserts one with epoch 1; an expired lease it locks FOR UPDATE - which waits for every write
         of the old epoch in flight - and takes in that transaction with the next epoch, where it is
-        still expired; a valid one it never locks. ``record`` runs in the transaction that took the
+        still expired; a valid one it never locks. Its own lapsed lease counts as expired only once
+        it has been expired for the pause (§8). ``record`` runs in the transaction that took the
         lease - a server's leader.acquired (§8): when it fails, nothing is taken. A try whose wait
         outlasts the retry period takes nothing."""
         try:
             with self.engine.connect() as conn:
                 with self._bounded(conn, write=False):
                     row = conn.execute(
-                        sa.select(leases.c.epoch, self._expired().label("expired")).where(
+                        sa.select(leases.c.epoch, self._takeable().label("takeable")).where(
                             leases.c.name == self.name
                         )
                     ).first()
                 if row is None:
                     return self._take_first(conn, record)
-                if not row.expired:
+                if not row.takeable:
                     return None
                 return self._take_over(conn, record)
         except sa.exc.OperationalError as exc:
@@ -276,7 +295,7 @@ class Lease:
         with self._bounded(conn):
             locked = conn.execute(
                 sa.select(leases.c.epoch, leases.c.holder)
-                .where(leases.c.name == self.name, self._expired())
+                .where(leases.c.name == self.name, self._takeable())
                 .with_for_update()
             ).first()
             if locked is None:
@@ -402,6 +421,7 @@ class Lease:
 
 
 __all__ = [
+    "PAUSE_PERIODS",
     "RETRY_S",
     "Lease",
     "LeaseRow",
