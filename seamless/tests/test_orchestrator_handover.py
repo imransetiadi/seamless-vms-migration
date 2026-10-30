@@ -73,7 +73,7 @@ def assert_rolled_back(clouds):
 
 
 async def test_a_handover_step_cut_off_by_the_step_timeout_ends_only_after_its_call_returned(
-    tmp_path, store
+    tmp_path, store, monkeypatch
 ):
     """SDD §7.3, §15.1: the step timeout fires while Cinder's answer to the boot volume's manage at
     RHOSO is slow. The step ends - and the automatic rollback starts - only once that call
@@ -82,6 +82,18 @@ async def test_a_handover_step_cut_off_by_the_step_timeout_ends_only_after_its_c
     h, calls, clouds, mig = handover_harness(
         tmp_path, store, step_timeout_s=1.0, max_step_retries=0
     )
+    # the 1 s ceiling is for the cutover this test cuts off. The step timeout bounds every step
+    # attempt (SDD §15.1), so the rollback the test expects to succeed would run under it too - and
+    # on a loaded runner it took longer ("rollback exceeded the step timeout of 1 s", a CI flake):
+    # the rollback runs unbounded (0 = no bound), from its start on, after the cutover failed
+    unbounded = h.orch.settings.model_copy(update={"step_timeout_s": 0.0})
+    do_rollback = h.orch._do_rollback
+
+    async def rollback_unbounded(m):
+        monkeypatch.setattr(h.orch, "settings", unbounded)
+        await do_rollback(m)
+
+    monkeypatch.setattr(h.orch, "_do_rollback", rollback_unbounded)
     held, release = held_manage(clouds["dst"], "volume-vol-root")
     await h.orch.start()
     try:
