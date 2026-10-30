@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import re
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -169,8 +170,12 @@ def test_provider_errors_are_redacted_in_the_api(api, monkeypatch):
     assert "hunter2" not in res.text and "auth failed" in res.text
 
 
-def test_large_responses_are_gzip_compressed_when_the_client_accepts_gzip(api):
+def test_large_responses_are_gzip_compressed_when_the_client_accepts_gzip(api, monkeypatch):
     """SDD §12: responses of 1 KiB and more are gzip-compressed when Accept-Encoding allows it."""
+    # the stats' throughput buckets start at the orchestrator's minute: one clock for both requests,
+    # or two requests either side of a minute boundary answer different series (a CI flake)
+    pinned = datetime(2026, 10, 30, 12, 0, 59, 900000, tzinfo=UTC)
+    monkeypatch.setattr(api.client.app.state.services.orchestrator, "_now", lambda: pinned)
     path = "/api/v1/stats"  # 60 throughput buckets: well over 1 KiB
     accepted = api.client.get(path, headers={**api.h(Role.viewer), "Accept-Encoding": "gzip"})
     assert accepted.status_code == 200
