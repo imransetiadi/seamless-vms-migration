@@ -236,8 +236,12 @@ class FakeImpl:
     async def check_project(self, project_id):
         """A sign-in with the provider's credential for the project (SDD §10 check_project): what
         its token says - the project ``registry.scoped`` scopes it to, else its own -, a
-        credential that never expires. Keystone refuses one the registry revoked."""
+        credential that never expires. Keystone refuses one the registry revoked, and a project of
+        ``registry.sign_in_failures`` fails with its error."""
         self.calls.append(("check_project", project_id))
+        failure = self.registry.sign_in_failures.get(project_id)
+        if failure is not None:
+            raise failure
         return {
             "project_id": self.registry.scoped.get(project_id, project_id),
             "project_name": "tenant-a",
@@ -334,10 +338,12 @@ class FakeRegistry:
         self.private_flavors: set[str] = set()
         # each call with the credential it came with: (credential, method) (SDD §27.5, §27.10)
         self.credential_calls: list[tuple[str, str]] = []
-        # the projects whose credentials Keystone refuses at each call (revoked), and those whose
-        # token another project scopes (SDD §10 check_project, §27.7)
+        # the projects whose credentials Keystone refuses at each call (revoked), those whose
+        # token another project scopes, and those whose sign-in fails with an error of its own
+        # (SDD §10 check_project, §27.7)
         self.revoked: set[str] = set()
         self.scoped: dict[str, str] = {}
+        self.sign_in_failures: dict[str, Exception] = {}
 
     def get(self, provider, project_id=None):
         """The provider's double as its own credential reaches it, or - with ``project_id`` - its
@@ -790,6 +796,85 @@ async def test_a_step_whose_project_credential_cannot_sign_in_fails_before_any_p
     plain, _ = ctx_for(env, strategy=Strategy.cold)
     await env.executor.run(StepName.CUTOVER, plain)
     assert env.registry.used("check_project") == []
+    assert len(read_log(env.log)) > playbooks
+
+
+async def test_a_step_whose_keystone_cannot_be_reached_fails_transiently_before_any_playbook(env):
+    """SDD §7.1, §10 (the owner's decision of 2026-10-30, plan task TC7): a sign-in whose
+    Keystone cannot be reached - a connection refused, a TLS handshake that failed, a timeout, the
+    call's bound - or answers 5xx fails the step as transient, which the orchestrator retries as
+    its other transient failures (§8), before anything of it: no playbook, no call but the
+    sign-ins, no stop - a pre-staging and a finalize alike. A credential Keystone rejects, 401 or
+    403, stays permanent. Each failure names the provider, the project and the plan's side, never
+    the credential; once Keystone answers again, the step runs."""
+    from seamless_migrate.providers.base import ProviderUnreachable
+
+    t = _projects(env)
+    src, dst = of_project(t.source, t.a), of_project(t.destination, t.c)
+    unreachable = [
+        ProviderUnreachable("dst-rhoso: the sign-in failed: ConnectFailure"),
+        ProviderUnreachable("dst-rhoso: the sign-in failed: SSLError"),
+        ProviderUnreachable("dst-rhoso: the sign-in failed: ConnectTimeout"),
+        ProviderUnreachable("dst-rhoso: call timed out after 300 s"),
+        ProviderUnreachable("dst-rhoso: the sign-in failed: HTTP 503"),
+    ]
+    rejected = [
+        ProviderError("dst-rhoso: the sign-in failed: HTTP 401"),
+        ProviderError("dst-rhoso: the sign-in failed: HTTP 403"),
+    ]
+    steps = [
+        (Strategy.warm, StepName.PRECOPY),
+        (Strategy.warm, StepName.CUTOVER),
+        (Strategy.warm, StepName.ROLLBACK),
+        (Strategy.cold, StepName.CUTOVER),
+    ]
+    playbooks = len(read_log(env.log))
+    for failure in unreachable + rejected:
+        env.registry.sign_in_failures = {t.c: failure}
+        transient = isinstance(failure, ProviderUnreachable)
+        kind = TransientStepError if transient else PermanentStepError
+        for strategy, step in steps:
+            env.registry.credential_calls.clear()
+            ctx, rec = _project_ctx(env, t, strategy)
+            with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+                await env.executor.run(step, ctx)
+            what = (str(failure), strategy, step)
+            assert type(failed.value) is kind, what
+            assert env.registry.credential_calls == [
+                (src, "check_project"),
+                (dst, "check_project"),
+            ], what
+            assert len(read_log(env.log)) == playbooks and rec.downtime_marks == 0, what
+            text = str(failed.value)
+            assert t.destination.label in text and t.c in text, what
+            assert "destination project" in text and str(failure) in text, what
+            assert t.ids["src"] not in text and t.ids["dst"] not in text, what
+
+    # the source's Keystone alike: transient after the source's sign-in alone
+    env.registry.sign_in_failures = {t.a: unreachable[0]}
+    env.registry.credential_calls.clear()
+    ctx, _ = _project_ctx(env, t, Strategy.cold)
+    with pytest.raises(TransientStepError, match=t.a):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert env.registry.credential_calls == [(src, "check_project")]
+
+    # a pre-staging that runs a playbook, and a finalize that deletes the source
+    env.registry.sign_in_failures = {t.c: unreachable[-1]}
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["networks"], **t.plan_kw)
+    with pytest.raises(TransientStepError, match=t.c):
+        await env.executor.prestage(plan, t.source, t.destination, deploy_conversion_hosts=False)
+    env.registry.sign_in_failures = {t.a: unreachable[1]}
+    env.registry.credential_calls.clear()
+    finalize, _ = _project_ctx(env, t, Strategy.cold, delete_source=True)
+    with pytest.raises(TransientStepError, match=t.a):
+        await env.executor.run(StepName.FINALIZE, finalize)
+    assert env.registry.used("delete_server") == []
+    assert len(read_log(env.log)) == playbooks
+
+    # Keystone answers again: the next attempt signs in anew and runs
+    env.registry.sign_in_failures = {}
+    ctx, _ = _project_ctx(env, t)
+    await env.executor.run(StepName.PRECOPY, ctx)
     assert len(read_log(env.log)) > playbooks
 
 

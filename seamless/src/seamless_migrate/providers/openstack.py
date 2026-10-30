@@ -42,6 +42,7 @@ from ..storage import ceph_location, storage_family
 from .base import (
     ProviderConflict,
     ProviderError,
+    ProviderUnreachable,
     VMNotFound,
     microversion_text,
     missing_dependency,
@@ -564,14 +565,36 @@ def _read_failure(exc: Exception) -> tuple[Literal["forbidden", "error"], str]:
     status (openstacksdk's status_code, keystoneauth's http_status), or the failure's kind when
     nothing answered; never a message's text, which may name a stack, a load balancer or a
     credential."""
+    status = _answer_status(exc)
+    if status is not None:
+        return ("forbidden" if status == 403 else "error"), f"HTTP {status}"
+    return "error", type(exc).__name__
+
+
+def _answer_status(exc: BaseException) -> int | None:
+    """The HTTP status of the answer ``exc`` carries - ours, openstacksdk's status_code,
+    keystoneauth's http_status -; None when nothing answered."""
     status = (
         exc.status
         if isinstance(exc, _ServiceAnswer)
         else getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
     )
-    if isinstance(status, int) and not isinstance(status, bool):
-        return ("forbidden" if status == 403 else "error"), f"HTTP {status}"
-    return "error", type(exc).__name__
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _unreachable(exc: BaseException) -> bool:
+    """Whether a sign-in, or a read of Keystone, failed as Keystone could not be reached (SDD
+    §7.1, §10; the owner's decision of 2026-10-30): a 5xx answer, or none - keystoneauth's
+    connection failures: a connection refused or reset, a name that does not resolve, a TLS
+    handshake that failed, a timeout. A 401, a 403 or any other 4xx is a rejection."""
+    status = _answer_status(exc)
+    if status is not None:
+        return status >= 500
+    try:
+        from keystoneauth1.exceptions import ConnectionError as NoConnection
+    except ImportError:  # without keystoneauth no such error can arise
+        return False
+    return isinstance(exc, NoConnection)
 
 
 def _link_id(resource: Mapping[str, Any], rel: str) -> str | None:
@@ -702,13 +725,17 @@ class OpenStackProvider:
                 )
             return self._conn
 
-    async def _run(self, fn: Callable[..., T], *args: Any) -> T:
+    async def _run(
+        self, fn: Callable[..., T], *args: Any, bound: type[ProviderError] = ProviderError
+    ) -> T:
+        """``fn(*args)`` in a worker thread, within the call's bound: a call past it raises
+        ``bound`` - a project sign-in's is ProviderUnreachable (SDD §7.1, §10)."""
         try:
             return await asyncio.wait_for(asyncio.to_thread(fn, *args), PROVIDER_CALL_TIMEOUT_S)
         except ProviderError:
             raise
         except TimeoutError:
-            raise ProviderError(
+            raise bound(
                 f"{self.provider.id}: call timed out after {PROVIDER_CALL_TIMEOUT_S:g} s"
             ) from None
         except Exception as exc:
@@ -727,9 +754,10 @@ class OpenStackProvider:
     async def check(self) -> dict[str, Any]:
         return await self._run(self._check)
 
-    # the provider check's sign-in with a project credential (SDD §10, §27.7, plan task TC3)
+    # the provider check's sign-in with a project credential (SDD §10, §27.7, plan task TC3) - and
+    # the executors' before a step (§7.1): one Keystone does not answer in time is unreachable
     async def check_project(self, project_id: str) -> dict[str, Any]:
-        return await self._run(self._check_project, project_id)
+        return await self._run(self._check_project, project_id, bound=ProviderUnreachable)
 
     async def list_vms(self) -> list[VMRef]:
         return await self._run(self._list_vms)
@@ -982,7 +1010,9 @@ class OpenStackProvider:
             try:
                 access = conn.session.auth.get_access(conn.session)
             except Exception as exc:
-                raise ProviderError(
+                # a Keystone that cannot be reached, or answers 5xx, apart from a rejection (§7.1)
+                failure = ProviderUnreachable if _unreachable(exc) else ProviderError
+                raise failure(
                     f"{self.provider.id}: the sign-in failed: {_read_failure(exc)[1]}"
                 ) from None
             project = _token_project(access) or {}
@@ -1019,9 +1049,11 @@ class OpenStackProvider:
             status = int(response.status_code)
             record = response.json().get("application_credential") if status == 200 else None
         except Exception as exc:
-            raise ProviderError(f"{record_of} was not read: {_read_failure(exc)[1]}") from None
+            failure = ProviderUnreachable if _unreachable(exc) else ProviderError
+            raise failure(f"{record_of} was not read: {_read_failure(exc)[1]}") from None
         if status != 200:
-            raise ProviderError(f"{record_of} was not read: HTTP {status}")
+            failure = ProviderUnreachable if status >= 500 else ProviderError
+            raise failure(f"{record_of} was not read: HTTP {status}")
         if not isinstance(record, Mapping):
             raise ProviderError(f"{record_of} was not read: Keystone answered none")
         expires_at = record.get("expires_at")

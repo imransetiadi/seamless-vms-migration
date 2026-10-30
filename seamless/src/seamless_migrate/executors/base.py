@@ -19,7 +19,7 @@ from ..credentials import implementation
 from ..domain.enums import Strategy
 from ..domain.models import Migration, Plan, Provider, SyncPass
 from ..planning.preflight import project_check, project_words
-from ..providers.base import ProviderError
+from ..providers.base import ProviderError, ProviderUnreachable
 
 T = TypeVar("T")
 
@@ -125,15 +125,22 @@ class PermanentStepError(Exception):
 async def sign_in(registry: Any, provider: Provider, project_id: str, side: str) -> None:
     """The executors' sign-in with a plan's project credential before a step's first playbook or
     call (SDD §7.1, §27.5, §27.7, plan task TC7): ``check_project`` (§10) of what acts with that
-    credential, one sign-in on a connection of its own. A failure - Keystone refuses it or does
-    not answer within the call's bound, the secret cannot be read, the provider holds no
-    credential for the project, its token is another project's - is a PermanentStepError before
-    anything of the step changes, never replaced by the provider's own credential; it names the
-    provider, the project and the plan's ``side``, never the credential."""
+    credential, one sign-in on a connection of its own. A failure fails the step before anything
+    of it changes, never replaced by the provider's own credential, and names the provider, the
+    project and the plan's ``side``, never the credential: a TransientStepError, retried as the
+    step's other transient failures are, for a Keystone that cannot be reached or answers 5xx
+    (ProviderUnreachable; the owner's decision of 2026-10-30); a PermanentStepError for a
+    credential that is rejected - a 401, a 403, a secret that cannot be read, no credential for
+    the project, a token of another project."""
     words = project_words(project_id, project_check(provider.capabilities, project_id))
     whose = f"the credential of project {words} at {provider.label}, the plan's {side} project,"
     try:
         read = await implementation(registry, provider, project_id).check_project(project_id)
+    except ProviderUnreachable as exc:
+        raise TransientStepError(
+            f"{whose} cannot sign in now: {redact_cut(str(exc), 300)}; Keystone could not be "
+            "reached - the step is tried again (SDD §7.1)"
+        ) from None
     except ProviderError as exc:
         raise PermanentStepError(
             f"{whose} cannot sign in: {redact_cut(str(exc), 300)}; an admin writes a new one - "

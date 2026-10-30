@@ -5063,6 +5063,60 @@ async def test_a_cutover_its_credentials_hold_starts_no_gpu_capacity_read(tmp_pa
     assert dst.reads and h.history(m).count(P.cutover) == 1
 
 
+async def test_a_sign_in_whose_keystone_cannot_be_reached_is_retried_and_a_rejected_one_is_not(
+    tmp_path, store
+):
+    """SDD §7.1, §8 (the owner's decision of 2026-10-30, plan task TC7): a step whose sign-in finds
+    Keystone unreachable fails as transient, and the orchestrator tries it again as it tries its
+    other transient failures - the next attempt signs in anew, and the migration completes; a
+    sign-in Keystone rejects fails the migration at once, its source never stopped."""
+    from seamless_migrate.executors.base import sign_in
+    from seamless_migrate.providers.base import ProviderUnreachable
+
+    def cold_plan(path, i):
+        cold = {"default_strategy": Strategy.cold}
+        h, plan, registry, t = _tenant_plan(path, store, [vm(i)], cold)
+        failures: list[Exception] = []
+        signs_in = h.destination.check_project
+
+        async def keystone(project_id):
+            if failures:
+                raise failures.pop(0)
+            return await signs_in(project_id)
+
+        async def cutover(ctx):
+            # an executor's cutover: its sign-in first (SDD §7.1)
+            project = ctx.plan.destination_project
+            await sign_in(h.orch.providers, ctx.destination, project, "destination")
+            return await h.executor.sim.run(StepName.CUTOVER, ctx)
+
+        h.destination.check_project = keystone
+        h.executor.hooks[StepName.CUTOVER] = cutover
+        return h, plan, failures
+
+    h, plan, failures = cold_plan(tmp_path, 1)
+    await h.orch.validate_plan(plan.id, "alice")
+    failures.append(ProviderUnreachable("dst-rhoso: the sign-in failed: HTTP 503"))
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert [step for i, step in h.executor.calls if i == mid].count(StepName.CUTOVER) == 2
+    assert failures == [] and m.error is None
+
+    h, plan, failures = cold_plan(tmp_path / "rejected", 2)
+    await h.orch.validate_plan(plan.id, "alice")
+    failures.append(ProviderError("dst-rhoso: the sign-in failed: HTTP 401"))
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-2")).id
+    m = await h.wait_phase(mid, P.failed)
+    await h.orch.stop()
+    assert [step for i, step in h.executor.calls if i == mid].count(StepName.CUTOVER) == 1
+    assert "HTTP 401" in (m.error or "") and m.downtime_started_at is None
+
+
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
     """A provider deleted while its check ran is not re-inserted by the check's write."""
     h, plan = await setup(tmp_path, store, [vm(1)])

@@ -1259,6 +1259,78 @@ async def test_a_handover_whose_destination_credential_cannot_sign_in_stops_noth
     assert {credential for credential, op in used} == {cred.src}
 
 
+class FailsSignIn:
+    """A provider whose sign-in with a project credential fails with ``failure`` (SDD §10
+    check_project): an unreachable Keystone's ProviderUnreachable, or a rejection's
+    ProviderError."""
+
+    def __init__(self, failure):
+        self.failure = failure
+
+    async def check_project(self, project_id):
+        raise self.failure
+
+
+async def test_a_handover_whose_keystone_cannot_be_reached_fails_transiently_and_stops_nothing(
+    tmp_path,
+):
+    """SDD §7.1, §7.3 step 0, §10 (the owner's decision of 2026-10-30, plan task TC7): a handover
+    whose destination Keystone cannot be reached - a connection refused, a TLS handshake that
+    failed, a timeout - or answers 5xx fails its cutover as transient, which the orchestrator
+    retries as its other transient failures, before any call: no call of either cloud, the source
+    never stopped, no clock opened - a resumed cutover too, and its rollback before its first call
+    at the destination. A 403 stays permanent. Once Keystone answers again, the rollback runs."""
+    from seamless_migrate.providers.base import ProviderUnreachable
+
+    executor, calls, clouds, plan, mig, settings, src, dst, used, cred = _project_handover(
+        tmp_path, dst_crash_on="create_server"
+    )
+    registry = executor.providers
+    project = plan.destination_project
+    unreachable = [
+        ProviderUnreachable("dst-rhoso: the sign-in failed: ConnectFailure"),
+        ProviderUnreachable("dst-rhoso: the sign-in failed: SSLError"),
+        ProviderUnreachable("dst-rhoso: call timed out after 300 s"),
+        ProviderUnreachable("dst-rhoso: the sign-in failed: HTTP 503"),
+    ]
+    for failure in unreachable:
+        registry.by_credential[cred.dst] = FailsSignIn(failure)
+        ctx, rec = make_ctx(plan, mig, src, dst, settings)
+        with pytest.raises(TransientStepError, match=project) as failed:
+            await executor.run(StepName.CUTOVER, ctx)
+        assert str(failure) in str(failed.value)
+        assert (used, calls, rec.downtime_marks) == ([], [], 0), str(failure)
+    registry.by_credential[cred.dst] = FailsSignIn(
+        ProviderError("dst-rhoso: the sign-in failed: HTTP 403")
+    )
+    with pytest.raises(PermanentStepError, match=project):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    assert (used, calls) == ([], [])
+
+    # signed in, the cutover stops the source and fails at the destination's create; its resume,
+    # Keystone unreachable, fails as transient before any call
+    del registry.by_credential[cred.dst]
+    with pytest.raises(PermanentStepError, match="create the server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, src, dst, settings)[0])
+    assert ("src", "stop_server", "srv-1") in calls
+    registry.by_credential[cred.dst] = FailsSignIn(unreachable[-1])
+    used.clear()
+    calls.clear()
+    resumed, rec = make_ctx(plan, mig, src, dst, settings)
+    with pytest.raises(TransientStepError, match=project):
+        await executor.run(StepName.CUTOVER, resumed)
+    assert (used, calls, rec.downtime_marks) == ([], [], 0)
+
+    # its rollback, the destination's managed volumes to undo: transient before its first call
+    with pytest.raises(TransientStepError, match=project):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert (used, calls) == ([], [])
+    # Keystone answers again: the rollback's next attempt signs in and runs
+    del registry.by_credential[cred.dst]
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert result.details["source_running"] is True
+
+
 async def test_handover_rollback_reverses_order(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)

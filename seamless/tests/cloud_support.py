@@ -75,8 +75,11 @@ class InProcessCloud:
     (``{secret, user_id, project, roles, unrestricted, expires_at}``, plan task TC3): each signs in
     to its project as its user - a wrong secret or an unknown id answers 401 -, its token naming it
     restricted unless ``unrestricted``, and its record answers its user's GET of it
-    (``users/{user_id}/application_credentials/{id}``), or ``record`` (a status) instead; ``hold``
-    (a ``threading.Event``) keeps its sign-in unanswered until it is set. ``sign_ins`` records who
+    (``users/{user_id}/application_credentials/{id}``), or ``record`` (a status, or an exception the
+    transport raises) instead; ``hold``
+    (a ``threading.Event``) keeps its sign-in unanswered until it is set, and ``sign_in`` answers
+    it instead - a status, or an exception the transport raises (requests' connection refused, TLS
+    handshake or timeout, which keystoneauth turns into its own). ``sign_ins`` records who
     each sign-in came with - the clouds.yaml user's name or an application credential's id -,
     ``tokens`` the project and the roles of each token it answered (``{project, roles}``), and
     ``records_read`` each record read. ``connect`` is what OpenStackProvider takes as
@@ -328,6 +331,11 @@ class InProcessCloud:
         known = self.app_credentials.get(given["id"])
         if known is not None and known.get("hold") is not None:
             known["hold"].wait(30)
+        answer = known.get("sign_in") if known is not None else None
+        if isinstance(answer, BaseException):
+            return answer  # the transport raises it: nothing answered
+        if answer is not None:
+            return answer, {"error": {"code": answer, "title": "Keystone's answer"}}, {}
         if known is None or known["secret"] != given["secret"]:
             refusal = {"code": 401, "title": "Unauthorized", "message": "authentication required"}
             return 401, {"error": refusal}, {}
@@ -361,6 +369,8 @@ class InProcessCloud:
         known = self.app_credentials.get(credential_id)
         if known is None or known["user_id"] != user_id:
             return 404, {"error": {"code": 404, "title": "Not Found"}}, {}
+        if isinstance(known.get("record"), BaseException):
+            return known["record"]  # the transport raises it: nothing answered
         if known.get("record") is not None:
             return known["record"], {"error": {"code": known["record"]}}, {}
         record = {
