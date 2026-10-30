@@ -560,8 +560,12 @@ async def test_a_relayed_request_is_never_relayed_again(cluster, any_store):
     follower - a lease taken since it read the row, here a lease whose address is a follower's - the
     request goes no further, where it would otherwise travel from one follower to the next. The
     leader serves a marked request as any other: the marker grants nothing."""
-    a = await cluster("seamless-a")
-    b = await cluster("seamless-b")
+    # A leads and B follows throughout the first part - no takeover here: a lease of 30 s (its
+    # renew deadline 20 s), as in production, so a renewal a loaded runner delays past the 2 s
+    # lease's deadline of 1.33 s does not depose A before it serves (a CI flake, SDD §8)
+    a = await cluster("seamless-a", lease_s=30.0)
+    b = await cluster("seamless-b", lease_s=30.0)
+    assert a.svc.leadership.leads() and not b.svc.leadership.leads()
     marked = {**cluster.auth(Role.admin), MARKER: "1"}
     async with httpx.AsyncClient(timeout=10) as caller:
         answer = await caller.post(f"{b.url}/api/v1/providers", json=SOURCE, headers=marked)
