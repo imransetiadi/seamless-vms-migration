@@ -25,14 +25,15 @@ describe("the offline mock's finding catalog is the API's (SDD §9.3, §16)", ()
     expect([...new Set(off.map((f) => `${f.code}: ${f.remediation}`))]).toEqual([]);
   });
 
-  // a conversion host without a declared key or a pin, and a data path that checks none (SDD §9.3, §26.5; plan task ST7)
+  // a conversion host without a declared key or a pin, and a data path that checks none (SDD §9.3, §26.5; plan task ST7);
+  // what helps on each side: declared keys are the provider's own host's alone (§26.10 decisions 11 and 12)
   it('has the two host key findings', () => {
     const strategies = ['cold', 'warm', 'vmware_cold', 'vmware_warm'];
     expect(FINDING_CATALOG.CONV_HOST_KEY_UNKNOWN).toEqual({
       severity: 'blocker',
       strategies,
       remediation:
-        "Declare the conversion host's public keys on its provider (conversion_host.ssh_host_keys), read out of band; or, for a host Seamless manages, delete it and pre-stage again, which creates it with an injected key.",
+        "For the provider's own conversion host: declare its public keys on the provider (conversion_host.ssh_host_keys), read out of band, or, while it has no pin, let the provider check pin them from its console; one Seamless manages can also be deleted and pre-staged again, which creates it with an injected key. For a project's host, which the provider's declared keys do not reach: let the plan's pre-staging create it in that project and pin it with an injected key - delete a replaced one first -, or, while it has no pin, let a run pin it from its console with that project's credential.",
     });
     expect(FINDING_CATALOG.CONV_HOST_KEYS_UNCHECKED).toEqual({
       severity: 'warning',

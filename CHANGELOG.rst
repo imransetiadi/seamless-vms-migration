@@ -729,3 +729,16 @@ This project follows a simple changelog to satisfy collection metadata validatio
   in full, and the summary adds ``extent_chunks`` and ``missed_chunks``, the
   changed chunks the extents did not list. The receiver accepts versions 1
   and 2. A malformed, negative, empty or out-of-range extent exits 2.
+- A conversion host's floating IP without an address (Seamless Migrate SDD
+  6.5, 7.2): the ``conversion_host`` role's ``create_fip.yml`` passes
+  ``os_migrate_conversion_floating_ip_reuse`` (default ``true``) as the
+  ``floating_ip`` module's ``reuse``, and ``deploy_conversion_hosts.yml``
+  takes each side's ``os_migrate_src_conversion_floating_ip_reuse`` and
+  ``os_migrate_dst_conversion_floating_ip_reuse`` (default ``true``).
+  ``true`` keeps upstream's behaviour: a host without a floating IP takes one
+  its project holds detached when there is one. ``false`` creates a new
+  floating IP, never one the project holds detached, such as a tenant's own
+  or an address reserved for a later migration; Seamless Migrate sets it for
+  a conversion host it deploys in a plan's project. A host that holds a
+  floating IP keeps it, and ``os_migrate_conversion_floating_ip_address`` is
+  attached as before.
