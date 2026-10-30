@@ -15,6 +15,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [ARGUMENTS] [OPTIONS]
 | `openshift` | the manifests in `deploy/openshift/` (OpenShift 4.16+) | `oc` |
 
 The binding description is [SDD §17.2](SDD.md); `scripts/seamless-ctl.sh --help` prints the same options.
+On a cluster, sections 4.7–4.11 run two replicas of the control plane: the HA control plane of 0.5.0, a Technology
+Preview (SDD §25).
 Section 7 also sets up what 0.5.0 adds: the conversion hosts' host keys (7.2), changed-extent tracking (7.3) and
 notifications (7.4). Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
 Designate zones and Manila shares (SDD §23.2).
@@ -26,15 +28,21 @@ Designate zones and Manila shares (SDD §23.2).
 A deployment has two parts:
 
 * **The control plane** (`seamless`): the API, the dashboard and the **orchestrator** that drives every
-  migration. Its orchestrator is a *singleton*: exactly one may run against a database (SDD §17, open
-  decision D2). Two replicas would run two orchestrators that both start, cut over and roll back the same
-  migrations. That is why the Kubernetes and OpenShift Deployment has `replicas: 1` and `strategy: Recreate`.
-* **PostgreSQL**, the system of record: plans, migrations, events and the dashboard users.
+  migration. One orchestrator runs against a database at a time: a lease in PostgreSQL elects the server that runs
+  it, the *leader*, and the database checks the lease's epoch in every write a server makes, so a server that lost
+  the lease writes nothing (SDD §8, §11, §25). The single host runs one control plane. On a cluster the Deployment
+  runs one replica, or two on two nodes with the HA component (section 4.7): the leader runs the orchestrator, and
+  the other replica relays the API and the event stream to it and takes over when it is lost.
+  `strategy: Recreate` keeps one version running at a time.
+* **PostgreSQL**, the system of record: plans, migrations, events, the dashboard users and the orchestrator's
+  lease.
 
 So **scaling** has two meanings here:
 
-* **Scale down / up between 0 and 1.** `scale 0` stops the control plane (PostgreSQL keeps running), `scale 1`
-  starts it again. The script refuses any other count.
+* **Scale between 0 and 1 - or 2 on a cluster.** `scale 0` stops the control plane (PostgreSQL keeps running),
+  `scale 1` starts one replica, and on a cluster `scale 2` starts two, only while `seamless-data` is ReadWriteMany
+  (section 4.8). The script refuses any other count. A second replica adds availability, not capacity: the
+  leader's orchestrator still drives every migration.
 * **Capacity: scale the one control plane up or down.** `capacity` changes how much work it takes on at once -
   `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` (default 10) and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (default 3) - and, on a
   cluster, its CPU and memory limits. Each concurrent migration needs about 250 MiB (an `ansible-playbook`
@@ -43,7 +51,10 @@ So **scaling** has two meanings here:
 
 **Stopping is always safe.** When the control plane stops, its running steps end within the stop grace
 (30 s on Compose, 60 s on Kubernetes and OpenShift), and every migration resumes from its last checkpoint when
-it runs again (SDD §8). A planned stop can be made quieter with `--drain` (section 5).
+it runs again (SDD §8). A planned stop can be made quieter with `--drain` (section 5). A stop releases the
+orchestrator's lease, so the next start - or the other replica - takes it at once; a control plane that crashed
+(killed, out of memory, its host or node lost) holds it until it lapses, at most 30 s after its last renewal, and
+the API answers 503 `no_leader` meanwhile (section 4.10).
 
 **Nothing deletes data.** `down` keeps the database and the data volumes (Compose) or the PVCs, Secrets and the
 ConfigMap (clusters). Deleting them stays a deliberate, separate act: `make seamless-reset CONFIRM=yes` on
@@ -55,15 +66,15 @@ Compose, deleting the namespace or its PVCs on a cluster.
 
 | Action | What it does | docker / podman | kubernetes / openshift |
 |---|---|---|---|
-| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited - PostgreSQL's extra pods, if it was scaled out, gone first |
+| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL at one replica and the control plane at the overlay's count - one, or two with the HA component (section 4.7) -, both rollouts awaited - PostgreSQL's extra pods, if it was scaled out, gone first; with the component, a `seamless-data` that is not ReadWriteMany refused before the apply |
 | `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its running pod gone; an evicted pod is not waited for), then PostgreSQL to 0 |
 | `stop` | stop the control plane alone | `make seamless-stop` | control plane to 0 replicas |
-| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone (by its pods, also when the count already reads 1), its PVC kept -, then the control plane |
-| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts); a stopped control plane is started instead |
-| `scale 0` / `scale 1` | the control plane's replicas | `stop` / `start` | `stop` / `start` |
+| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone (by its pods, also when the count already reads 1), its PVC kept -, then the control plane at the overlay's count |
+| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pods end before the new ones start); a stopped control plane is started with one replica instead |
+| `scale 0` / `scale 1` / `scale 2` | the control plane's replicas | `stop` / `start`; 2 is refused: one control plane per host | `stop` / `start` with one replica / with two, only while `seamless-data` is ReadWriteMany (section 4.8) |
 | `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a limit the API server refuses changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout; a failed patch or rollout - a LimitRange or quota refusing the new pod - is rolled back, the settings put back |
-| `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ health with `--url`) |
-| `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f` |
+| `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ with `--url` the health and the leading pod) |
+| `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f`: one pod's, not necessarily the leader's (section 4.9) |
 | `resume` | start again the plans a `--drain` paused | `POST /plans/{id}/start` | the same, through `--url` |
 
 Options: `--namespace NS` (clusters; default `seamless-migrate`), `--demo` (docker/podman `up`, `start`,
@@ -189,7 +200,7 @@ Create the Secrets first (`deploy/openshift/secret-example.yaml` lists them; on 
 secret `seamless-tls`), set your image in the kustomization (`newName`/`newTag`, or a digest), then:
 
 ```bash
-scripts/seamless-ctl.sh kubernetes up       # kubectl apply -k deploy/kubernetes, both scaled to 1, rollouts awaited
+scripts/seamless-ctl.sh kubernetes up       # apply -k deploy/kubernetes, the overlay's replicas, rollouts awaited
 scripts/seamless-ctl.sh openshift up        # oc apply -k deploy/openshift
 ```
 
@@ -200,17 +211,22 @@ namespace differs from the one given.
 ### 4.2 Day to day
 
 ```bash
-scripts/seamless-ctl.sh openshift status --url https://seamless.apps.example.com    # pods, rollouts, health
-scripts/seamless-ctl.sh openshift logs
+scripts/seamless-ctl.sh openshift status --url https://seamless.apps.example.com    # pods, health, the leading pod
+scripts/seamless-ctl.sh openshift logs      # one pod's log: with two replicas, see section 4.9 for the leader's
 ```
 
 ### 4.3 Stop, start and scale
 
 ```bash
-scripts/seamless-ctl.sh kubernetes stop      # = scale 0: the control plane's pod ends; PostgreSQL keeps running
-scripts/seamless-ctl.sh kubernetes start     # = scale 1: PostgreSQL first when a down left it at 0
-scripts/seamless-ctl.sh kubernetes scale 2   # refused: one orchestrator only (SDD §17, D2)
+scripts/seamless-ctl.sh kubernetes stop      # = scale 0: the control plane's pods end; PostgreSQL keeps running
+scripts/seamless-ctl.sh kubernetes start     # the overlay's count, 1 or 2; PostgreSQL first when a down left it at 0
+scripts/seamless-ctl.sh kubernetes scale 1   # one replica, until the next up or start restores the overlay's count
+scripts/seamless-ctl.sh kubernetes scale 2   # two replicas on two nodes: a ReadWriteMany seamless-data (section 4.8)
 ```
+
+`scale 2` without the HA component runs two replicas without what the component adds - the relay's NetworkPolicy,
+without which a follower reaches no leader, the anti-affinity, the disruption budget and `FORWARDED_ALLOW_IPS`
+(section 4.7) -: enable the component instead.
 
 ### 4.4 After a change
 
@@ -247,6 +263,7 @@ one rollout. These are live changes: the next `up` (`apply -k`) brings the manif
 lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `resources:` of
 `deploy/openshift/deployment.yaml` (or a kustomize patch of your own). The requests and limits there are sized for
 10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
+With the HA component the limits are each replica's: either may lead.
 The rollout restarts the control plane: add `--drain` and `--url` (section 5) to let the cutovers in flight end
 first. A namespace's LimitRange or quota judges the new pod, not the Deployment the dry run checks: when the new pod
 does not start within `--timeout`, the script puts the settings back and rolls the template back, so the control
@@ -255,6 +272,249 @@ pod is refused too - a LimitRange or a quota tightened since the last rollout -,
 back but its pod is not available: roll back no further, and fix the limit or the quota. When the settings could not
 be put back, it names them: set them in `seamless-config`, then `restart`, since the pod the rollback started read
 the new ones.
+
+### 4.7 Two replicas on two nodes: the HA component (0.5.0, a Technology Preview)
+
+The HA component runs the control plane as two replicas on two nodes (SDD §17, §25.7). A lease in PostgreSQL makes one
+of them the *leader*, which alone runs the orchestrator; the other, a *follower*, serves the dashboard, the API
+documents, `/api/v1/health`, `/api/v1/ready` and `/api/v1/metrics` itself and relays every other API request, and the
+event stream, to the leader (SDD §25.6). When the leader is lost the follower takes over and resumes the migrations
+from their checkpoints, as a restart does, within about 35 s; one replica on a lost node takes about 12 minutes
+(section 4.10). It is a Technology Preview until the lab's failover cases pass (QASuite LAB-HA01–LAB-HA05). The single
+host keeps one control plane (section 1).
+
+`deploy/openshift/ha/kustomization.yaml` sets:
+* `replicas: 2`, with a required pod anti-affinity on the host name: the replicas run on two nodes;
+* `strategy: Recreate`, kept: a rollout ends both old pods before it starts new ones, so one version runs at a time,
+  and an upgrade stays an outage of the control plane, which `--drain` keeps cutovers out of (section 5);
+* the PodDisruptionBudget `seamless`, `maxUnavailable: 1` with `unhealthyPodEvictionPolicy: AlwaysAllow`: a drain
+  evicts one replica at a time, and a replica that is not ready never blocks it;
+* `seamless-data` ReadWriteMany: the new leader reads the run directories the old one wrote;
+* the NetworkPolicy `seamless-allow-relay`: the replicas reach each other's API port, TCP 8080, and nothing else;
+* `FORWARDED_ALLOW_IPS`, the cluster's pod network, so the leader's lockout and audit count the caller of a relayed
+  request, never the follower.
+
+**What it needs.**
+* **Seamless Migrate 0.5.0 or later** on the control plane: an earlier version takes no lease, and two of its
+  replicas would both drive the same migrations. Upgrade first (section 6), then enable the component.
+* **Two nodes** the control plane may run on, each with room for the requests of `deploy/openshift/deployment.yaml`:
+  either replica may lead. During a drain the evicted replica waits for a node without the other one, which leads
+  meanwhile.
+* **A ReadWriteMany storage class** for `seamless-data` that encrypts in transit: while a playbook runs, its run's
+  secret files cross the storage network (Security.md C2-21). On OpenShift, a CephFS class of OpenShift Data
+  Foundation (`ocs-storagecluster-cephfs`, commented in the component); the class and its encryption in transit are
+  to be confirmed in the lab. Without a ReadWriteMany class the control plane stays one replica.
+* **A database that outlives a node.** Two control plane nodes help only then: the bundled PostgreSQL is one pod, and
+  while its node is down no replica leads (SDD §25.7). A database with high availability of its own - from an
+  operator or a managed service - is the installation's to bring, with the settings of section 4.11.
+* **The pod network in `FORWARDED_ALLOW_IPS`.** The component sets OpenShift's default, `10.128.0.0/14`, and
+  `deploy/kubernetes/ha` the Kubernetes overlay's, `10.244.0.0/16` (k3s: `10.42.0.0/16`). A cluster with another pod
+  network sets its own - the range the NetworkPolicies' `except` lists hold -, or the leader's lockout and audit count
+  the follower instead of the caller. Never `*`.
+* **`unhealthyPodEvictionPolicy`**, which the budget sets, is stable since Kubernetes 1.31 and beta, on by default,
+  since 1.27; on NFR-10's 1.28 it is to be confirmed in the lab.
+* **A database clock that slews**, never stepping forward by more than 10 s: the lease's times are the database's,
+  and a larger step defeats the margin that keeps a deposed leader from acting beside the new one (SDD §25.4).
+
+**Enabling it**, on a new installation or once `/data` moved (section 4.8):
+1. Uncomment the two `components:` lines of the overlay you apply - `deploy/openshift/kustomization.yaml` on
+   OpenShift; `deploy/kubernetes/kustomization.yaml` on Kubernetes, which includes the component through
+   `deploy/kubernetes/ha` (there, never in `deploy/openshift` as well):
+
+   ```yaml
+   components:
+     - ha
+   ```
+
+2. Unless the cluster's default class serves ReadWriteMany, uncomment the `storageClassName` patch of
+   `deploy/openshift/ha/kustomization.yaml` and name the class.
+3. Check `FORWARDED_ALLOW_IPS` against the pod network: in `deploy/openshift/ha/kustomization.yaml`, or in
+   `deploy/kubernetes/ha/kustomization.yaml` on Kubernetes.
+4. Apply it, then see which pod leads:
+
+   ```bash
+   scripts/seamless-ctl.sh openshift up      # refused (exit 2) while seamless-data exists and is not ReadWriteMany
+   scripts/seamless-ctl.sh openshift status --url https://seamless.apps.example.com    # ... leading pod: seamless-...
+   ```
+
+From then on `up` and `start` bring the control plane back to the component's two replicas, and `scale 1` runs one
+until the next `up` or `start`.
+
+### 4.8 Moving `/data` to a ReadWriteMany claim
+
+An installation that ran one replica has `seamless-data` ReadWriteOnce, and a claim's access modes never change.
+`up` with the component refuses it before it applies anything, and so do `start` and `scale 2`, with exit 2 and
+`two replicas share seamless-data from two nodes ... move /data to a ReadWriteMany claim first`.
+Make the claim again as ReadWriteMany and copy `/data` into it, once, with the control plane stopped: `/data` holds
+the run directories with the warm state and the handover journals the migrations resume from, and the installation's
+conversion key (SDD §7.2, §25.1), so a control plane started on an empty one would resume its migrations without
+them. No lab has run this procedure yet - the ReadWriteMany class is one of the lab's open questions (SDD §25.10) -:
+rehearse it in a namespace of its own first.
+
+**First, drain and stop the control plane.** PostgreSQL keeps running, and no pod mounts `seamless-data` any more:
+
+```bash
+scripts/seamless-ctl.sh openshift stop --drain ~/.seamless/operator.token --url https://seamless.apps.example.com
+```
+
+**Then back up** the database (`deploy/openshift/backup/`) and snapshot `seamless-data` (volume snapshots, or
+Velero/OADP; SDD §17).
+
+**Then copy `/data` to a temporary claim, make `seamless-data` again as ReadWriteMany, and copy it back.** The copies
+run `cp -a` in a pod of the control plane's own image, under its security context; the new claims ask for the size
+the old one asked for, which the overlay's `pvc.yaml` must ask for too. Each step runs only when the one before it
+succeeded, so a failed copy deletes nothing:
+
+```bash
+NS=seamless-migrate
+IMAGE=$(kubectl -n "$NS" get deployment/seamless -o 'jsonpath={.spec.template.spec.containers[0].image}')
+SIZE=$(kubectl -n "$NS" get pvc/seamless-data -o 'jsonpath={.spec.resources.requests.storage}')
+CLASS=ocs-storagecluster-cephfs      # the class the component names - empty for the cluster's default
+POD_SC='runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}'
+# Kubernetes - the overlay's user and groups:  POD_SC="$POD_SC, runAsUser: 1001, runAsGroup: 0, fsGroup: 0"
+claim() {  # NAME MODE [CLASS]: created, not applied, so the next apply -k takes it over as it is
+  kubectl -n "$NS" create -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: $1}
+spec: {accessModes: [$2], resources: {requests: {storage: $SIZE}}${3:+, storageClassName: $3}}
+EOF
+}
+copy() {   # FROM TO: cp -a in a pod of the control plane's image and security context
+  kubectl -n "$NS" create -f - <<EOF || return
+apiVersion: v1
+kind: Pod
+metadata: {name: seamless-data-copy}
+spec:
+  restartPolicy: Never
+  securityContext: {$POD_SC}
+  containers:
+    - name: copy
+      image: $IMAGE
+      command: [sh, -c, 'cp -a /from/. /to/']
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: from, mountPath: /from, readOnly: true}, {name: to, mountPath: /to}]
+  volumes:
+    - {name: from, persistentVolumeClaim: {claimName: $1, readOnly: true}}
+    - {name: to, persistentVolumeClaim: {claimName: $2}}
+EOF
+  while phase=$(kubectl -n "$NS" get pod/seamless-data-copy -o 'jsonpath={.status.phase}'); do
+    case $phase in
+      Succeeded) kubectl -n "$NS" delete pod/seamless-data-copy; return ;;
+      Failed) echo "the copy failed: kubectl -n $NS logs pod/seamless-data-copy" >&2; return 1 ;;
+    esac
+    sleep 5
+  done
+  return 1
+}
+claim seamless-data-move ReadWriteOnce && copy seamless-data seamless-data-move &&
+  kubectl -n "$NS" delete pvc/seamless-data &&     # its data is in seamless-data-move, and in the snapshot
+  claim seamless-data ReadWriteMany "$CLASS" && copy seamless-data-move seamless-data && echo "/data moved"
+```
+
+A copy that fails leaves its pod for `kubectl -n "$NS" logs pod/seamless-data-copy`: delete the pod before the next
+try. `oc` takes the same commands.
+
+**Last, enable the component and start it** (section 4.7): `up` finds `seamless-data` ReadWriteMany, applies the
+overlay and starts two replicas. Check that `status` names a leading pod, resume the plans the drain paused (section
+5), and once the migrations run, delete the temporary claim:
+`kubectl -n seamless-migrate delete pvc/seamless-data-move`.
+
+### 4.9 Which replica leads
+
+Where to see which replica leads:
+* **`status --url`** prints the health, then the leading pod - `leading pod: <pod>` - or
+  `no replica leads: migrations wait until one takes over`:
+
+  ```bash
+  scripts/seamless-ctl.sh openshift status --url https://seamless.apps.example.com
+  ```
+
+* **The health:** `GET /api/v1/health` gives `leader`: `leading` - whether the replica that answered leads -, the
+  lease's `holder` - the leading pod's name and 8 hex digits of its process -, its `epoch` and `since`, each null
+  while no replica leads. Its `orchestrator` is the leader's, whichever replica answered, while its `status` field
+  and `/api/v1/ready` judge the replica that answered: both replicas are ready while one leads (SDD §12, §25.6).
+* **`seamless status`** in a pod prints the lease first, judged on the database's clock -
+  `leader: <holder> (epoch <n>)`, `leader: none (the lease of <holder> at epoch <n> expired)` or
+  `leader: none (no server took the lease)` -, then its table of the migrations:
+
+  ```bash
+  kubectl -n seamless-migrate exec deploy/seamless -- seamless status
+  ```
+
+* **The dashboard:** the session footer names the leading replica, or says "No replica leads", and while none leads
+  the notice above every page says that migrations wait until one takes over.
+* **The metrics:** `seamless_leader` is 1 on the replica that leads and 0 on a follower, and `seamless_leader_epoch`
+  the lease's epoch as the replica read it, whose increases are the changes of leader (Performance.md §10.1). Each
+  replica answers for itself, and a scrape through the Route reaches one of them at a time.
+* **The events:** `leader.acquired` - the new holder and epoch, the previous ones, its `cause` (`first`, `released`
+  or `expired`) and how many migrations it `resumes` - and `leader.released`, on the Events page under Security.
+* **The logs:** `scripts/seamless-ctl.sh openshift logs` follows one pod of the Deployment, not necessarily the
+  leader; follow the leader by the name `status` gives: `kubectl -n seamless-migrate logs -f <leading pod>`. The
+  leader logs `<holder> took the orchestrator lease with epoch <n> (<cause>)` and a follower
+  `<holder> follows: <holder> holds the orchestrator lease at epoch <n>`; a deposed leader logs why, with the
+  playbook process groups it killed, and each write the fence refused names both epochs:
+  `the fence refused ...: this process's epoch is ..., the lease's is ...`.
+
+### 4.10 A failover
+
+* **A clean stop hands over at once.** A leader that stops - its pod evicted by a drain or deleted, a rollout,
+  `stop` - stops its orchestrator, then releases the lease (`leader.released`): a follower takes it at its next try,
+  within 2 s, and resumes the migrations from their checkpoints (`leader.acquired`, cause `released`); after a
+  rollout or a `start`, the first replica that tries takes it.
+* **A lost leader holds its lease until it lapses** - its pod killed, its node down, its network cut -, at most 30 s
+  after its last renewal (`SEAMLESS_LEADER_LEASE_S`); the follower, which tries every 2 s, takes it then
+  (`leader.acquired`, cause `expired`) and resumes every migration in `precopy`, `syncing`, `cutover`, `verifying`
+  and `rolling_back` from its checkpoint, as a restart does. A leader drives the migrations again about 35 s after
+  the loss (lease 30 s, retry 2 s, about 3 s to start), against about 12 minutes for one replica on a lost node (SDD
+  §25.1, §25.5).
+* **The old leader acts no more.** A leader that cannot renew its lease for 20 s - its renew deadline, two thirds of
+  the lease - is deposed before the lease can lapse: it kills its playbooks, cancels its steps and starts nothing on
+  a cloud, and the database refuses every write it still tries (SDD §25.4). It serves on as a follower and campaigns
+  again, but takes its own lapsed lease only once the lease has been expired for 6 s - three retry periods -, so a
+  healthy follower takes over first.
+* **A lone replica** - one replica on a cluster, Compose, Podman, a server on SQLite - deposed by a stalled tick loop
+  or a failed start waits that pause and takes its lease again within the lease, the pause and one retry period of
+  its last renewal, about 38 s, and drives its migrations again after about 41 s (lease 30 s, pause 6 s, retry 2 s,
+  about 3 s to start).
+* **The downtime it adds.** A VM whose source is stopped stays down for the recovery time plus the work its step does
+  again: a final delta pass starts over, and a destination server already created is found by its record or its name
+  (SDD §7.2, §25.5). A migration before its stop loses time only. How long a playbook takes to reach its first task
+  again is to be measured in the lab (QASuite LAB-HA01).
+* **The API meanwhile.** A follower answers 503 `no_leader` with `Retry-After: 2` while no replica leads or the
+  leader does not answer, and the dashboard says that migrations wait until a replica takes over. A relayed event
+  stream ends when the leader goes; the dashboard reconnects with `?since=` and gets what it missed from the new
+  leader, but the progress and log lines of the gap are lost, as across a restart.
+* **A database outage** longer than the renew deadline (20 s) deposes the leader, a single replica's too: its steps
+  are cancelled, and they resume once the database is back and a replica leads. A database restart or failover
+  shorter than 20 s deposes nobody; the database's own times are to be measured in the lab (QASuite LAB-HA03).
+* **After a failover**, the Events page shows `leader.acquired` with the new holder, its cause and the migrations it
+  resumed; check that a VM whose cutover was cut off stopped once at the source and has one destination server.
+
+### 4.11 The database's settings for the lease
+
+The lease runs on every PostgreSQL installation, one replica or two (SDD §25.11, decision 9), and a leader cut off
+from the database must not hold its locks for long:
+* **The server's keepalives:** `tcp_keepalives_idle` 10, `tcp_keepalives_interval` 5 and `tcp_keepalives_count` 6.
+  A client that vanished is dropped within 40 s, and with it its session locks - a cut-off leader's VM-claim lock
+  among them -, instead of after Linux's default of two hours idle and nine probes 75 s apart (SDD §17, §25.3).
+* **`idle_in_transaction_session_timeout` 10 s for the application role:** a leader cut off inside a write holds its
+  key-share lock on the lease's row no longer, so the next leader's takeover waits no longer for it (SDD §25.4).
+
+The bundled PostgreSQL (`deploy/openshift/postgres-statefulset.yaml`) starts its server with all four - the image's
+`run-postgresql` arguments, which it hands to `postgres` as `-c` options -, so they hold for whichever role the
+control plane connects as; `pg_dump` and `pg_restore` lift the timeout for their own sessions. A database of your own
+needs them set: the keepalives on its server - which of them a managed service lets you change is to be confirmed per
+service -, and the timeout for the application role, the one in `SEAMLESS_DB_URL`:
+
+```sql
+ALTER ROLE seamless_app SET idle_in_transaction_session_timeout = '10s';
+```
+
+Check them as that role, over TCP: `SHOW tcp_keepalives_idle;` and `SHOW idle_in_transaction_session_timeout;`. With
+the two-role model of Security.md §9.4, the application role also needs `SELECT`, `INSERT` and `UPDATE` on `leases`
+once the owner role created the table - the owner's first start of 0.5.0 does -: without them no replica takes the
+lease, and no migration advances.
 
 ---
 
@@ -284,6 +544,9 @@ end first:
    scripts/seamless-ctl.sh docker stop --drain ~/.seamless/operator.token
    scripts/seamless-ctl.sh openshift down --drain ~/.seamless/operator.token --url https://seamless.apps.example.com
    ```
+
+   On a cluster with two replicas its calls reach the leader through the relay, whichever replica the Route sends
+   them to (section 4.7).
 
    It prints the plans it paused. If a cutover is still in flight when the wait ends, it **stops nothing**,
    names the paused plans, and exits 1 - try again later, or stop without `--drain`. Any other end before the
@@ -333,13 +596,26 @@ its console. A host whose console no longer prints the block blocks its plans wi
 declare its keys (section 7.2). 0.4.0's link keys go with the first 0.5.0 run on each host pair; a link you made by
 hand stays yours to remove.
 
+0.5.0 also brings the orchestrator's lease (SDD §25): every server takes it before it runs the orchestrator, and
+`seamless status` and `GET /api/v1/health` name the leader (section 4.9). With the two-role database model, the
+owner role's first start creates the table `leases`: grant the application role `SELECT`, `INSERT` and `UPDATE` on
+it before the control plane runs as that role (Security.md §9.4); a database of your own needs the settings of
+section 4.11. Enable the HA component only with a 0.5.0 image or later (section 4.7): `strategy: Recreate` ends
+the old version's pod before the new one starts, so 0.4.0's unfenced orchestrator never runs beside a fenced one.
+
 ---
 
 ## 7. Troubleshooting
 
 | Message | Meaning and fix |
 |---|---|
-| `scale takes 0 or 1 ...` | One control plane only; to scale up use `capacity`. |
+| `scale takes 0 or 1 on docker ...` / `scale takes 0, 1 or 2 on kubernetes ...` | The single host runs one control plane, and a cluster one replica or two - one leads, the other relays to it (section 4.7): a further replica adds no capacity. To scale up, use `capacity`. |
+| `two replicas share seamless-data from two nodes ... and it is ReadWriteOnce: move /data to a ReadWriteMany claim first ...` | `up` with the HA component, `start` restoring its two replicas, or `scale 2` found `seamless-data` ReadWriteOnce, which no apply can change: move `/data` (section 4.8). Nothing was changed. |
+| `cannot read pvc/seamless-data in namespace ..., whose access modes two replicas need ...` | `kubectl` or `oc` cannot read the claim - an expired login, a mistyped `--namespace`, no access: nothing was changed. |
+| `the HA component's replicas, the count up and start restore, must be 1 or 2 in deploy/openshift/ha/kustomization.yaml, not '...'` | The component's `replicas` count was edited: set it back to 2. Nothing was changed. |
+| `no replica leads: migrations wait until one takes over` | `status` found no replica holding the lease: a failover is under way (about 35 s, section 4.10), or no replica can take the lease - its log says why: the database out of reach, or the application role without its grants on `leases` (section 4.11). |
+| `no_leader` (HTTP 503, `Retry-After: 2`) from the API | The replica that answered does not lead, and no replica leads or the leader does not answer: a failover is under way (section 4.10). Try again after two seconds. |
+| `error: another server runs against this database` | A second `seamless serve` against one SQLite file: SQLite serves one server per database (SDD §25.3). Stop the other one, or use PostgreSQL. |
 | `the token file ... may be read by others` | `chmod 600` the file. |
 | `xtrace (bash -x) is on ...` | Run without `bash -x`: it would print the token. |
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
@@ -456,12 +732,31 @@ cat /etc/ssh/ssh_host_ed25519_key.pub   # and ecdsa or rsa, if sshd offers those
 
 Paste them, one per line, into **Host keys** of the provider form (`PATCH /api/v1/providers/{id}` →
 `conversion_host.ssh_host_keys`). A line that is no public key is refused by name, never quoted back. Declared keys
-win over the pin; clear them to go back to it.
+win over the pin; clear them to go back to it. They are the keys of the provider's own host - the one its own
+credential reaches, which every plan without a project on that side uses - and of no project's host (SDD §26.10
+decision 12).
+
+**A project's conversion host** (SDD §26.4, §26.10 decisions 11 to 14). A plan with a project on a side deploys its
+own conversion host in that project, with the project's credential, under the provider's `conversion_host.name`
+(else `os_migrate_conv_src` or `os_migrate_conv_dst`). Its pin is the project credential's, set from the key its
+pre-staging injects, or from its console by the plan's first run when the host exists without a pin; deleting the
+credential deletes the pin with it. The provider's declared keys do not reach the host, and it is looked up by its
+name in its project alone, never at the provider's address. It takes a new floating IP of its own project on the
+host's external network - never one the project holds detached, such as a tenant's own or an address a keep-address
+plan reserved - and counts against that project's quotas, the floating IP's included. The provider's
+`conversion_host.address` stays its own host's; deployed without it, that host still takes a floating IP its
+credential's project holds detached when there is one, else a new one, as upstream's role does.
 
 **A plan blocked by `CONV_HOST_KEY_UNKNOWN`.** The plan needs a host that has neither declared keys nor a pin and
-that Seamless will not create, or whose pin belongs to another server than the one the provider's host resolves to.
-Declare the keys as above; or, for a host Seamless manages, delete it and start the plan again: the pre-staging
-creates it with an injected key and pins it.
+that Seamless will not create, or whose pin belongs to another server than the one the host resolves to. The message
+names the host by its side, provider and name - "in project ..." for a project's host:
+
+- **The provider's own host:** declare its keys as above; or, while it has no pin, let the provider check pin it
+  from its console (its image's cloud-init prints the `SSH HOST KEY KEYS` block); or, for a host Seamless manages,
+  delete it and start the plan again: the pre-staging creates it with an injected key and pins it.
+- **A project's host** (above), which declared keys do not reach: delete it in that project and start the plan
+  again - the plan's pre-staging creates it there with an injected key and pins it as the project credential's pin.
+  One without a pin needs nothing: the plan's first run pins it from its console with that project's credential.
 
 **A refused key.** A run that meets another key fails at once and for good: the migration's reason starts with
 `host key refused:` and names the side, the server, the address, the pinned and the offered fingerprints, and the
@@ -470,14 +765,16 @@ refused key may be an attack. A cutover checks both hosts and its link before th
 running; one whose source was already stopped rolls back. Find out why the key changed before anything else:
 
 - **The host was rebuilt or replaced** (the reason `conversion host replaced:`, or the provider's check reporting
-  it): a conversion host deleted and created again under its name and address is a new server, and the old pin does
-  not apply. Declare the new host's keys, or delete it and let a pre-staging create and pin it again.
+  it - in its status for the provider's own host, in the project's entry for a project's): a conversion host deleted
+  and created again under its name is a new server, and the old pin does not apply. For the provider's own host,
+  declare the new host's keys, or delete it and let a pre-staging create and pin it again; for a project's host,
+  delete it and let the plan's pre-staging create and pin it again - declared keys do not reach it.
 - **The image regenerated its keys** (a host Seamless created that "does not present" its injected key): check the
   image's cloud-init (`ssh_deletekeys`, `ssh_keys` honoured; SDD §26.3), then delete the host and pre-stage again.
 - **Neither**: treat the host's network as compromised (Security.md §13), and do not declare the offered key.
 
 Seamless never accepts a refused key on its own: no prompt, no `accept-new`, no new pin for the same server. The way
-out is always a declared key or a host pre-staged again.
+out is always a declared key - the provider's own host's alone - or a host pre-staged again.
 
 **The link between the hosts.** Each run makes its own link key on the destination host and writes one restricted
 line into the source host's `~/.ssh/authorized_keys` (comment `seamless-link workload=<server id> run=<run>`); the run

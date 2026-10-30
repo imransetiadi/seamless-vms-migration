@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Create the conversion host floating IP with a predefined IP
   os_migrate.os_migrate.floating_ip:
     server: "{{ os_migrate_conversion_host_name }}"
@@ -23,7 +24,9 @@
     state: present
     wait: true
     timeout: "{{ os_migrate_conversion_host_deploy_timeout }}"
-    reuse: true
+    # true, upstream's: a floating IP the project holds detached when there is one; false: a new
+    # one, never a detached one (Seamless Migrate SDD 6.5, 7.2)
+    reuse: "{{ os_migrate_conversion_floating_ip_reuse | bool }}"
     cloud: "{{ os_migrate_conversion_cloud }}"
     validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
     ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"

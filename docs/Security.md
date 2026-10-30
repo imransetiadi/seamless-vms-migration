@@ -6,7 +6,7 @@
 | Version | 0.1.0 |
 | Status | Security design and threat model companion to the SDD (the SDD stays binding for interfaces) |
 | Date | 2026-10-08 |
-| Related | [SDD.md](SDD.md) §6.6, §7, §13, §14, §17, §24 · [PRD.md](PRD.md) NFR-06, NFR-07 · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) §10, §11 · [Performance.md](Performance.md) |
+| Related | [SDD.md](SDD.md) §6.6, §7, §13, §14, §17, §24, §25 · [PRD.md](PRD.md) NFR-06, NFR-07 · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) §10, §11 · [Performance.md](Performance.md) |
 
 How to read the status tags: **Impl** — specified by the SDD or the plan and covered by a named test;
 **Cfg** — delivered as a deployment setting or operating procedure; **Rec** — a recommendation that is *not*
@@ -85,12 +85,14 @@ can print anything to its console and can name its VM anything).
 | Flow | Data | Protection |
 |---|---|---|
 | TB1 operator → API | commands, plan data, tokens | TLS at the Route; `Authorization: Bearer` header only (never in URLs; the dashboard streams with `fetch`, not `EventSource`, SDD §12) |
+| TB1 relayed: follower → leader (0.5.0, the HA component; SDD §25.6) | an API request or the event stream as the caller sent it - method, path, query, body and the caller's `Authorization`, `Content-Type` and `Accept-Encoding` -, `X-Forwarded-For` extended with the caller's address, the marker `X-Seamless-Relayed: 1` | plain HTTP inside the namespace, as the router's hop to the pod (§8); the NetworkPolicy `seamless-allow-relay` admits only the control plane's pods, on TCP 8080 alone; the leader authenticates, authorizes and audits the request as a direct one, while the follower checks no token and logs a failed relay by its method and path alone (C1-13) |
 | TB2 control plane → clouds, vCenter | credentials, inventory, volume/server operations | TLS with verification on by default (`verify_tls=true`, `ca_cert_path`); Keystone application credentials recommended |
 | TB2 control plane → webhook endpoints and DNS servers (0.4.0, SDD §23) | a hook's context document - ids, labels, addresses, floating IPs, never a credential - with its bearer token; DNS reads and compare-and-swap updates | a webhook: an `https://` URL without user information, TLS verified, no redirect followed; Designate with the destination provider's credential, as TB2; RFC 2136 over TCP, each message TSIG-signed (SDD §8.4) |
 | TB2 control plane → the SMTP relay, Slack and webhook receivers (0.5.0, SDD §24) | the messages of SDD §24.5 - VM, plan and wave names (ids on a channel that redacts them), ids, phases, times, the downtime - as §8.1 lists them; the relay's credential; a webhook's signature | SMTP over STARTTLS (587) or implicit TLS (465), never plain text, the relay's certificate verified (the system's CAs or `SEAMLESS_SMTP_CA_FILE`), AUTH after TLS alone; HTTPS with the certificate verified and no redirect followed; a Slack URL is the request's address and nothing else; the signing key never travels (§8, C2-16, C2-18) |
 | TB3 control plane → conversion hosts | Ansible over SSH | key auth, `BatchMode=yes`; host-key policy in §6.3 |
 | TB4 src ↔ dst conversion hosts | disk blocks | SSH encryption; NBD exports bound to loopback and read-only; blocksync manifest digest compared end-to-end (SDD §6.2) |
-| TB5 control plane → PostgreSQL | documents, events | NetworkPolicy / internal Compose network; a password (scram-sha-256) on every `pg_hba` line (§9.4); TLS recommended (§8) |
+| TB5 control plane → PostgreSQL | documents, events, the orchestrator's lease (0.5.0, SDD §11) | NetworkPolicy / internal Compose network; a password (scram-sha-256) on every `pg_hba` line (§9.4); TLS recommended (§8) |
+| Control plane → `seamless-data` on a ReadWriteMany class (0.5.0, the HA component; SDD §25.9) | the run directories - a run's `secrets.yml`, `clouds.yaml` and Ceph files while its playbook runs -, the installation's conversion key | the class's storage network, which must encrypt in transit (`TODO(LAB): confirm` per class); the files 0600 in 0700 directories (C2-21) |
 | TB6 control plane → Jev | redacted summaries; screened console excerpts only where the console may leave (`SEAMLESS_JEV_DEPLOYMENT=on_prem`, or `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE=true`; by default it never leaves the installation, SDD §13.4) | env whitelist for the stdio child; bearer on the HTTP sidecar; TLS to the provider; circuit breaker (§10) |
 | TB7 control plane → agentmemory | redacted lessons | redaction; 5 s timeout; failures swallowed ([MEMORY.md](MEMORY.md)) |
 | TB8 untrusted content → AI | console excerpts, names, tags | `jev_screen`; bounded outputs; deterministic fallback (§10) |
@@ -119,6 +121,7 @@ QASuite case that exercises the control.
 | C1-10 | Elevation | SSRF or file read through admin-supplied `Provider.endpoint` / `ca_cert_path` / `credentials_secret` | Admin-only route; NetworkPolicy egress excludes cluster networks and `169.254.0.0/16`; `security.secrets.resolve` accepts only names matching `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$` (no `/`, never `.`/`..`) before building `{SECRETS_DIR}/{name}/…`, and on Kubernetes reads only Secrets the store wrote or labelled `seamless.io/provider-secret: "true"`; `POST`/`PATCH /providers` refuse another provider's `provider-*` name for the fields a request sets (a provider stored with one before 4b95f4d still resolves it), and `POST` refuses an id whose managed names `provider-{id}`/`provider-{id}-ssh` would be another provider's (409, a9f50b3: a `vc-dc2-ssh` provider would otherwise overwrite and delete `vc-dc2`'s key) (R-03); `ca_cert_path` is still an unvalidated path (admin-only) | Impl (secret names, asserted by the `../etc`/`a/b`/`..` cases of `test_secret_resolution_file_then_env`) + Cfg | L | QASuite §10 case S-08 |
 | C1-11 | Tampering | XSS in the dashboard via VM names, finding messages, advisor notes, console excerpts | React escapes by default; no raw-HTML rendering; every response carries `Content-Security-Policy` (`default-src 'self'`, `frame-ancestors 'none'`, a per-response nonce for Swagger UI), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` (R-05) | Impl | M (token lives in `sessionStorage`) | dashboard tests; QASuite §12 |
 | C1-12 | Spoofing | CSRF against the API | Bearer header authentication, no cookies → not applicable with authentication on; with it off (the loopback demo) a state-changing request whose `Origin` names no loopback address (`null` included) or whose `Sec-Fetch-Site` is `cross-site` is refused (403, SDD §13.1, audit AP-03); CORS list empty by default, never `*` | Impl | L | QASuite S-31, `test_with_authentication_off_only_this_machines_pages_reach_the_api` |
+| C1-13 | Spoofing / Repudiation | A relayed request (0.5.0, the HA component; SDD §25.6) is counted and audited as the follower's - every relayed caller sharing its address in the lockout -, or a caller forges the address the leader records | The follower appends the caller's address to `X-Forwarded-For`, and uvicorn takes it from there only on a peer that `FORWARDED_ALLOW_IPS` lists: the component sets the pod network - OpenShift's default `10.128.0.0/14`, the Kubernetes overlay's `10.244.0.0/16` -, which a cluster with another pod network must change, or the leader's lockout counts the follower instead of the caller; never `*`, and the NetworkPolicies admit only the router and the other replica to the API port. The leader authenticates, refuses and records a relayed request as a direct one (SDD §13.1); the follower checks no token and records `auth.denied` only for what it answers itself (`/metrics`, the API documents). A replica that does not lead answers a request marked `X-Seamless-Relayed` with 503 and never relays it again, and the leader serves a marked request as any other, so a marker a client sets itself gains nothing | Impl + Cfg | L | `test_the_leader_sees_the_callers_address_through_the_relay`, `test_a_relayed_request_is_never_relayed_again`, `test_a_follower_relays_a_write_to_the_leader_with_the_callers_token`, `test_the_replicas_reach_each_other_on_the_api_port_alone` |
 
 ### 4.2 Orchestrator and executors (C2)
 
@@ -143,6 +146,8 @@ QASuite case that exercises the control.
 | C2-17 | Denial of service | A flood: a wave's cutovers or a burst of events become a stream of messages that Slack throttles (429), that fills mailboxes, or that piles up behind a slow channel; a channel that never answers holds a migration back | One message a second per channel, Slack's limit for a webhook, kept for every kind; at most 5 tries over about 5 minutes, a `Retry-After` honoured up to 300 s; a message whose event is an hour old when its turn comes is not sent, and a run of them is one `notification.failed` (`expired`); `approval`, `downtime` and `problem` by default, `outcome` and `progress` on request, one message per event; `notification.*`, `channel.*` and `subscription.*` are never notified, so no message makes another; a channel holds back its own messages alone, never another channel's or a step: no step, gate, transition or route waits for the notifier, an HTTP request has 15 s and an SMTP session 30 s, in two threads of the notifier's own (SDD §8.7, §24.6) | Impl | L | `test_a_channel_sends_at_most_one_message_a_second`, `test_a_slack_429_waits_its_retry_after`, `test_a_temporary_failure_is_retried_with_backoff_and_retry_after`, `test_a_message_whose_event_is_an_hour_old_expires`, `test_a_run_of_expired_messages_is_one_event`, `test_notification_events_are_never_notified`, `test_a_failing_channel_holds_back_no_other_channel`, `test_a_channel_that_never_answers_delays_no_migration` |
 | C2-18 | Spoofing / Tampering | A forged or replayed webhook: someone who learns a receiver's URL posts a document of their own ("web-01 migrated"), or sends a captured request again | Each request is signed as Standard Webhooks specify: `webhook-signature` is `v1,` and the base64 HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<body>` with the channel's signing key, which never leaves the control plane; each try takes a new timestamp and signature under the same `webhook-id`; HTTPS with the certificate verified, no redirect followed (SDD §8.7, §13.3). **The receiver must verify** - the signature in constant time, the timestamp's age and the ids it saw (docs/Operations.md §7.4) - or it believes whoever reaches it | Impl + **Cfg** | L; M for a receiver that does not verify | `test_a_webhook_is_signed_as_standard_webhooks_specify`, `test_each_try_is_signed_anew_with_the_same_webhook_id`, `test_the_signing_key_never_leaves_the_control_plane`, `test_a_webhook_redirect_is_not_followed` |
 | C2-19 | Info disclosure | The installation's data reaches a third party or the wrong audience: Slack's service outside the organization, a receiver, the relay and the recipients' mail systems; a man in the middle who strips STARTTLS or poses as the relay; the recipients, personal data, exposed | Only an admin keeps the catalog, each change a `channel.*` event with its actor, and an operator subscribes a channel of it to a plan (§5.2); a message's content is fixed (§8.1) - names, ids, phases, times and the downtime, never a credential, an address, a hostname, a provider, an error's text, a comment or who acted, and a link of ids alone -, and `redact_names` sends ids instead of names; SMTP never in plain text - a relay that offers no STARTTLS gets nothing but EHLO -, its certificate verified, AUTH after TLS alone; recipients shown to an admin alone and named by no event; nothing of a notification reaches Jev or agentmemory (§10.4) | Impl + Cfg | M (names leave unless the channel redacts them) | `test_no_message_carries_an_error_an_address_a_comment_or_an_actor`, `test_a_channel_that_redacts_names_sends_ids`, `test_only_an_admin_changes_the_channel_catalog`, `test_only_an_admin_subscribes_a_channel_to_every_plan`, `test_a_relay_without_starttls_gets_nothing_in_clear_text`, `test_a_relay_whose_certificate_fails_verification_gets_nothing`, `test_email_goes_over_starttls_and_authenticates_after_it` |
+| C2-20 | Tampering | Two orchestrators drive one migration (0.5.0: two replicas, or a second server against one database; SDD §25.4): a deposed leader that does not know it yet - its process paused, its network cut, its loop stuck - stops a source VM, writes a phase or creates a server beside the new leader | A lease row in PostgreSQL elects the one replica that runs the orchestrator, on the database's clock alone; a server's store reads the lease's epoch under a key-share lock at the start of every write and refuses one of another epoch (`Fenced`), nothing of it written, `auth.denied` aside; a takeover's `FOR UPDATE` waits for every such write in flight; before each step attempt, hook, floating IP move, DNS swap and member change the orchestrator checks its deadline and the epoch; the watchdog deposes a leader at its renew deadline, at least 10 s before its lease may be taken, and kills its playbooks (SIGKILL) from its own thread; the new leader resumes through the restart path (SDD §8, §11). Named rather than solved (SDD §25.4): a control-plane process that cannot run for longer than that margin while its playbooks run on, and a database clock that steps forward by more than it - the database host's clock must slew | Impl | M | `test_a_write_of_an_old_epoch_writes_nothing`, `test_a_takeover_waits_for_a_write_of_the_old_epoch_in_flight`, `test_a_deposed_leader_kills_its_playbooks_before_its_lease_expires`, `test_a_deposed_leader_starts_no_step_hook_or_floating_ip_move`, `test_a_takeover_resumes_a_cutover_once_and_keeps_its_open_clock`; QASuite LAB-HA01–LAB-HA05 |
+| C2-21 | Info disclosure | A run's secret files on a shared volume (0.5.0, the HA component; SDD §25.9): on a ReadWriteMany `seamless-data` a run's `secrets.yml`, `clouds.yaml` and Ceph files cross the storage network while its playbook runs, and a dead leader's stay there until its step runs again; the installation's conversion key lives on the same volume (SDD §7.2) | The files are 0600 in 0700 run directories and deleted when a run ends (C2-02); only the HA component asks for ReadWriteMany - the base keeps ReadWriteOnce -; **the class must encrypt in transit**, and at rest as every PVC (§9.4); no pod but the control plane's mounts the volume - and, once, the copy of docs/Operations.md §4.8 | Cfg + **Rec** | M | per class, in the lab (SDD §25.10: the ReadWriteMany class and its encryption, `TODO(LAB): confirm`) |
 
 ### 4.3 Conversion hosts and the data path (C3)
 
@@ -180,7 +185,7 @@ QASuite case that exercises the control.
 | C5-02 | Info disclosure | Plans, names and addresses read from the DB, dumps or volumes | Classified Confidential; storage-class encryption; encrypted backups; no host port in Compose | Cfg | M |
 | C5-03 | Spoofing | Credential theft; weak password; **password-less access inside the container** (the official `postgres` image initializes `trust` for the unix socket and loopback) | Random 192-bit password from `compose-init.sh` / `openssl rand`; scram-sha-256 for stored passwords; in Compose `initdb` runs with `--auth-local=scram-sha-256 --auth-host=scram-sha-256` so that every connection needs the password (§9.4, QASuite S-24); Secret-only storage | Cfg | L |
 | C5-04 | Info disclosure | Traffic sniffing between pods or nodes | NetworkPolicy; **TLS** (`sslmode=verify-full`) for external or cross-node DBs; the bundled StatefulSet runs without TLS (§8) | Cfg + **Rec** | M |
-| C5-05 | Denial of service | Connection exhaustion; outage | Pool 5 (+5 overflow) with `pool_pre_ping`; `max_connections` sized above it; `/api/v1/health` reports `"db":"error"`; resume from `checkpoint` after recovery | Impl | L |
+| C5-05 | Denial of service | Connection exhaustion; outage | Pool 5 (+5 overflow) with `pool_pre_ping`, and the lease's own connection outside the pool (0.5.0, SDD §8); `max_connections` sized above them; `/api/v1/health` reports `"db":"error"`; resume from `checkpoint` after recovery. Since 0.5.0 an outage longer than the lease's renew deadline (20 s) deposes the leader, a single replica's too: its steps are cancelled and its playbooks killed, and they resume once the database is back and a replica leads; a restart or failover shorter than 20 s deposes nobody (SDD §25.5) | Impl | L |
 | C5-06 | Elevation | SQL injection | Core with bound parameters; constant table/kind names | Impl | L |
 | C5-07 | Elevation | The application role is the cluster **superuser** in the Compose stack (the official image makes `POSTGRES_USER` the bootstrap superuser), so an application-level SQL compromise would also reach files and programs of the database container | Accepted for a throw-away local stack: internal network, not published, no real data, no cloud credentials in the database. Compose on a Linux host is a supported single-host deployment (SDD §17.1) whose database may hold real data: for a long-lived one this acceptance is **open** (owner question) - use the two-role model of §9.4; shared and OpenShift databases use an owner role plus a non-superuser application role (§9.4; the SCL image already creates an ordinary owner role and keeps the superuser disabled) | Cfg + **Rec** | L |
 
@@ -312,7 +317,11 @@ logging, and export `events` to a SIEM by polling `GET /api/v1/events?since=<seq
 database-side export. On PostgreSQL an event appended by another process (the `seamless` CLI while
 the server runs) can commit after a higher sequence number from the server; poll with an overlap
 (re-read from `last_seq - 100`) or export database-side when exactness matters. Retention guidance is in [MEMORY.md](MEMORY.md) §3.4. The audit trail is only as
-trustworthy as the database role model — see §9.4.
+trustworthy as the database role model — see §9.4. With the orchestrator's lease (0.5.0, SDD §11, §25.9) the
+leader is the only server that writes the trail: a server's store refuses each write while the lease's epoch is
+not the one it took - `auth.denied` aside, which the replica that refuses a request records itself -, and the
+CLI's writes stay a person's (`actor: cli`). `leader.acquired` and `leader.released` record each change of
+leader, and the lease adds no credential.
 
 ---
 
@@ -385,11 +394,18 @@ known before the first connection, and `StrictHostKeyChecking=no` is gone from t
   host - the role passes an ed25519 pair the control plane made in memory as the server's user data, with
   `ssh_deletekeys: true`, and the public half is pinned once the role reports the server created -, read once from
   the Nova console log's `SSH HOST KEY KEYS` block for a host Seamless did not create and for 0.4.0's hosts, or
-  declared by the operator in the provider's `conversion_host.ssh_host_keys`. Declared keys win over a pin. No key
-  is ever learned from an SSH connection: no `accept-new`, no trust on first use, no scan, no DNS.
-* **The pin** is the provider's (`conversion_host_pin`: the Nova server's id, the keys, their source `injected` or
-  `console`, the time; SDD §26.4). It belongs to one server: a host that resolves to another server is refused as
-  replaced until the operator declares its keys, or deletes it and pre-stages it again.
+  declared by the operator in the provider's `conversion_host.ssh_host_keys` - for the provider's own host alone,
+  never a project's, a server Seamless creates in that project (SDD §26.10 decision 12). Declared keys win over the
+  provider's own pin. No key is ever learned from an SSH connection: no `accept-new`, no trust on first use, no
+  scan, no DNS.
+* **The pin** is the provider's for its own host (`conversion_host_pin`: the Nova server's id, the keys, their source
+  `injected` or `console`, the time; SDD §26.4) and a project credential's for the host a plan with that project
+  deploys in it (`ProjectCredential.conversion_host_pin`, SDD §26.10 decision 11): two tenants' hosts never share or
+  replace a pin. It belongs to one server: a host that resolves to another server is refused as replaced until the
+  operator declares its keys - the provider's own host alone - or deletes it and pre-stages it again, a project's
+  host's one way out. A project's host is looked up by its name in its project alone and takes a floating IP of its
+  own project, never the provider's `conversion_host.address` (SDD §26.10 decisions 13 and 14): it never resolves
+  to the provider's own host or another server at that address.
 * **Each run writes its own `known_hosts`** in its run directory, one hashed entry per key under the host's alias
   (`os_migrate_conv_src`, `os_migrate_conv_dst`; `conversion_host` for a VMware destination's host), and every hop
   runs with `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<the run's file>`, `GlobalKnownHostsFile=/dev/null`,
@@ -536,6 +552,8 @@ provider supports per-key budgets or scopes, create one key per environment.
 | Source conversion host → Ceph monitors and OSDs (0.5.0, a plan that tracks extents) | Ceph messenger v2 (TCP 3300; v1 6789; OSDs 6800–7300), `cephx` with the metadata-only user | the host's address alone, through the operator's route to the Ceph public network (§6.4); the key is limited with `network` to that address (C4-08); reads of image metadata only, no data, no write |
 | Control plane → conversion hosts; dst → src | SSH | key auth, host-key policy in §6.3 |
 | Control plane → PostgreSQL | PostgreSQL protocol | **Compose:** internal network, no route out. **OpenShift:** NetworkPolicy to the StatefulSet; the bundled instance runs **without TLS** — for regulated environments use a TLS-enabled or managed database and `?sslmode=verify-full&sslrootcert=…` in `SEAMLESS_DB_URL` |
+| Follower → leader (0.5.0, the HA component; SDD §25.6) | plain HTTP inside the namespace, to the leader's pod on TCP 8080 | as the router's hop to the pod (edge TLS, above): the caller's bearer token crosses it; the NetworkPolicy `seamless-allow-relay` admits only the control plane's pods to each other, in and out, on that port alone; the follower connects within 2 s and gives a request 300 s, a stream no bound (C1-13) |
+| Control plane → `seamless-data` (0.5.0, a ReadWriteMany class with the HA component) | the class's protocol - CephFS on OpenShift Data Foundation | a run's secret files cross it while its playbook runs (C2-21): use a class that encrypts in transit (`TODO(LAB): confirm` per class, SDD §25.9) |
 | Control plane → Jev sidecar | HTTP + bearer on an internal network (Compose) | jev-mcp serves plain HTTP: keep it internal or terminate TLS in front; the token is mandatory for non-loopback binds |
 | Control plane → provider API | HTTPS | provider TLS; egress allowed only to the provider |
 | Control plane → agentmemory | HTTP(S) | loopback/host gateway in Compose; TLS and bearer for any remote server |
@@ -548,7 +566,9 @@ control plane only from the OpenShift ingress namespace (label `policy-group.net
 PostgreSQL accepts only `seamless` pods (and, with the backup overlay, its backup pods); egress limited to DNS, PostgreSQL and a port list towards networks
 outside the cluster, excluding the pod/service networks and `169.254.0.0/16` (the Kubernetes overlay excepts the
 cluster's own networks — kubeadm/kind defaults `10.244.0.0/16` and `10.96.0.0/12`, to adjust per cluster — and
-keeps them out of the 6443 rule too). The port list includes the verification checks the plan form proposes —
+keeps them out of the 6443 rule too). With the HA component, `seamless-allow-relay` lets the control plane's pods
+reach each other's API port, TCP 8080, in and out, and nothing else passes between them (SDD §17). The port list
+includes the verification checks the plan form proposes —
 TCP 22 (Linux) and 3389 (Windows), SDD §7.5, §17 — as a blocked check fails the verification and rolls a working
 migration back; a plan that verifies other ports, or application probes on them, needs those ports added. It
 also opens what the GPU capacity read and the network cut-over call (SDD §17): Placement, Heat, Octavia and
@@ -598,7 +618,7 @@ CIDRs of your clouds, vCenter, conversion hosts, Jev provider, agentmemory, the 
 | Network exposure | only `seamless` on `127.0.0.1:8080`; `postgres` on an `internal: true` network; `jev` only on the app network | Route (edge TLS) → Service; default-deny NetworkPolicies (§8) |
 | Secrets | `.env` (0600, never mounted), `tokens.yaml` bind-mounted read-only, `create_host_path: false` | Secret volumes `defaultMode 0440`, read-only; DB URL from a `secretKeyRef` |
 | Resource limits | memory limits per service | requests/limits on both workloads |
-| Single instance | one container | `replicas: 1`, `strategy: Recreate` (the orchestrator is a singleton); no PodDisruptionBudget, which would block node drains: a control plane evicted mid-run resumes its migrations from their checkpoints (QASuite R-01) |
+| Replicas | one container: Compose and Podman stay one replica (SDD §25.7) | the base: `replicas: 1`, `strategy: Recreate`, no PodDisruptionBudget, which would block node drains - a control plane evicted mid-run resumes its migrations from their checkpoints (QASuite R-01); the HA component (`deploy/openshift/ha`, a Technology Preview): `replicas: 2` on two nodes (a required anti-affinity), `strategy: Recreate` kept - one version at a time -, the PodDisruptionBudget `seamless` (`maxUnavailable: 1`, `unhealthyPodEvictionPolicy: AlwaysAllow`), `seamless-data` ReadWriteMany (C2-21). Whichever runs, the lease elects the one replica that runs the orchestrator, and the fence makes it the only server that writes (C2-20; SDD §17, §25) |
 | Logs | `json-file` with rotation | cluster logging; `SEAMLESS_LOG_JSON=true` |
 
 Not hardened in 0.1.0: the bundled PostgreSQL pod runs without TLS (its root filesystem is read-only, with
@@ -647,6 +667,13 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
 * Not published to any host port in Compose; reachable only from `seamless` pods (and the backup overlay's pods) in OpenShift.
 * TLS (`ssl = on`, certificate from your PKI, client `sslmode=verify-full`) for external or cross-node
   databases.
+* **The lease's settings** (0.5.0, SDD §17, §25.4, §25.7): the application role runs with
+  `idle_in_transaction_session_timeout` 10 s - a leader cut off inside a write holds its key-share lock on the
+  lease's row no longer -, and the server drops a vanished client within 40 s (`tcp_keepalives_idle` 10,
+  `tcp_keepalives_interval` 5, `tcp_keepalives_count` 6), and with it its session locks, a cut-off leader's
+  VM-claim lock among them. The bundled StatefulSet sets all four as server arguments, which hold for every role;
+  a database of your own needs the keepalives on its server and the `ALTER ROLE` line of the two-role model below
+  (docs/Operations.md §4.11).
 * Logging: `log_connections = on`, `log_disconnections = on`, `log_min_duration_statement = 1000`,
   `log_statement = 'ddl'`; consider `pgaudit` for regulated environments.
 * **Audit-table protection (Rec):** make the `events` table insert/select-only for the application role so
@@ -662,6 +689,8 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
   GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO seamless_app;
   GRANT SELECT, INSERT ON events TO seamless_app;
   GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO seamless_app;
+  GRANT SELECT, INSERT, UPDATE ON leases TO seamless_app;   -- the orchestrator's lease (0.5.0, SDD §11, §25.9)
+  ALTER ROLE seamless_app SET idle_in_transaction_session_timeout = '10s';   -- unless the server sets it (SDD §17)
   ```
 
   Create or upgrade the schema as the owner role first — start the control plane, or run any `seamless` command,
@@ -672,7 +701,10 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
   pattern, `CREATE SCHEMA seamless_app AUTHORIZATION seamless_app`): the store's tables still resolve to the owner's,
   and `create_schema()` reads their indexes there (review RV-07,
   `test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_tables`).
-  After an upgrade that adds an index, start once as the owner again. `events` is never updated by the application;
+  After an upgrade that adds an index, start once as the owner again. The upgrade to 0.5.0 adds the table `leases`,
+  which that start creates: grant it to the application role then (`SELECT`, `INSERT` and `UPDATE` - PostgreSQL
+  asks for `UPDATE` to read a row `FOR KEY SHARE` too), or no replica takes the orchestrator's lease and no
+  migration advances (SDD §11, §25.9). `events` is never updated by the application;
   it is deleted only by
   `seamless events prune` (older than a cut-off, SDD §15) and the test helper, so run the prune as the owner role,
   or grant DELETE on `events` to the role that runs it. The owner can still alter rows, so also export `events` periodically to write-once storage.
@@ -906,10 +938,25 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
 - [ ] `networkpolicy.yaml` egress tightened from `0.0.0.0/0` to your CIDRs (the destination's tenant networks included); every verification and application-probe port your plans use is in the port list (22 and 3389 ship; SDD §7.5, §17); default-deny present.
 - [ ] `FORWARDED_ALLOW_IPS` on the control plane set to the router/ingress pod addresses (uvicorn then
       takes the client address from `X-Forwarded-For` for the auth lockout and the audit log); never `*`
-      on a network where pods can reach the Service directly.
+      on a network where pods can reach the Service directly. With the HA component it is the cluster's pod
+      network instead (C1-13), which a cluster whose pod network is not OpenShift's default `10.128.0.0/14` or
+      the Kubernetes overlay's `10.244.0.0/16` sets to its own.
 - [ ] Route certificate trusted; HSTS present on responses (the Route's `hsts_header`, or your ingress's); ingress rate/connection limits configured.
 - [ ] PostgreSQL TLS or managed DB; encrypted storage class; backups encrypted and restore-tested (`deploy/openshift/backup/`: the nightly CronJob and the restore runbook; the data PVC through volume snapshots or Velero/OADP).
-- [ ] `replicas: 1` and `strategy: Recreate` unchanged.
+- [ ] `strategy: Recreate` unchanged; one replica, or two through the HA component alone (below).
+
+**HA control plane (SDD §25, 0.5.0, a Technology Preview)**
+- [ ] The control plane runs 0.5.0 or later before the component is enabled: an earlier version takes no lease,
+      and two of its replicas would both drive the migrations (C2-20).
+- [ ] `seamless-data` is ReadWriteMany on a class that encrypts in transit and at rest, and no other pod mounts it
+      (C2-21).
+- [ ] `FORWARDED_ALLOW_IPS` is the cluster's pod network, and `seamless-allow-relay` the only policy that lets
+      the replicas reach each other (C1-13).
+- [ ] The application role holds `SELECT`, `INSERT` and `UPDATE` on `leases` and runs with
+      `idle_in_transaction_session_timeout` 10 s, and the database server drops a vanished client within a minute
+      (§9.4).
+- [ ] The database host's clock slews and never steps forward by more than 10 s: the lease's times are the
+      database's (C2-20).
 
 **Conversion hosts and clouds**
 - [ ] Security group restricts SSH to the control plane and the peer host; no floating IP unless required.

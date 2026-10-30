@@ -340,7 +340,8 @@ user cannot write it on a host.
 ## Deploy on OpenShift
 
 Kustomize manifests live in [`deploy/openshift/`](deploy/openshift/) (Namespace, ServiceAccount, ConfigMap,
-PVC, PostgreSQL 16 StatefulSet + Service, single-replica Deployment with a hardened security context, Service,
+PVC, PostgreSQL 16 StatefulSet + Service, a Deployment of one replica - two with the HA component - with a hardened
+security context, Service,
 edge-TLS Route, default-deny NetworkPolicies). Secrets are **not** part of the kustomization — create them
 from the placeholders in `secret-example.yaml` (or an external secret store), build and push the image
 (`podman build -f seamless/Containerfile -t <registry>/seamless-migrate:<version> .` from the repository root),
@@ -368,8 +369,8 @@ kubectl -n seamless-migrate get ingress seamless
 ```
 
 Credentials entered in the dashboard are stored as Kubernetes Secrets on both platforms
-(`SEAMLESS_SECRET_STORE=kubernetes`, the Role in `secret-store-rbac.yaml`). CI renders both overlays and validates
-them against the Kubernetes 1.30 schemas.
+(`SEAMLESS_SECRET_STORE=kubernetes`, the Role in `secret-store-rbac.yaml`). CI renders both overlays, with and
+without the HA component, and validates them against the Kubernetes 1.30 schemas.
 
 | Platform | Where | Command |
 |---|---|---|
@@ -396,12 +397,17 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
 | `stop` | stop the control plane alone; PostgreSQL keeps running | `scripts/seamless-ctl.sh podman stop` |
 | `start` | start the control plane again - PostgreSQL first when `down` stopped it | `scripts/seamless-ctl.sh podman start` |
 | `restart` | restart the control plane from its current configuration - after a change | `scripts/seamless-ctl.sh kubernetes restart` |
-| `scale 0` / `scale 1` | scale the control plane down to 0 or back up to 1 | `scripts/seamless-ctl.sh openshift scale 0` |
+| `scale 0` / `scale 1` / `scale 2` | stop the control plane, start one replica, or - on a cluster with the HA component - two | `scripts/seamless-ctl.sh openshift scale 0` |
 | `capacity` | scale the one control plane up or down: concurrent migrations and cutovers, and on a cluster its CPU and memory | `scripts/seamless-ctl.sh kubernetes capacity --max-migrations 20 --memory 8Gi` |
 | `status` / `logs` | what runs and its health / follow the control plane's log | `scripts/seamless-ctl.sh docker status` |
 
-* **One control plane.** Its orchestrator is a singleton, so `scale` takes 0 or 1 and refuses more (a second
-  replica would run two orchestrators against one database); scale up with `capacity` instead.
+* **One leader at a time.** One orchestrator drives every migration: a lease in PostgreSQL elects the server that
+  runs it, and the database refuses every write of a server that lost it (SDD §25). On a cluster the HA component,
+  a Technology Preview, runs two replicas on two nodes: the leader runs the orchestrator, and the other relays the
+  API and the event stream to it and takes over within about 35 s when the leader is lost
+  ([docs/Operations.md](docs/Operations.md) §4.7). So `scale` takes 0 or 1 on the single host and 0, 1 or 2 on a
+  cluster - 2 only with a ReadWriteMany `seamless-data` -; a second replica adds availability, not capacity: scale
+  up with `capacity` instead.
 * **Stopping is safe.** Running steps end within the stop grace and every migration resumes from its checkpoint
   when the control plane runs again. Before planned maintenance, `--drain FILE` pauses the running plans and
   waits until no cutover is in flight, and `resume` starts them again afterwards (the operator's token is read

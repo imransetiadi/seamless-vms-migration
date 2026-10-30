@@ -4,9 +4,10 @@ rule of the control plane. ``credential_project`` reads §27.5's table and a pla
 a step acts with on a side, or None for the provider's own; ``implementation`` hands what acts
 with it from the provider registry, ``host_pin`` the pin of the conversion host it reaches
 (§26.4), and ``declared_keys`` and ``host_address`` that host's declared keys and the address it
-is looked up by - the provider's own host's alone (§10, §26.10 decisions 12 and 13). No
-executor, helper or route picks a credential, a pin or a host on its own, and a project
-credential the plan names is never replaced by the provider's own (§27.5, "No fallback")."""
+is looked up by and deployed at - the provider's own host's alone (§7.2, §10, §26.10 decisions 12
+to 14). No executor, helper or route picks a credential, a pin or a host on its own, and a
+project credential the plan names is never replaced by the provider's own (§27.5, "No
+fallback")."""
 
 from __future__ import annotations
 
@@ -212,10 +213,11 @@ def declared_keys(provider: Provider, project_id: str | None) -> tuple[str, ...]
 
 def host_address(provider: Provider, project_id: str | None) -> str | None:
     """The address the conversion host the credential of ``project_id`` reaches is looked up by
-    when no server bears its name (SDD §7.2, §10; the owner's decision of 2026-10-29, §26.10
-    decision 13): the provider's ``conversion_host.address`` for its own credential (None) - its
-    own host's -, none for a project's host, which is looked up by its name in its project alone
-    and so never resolves to the provider's own host."""
+    when no server bears its name, and the floating IP its pre-staging's deploy gives it (SDD
+    §7.2, §10; the owner's decisions of 2026-10-29 and 2026-10-30, §26.10 decisions 13 and 14):
+    the provider's ``conversion_host.address`` for its own credential (None) - its own host's -,
+    none for a project's host, which is looked up by its name in its project alone, so never
+    resolves to the provider's own host, and takes a floating IP of its own project."""
     host = provider.conversion_host
     if project_id is not None or host is None:
         return None
