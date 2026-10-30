@@ -534,8 +534,26 @@ def test_a_cluster_scale_two_needs_the_ha_component(tmp_path, platform, enabled_
     without it, refused with 2 before anything ran - its dry run too, which reads the same files -,
     naming how to enable it, whatever the claim; with it, two replicas run, and its dry run prints
     the commands and runs none. scale 1 turns HA off: one replica runs on the ReadWriteMany claim,
-    the component left in place."""
+    the component left in place. The files alone decide: on a machine without kubectl or oc, the
+    repository's overlays - the component's lines commented - give this refusal, not the tool's."""
     overlay = f"deploy/{platform}/kustomization.yaml"
+    if enabled_in is None:
+        tools = tmp_path / "no-kube"
+        tools.mkdir()
+        for name in ("bash", "dirname", "awk"):
+            found = shutil.which(name)
+            assert found, name
+            (tools / name).symlink_to(found)
+        bare = subprocess.run(
+            [str(tools / "bash"), str(SCRIPT), platform, "scale", "2"],
+            capture_output=True,
+            text=True,
+            env={"PATH": str(tools)},
+            timeout=60,
+        )
+        assert bare.returncode == 2, bare.stderr
+        assert "scale 2 takes the HA component" in bare.stderr, bare.stderr
+        assert "is needed for this action" not in bare.stderr, bare.stderr
     for dry in (False, True):
         state = fake_kube.cluster(replicas=1, data_modes=("ReadWriteMany",))
         run = tmp_path / f"two-{dry}"
