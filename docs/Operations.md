@@ -858,12 +858,31 @@ cat /etc/ssh/ssh_host_ed25519_key.pub   # and ecdsa or rsa, if sshd offers those
 
 Paste them, one per line, into **Host keys** of the provider form (`PATCH /api/v1/providers/{id}` →
 `conversion_host.ssh_host_keys`). A line that is no public key is refused by name, never quoted back. Declared keys
-win over the pin; clear them to go back to it.
+win over the pin; clear them to go back to it. They are the keys of the provider's own host - the one its own
+credential reaches, which every plan without a project on that side uses - and of no project's host (SDD §26.10
+decision 12).
+
+**A project's conversion host** (SDD §26.4, §26.10 decisions 11 to 14). A plan with a project on a side deploys its
+own conversion host in that project, with the project's credential, under the provider's `conversion_host.name`
+(else `os_migrate_conv_src` or `os_migrate_conv_dst`). Its pin is the project credential's, set from the key its
+pre-staging injects, or from its console by the plan's first run when the host exists without a pin; deleting the
+credential deletes the pin with it. The provider's declared keys do not reach the host, and it is looked up by its
+name in its project alone, never at the provider's address. It takes a new floating IP of its own project on the
+host's external network - never one the project holds detached, such as a tenant's own or an address a keep-address
+plan reserved - and counts against that project's quotas, the floating IP's included. The provider's
+`conversion_host.address` stays its own host's; deployed without it, that host still takes a floating IP its
+credential's project holds detached when there is one, else a new one, as upstream's role does.
 
 **A plan blocked by `CONV_HOST_KEY_UNKNOWN`.** The plan needs a host that has neither declared keys nor a pin and
-that Seamless will not create, or whose pin belongs to another server than the one the provider's host resolves to.
-Declare the keys as above; or, for a host Seamless manages, delete it and start the plan again: the pre-staging
-creates it with an injected key and pins it.
+that Seamless will not create, or whose pin belongs to another server than the one the host resolves to. The message
+names the host by its side, provider and name - "in project ..." for a project's host:
+
+- **The provider's own host:** declare its keys as above; or, while it has no pin, let the provider check pin it
+  from its console (its image's cloud-init prints the `SSH HOST KEY KEYS` block); or, for a host Seamless manages,
+  delete it and start the plan again: the pre-staging creates it with an injected key and pins it.
+- **A project's host** (above), which declared keys do not reach: delete it in that project and start the plan
+  again - the plan's pre-staging creates it there with an injected key and pins it as the project credential's pin.
+  One without a pin needs nothing: the plan's first run pins it from its console with that project's credential.
 
 **A refused key.** A run that meets another key fails at once and for good: the migration's reason starts with
 `host key refused:` and names the side, the server, the address, the pinned and the offered fingerprints, and the
@@ -872,14 +891,16 @@ refused key may be an attack. A cutover checks both hosts and its link before th
 running; one whose source was already stopped rolls back. Find out why the key changed before anything else:
 
 - **The host was rebuilt or replaced** (the reason `conversion host replaced:`, or the provider's check reporting
-  it): a conversion host deleted and created again under its name and address is a new server, and the old pin does
-  not apply. Declare the new host's keys, or delete it and let a pre-staging create and pin it again.
+  it - in its status for the provider's own host, in the project's entry for a project's): a conversion host deleted
+  and created again under its name is a new server, and the old pin does not apply. For the provider's own host,
+  declare the new host's keys, or delete it and let a pre-staging create and pin it again; for a project's host,
+  delete it and let the plan's pre-staging create and pin it again - declared keys do not reach it.
 - **The image regenerated its keys** (a host Seamless created that "does not present" its injected key): check the
   image's cloud-init (`ssh_deletekeys`, `ssh_keys` honoured; SDD §26.3), then delete the host and pre-stage again.
 - **Neither**: treat the host's network as compromised (Security.md §13), and do not declare the offered key.
 
 Seamless never accepts a refused key on its own: no prompt, no `accept-new`, no new pin for the same server. The way
-out is always a declared key or a host pre-staged again.
+out is always a declared key - the provider's own host's alone - or a host pre-staged again.
 
 **The link between the hosts.** Each run makes its own link key on the destination host and writes one restricted
 line into the source host's `~/.ssh/authorized_keys` (comment `seamless-link workload=<server id> run=<run>`); the run

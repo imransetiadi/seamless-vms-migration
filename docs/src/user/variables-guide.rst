@@ -1,3 +1,5 @@
+.. Modified by the Seamless Migrate project, 2026.
+
 Variables Guide
 ===============
 
@@ -249,6 +251,15 @@ following variables::
 
 When using this variable to specify an exact IP address, the floating
 IP must already exist and be available for attaching.
+
+Without an exact IP address, a conversion host that has no floating IP
+yet takes one that its project holds and that is not attached, when
+there is one, else a new one. To always give it a new floating IP,
+never one the project holds for something else, set the corresponding
+variable to ``false`` (default: ``true``)::
+
+    os_migrate_src_conversion_floating_ip_reuse
+    os_migrate_dst_conversion_floating_ip_reuse
 
 Attaching conversion hosts onto public networks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

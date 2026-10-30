@@ -53,6 +53,9 @@ os_migrate_conversion_image_name: os_migrate_conv
 os_migrate_conversion_host_content_install: true
 
 os_migrate_conversion_floating_ip_address: false
+# without an address: true takes a floating IP the project holds detached when there is one, as
+# upstream; false always creates a new one (Seamless Migrate SDD 6.5)
+os_migrate_conversion_floating_ip_reuse: true  # noqa: var-naming[no-role-prefix]
 
 os_migrate_conversion_host_ssh_key_type: ed25519
 os_migrate_conversion_host_ssh_key_bits: 4096

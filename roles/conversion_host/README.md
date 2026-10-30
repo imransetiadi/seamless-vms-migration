@@ -97,3 +97,27 @@ their Nova server id. It holds no key material:
 A server is created when the lookup found none of its name and the server task
 changed something, else found. Only a server under `created` holds the injected
 key.
+
+## Floating IP
+
+With `os_migrate_conversion_manage_fip` (default `true`), the role gives the
+conversion host a floating IP: the address
+`os_migrate_conversion_floating_ip_address` names, else one the `floating_ip`
+module takes on the external network
+`os_migrate_conversion_external_network_name`. In that second case
+`os_migrate_conversion_floating_ip_reuse` (default `true`) is the module's
+`reuse`:
+
+* `true`, as upstream: a floating IP the credential's project holds detached
+  on that network when there is one, else a new one;
+* `false`: always a new one, never one the project holds detached - a tenant's
+  own floating IP, or an address reserved for a later migration.
+
+A host that holds a floating IP already keeps it either way, and `reuse` plays
+no part with an address. `deploy_conversion_hosts.yml` takes each side's value
+as `os_migrate_src_conversion_floating_ip_reuse` and
+`os_migrate_dst_conversion_floating_ip_reuse`:
+
+```yaml
+os_migrate_dst_conversion_floating_ip_reuse: false
+```
