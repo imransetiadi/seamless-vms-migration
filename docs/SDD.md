@@ -1915,13 +1915,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 on a cloud - the Ansible executor and the handover executor - sign in with each project credential the step acts with,
 as the selection names it (§8): `executors.base.sign_in`, one `check_project` (§10) of what acts with that credential
 (`ProviderRegistry.get(provider, project_id)`), a sign-in on a connection of its own, never a token cached by an earlier
-step - so a credential revoked, deleted or expired since its last check is found out before the step acts. A failure -
-Keystone refuses the sign-in or does not answer within the call's bound, the secret cannot be read, the provider holds
-no credential for the project, the token is another project's - is a `PermanentStepError` before anything of the step
-changes: never retried, never replaced by the provider's own credential. Its message names the provider (its label),
-the project (the name its check read, with its id) and the plan's side, with the failure as the provider words it (an
-HTTP status or a failure's kind, §10), never a secret or the application credential's id. So a cutover whose
-destination credential cannot sign in stops nothing (§6.6, §7.3 step 0), nor does one whose source credential cannot.
+step - so a credential revoked, deleted or expired since its last check is found out before the step acts. A failure
+fails the step before anything of it changes, and its kind decides what follows (the owner's decision of 2026-10-30):
+* a credential that is rejected - Keystone answers the sign-in or its record's read with 401, 403 or another 4xx, the
+  token is another project's, the secret cannot be read, the provider holds no credential for the project - is a
+  `PermanentStepError`: never retried, never replaced by the provider's own credential;
+* a Keystone that cannot be reached - a connection refused or reset, a name that does not resolve, a TLS handshake that
+  failed, a timeout (a request's, or the call's bound) - or that answers 5xx is a `TransientStepError`, retried as the
+  step's other transient failures are (§8: `max_step_retries`, with backoff), the sign-in first at each attempt, and
+  failed once they are spent: `check_project` raises `ProviderUnreachable` for it (§10).
+
+Its message names the provider (its label), the project (the name its check read, with its id) and the plan's side,
+with the failure as the provider words it (an HTTP status or a failure's kind, §10), never a secret or the application
+credential's id. So a cutover whose destination credential cannot sign in stops nothing (§6.6, §7.3 step 0), nor does
+one whose source credential cannot.
 * The Ansible executor: a migration's run - a pre-copy, a sync, a cutover, a rollback, a cancel's cleanup - signs in
   with its run's two credentials (§7.2) before its conversion hosts' lookups; a pre-staging that runs a playbook with
   the plan's two (§27.5's pre-staging row; the flavor import's destination is the provider's own); a finalize that
@@ -3862,7 +3869,11 @@ class DestinationProvider(Protocol):
         # one call: a sign-in with the provider's credential for the Keystone project (§13.3) on a connection of its
         # own, which reads {project_id, project_name, domain, user_id, roles} from its token and - only when the
         # token's project is project_id - {restricted, expires_at} from the application credential's record; a
-        # provider error when the sign-in or the record's read fails, naming an HTTP status or a failure's kind alone
+        # provider error when the sign-in or the record's read fails, naming an HTTP status or a failure's kind alone:
+        # ProviderUnreachable (a ProviderError) when Keystone could not be reached - a connection refused or reset, a
+        # name that does not resolve, a TLS handshake that failed, a timeout, the call's bound - or answered 5xx, the
+        # executors' transient sign-in failure (§7.1; the owner's decision of 2026-10-30); any other failure, a 401 or
+        # a 403 among them, stays ProviderError
 
 # an OpenStack provider, source or destination, reads and changes Octavia pools for the member helper (§8.5, plan
 # task N9) - raw requests, none logged (§13.4), each read under one read's bound; a failure, or a change Octavia
@@ -9067,8 +9078,9 @@ another only where a service lets an admin act by id or on the project's behalf.
   would be rolled back with the same credential, which fails too, and the source would stay stopped until an admin
   writes a new one: the margin keeps that from happening.
 * **The executors** (binding in §7.1 since plan task TC7) sign in with the plan's credentials before each step's
-  playbooks or calls run; a failure to sign in is a permanent failure before anything changes, naming the provider and
-  the project, never the credential.
+  playbooks or calls run; a failure to sign in fails the step before anything changes, naming the provider and the
+  project, never the credential - permanently for a credential Keystone rejects, as a transient failure, retried, for
+  a Keystone that cannot be reached or answers 5xx (the owner's decision of 2026-10-30, §7.1).
 
 ### 27.8 Security
 
