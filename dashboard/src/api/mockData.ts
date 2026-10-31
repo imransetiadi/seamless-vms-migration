@@ -466,12 +466,24 @@ export const MOCK_CLOUD_PROJECTS: Readonly<Record<string, Readonly<Record<string
     '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3': { name: 'platform', domain: 'Default', user_id: '7e3a9c1d5b2f48e6a0c4d8b2f6e1a953', roles: ['load-balancer_member', 'member', 'reader'], restricted: false, expires_in: 5 * 24 * 3600_000 },
     c41a7e9b3d2f48a6b1e5c9d0f7a3b2e8: { name: 'analytics', domain: 'Default', user_id: '2c8f4e6a0b1d47c39e5a7d3b1f8c6e24', roles: ['member', 'reader'], restricted: true, expires_in: null },
   },
+  // the destination's tenant projects of the same names, other ids: its cloud's own (SDD §10, §27.10, plan task TC9)
+  'rhoso-prod': {
+    '2a7c9e1b3d5f47a8b0c2e4d6f8a1b3c5': { name: 'shop', domain: 'Default', user_id: '4c6e8a0b2d1f43a5b7c9e1d3f5a7b9c1', roles: ['member', 'reader'], restricted: true, expires_in: 30 * 24 * 3600_000 },
+    '7f1e3d5c9b2a46e8a0d4c6b8e2f1a3d5': { name: 'platform', domain: 'Default', user_id: 'e8b2d4f6a1c34e5b9d7f0a2c4e6b8d0f', roles: ['load-balancer_member', 'member', 'reader'], restricted: true, expires_in: null },
+  },
 };
 
-/** The project credentials the mock seeds (SDD §16, plan task TC8): the RHOSP 17.1 source's for shop and platform. */
+/**
+ * The project credentials the mock seeds, as the API's demo seeds two tenant projects on each side (SDD §10, §16, §27.10;
+ * plan tasks TC8, TC9): the RHOSP 17.1 source's and the RHOSO destination's for shop and platform.
+ */
 const SEEDED_PROJECT_CREDENTIALS: Readonly<Record<string, readonly string[]>> = {
   'rhosp17-dc1': ['5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6', '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3'],
+  'rhoso-prod': ['2a7c9e1b3d5f47a8b0c2e4d6f8a1b3c5', '7f1e3d5c9b2a46e8a0d4c6b8e2f1a3d5'],
 };
+
+/** The shop project of each side, which the pilot plan names (SDD §10 "The demo's tenant projects", plan task TC9). */
+const SHOP_PROJECTS = { source: '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6', destination: '2a7c9e1b3d5f47a8b0c2e4d6f8a1b3c5' } as const;
 
 /** A project credential's secret name, `provider-{id}.project-<h>`: the first 16 hex digits of its project id's SHA-256 (SDD §13.3). */
 export function projectSecretName(providerId: string, projectId: string): string {
@@ -1216,10 +1228,18 @@ export function buildProviders(now: number): Provider[] {
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31', [DEMO_HOST_KEYS.dst]),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-      capabilities: checkOf(
-        { id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
-        iso(now - 3 * 60_000),
-        inventories['rhoso-prod'],
+      capabilities: {
+        ...checkOf(
+          { id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
+          iso(now - 3 * 60_000),
+          inventories['rhoso-prod'],
+        ),
+        // its project credentials' check, by project id (SDD §10, §27.7, plan task TC9)
+        projects: projectsReport('rhoso-prod', SEEDED_PROJECT_CREDENTIALS['rhoso-prod']!, iso(now - 3 * 60_000)),
+      },
+      // an application credential per tenant project, as the API's demo seeds them (SDD §4.2, §10, plan task TC9)
+      project_credentials: Object.fromEntries(
+        SEEDED_PROJECT_CREDENTIALS['rhoso-prod']!.map((id) => [id, { secret: projectSecretName('rhoso-prod', id), updated_at: iso(now - 2 * 24 * 3600_000) }]),
       ),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
@@ -2378,7 +2398,8 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'completed',
     createdAgo: 9 * D,
-    overrides: { downtime_slo_s: 600 },
+    // its VMs are the shop project's: it moved them with the shop credentials of both sides (SDD §10, §27.4, plan task TC9)
+    overrides: { downtime_slo_s: 600, source_project: SHOP_PROJECTS.source, destination_project: SHOP_PROJECTS.destination },
     waves: [{ id: 'wave-1', name: 'Pilot', vms: ['os-0e65', 'os-0a14'], max_parallel: 2 }],
     migrations: [
       {
