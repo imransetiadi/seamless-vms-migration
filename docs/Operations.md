@@ -17,8 +17,9 @@ scripts/seamless-ctl.sh PLATFORM ACTION [ARGUMENTS] [OPTIONS]
 The binding description is [SDD §17.2](SDD.md); `scripts/seamless-ctl.sh --help` prints the same options.
 On a cluster, sections 4.7–4.13 run two replicas of the control plane: the HA control plane of 0.5.0, a Technology
 Preview (SDD §25) - how to enable it, which replica leads, a failover, scraping each replica, and turning it off.
-Section 7 also sets up what 0.5.0 adds: the conversion hosts' host keys (7.2), changed-extent tracking (7.3) and
-notifications (7.4). Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
+Section 7 also sets up what 0.5.0 adds: the conversion hosts' host keys (7.2), changed-extent tracking (7.3),
+notifications (7.4) and project credentials, a Keystone user and an application credential per tenant project (7.5).
+Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
 Designate zones and Manila shares (SDD §23.2).
 
 ---
@@ -1218,6 +1219,168 @@ receiver is down for maintenance: the channel skips the events meanwhile, and **
 | `410`, another 4xx (a webhook) | The receiver refused the message - a signature it could not verify (its key is not the channel's), a timestamp its clock calls old. Final. |
 | `429`, a 5xx, or an error's class: `ConnectError`, `ConnectTimeout`, `ReadTimeout`, `TimeoutError`, `ConnectionRefusedError`, ... | Tried 5 times over about 5 minutes, then failed: is the egress open (item 2), and the relay or the receiver up? |
 | `expired` | Messages whose event was more than an hour old when their turn came - after an outage of the channel or of the control plane: one `notification.failed` counts them (`expired`) with their first and last `seq`. The channel goes on with the next. |
+
+### 7.5 Project credentials: a Keystone user and an application credential per project (0.5.0, Technology Preview)
+
+Per-tenant credentials (SDD §27, FR-52) let one OpenStack or RHOSO provider hold, beside its own credential, an
+application credential per Keystone project, and a plan act in its source and destination projects with them: the
+work inside a project runs as that project, `member` in most cases, and the provider's own credential keeps the
+cloud-wide and admin-only steps. Moving many tenants then takes one provider per cloud, not one per tenant. They are a
+**Technology Preview** until LAB-TC01–LAB-TC06 pass (QASuite §7.2, §13.1e): the provider card's Projects, the Add
+project credential dialog, the plan form's project pickers and the Inventory's Project credential select carry the
+badge until then. A plan that names no project runs as before, with the providers' own credentials; a vCenter holds no
+project credential, and a plan from one names no project (SDD §27.9).
+
+**Which credential acts** (SDD §27.5). A plan's source and destination credentials are the project credentials its
+`source_project` and `destination_project` name, else the providers' own:
+
+* **the plan's project credentials:** the inventory of its VMs and of both clouds; the pre-staging of networks,
+  subnets, routers, security groups, keypairs and conversion hosts; every run of a `cold` or `warm` migration -
+  pre-copy, sync, cutover, verification, rollback, a cancel's cleanup, finalize - and the source watch; the storage
+  handover's destination half; the floating IP move, the Octavia member helper and the Designate swap;
+* **the provider's own credential:** the provider check and its storage pools, Placement's GPU capacity, the flavor
+  import at the destination, the storage handover's source half (by id), and the keep-address reservation for a
+  `member` project, made for the project.
+
+A project credential that is missing, failed its check or has expired is never replaced by the provider's own:
+validation refuses the plan (400), and a step whose credential cannot sign in fails before it changes anything - a
+cutover before it stops the source.
+
+**The roles a project credential needs** (SDD §27.5, §27.7, §9.3):
+
+| Role on the project | When |
+|---|---|
+| `member` | always: `PROJECT_CREDENTIAL_ROLE_MISSING` blocks a plan whose credential lacks it; a token lists the roles its roles imply, so `manager` and `admin` carry it (`TODO(LAB)`) |
+| `load-balancer_member` | on both sides of a plan that maps Octavia pools (`network_cutover.lb_pools`): the member helper drains, joins and restores with it, and `PROJECT_CREDENTIAL_ROLE_MISSING` blocks without it |
+| `service` (secure-RBAC), `advsvc` (legacy) | the destination's, for a VM whose port the cutover recreates, with its address or MAC, on another project's shared or external network: `NET_PORT_NOT_PERMITTED` judges it (Security.md C4-06) |
+| `manager` (secure-RBAC) or `admin` | not needed: with one, the destination's credential reserves a kept floating IP address itself; without, the destination provider's own credential - which then needs `admin` - reserves it for the project |
+| `admin` | the destination's, for a storage handover into the project - without it `storage_handover` is ineligible for the plan, the reason naming the project -, and for a VM on an external network that is not shared. A project credential with `admin` is no narrower than an admin one (Security.md C4-03) |
+
+**1. A Keystone user per project** (owner decision 3; Security.md C4-04). An application credential acts as the user
+who made it: Keystone's and Nova's logs name that user, and keypairs belong to users, so two project credentials of one
+user share its keypairs - a key name two tenants use is one key there, which `DST_KEYPAIR_KEY_MISMATCH` blocks
+(SDD §27.6). Give each project credential a user of its own, with roles on its project alone. As a cloud admin:
+
+```bash
+PROJECT=<the project id>               # openstack project show <project name> -f value -c id
+DOMAIN=<the project domain name>       # Default, for one
+openstack user create --domain "$DOMAIN" --password-prompt seamless-<project name>
+openstack role add --user seamless-<project name> --user-domain "$DOMAIN" --project "$PROJECT" member
+# each further role the table above names for the project's plans, for example:
+openstack role add --user seamless-<project name> --user-domain "$DOMAIN" --project "$PROJECT" load-balancer_member
+```
+
+The user's password stays with you: Seamless takes no password for a project (SDD §27.8), and the API refuses one.
+
+**2. The application credential.** Keystone lets a user make application credentials for itself alone, so sign in as
+the new user, scoped to the project, and make one: restricted - as Keystone makes it unless `--unrestricted` is given,
+which `PROJECT_CREDENTIAL_UNRESTRICTED` warns of -, with the roles it needs (one `--role` each; without `--role` it
+takes all the user's roles on the project) and an expiry (`--expiration`; `PROJECT_CREDENTIAL_EXPIRING` warns 7 days
+before it, item 5). Keystone shows the secret once. The password reaches `openstack` through its environment alone,
+typed at a prompt that does not echo it, and the answer goes to a file only you can read (Security.md §7.2):
+
+```bash
+CRED=$(mktemp -d)/credential.json      # mktemp -d makes a 0700 directory
+( unset OS_CLOUD && read -rs OS_PASSWORD && export OS_PASSWORD && umask 077 &&
+  OS_AUTH_URL=<the provider auth URL> OS_IDENTITY_API_VERSION=3 OS_USERNAME=seamless-<project name> \
+  OS_USER_DOMAIN_NAME="$DOMAIN" OS_PROJECT_ID="$PROJECT" \
+  openstack application credential create seamless-<project name> --role member \
+    --expiration 2027-01-31T00:00:00 -f json > "$CRED" )
+# in a shell where no openrc set other OS_* variables; a private CA: add OS_CACERT=<its CA file>
+```
+
+**3. Writing it into Seamless** (admin; SDD §12, §13.3). On the **Providers** page, the provider's card, **Projects**:
+**Add project credential** takes the project's id (1-64 letters, digits, `-` or `_`), the application credential's id
+and its secret (its id and its secret, in the file above); **Save and check** writes them
+(`PUT /api/v1/providers/{id}/projects/{project_id}/credentials`), clears the secret from the form whatever the answer,
+then checks the provider and shows that project's entry: "Signed in to {project} with {roles}.", or why its check
+failed - the credential stays written; **Check again** once the cause is fixed. The dashboard never shows the secret,
+its secret's name or the application credential's id again, and no route returns a value. A project the provider
+already holds a credential for gets the new one: that is a rotation (item 5). Remove the file then:
+`rm -rf "$(dirname "$CRED")"`.
+
+The same through the API, for automation, with `URL` and a `HEADER_FILE` made as in section 7.4, item 3:
+
+```bash
+PROVIDER=<the provider id>
+python3 - "$CRED" <<'PY' | curl -sS -X PUT "$URL/api/v1/providers/$PROVIDER/projects/$PROJECT/credentials" \
+    -H @"$HEADER_FILE" -H 'Content-Type: application/json' --data-binary @-
+import json, sys
+c = {k.lower(): v for k, v in json.load(open(sys.argv[1])).items()}   # whatever case the client names its keys in
+print(json.dumps({"application_credential_id": c["id"], "application_credential_secret": c["secret"]}))
+PY
+curl -sS -X POST "$URL/api/v1/providers/$PROVIDER/check" -H @"$HEADER_FILE"   # signs in with each project credential
+rm -rf "$(dirname "$CRED")"            # Keystone never shows the secret again; Seamless keeps it
+```
+
+The API refuses (422) a blank field, a password, an `auth_url` or an `interface`, a project id that is not 1-64
+letters, digits, `-` or `_`, and a vCenter; it answers 409, writing nothing, when another project's credential holds the
+secret's name (two project ids whose SHA-256 begin alike). A project credential signs in where the provider's own
+credential does - its secret's `auth_url` or its `clouds.yaml` entry's, else the provider's endpoint - with that
+entry's other settings: the same cloud, reached the same way, as another user (SDD §13.3). Each write is the event
+`provider.credentials_updated` (Events), naming the provider, the project, the secret's name and the key names, never
+a value; the secret lives in the secret store as `provider-{id}.project-<h>`, `<h>` the first 16 hex digits of the
+SHA-256 of the project id (Security.md §7.1).
+
+**4. Reading the check.** The provider check - the card's **Check**, `POST /api/v1/providers/{id}/check`, and the Add
+dialog's - signs in with each project credential once, after the provider's own credential, and a validation's check
+with the plan's project credentials alone; one project's failure fails neither the provider's status nor another
+project's entry (SDD §10, "The check of project credentials"). `GET /api/v1/providers/{id}` reports them in
+`capabilities.projects`, by project id, and the provider credential's own project in `capabilities.project` (`id`,
+`name`, `domain`), which the card shows as "Own credential: {name} ({id})":
+
+| `capabilities.projects.<project id>` | On the card | Look for |
+|---|---|---|
+| `status`, `message` | "Checked" with its time; "Check failed" with the message; "Not checked since written" while no check read it since its write | `ok`. An `error` names an HTTP status or a failure's kind, never Keystone's words or a value: Keystone refused the sign-in - the credential expired or was deleted, or its user lost the role (SDD §27.8) -, the token's project is another one - the credential is another project's: write the right one -, or its record could not be read, so its expiry is unknown. An `ok` entry's message reports the project's conversion host found replaced or not found (section 7.2) |
+| `project_name`, `domain` | the project's name, above its id | the project you meant |
+| `user_id` | - | the project's own user (item 1) |
+| `roles` | "Roles: member, ..." | what the table above asks of the project's plans |
+| `restricted` | "Restricted", or "Unrestricted: it may create application credentials and trusts" in the warning tone | `true` |
+| `expires_at` | "Never expires", "Expires {time}" - ", within 7 days" in the warning tone - or "Expired {time}" | later than the windows of the project's plans |
+| `checked_at` | the time beside "Checked" | later than the credential's write ("Written 3 days ago") |
+
+**5. Rotating it** (Security.md §7.1). Before it expires, on staff change or on suspicion: make a new application
+credential for the same user and project (item 2), write it for the same project (item 3) - the next step of every
+plan signs in with it -, check the provider (the dialog does), and only then delete the old one in Keystone, as the
+project's user: `openstack application credential delete <old name or id>`. Meanwhile:
+
+* validation warns with `PROJECT_CREDENTIAL_EXPIRING` of a credential that expires within 7 days or before the plan's
+  `cutover_window` ends, and refuses (400) a plan whose credential is missing, has expired or failed its check;
+* the cutover gate holds a cutover (SDD §5.4 rule 6) while a credential its cutover or a rollback would act with
+  expires within 24 hours, was written since the provider's last check, or failed that check. The source keeps
+  running - a warm migration keeps its keep-warm passes -, and the migration page names each such credential, its
+  project, provider and side, with what releases it: a check of the provider, or a new credential and then a check;
+* a step whose credential Keystone rejects fails before it changes anything, for good: never retried, never with the
+  provider's own credential - write a new credential, check, then retry the migration. A Keystone that cannot be
+  reached, or answers 5xx, is a transient failure, retried (SDD §7.1).
+
+**6. The plan's projects.** In the plan form (**New plan**, or **Edit plan**), the **Project pair** of an OpenStack or
+RHOSO source offers a **Source project** and a **Destination project**: the provider's own credential's project first
+("Its own credential's project: {name} ({id})", sent as none), then each project its provider holds a credential for.
+Through the API they are the plan's `source_project` and `destination_project`, project ids, null for the provider's
+own credential (`POST /api/v1/plans`, `PATCH /api/v1/plans/{id}`, `seamless plan apply`); both are refused (422) for a
+VMware source. The plan's VMs land in its destination project. Validation refuses (400) a plan
+
+* whose project credential is missing, failed its check or has expired, naming the provider and the project;
+* whose VMs are not all of its source project, naming each project with its VM count: one project pair per plan
+  (owner decision 7), so a plan per tenant;
+* that names a project on a side whose conversion host is an existing one (`conversion_host.manage: false`), which
+  serves its provider's own project alone: a plan with a project deploys its own conversion hosts there (section 7.2,
+  "A project's conversion host").
+
+A change of either project is refused (409) while a migration of the plan is in flight or `failed`, since a rollback
+acts with its attempt's credentials: roll it back or cancel it first. The **Inventory**'s **Project credential**
+select, beside **Provider**, reads a provider's VMs, or a destination's view, with a project's credential
+(`GET /api/v1/providers/{id}/inventory?project=<project id>`): the source project's VMs are those its plan may take.
+
+**7. Deleting it.** The credential's **Delete** on the card (admin; the project's id typed to confirm), or
+`DELETE /api/v1/providers/{id}/projects/{project_id}/credentials`, deletes the secret, then the entry - and the pin of
+the project's conversion host with it (section 7.2). It is unavailable (409) while a plan needs the project: one that
+names it on that side and is neither completed nor cancelled, or a completed one with VMs not finalized, rolled back or
+cancelled, each plan named. A secret store that cannot delete the secret answers 503 and keeps the entry: send the
+deletion again. The event `provider.credentials_updated` says `deleted`. Nothing changes in the cloud: delete the
+application credential in Keystone too (item 5). Deleting the provider deletes every project credential's secret with
+it.
 
 ---
 
