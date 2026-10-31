@@ -9373,9 +9373,10 @@ another only where a service lets an admin act by id or on the project's behalf.
   * LAB-TC01: a cold and a warm plan per project pair: the servers, volumes, ports and floating IPs land in the plan's
     destination project, and no admin credential is in their steps' run files;
   * LAB-TC02: the handover into a project, its credential with `admin`; its source half by id with the provider's admin;
-  * LAB-TC03: expiry and deletion: a credential that expires during a sync pass fails it before it changes anything,
-    and the next pass runs once an admin wrote a new one; one deleted before a cutover fails it before the source
-    stops; one that expires within 24 hours holds the cutover at the gate; nothing runs with the provider's credential;
+  * LAB-TC03: expiry and deletion: a credential that has expired when a sync pass signs in fails the pass before it
+    changes anything - permanently, as a credential Keystone rejects (§7.1) -, and the next pass runs, after a retry,
+    once an admin wrote a new one; one deleted before a cutover fails it before the source stops; one that expires
+    within 24 hours holds the cutover at the gate; nothing runs with the provider's credential;
   * LAB-TC04: roles under each policy profile: `member` alone; `service` (secure-RBAC) for another project's network;
     the keep-address reservation by the provider's admin; `load-balancer_member` for the member helper;
   * LAB-TC05: keypairs: two project credentials of one user and a key name both tenants use (the finding blocks), then
@@ -9427,7 +9428,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | the check of each project credential: the report keys `projects` and `project` | §10, §21.5 (binding) | TC3 |
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 (binding) | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 (binding) | TC5 |
-| the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
+| the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 (binding) | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure; the migration page's naming of the credential that holds a cutover | §5.4, §7.1, §16 (binding) | TC7 |
 | the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 (binding) | TC8 |
 | the demo's tenant projects and its plan with a project pair | §10 (binding) | TC9 |
