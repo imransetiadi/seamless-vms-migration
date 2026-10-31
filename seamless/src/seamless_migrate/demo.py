@@ -1,12 +1,14 @@
-"""Demo seeding (``seamless serve --demo``): providers, two running plans and the notification
-channels.
+"""Demo seeding (``seamless serve --demo``): providers, their tenant projects' credentials, three
+running plans and the notification channels.
 
 Idempotent: providers, plans and channels that already exist (by id / name) are left untouched.
 Plans are auto-waved, validated and started so the dashboard shows every phase within minutes: the
 finance plan cuts over automatically (simulated failures exercise rollback), the VMware plan waits
 for approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrates (SDD §10,
-§22.10). VMs blocked by pre-flight are cancelled with an explanatory reason. One channel of each
-kind is subscribed to both plans, and records every message instead of sending it (§7.4, §24.9).
+§22.10). The tenant plan moves the payments project's VMs with the payments credentials of both
+sides (§10 "The demo's tenant projects", §27, plan task TC9). VMs blocked by pre-flight are
+cancelled with an explanatory reason. One channel of each kind is subscribed to the plans, and
+records every message instead of sending it (§7.4, §24.9).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import logging
 from datetime import UTC, datetime
 
 from .config import Settings
+from .credentials import Step, for_step, run_row
 from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
     AdvisorPolicy,
@@ -31,8 +34,10 @@ from .domain.models import (
     NotificationSubscription,
     Plan,
     PolicyScope,
+    ProjectCredential,
     Provider,
     VerificationConfig,
+    utcnow,
 )
 from .events import put_and_emit
 from .executors.simulated import server_flavor
@@ -43,13 +48,18 @@ from .providers.base import ProviderError
 from .providers.fake import (
     DEMO_CEPH_FSID,
     DEMO_DESTINATION_POOL,
+    DEMO_DESTINATION_TENANTS,
     DEMO_DNS_NEW_ADDRESS,
     DEMO_DNS_VM,
     DEMO_DNS_ZONES,
     DEMO_PORTAL_POOL,
+    DEMO_SOURCE_TENANTS,
     DEMO_STACK_SERVERS,
+    DemoProject,
     FakeSourceProvider,
+    tenant_named,
 )
+from .security.secret_store import project_secret_name
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -68,7 +78,16 @@ DEMO_GPU_PROFILES = {"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}
 #: the GPU flavor the demo plans map their GPU VMs to (SDD §10, §22.10)
 DEMO_GPU_FLAVOR = "g1.a100-4c"
 VMWARE_PLAN = "DC2 VMware exit"
-DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
+#: the plan of a project pair (SDD §10 "The demo's tenant projects", §27.4, plan task TC9)
+TENANT_PLAN = "Payments tenant (RHOSP 17.1 → RHOSO)"
+#: the tenant project the tenant plan moves, on both sides
+DEMO_TENANT = "payments"
+DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN, TENANT_PLAN)
+#: the providers the seed gives their side's tenant projects' credentials (SDD §10)
+DEMO_TENANT_PROVIDERS: dict[str, dict[str, DemoProject]] = {
+    "rhosp17-finance": DEMO_SOURCE_TENANTS,
+    "rhoso18": DEMO_DESTINATION_TENANTS,
+}
 DEMO_ACTOR = "demo"
 FINANCE_POLICY = "Finance — approval required"
 #: ADV-17 (SDD §5.4): the VMware plan's first cutovers, asked for by one person, approved by another
@@ -199,6 +218,13 @@ DEMO_PROVIDERS = (
 async def _plans(settings: Settings) -> list[Plan]:
     finance_vms = await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed).list_vms()
     vmware_vms = await FakeSourceProvider(ProviderKind.vmware, settings.demo_seed).list_vms()
+    source_tenant = tenant_named(DEMO_SOURCE_TENANTS, DEMO_TENANT)
+    destination_tenant = tenant_named(DEMO_DESTINATION_TENANTS, DEMO_TENANT)
+    tenant_vms = (
+        await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed)
+        .as_project(source_tenant.id)
+        .list_vms()
+    )
     planned = [vm for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS]
     # the finance plan probes its databases' services (ADV-18, SDD §7.4); the VMware plan probes
     # nothing, so its validation warns about its database VMs (APP_PROBE_MISSING)
@@ -268,6 +294,31 @@ async def _plans(settings: Settings) -> list[Plan]:
             keep_warm_interval_s=300,
             verification=VerificationConfig(timeout_s=120),
         ),
+        # a tenant's VMs into its own project, with its credentials on both sides (SDD §10 "The
+        # demo's tenant projects", §27.5, plan task TC9): the payments credential, member alone,
+        # may not choose an address, so rhoso18's admin reserves pay-web-01's for the project
+        Plan(
+            name=TENANT_PLAN,
+            description=(
+                "The payments tenant into its own project, with the tenant's application "
+                "credentials on both clouds; cuts over automatically."
+            ),
+            source_provider_id="rhosp17-finance",
+            destination_provider_id="rhoso18",
+            source_project=source_tenant.id,
+            destination_project=destination_tenant.id,
+            vm_ids=[vm.source_id for vm in tenant_vms],
+            mappings=Mappings(
+                networks={"payments-app": "payments-app"},
+                volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
+            ),
+            downtime_slo_s=600,
+            require_approval=False,
+            auto_cutover=True,
+            keep_warm_interval_s=120,
+            verification=VerificationConfig(timeout_s=120),
+            network_cutover=NetworkCutover(floating_ips="keep_address"),
+        ),
     ]
 
 
@@ -312,6 +363,8 @@ async def seed_demo(
             expected_version=0,
         )
     existing_plans = {p.name for p in await db.list("plan", Plan)}
+    if TENANT_PLAN not in existing_plans:
+        await _seed_tenant_credentials(orchestrator)
     for plan in await _plans(settings):
         if plan.name in existing_plans:
             continue
@@ -331,6 +384,33 @@ async def seed_demo(
     await _seed_notifications(orchestrator)
     await _restore_source_power(orchestrator)
     await _restore_destination_servers(orchestrator)
+
+
+async def _seed_tenant_credentials(orchestrator: Orchestrator) -> None:
+    """Each tenant provider's credentials of its side's tenant projects, as an admin's write
+    records them - their secrets the demo neither holds nor needs, as it holds no provider
+    credential -, then a check of the provider, so each project's entry reads (SDD §10 "The demo's
+    tenant projects", plan task TC9). The seed runs it while the store holds no tenant plan: a
+    database seeded before TC9 gets them on its next start, and a restart afterwards keeps what an
+    admin changed."""
+    db = orchestrator.db
+    for provider_id, tenants in DEMO_TENANT_PROVIDERS.items():
+        provider, version = await db.get_versioned("provider", provider_id, Provider)
+        missing = {
+            project_id: ProjectCredential(
+                secret=project_secret_name(provider_id, project_id), updated_at=utcnow()
+            )
+            for project_id in tenants
+            if project_id not in provider.project_credentials
+        }
+        if missing:
+            credentials = {**provider.project_credentials, **missing}
+            await db.put(
+                "provider",
+                provider.model_copy(update={"project_credentials": credentials}),
+                expected_version=version,
+            )
+        await orchestrator.check_provider(provider_id, DEMO_ACTOR)
 
 
 async def _seed_notifications(orchestrator: Orchestrator) -> None:
@@ -383,16 +463,22 @@ async def _restore_source_power(orchestrator: Orchestrator) -> None:
         plan = plans.get(m.plan_id)
         if not stopped or plan is None:
             continue
-        source = await orchestrator.source_client(plan)
-        power_off = getattr(source, "power_off", None)
-        if power_off is not None:
-            await power_off(m.vm.source_id)
+        try:
+            # the plan's source credential, as the source watch reads it (SDD §8.1, §27.5)
+            source = await orchestrator.source_client(plan)
+            power_off = getattr(source, "power_off", None)
+            if power_off is not None:
+                await power_off(m.vm.source_id)
+        except ProviderError as exc:
+            log.warning("demo source %s not stopped again: %s", m.vm.name, exc)
 
 
 async def _restore_destination_servers(orchestrator: Orchestrator) -> None:
     """A restart builds new fake destinations, whose Placement holds no server (SDD §10): hand
     them again the servers the migrations recorded, each with the flavor its plan names for it,
-    as the simulated cutover created it (§7.4), so the GPU units they hold stay taken."""
+    as the simulated cutover created it (§7.4), so the GPU units they hold stay taken - and with
+    the credential its cutover acted with, so it lands in that credential's project (§27.5,
+    plan task TC9)."""
     providers = {p.id: p for p in await orchestrator.db.list("provider", Provider)}
     plans = {p.id: p for p in await orchestrator.db.list("plan", Plan)}
     for m in await orchestrator.db.list("migration", Migration):
@@ -403,10 +489,12 @@ async def _restore_destination_servers(orchestrator: Orchestrator) -> None:
         destination = providers.get(plan.destination_provider_id)
         if source is None or destination is None:
             continue
-        create = getattr(orchestrator.providers.get(destination), "create_server", None)
-        if create is None:
-            continue
         try:
+            step = run_row(m.strategy) if m.strategy else Step.MIGRATION
+            client = for_step(orchestrator.providers, step, destination, plan)
+            create = getattr(client, "create_server", None)
+            if create is None:
+                continue
             await create(m.destination_server_id, server_flavor(m.vm, plan, source))
         except ProviderError as exc:
             log.warning("demo server of %s not restored: %s", m.vm.name, exc)

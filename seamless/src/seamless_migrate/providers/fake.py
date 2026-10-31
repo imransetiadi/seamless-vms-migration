@@ -1,19 +1,26 @@
 """Deterministic demo providers (SDD §10): 24 OpenStack VMs, 16 VMware VMs and two destinations,
 RHOSO 18.0 and a community cloud, with GPU flavors and the Placement pools of their vGPUs (§22.10).
+Each OpenStack cloud holds two tenant projects beside its credential's own, and each call of a fake
+is recorded with the credential it came with (§10 "The demo's tenant projects", plan task TC9).
 
 The traits (names, special cases) are fixed; sizes, usage and change rates vary with the seed.
 """
 
 from __future__ import annotations
 
+import copy
+import functools
 import hashlib
+import inspect
 import random
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from ..domain.enums import ProviderKind
-from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utc_text, utcnow
 from ..planning.gpu import gpu_pools, gpu_requests, pool_name
 from ..planning.platforms import destination_release
 from ..planning.preflight import (
@@ -103,6 +110,190 @@ DEMO_DNS_ZONES = ("internal.example.org.",)
 #: destination's owns its own networks (network_details)
 DEMO_SOURCE_PROJECT = {"id": "project-finance", "name": "finance", "domain": "Default"}
 DEMO_DESTINATION_PROJECT = {"id": "project-demo", "name": "demo", "domain": "Default"}
+
+
+def _keystone_id(*words: str) -> str:
+    """A made-up Keystone id of the demo: 32 hex digits, as Keystone makes them, from the words."""
+    return hashlib.sha256(" ".join(("seamless demo", *words)).encode()).hexdigest()[:32]
+
+
+@dataclass(frozen=True)
+class DemoProject:
+    """A tenant project of a demo cloud beside its credential's own, and what the sign-in of its
+    application credential reads (SDD §10 "The demo's tenant projects", §27.7, plan task TC9):
+    a Keystone user of its own (§27.11 decision 3)."""
+
+    id: str
+    name: str
+    user_id: str
+    roles: tuple[str, ...]
+    restricted: bool
+    #: days from each read to the credential's expiry, so the demo keeps showing it; None: never
+    expires_in_days: int | None = None
+
+
+def _projects(*projects: DemoProject) -> dict[str, DemoProject]:
+    return {project.id: project for project in projects}
+
+
+#: the source's tenant projects, by id (SDD §10): payments plain, treasury unrestricted
+DEMO_SOURCE_TENANTS = _projects(
+    DemoProject(
+        _keystone_id("dc1", "payments"),
+        "payments",
+        _keystone_id("dc1", "payments", "user"),
+        ("member", "reader"),
+        restricted=True,
+    ),
+    DemoProject(
+        _keystone_id("dc1", "treasury"),
+        "treasury",
+        _keystone_id("dc1", "treasury", "user"),
+        ("load-balancer_member", "member", "reader"),
+        restricted=False,
+    ),
+)
+#: the destinations' tenant projects, by id - other ids than the source's (SDD §10): the payments
+#: credential expires 5 days after each read, so the tenant plan's validation warns of it
+DEMO_DESTINATION_TENANTS = _projects(
+    DemoProject(
+        _keystone_id("rhoso", "payments"),
+        "payments",
+        _keystone_id("rhoso", "payments", "user"),
+        ("member", "reader"),
+        restricted=True,
+        expires_in_days=5,
+    ),
+    DemoProject(
+        _keystone_id("rhoso", "treasury"),
+        "treasury",
+        _keystone_id("rhoso", "treasury", "user"),
+        ("member", "reader"),
+        restricted=True,
+        expires_in_days=30,
+    ),
+)
+#: the subnet prefix of each tenant network, at the source and in its destination project
+_TENANT_SUBNETS = {"payments-app": "10.30.1", "treasury-app": "10.31.1"}
+#: the record of calls each simulated cloud keeps, newest last (SDD §10)
+_CALLS_KEPT = 10_000
+
+
+def tenant_named(tenants: dict[str, DemoProject], name: str) -> DemoProject:
+    """The tenant project of that name (SDD §10 "The demo's tenant projects")."""
+    return next(project for project in tenants.values() if project.name == name)
+
+
+def _self_recorded(method: Callable[..., Any]) -> Callable[..., Any]:
+    """A fake's method that records its call itself, with the credential it signs in with."""
+    method.__self_recorded__ = True  # type: ignore[attr-defined]
+    return method
+
+
+def _recorded(name: str, method: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(method)
+    async def call(self: _Recorded, *args: Any, **kwargs: Any) -> Any:
+        self._sign_in(name)
+        return await method(self, *args, **kwargs)
+
+    call.__self_recorded__ = True  # type: ignore[attr-defined]
+    return call
+
+
+class _Recorded:
+    """A demo fake acting with one credential (SDD §10 "The demo's tenant projects", §27.10, plan
+    task TC9): each call of a public coroutine method is recorded in its simulated cloud with the
+    credential it came with - the provider's own as the provider's id, a project credential as
+    ``{provider id}/{project id}`` -, and a credential of a project the cloud does not hold is
+    refused as Keystone refuses it. ``as_project`` is the fake acting with the provider's credential
+    for a project: a view of the same cloud, which holds no connection."""
+
+    _label: str
+    #: None: the provider's own credential, an admin token; else the project credential's project
+    _project: str | None = None
+    #: the Keystone project the provider's own credential is scoped to; None without Keystone
+    _own_project: str | None = None
+    _tenants: dict[str, DemoProject]
+    _cloud: Any
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for name in dir(cls):
+            attr = inspect.getattr_static(cls, name)
+            if name.startswith("_") or not inspect.iscoroutinefunction(attr):
+                continue
+            if not getattr(attr, "__self_recorded__", False):
+                setattr(cls, name, _recorded(name, attr))
+
+    @property
+    def calls(self) -> deque[tuple[str, str]]:
+        """The calls its simulated cloud recorded, as ``(credential, method)``, newest last."""
+        return self._cloud.calls
+
+    @property
+    def _credential(self) -> str:
+        return self._label if self._project is None else f"{self._label}/{self._project}"
+
+    @property
+    def _acting(self) -> str | None:
+        """The project its calls act in: the project credential's, else the provider's own."""
+        return self._project or self._own_project
+
+    def _sign_in(self, method: str) -> None:
+        self._cloud.calls.append((self._credential, method))
+        if self._project is not None and self._project not in self._tenants:
+            raise ProviderError(f"{self._label}: the sign-in failed: HTTP 401")
+
+    def _sees(self, project: str | None) -> bool:
+        """Whether its credential reaches a resource of ``project``: the provider's own, an admin
+        token, every project's by id; a project credential its own project's alone."""
+        return self._project is None or project == self._project
+
+    def as_project(self, project_id: str) -> Any:
+        """The fake acting with the provider's credential for the project ``project_id`` (SDD §10):
+        its cloud, its record of calls and its estate shared."""
+        view = copy.copy(self)
+        view._project = project_id
+        return view
+
+    def close(self) -> None:
+        """Nothing to close: a fake holds no connection, which its caller closes after a project
+        credential's read (SDD §10, §12)."""
+
+    @_self_recorded
+    async def check_project(self, project_id: str) -> dict[str, Any]:
+        """The sign-in with the provider's credential for the project (SDD §10 "The check of
+        project credentials", §27.7), recorded with that credential: what its token and its
+        record read, or a provider error for a project the cloud does not hold, as Keystone
+        refuses its application credential."""
+        self._cloud.calls.append((f"{self._label}/{project_id}", "check_project"))
+        project = self._tenants.get(project_id)
+        if project is None:
+            raise ProviderError(f"{self._label}: the sign-in failed: HTTP 401")
+        expires = project.expires_in_days
+        return {
+            "project_id": project_id,
+            "project_name": project.name,
+            "domain": "Default",
+            "user_id": project.user_id,
+            "roles": sorted(project.roles),
+            "restricted": project.restricted,
+            "expires_at": None if expires is None else utc_text(utcnow() + timedelta(days=expires)),
+        }
+
+    def _token(self, report: dict[str, Any]) -> dict[str, Any]:
+        """The check report as a project credential's token would read it (SDD §10): not admin,
+        its project's roles and the project; the provider's own report unchanged."""
+        project = self._tenants.get(self._project or "")
+        if project is None:
+            return report
+        return {
+            **report,
+            "admin": False,
+            "roles": sorted(project.roles),
+            "project": {"id": project.id, "name": project.name, "domain": "Default"},
+        }
+
 
 # the demo's network cut-over (SDD §10, §23.9, plan task N11)
 #: the source's Heat stack: web-01 a server resource, the Tomcat pair its autoscaling group's
@@ -239,6 +430,62 @@ _OPENSTACK: tuple[_Spec, ...] = (
     ),
 )
 
+#: the VMs of the source's tenant projects, by project name (SDD §10 "The demo's tenant
+#: projects", plan task TC9): the source's own credential lists none of them
+_TENANT_OPENSTACK: dict[str, tuple[_Spec, ...]] = {
+    "payments": (
+        _Spec(
+            "pay-web-01",
+            "m1.small",
+            (20,),
+            "rhel9",
+            network="payments-app",
+            rate_mib=0.5,
+            tags=(("app", "payments"),),
+            # the tenant plan keeps its address (SDD §8.3, §27.6)
+            floating_ips=("203.0.113.20",),
+        ),
+        _Spec(
+            "pay-api-01",
+            "m1.medium",
+            (40,),
+            "rhel9",
+            network="payments-app",
+            rate_mib=1.0,
+            tags=(("app", "payments"),),
+        ),
+        _Spec(
+            "pay-batch-01",
+            "m1.medium",
+            (60,),
+            "rhel8",
+            network="payments-app",
+            rate_mib=0.8,
+            tags=(("app", "payments"),),
+        ),
+    ),
+    "treasury": (
+        _Spec(
+            "tsy-app-01",
+            "m1.medium",
+            (40,),
+            "rhel9",
+            network="treasury-app",
+            rate_mib=1.0,
+            tags=(("app", "treasury"),),
+        ),
+        _Spec(
+            "tsy-report-01",
+            "m1.small",
+            (20,),
+            "ubuntu 24.04",
+            network="treasury-app",
+            rate_mib=0.3,
+            tags=(("app", "treasury"),),
+        ),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class _VSpec:
@@ -348,29 +595,34 @@ def _pool_facts(name: str, balancer: str) -> dict[str, Any]:
 
 class _DemoOctavia:
     """A demo cloud's Octavia pools for the member helper (SDD §8.5, §10): each pool's facts and
-    members by id; a change is ACTIVE at once."""
+    members by id; a change is ACTIVE at once. The pools are the provider's own project's: a
+    project credential sees none of them (plan task TC9)."""
 
     _pools: dict[str, dict[str, Any]]
+    _project: str | None
+
+    def _seen_pools(self) -> dict[str, dict[str, Any]]:
+        return self._pools if self._project is None else {}
 
     async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
-        pool = self._pools.get(pool_id)
+        pool = self._seen_pools().get(pool_id)
         if pool is None:
             return None
         facts = {k: v for k, v in pool["facts"].items() if k != "load_balancer"}
         return {**facts, "id": pool_id}
 
     async def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
-        pool = self._pools.get(pool_id)
+        pool = self._seen_pools().get(pool_id)
         return [] if pool is None else [{**m, "id": i} for i, m in pool["members"].items()]
 
     async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
-        member = self._pools.get(pool_id, {}).get("members", {}).get(member_id)
+        member = self._seen_pools().get(pool_id, {}).get("members", {}).get(member_id)
         if member is None:
             raise ProviderError(f"Octavia holds no member {member_id} in pool {pool_id}")
         member["admin_state_up"] = admin_state_up
 
     async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
-        pool = self._pools.get(pool_id)
+        pool = self._seen_pools().get(pool_id)
         if pool is None:
             raise ProviderError(f"Octavia holds no pool {pool_id}")
         member_id = _stable_id("member", f"{pool_id}-{address}-{protocol_port}")
@@ -378,7 +630,7 @@ class _DemoOctavia:
         return member_id
 
     async def delete_pool_member(self, pool_id: str, member_id: str) -> None:
-        self._pools.get(pool_id, {}).get("members", {}).pop(member_id, None)
+        self._seen_pools().get(pool_id, {}).get("members", {}).pop(member_id, None)
 
 
 def _member(address: str, port: int) -> dict[str, Any]:
@@ -390,7 +642,11 @@ def _member(address: str, port: int) -> dict[str, Any]:
     }
 
 
-def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
+def _openstack_vm(
+    spec: _Spec, rng: random.Random, index: int, project: DemoProject | None = None
+) -> VMRef:
+    """A demo OpenStack VM: of the finance project, its credential's own, else of the tenant
+    ``project`` on that project's network (SDD §10)."""
     vcpus, ram, flavor_disk = _FLAVORS[spec.flavor]
     disks: list[Disk] = []
     for i, size in enumerate(spec.disks_gb):
@@ -416,12 +672,17 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
             )
         )
     net_mtu = 9000 if spec.network == "finance-db" else 1500
+    if project is None:
+        prefix = f"10.20.{1 if spec.network == 'finance-app' else 2}"
+    else:
+        prefix = _TENANT_SUBNETS[spec.network]
     return VMRef(
         source_id=_stable_id("srv", spec.name),
         name=spec.name,
-        project="finance",
-        # the project its source credential's check names as its own (SDD §10, plan task TC4)
-        project_id=DEMO_SOURCE_PROJECT["id"],
+        project="finance" if project is None else project.name,
+        # the project its source credential's check names as its own (SDD §10, plan task TC4),
+        # else its tenant project's (plan task TC9)
+        project_id=DEMO_SOURCE_PROJECT["id"] if project is None else project.id,
         flavor=spec.flavor,
         vcpus=vcpus,
         ram_mb=ram,
@@ -430,7 +691,7 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
             Nic(
                 network=spec.network,
                 mac=_mac(rng),
-                fixed_ips=[f"10.20.{1 if spec.network == 'finance-app' else 2}.{10 + index}"],
+                fixed_ips=[f"{prefix}.{10 + index}"],
                 mtu=net_mtu,
                 allowed_address_pairs=list(spec.address_pairs),
                 floating_ips=list(spec.floating_ips),
@@ -493,26 +754,37 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
 
 
 class _FloatingIPs:
-    """A fake's project's floating IPs as the keep-address move moves them (SDD §8.3, §10)."""
+    """A fake cloud's floating IPs as the keep-address move moves them (SDD §8.3, §10): the port
+    each is on, and the project each is of - a project credential reaches its own project's alone
+    (plan task TC9)."""
 
     _floating: dict[str, str | None]
+    _floating_projects: dict[str, str | None]
+    #: whether its credential reaches a resource of the project (``_Recorded._sees``)
+    _sees: Callable[[str | None], bool]
+
+    def _holds(self, address: str) -> bool:
+        return address in self._floating and self._sees(self._floating_projects.get(address))
 
     async def floating_ip_port(self, address: str) -> str | None:
-        return self._floating.get(address)
+        return self._floating.get(address) if self._holds(address) else None
 
     async def disassociate_floating_ip(self, address: str) -> str | None:
-        port = self._floating.get(address)
-        if address in self._floating:
-            self._floating[address] = None
+        if not self._holds(address):
+            return None
+        port = self._floating[address]
+        self._floating[address] = None
         return port
 
     async def associate_floating_ip(self, address: str, port_id: str) -> None:
-        if address not in self._floating:
+        if not self._holds(address):
             raise ProviderError(f"the project holds no floating IP {address}")
         self._floating[address] = port_id
 
     async def release_floating_ip(self, address: str) -> None:
-        self._floating.pop(address, None)
+        if self._holds(address):
+            self._floating.pop(address, None)
+            self._floating_projects.pop(address, None)
 
 
 class _NoKeypairs:
@@ -523,58 +795,117 @@ class _NoKeypairs:
         return None
 
 
-class FakeSourceProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
-    def __init__(self, kind: ProviderKind | str, seed: int = 42) -> None:
+@dataclass
+class _SourceCloud:
+    """What a fake source's simulated cloud holds (SDD §10): the fakes of its provider's own
+    credential and of each project credential share it, and a fake rebuilt for a changed provider
+    document takes it over, as a real cloud keeps its VMs' power whatever the document says."""
+
+    #: power states the demo changed (SDD §8.1): a simulated cutover stops the source, a rollback
+    #: starts it, the demo power control either
+    power: dict[str, str] = field(default_factory=dict)
+    #: the floating IPs of its VMs' ports (SDD §8.3), and the project each is of
+    floating: dict[str, str | None] = field(default_factory=dict)
+    floating_projects: dict[str, str | None] = field(default_factory=dict)
+    #: its Octavia pools and their members, the OpenStack source's alone (SDD §10, N11)
+    pools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: each call with the credential it came with (SDD §10 "The demo's tenant projects")
+    calls: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=_CALLS_KEPT))
+
+
+class FakeSourceProvider(_Recorded, _FloatingIPs, _DemoOctavia, _NoKeypairs):
+    def __init__(
+        self, kind: ProviderKind | str, seed: int = 42, provider: Provider | None = None
+    ) -> None:
         self.kind = ProviderKind(kind)
         self.seed = seed
+        #: the demo provider it stands for: its id names its credentials in the record (SDD §10)
+        self.provider = provider
+        self._label = provider.id if provider is not None else f"demo-{self.kind}"
+        openstack = self.kind != ProviderKind.vmware
+        self._own_project = DEMO_SOURCE_PROJECT["id"] if openstack else None
+        #: its cloud's tenant projects beside its credential's own; vCenter has none (SDD §10)
+        self._tenants = dict(DEMO_SOURCE_TENANTS) if openstack else {}
         rng = random.Random(f"{self.kind}:{seed}")
         if self.kind == ProviderKind.vmware:
             self._vms = [_vmware_vm(s, rng, i) for i, s in enumerate(_VMWARE)]
         else:
             self._vms = [_openstack_vm(s, rng, i) for i, s in enumerate(_OPENSTACK)]
-        self._by_id = {vm.source_id: vm for vm in self._vms}
-        #: power states the demo changed (SDD §8.1): a simulated cutover stops the source, a
-        #: rollback starts it, the demo power control either; the registry keeps one fake each
-        self._power: dict[str, str] = {}
-        #: the floating IPs of its VMs' ports (SDD §8.3)
-        self._floating = {
-            address: f"port-{vm.source_id}-{i}"
-            for vm in self._vms
+        #: the tenant projects' VMs by project id, of a seed of their own, so the VMs of its
+        #: own project keep their sizes and addresses (plan task TC9)
+        tenant_rng = random.Random(f"{self.kind}:{seed}:tenants")
+        self._tenant_vms = {
+            project.id: [
+                _openstack_vm(spec, tenant_rng, i, project)
+                for i, spec in enumerate(_TENANT_OPENSTACK[project.name])
+            ]
+            for project in self._tenants.values()
+        }
+        every = self._vms + [vm for vms in self._tenant_vms.values() for vm in vms]
+        self._by_id = {vm.source_id: vm for vm in every}
+        ports = [
+            (address, f"port-{vm.source_id}-{i}", vm.project_id)
+            for vm in every
             for i, nic in enumerate(vm.nics)
             for address in nic.floating_ips
-        }
-        #: its Octavia pools and their members, the OpenStack source's alone (SDD §10, N11)
-        self._pools: dict[str, dict[str, Any]] = (
-            {
-                pool: {
-                    "facts": _pool_facts(pool, balancer),
-                    "members": {
-                        _stable_id("member", f"{pool}-{name}"): _member(
-                            _openstack_address(name), port
-                        )
-                        for name in names
-                    },
+        ]
+        self._cloud = _SourceCloud(
+            floating={address: port for address, port, _ in ports},
+            floating_projects={address: project for address, _, project in ports},
+            pools=(
+                {
+                    pool: {
+                        "facts": _pool_facts(pool, balancer),
+                        "members": {
+                            _stable_id("member", f"{pool}-{name}"): _member(
+                                _openstack_address(name), port
+                            )
+                            for name in names
+                        },
+                    }
+                    for pool, (balancer, names, port) in DEMO_SOURCE_POOLS.items()
                 }
-                for pool, (balancer, names, port) in DEMO_SOURCE_POOLS.items()
-            }
-            if self.kind != ProviderKind.vmware
-            else {}
+                if openstack
+                else {}
+            ),
         )
 
     def adopt(self, old: FakeSourceProvider) -> None:
-        """Rebuilt for a changed provider document (SDD §10): its VMs keep the power states the
-        replaced fake gave them - the same states, which a call on either changes -, their
-        floating IPs where the replaced fake left them, and its pools' members as they are."""
+        """Rebuilt for a changed provider document (SDD §10): it takes over the replaced fake's
+        cloud - its VMs' power states, which a call on either changes, their floating IPs where
+        the replaced fake left them, its pools' members as they are and its record of calls."""
         if old.kind == self.kind:
-            self._power = old._power
-            self._floating = old._floating
-            self._pools = old._pools
+            self._cloud = old._cloud
+
+    @property
+    def _power(self) -> dict[str, str]:
+        return self._cloud.power
+
+    @property
+    def _floating(self) -> dict[str, str | None]:  # type: ignore[override]
+        return self._cloud.floating
+
+    @property
+    def _floating_projects(self) -> dict[str, str | None]:  # type: ignore[override]
+        return self._cloud.floating_projects
+
+    @property
+    def _pools(self) -> dict[str, dict[str, Any]]:  # type: ignore[override]
+        return self._cloud.pools
 
     def _as_now(self, vm: VMRef) -> VMRef:
         copy = vm.model_copy(deep=True)
         if vm.source_id in self._power:
             copy.power_state = self._power[vm.source_id]  # type: ignore[assignment]
         return copy
+
+    def _vm(self, source_id: str) -> VMRef:
+        """The VM its credential reaches by id (SDD §10): any project's for the provider's own,
+        an admin token, its own project's for a project credential."""
+        vm = self._by_id.get(source_id)
+        if vm is None or not self._sees(vm.project_id):
+            raise VMNotFound(f"VM {source_id!r} not found")
+        return vm
 
     async def check(self) -> dict[str, Any]:
         if self.kind == ProviderKind.vmware:
@@ -590,7 +921,7 @@ class FakeSourceProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
                 ),
                 "vms_without_tools": sum(1 for v in self._vms if v.tools_ok is False),
             }
-        return {
+        report = {
             "admin": True,
             "roles": ["admin", "member", "reader"],
             "project": dict(DEMO_SOURCE_PROJECT),
@@ -601,40 +932,48 @@ class FakeSourceProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
             "tls": True,
             "plain_http": [],
         }
+        return self._token(report)
 
     async def list_vms(self) -> list[VMRef]:
-        return [self._as_now(vm) for vm in self._vms]
+        # its credential's project's VMs, as Nova lists them without all_projects (SDD §10)
+        vms = self._vms if self._project is None else self._tenant_vms.get(self._project, [])
+        return [self._as_now(vm) for vm in vms]
 
     async def get_vm(self, source_id: str) -> VMRef:
-        try:
-            return self._as_now(self._by_id[source_id])
-        except KeyError:
-            raise VMNotFound(f"VM {source_id!r} not found") from None
+        return self._as_now(self._vm(source_id))
 
     async def power_on(self, source_id: str) -> None:
-        await self.get_vm(source_id)
+        self._vm(source_id)
         self._power[source_id] = "running"
 
     async def powered_on_since(self, source_id: str, since: Any) -> bool:
         # the demo runs no VMware kit, whose cutover retry asks it (SDD §7.2)
-        await self.get_vm(source_id)
+        self._vm(source_id)
         return False
 
     async def disk_keys(self, source_id: str) -> list[int]:
         # vCenter's keys of the VM's disks, in its device order: 2000 on (SDD §7.2, §10)
-        vm = await self.get_vm(source_id)
-        return [2000 + i for i in range(len(vm.disks))]
+        return [2000 + i for i in range(len(self._vm(source_id).disks))]
 
     async def power_off(self, source_id: str) -> None:
-        await self.get_vm(source_id)
+        self._vm(source_id)
         self._power[source_id] = "stopped"
 
     async def delete_server(self, source_id: str) -> None:
-        await self.get_vm(source_id)
+        self._vm(source_id)
 
     async def inventory(self) -> SourceInventory:
         if self.kind == ProviderKind.vmware:
             return SourceInventory(networks={"DC2-Prod": None, "DC2-DMZ": None}, projects=["DC2"])
+        if self._project is not None:
+            # a tenant project's networks; its stacks and pools none (SDD §10, plan task TC9)
+            vms = self._tenant_vms.get(self._project, [])
+            return SourceInventory(
+                networks={nic.network: nic.mtu for vm in vms for nic in vm.nics},
+                projects=[self._tenants[self._project].name],
+                stacks=StackRead(servers={}),
+                lb_members=MemberRead(members=[]),
+            )
         # its Heat stack and Octavia pools, as an OpenStack source reads them (SDD §10, N11)
         ids = {vm.name: vm.source_id for vm in self._vms}
         servers = {
@@ -729,10 +1068,14 @@ class _DestinationCloud:
     servers: dict[str, str | None] = field(default_factory=dict)
     #: the GPU units each of them holds, by GPU: its Placement allocations (§22.3)
     held: dict[str, dict[int, int]] = field(default_factory=dict)
+    #: the project each of those servers was created in: its credential's (plan task TC9)
+    server_projects: dict[str, str | None] = field(default_factory=dict)
     #: the cutover gate's reads that found the other tenant's GPU held (SDD §22.10)
     tenant_reads: int = 0
-    #: its project's floating IPs by address: the port each is on, None detached (SDD §8.3)
+    #: its floating IPs by address: the port each is on, None detached (SDD §8.3), and the
+    #: project each is of (plan task TC9)
     floating: dict[str, str | None] = field(default_factory=dict)
+    floating_projects: dict[str, str | None] = field(default_factory=dict)
     #: its Octavia pools: the one the finance plan maps the portal pool to, empty (SDD §10, N11)
     pools: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {
@@ -758,24 +1101,50 @@ class _DestinationCloud:
             }
         }
     )
+    #: each call with the credential it came with (SDD §10 "The demo's tenant projects")
+    calls: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=_CALLS_KEPT))
 
 
-class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
+#: what Placement answers a project credential's token, as it answers a member's (SDD §22.3)
+_PLACEMENT_REFUSED = "HTTP 403"
+
+
+class FakeDestinationProvider(_Recorded, _FloatingIPs, _DemoOctavia, _NoKeypairs):
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
         self.provider = provider
+        self._label = provider.id if provider is not None else "demo-destination"
+        self._own_project = DEMO_DESTINATION_PROJECT["id"]
+        #: its cloud's tenant projects beside its credential's own (SDD §10, plan task TC9)
+        self._tenants = dict(DEMO_DESTINATION_TENANTS)
         self._cloud = _DestinationCloud()
 
     def adopt(self, old: FakeDestinationProvider) -> None:
         """Rebuilt for a changed provider document - a rename, its declared profiles, a written
         credential (SDD §10): it takes over the replaced fake's cloud, its servers, their GPU
-        units and the gate's reads, which a call on either fake changes from then on."""
+        units, the gate's reads and its record of calls, which a call on either fake changes from
+        then on."""
         self._cloud = old._cloud
 
     @property
     def _pools(self) -> dict[str, dict[str, Any]]:  # type: ignore[override]
         return self._cloud.pools
+
+    def _server(self, server_id: str) -> None:
+        """Refuses a server its credential does not reach (SDD §10): another project's, for a
+        project credential; a server no simulated cutover created is any credential's."""
+        if server_id in self._cloud.server_projects and not self._sees(
+            self._cloud.server_projects[server_id]
+        ):
+            raise ProviderError(f"server {server_id!r} not found")
+
+    def _placement(self) -> None:
+        """Placement refuses a project credential, as it refuses a member (SDD §10, §22.3)."""
+        if self._project is not None:
+            raise ProviderError(
+                f"{self._label}: Placement refused the credential: {_PLACEMENT_REFUSED}"
+            )
 
     @property
     def deleted(self) -> set[str]:
@@ -835,7 +1204,7 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         release = self.provider.release if self.provider is not None else None
         profile = self.provider.policy_profile if self.provider is not None else None
         # an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
-        return {
+        report = {
             "admin": True,
             "roles": ["admin", "member", "reader"],
             "project": dict(DEMO_DESTINATION_PROJECT),
@@ -851,6 +1220,7 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
             # its GPU flavors' pools, which the provider card shows (SDD §22.3, §22.11)
             "gpu_capacity": self._flavor_capacity().to_dict(),
         }
+        return self._token(report)
 
     async def inventory(self) -> DestinationInventory:
         flavors = [
@@ -880,20 +1250,37 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
             ("dc2-dmz", 1442, True, "10.2.9.0/24"),
             ("provider-vlan100", 1500, False, "172.16.100.0/24"),
         ]
+        projects, roles = ["finance", "dc2"], ["admin", "member", "reader"]
+        capacity, zones = self._flavor_capacity(), list(DEMO_DNS_ZONES)
+        tenant = self._tenants.get(self._project or "")
+        if tenant is not None:
+            # a tenant project's own network, of the source's name, and the shared one; its
+            # member token, which Placement refuses; no zone of its own (plan task TC9)
+            network = f"{tenant.name}-app"
+            networks = [
+                (network, 1500, True, f"{_TENANT_SUBNETS[network]}.0/24"),
+                ("provider-vlan100", 1500, False, "172.16.100.0/24"),
+            ]
+            projects, roles = [tenant.name], sorted(tenant.roles)
+            capacity = GpuCapacity(
+                status="unknown", reason="forbidden", detail=_PLACEMENT_REFUSED, read_at=utcnow()
+            )
+            zones = []
         return DestinationInventory(
             networks={name: mtu for name, mtu, _, _ in networks},
             flavors=flavors,
             volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
-            quotas={"finance": dict(free), "dc2": dict(free)},
-            projects=["finance", "dc2"],
-            # the demo's admin token, as its check reports it (SDD §10, RV19-01)
-            roles=["admin", "member", "reader"],
+            quotas={project: dict(free) for project in projects},
+            projects=projects,
+            # the demo's admin token, as its check reports it (SDD §10, RV19-01), or the project
+            # credential's roles
+            roles=roles,
             network_details=[
                 {
                     "id": f"net-{name}",
                     "name": name,
                     "mtu": mtu,
-                    "project_id": DEMO_DESTINATION_PROJECT["id"] if own else "project-admin",
+                    "project_id": self._acting if own else "project-admin",
                     "own": own,
                     "shared": not own,
                     "external": False,
@@ -915,17 +1302,22 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
             ],
             # the GPU flavors with their declared profiles, and their pools (SDD §22.3, §22.10)
             gpu_flavors=self._gpu_flavor_list(),
-            gpu_capacity=self._flavor_capacity(),
+            gpu_capacity=capacity,
             # no floating IP held detached, and Neutron's DNS integration without the demo
             # source's zone (SDD §10, plan task N2b)
             floating_ips=[],
-            dns=DnsRead(extension=True, zones=list(DEMO_DNS_ZONES)),
+            dns=DnsRead(extension=True, zones=zones),
         )
 
     async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
         """The pools of the requests (SDD §22.3): the cutover gate's read (§22.7), whose first two
         reads that ask for the other tenant's GPU's trait find it full, as if that tenant then
         released its vGPUs (§22.10) - the inventory, the validation's read, never."""
+        if self._project is not None:
+            # Placement refuses a project credential's token (SDD §10, §22.3)
+            return GpuCapacity(
+                status="unknown", reason="forbidden", detail=_PLACEMENT_REFUSED, read_at=utcnow()
+            )
         trait = _GPUS[_TENANT_GPU][1]
         tenant = self._cloud.tenant_reads < _TENANT_READS and any(
             device.kind == "vgpu" and trait in device.traits for device in requests
@@ -975,16 +1367,21 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         self._cloud.deleted.discard(server_id)
         self._cloud.servers[server_id] = flavor
         self._cloud.held[server_id] = held
+        # in its credential's project, as Nova creates a server (SDD §27.6, plan task TC9)
+        self._cloud.server_projects[server_id] = self._acting
 
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         """The GPU units the server holds, per resource class (SDD §10, §22.3): the fake's
-        Placement holds GPUs alone, so None for a server that holds none."""
+        Placement holds GPUs alone, so None for a server that holds none. Placement refuses a
+        project credential (plan task TC9)."""
+        self._placement()
         units: dict[str, int] = {}
         for gpu, count in self._cloud.held.get(server_id, {}).items():
             units[_GPUS[gpu][0]] = units.get(_GPUS[gpu][0], 0) + count
         return units or None
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
+        self._server(server_id)
         if server_id in self._cloud.deleted:
             raise ProviderError(f"server {server_id!r} not found")
         octet = int(hashlib.sha1(server_id.encode()).hexdigest()[:2], 16) % 200 + 20
@@ -999,6 +1396,7 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         }
 
     async def console_log(self, server_id: str, lines: int | None = 200) -> str | None:
+        self._server(server_id)
         # no keys block: the demo pins no conversion host (SDD §10 "Host key pins")
         return (
             "[    1.902] EXT4-fs (vda1): mounted filesystem with ordered data mode.\n"
@@ -1027,10 +1425,12 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
         return ProbeAnswer("passed", "HTTP 200", True)
 
     async def delete_server(self, server_id: str) -> None:
+        self._server(server_id)
         self._cloud.deleted.add(server_id)
         # its units are free again (SDD §7.4, §10)
         self._cloud.servers.pop(server_id, None)
         self._cloud.held.pop(server_id, None)
+        self._cloud.server_projects.pop(server_id, None)
 
     async def find_server(self, name: str) -> str | None:
         return _stable_id("dst", name)
@@ -1071,27 +1471,43 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
     def _floating(self) -> dict[str, str | None]:  # type: ignore[override]
         return self._cloud.floating
 
+    @property
+    def _floating_projects(self) -> dict[str, str | None]:  # type: ignore[override]
+        return self._cloud.floating_projects
+
     async def reserve_floating_ip(self, address: str, project_id: str | None = None) -> None:
         """SDD §8.3: the demo's external network takes any address; one a port holds is refused.
-        The demo has one project: an admin's reservation for another lands there too (§27.6)."""
+        It is its credential's project's, or with ``project_id`` that project's: the provider's
+        admin reserves for a project, which its credential may not do for another (§27.6)."""
+        if project_id is not None and self._project is not None and project_id != self._project:
+            raise ProviderError(
+                f"{self._label}: a floating IP for project {project_id} refused: HTTP 403"
+            )
         if self._cloud.floating.get(address) is not None:
             raise ProviderError(f"floating IP {address} is held by a port of the project")
         self._cloud.floating[address] = None
+        self._cloud.floating_projects[address] = project_id or self._acting
 
     async def server_port(self, server_id: str, address: str) -> str | None:
-        return f"port-{server_id}" if server_id in self._cloud.servers else None
+        if server_id not in self._cloud.servers:
+            return None
+        self._server(server_id)
+        return f"port-{server_id}"
 
     async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
         """SDD §8.4, §10: the demo's Designate holds ledger-web-01's record in internal.example.org.
-        (plan task N11); another name has none - a swap finds nothing to move, a conflict."""
+        (plan task N11); another name has none - a swap finds nothing to move, a conflict. Its
+        zone is the provider's own project's: a project credential finds none (plan task TC9)."""
         found = self._cloud.recordsets.get((zone, name, rdtype))
-        return None if found is None else {**found, "records": list(found["records"])}
+        if found is None or self._project is not None:
+            return None
+        return {**found, "records": list(found["records"])}
 
     async def update_dns_recordset(
         self, zone_id: str, recordset_id: str, records: list[str]
     ) -> None:
         """The recordset's records replaced, ACTIVE at once (SDD §8.4, §10)."""
-        for found in self._cloud.recordsets.values():
+        for found in self._cloud.recordsets.values() if self._project is None else ():
             if (found["zone_id"], found["id"]) == (zone_id, recordset_id):
                 found["records"] = list(records)
                 return

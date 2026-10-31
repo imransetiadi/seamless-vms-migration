@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import smtplib
 import socket
 from collections import defaultdict
@@ -28,7 +29,9 @@ from seamless_migrate.domain.models import (
 from seamless_migrate.events import emit
 from seamless_migrate.notify.notifier import Notifier, Timing, senders_for
 from seamless_migrate.orchestrator import NotAllowed
+from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.providers.fake import FakeSourceProvider
+from seamless_migrate.security.secret_store import project_secret_name
 
 
 async def test_demo_seed_idempotent(tmp_path, store):
@@ -56,12 +59,18 @@ async def test_demo_seed_idempotent(tmp_path, store):
     assert sum(p.role == ProviderRole.destination for p in providers) == 2
     plans = store.list("plan", Plan)
     assert sorted(p.name for p in plans) == sorted(DEMO_PLAN_NAMES)
-    assert DEMO_PLAN_NAMES == ("Finance apps (RHOSP 17.1 → RHOSO)", "DC2 VMware exit")
+    assert DEMO_PLAN_NAMES == (
+        "Finance apps (RHOSP 17.1 → RHOSO)",
+        "DC2 VMware exit",
+        # the plan of a project pair (SDD §10 "The demo's tenant projects", plan task TC9)
+        "Payments tenant (RHOSP 17.1 → RHOSO)",
+    )
     assert all(p.status == PlanStatus.running and p.waves for p in plans)
     migrations = store.list("migration", Migration)
     # report-01 and batch-01 stay unplanned, so a new plan can take them (SDD §10, §5.4), and
-    # dc2-portal-02, dc2-ml-02 and dc2-cuda-01 for the operator to plan (§7.4, §22.10)
-    assert len(migrations) == 22 + 13
+    # dc2-portal-02, dc2-ml-02 and dc2-cuda-01 for the operator to plan (§7.4, §22.10); the
+    # tenant plan takes the payments project's three VMs (plan task TC9)
+    assert len(migrations) == 22 + 13 + 3
     planned = {m.vm.name for m in migrations}
     assert not planned & {"report-01", "batch-01", "dc2-portal-02", "dc2-ml-02", "dc2-cuda-01"}
     finance = next(p for p in plans if p.source_provider_id == "rhosp17-finance")
@@ -74,8 +83,8 @@ async def test_demo_seed_idempotent(tmp_path, store):
     events_before = store.max_seq()
     await seed_demo(store, settings, services.orchestrator)
     assert len(store.list("provider", Provider)) == 4
-    assert len(store.list("plan", Plan)) == 2
-    assert len(store.list("migration", Migration)) == 35
+    assert len(store.list("plan", Plan)) == 3
+    assert len(store.list("migration", Migration)) == 38
     assert store.max_seq() == events_before, "a second seed changes nothing"
 
 
@@ -1103,6 +1112,261 @@ def test_the_demo_destinations_declare_their_conversion_hosts_keys():
         if p.role == ProviderRole.destination
     ]
     assert len(set(declared)) == len(declared)  # each host its own key
+
+
+# -- the demo's tenant projects (SDD §10, §27.10, plan task TC9) --------------------------------
+
+#: the tenant plan's VMs: the source's payments project's (SDD §10 "The demo's tenant projects")
+TENANT_VMS = {"pay-web-01", "pay-api-01", "pay-batch-01"}
+
+
+def _tenant_projects(provider: Provider) -> dict[str, str]:
+    """The provider's project credentials by the name its check read of each project."""
+    return {e["project_name"]: pid for pid, e in provider.capabilities["projects"].items()}
+
+
+def _by_credential(*fakes) -> dict[str, set[str]]:
+    """The methods the fakes' clouds recorded, by the credential each call came with."""
+    methods = defaultdict(set)
+    for fake in fakes:
+        for credential, method in fake.calls:
+            methods[credential].add(method)
+    return methods
+
+
+async def _run_seeded(services, store, names, timeout=60.0) -> dict[str, Migration]:
+    """The seeded demo run until the migrations of the VMs ``names`` end (SDD §10)."""
+    orch = services.orchestrator
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        ends = (Phase.completed, Phase.rolled_back, Phase.failed, Phase.cancelled)
+        while loop.time() < deadline:
+            mine = [m for m in store.list("migration", Migration) if m.vm.name in names]
+            if len(mine) == len(names) and all(m.phase in ends for m in mine):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await orch.stop()
+    return {m.vm.name: m for m in store.list("migration", Migration) if m.vm.name in names}
+
+
+async def test_the_demo_seeds_a_plan_with_a_project_pair(tmp_path, store):
+    """SDD §10 "The demo's tenant projects", §27.4, §27.10 (plan task TC9): the seed gives
+    rhosp17-finance and rhoso18 a project credential of each of their side's tenant projects -
+    payments and treasury, each with a user of its own and an id of 32 hex digits, the two sides'
+    different - recorded under its secret's name, and checks both providers, each entry ok. It
+    seeds the tenant plan, which names the payments pair and takes the three VMs of the source's
+    payments project: validated - warning of the destination credential's expiry within 7 days -,
+    started, none blocked. The source's own credential still lists the 24 finance VMs alone, and
+    a second seed changes nothing."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+
+    providers = {p.id: p for p in store.list("provider", Provider)}
+    tenants = {}
+    for provider_id in ("rhosp17-finance", "rhoso18"):
+        provider = providers[provider_id]
+        report = provider.capabilities["projects"]
+        assert sorted(provider.project_credentials) == sorted(report)
+        assert {e["project_name"] for e in report.values()} == {"payments", "treasury"}
+        assert {(e["status"], e["domain"]) for e in report.values()} == {("ok", "Default")}
+        assert all(re.fullmatch(r"[0-9a-f]{32}", project_id) for project_id in report)
+        # a Keystone user per project credential (SDD §27.11 decision 3)
+        assert len({e["user_id"] for e in report.values()}) == 2
+        assert {p: c.secret for p, c in provider.project_credentials.items()} == {
+            p: project_secret_name(provider_id, p) for p in report
+        }
+        tenants[provider_id] = _tenant_projects(provider)
+    assert not set(tenants["rhosp17-finance"].values()) & set(tenants["rhoso18"].values())
+    assert providers["vcenter-dc2"].project_credentials == {}
+    assert providers["hibiscus-dc3"].project_credentials == {}
+
+    [plan] = [p for p in store.list("plan", Plan) if p.source_project or p.destination_project]
+    assert (plan.source_provider_id, plan.destination_provider_id) == ("rhosp17-finance", "rhoso18")
+    assert plan.source_project == tenants["rhosp17-finance"]["payments"]
+    assert plan.destination_project == tenants["rhoso18"]["payments"]
+    assert plan.status == PlanStatus.running and plan.waves
+    migrations = [m for m in store.list("migration", Migration) if m.plan_id == plan.id]
+    assert {m.vm.name for m in migrations} == TENANT_VMS
+    assert {(m.vm.project, m.vm.project_id) for m in migrations} == {
+        ("payments", plan.source_project)
+    }
+    assert not [m for m in migrations if m.phase in (Phase.blocked, Phase.cancelled)]
+    expiring = [
+        f for m in migrations for f in m.findings if f.code == "PROJECT_CREDENTIAL_EXPIRING"
+    ]
+    assert expiring and {f.severity for f in expiring} == {"warning"}
+    own = await services.orchestrator.providers.get(providers["rhosp17-finance"]).list_vms()
+    assert len(own) == 24 and {vm.project_id for vm in own} == {"project-finance"}
+
+    events_before = store.max_seq()
+    await seed_demo(store, settings, services.orchestrator)
+    assert store.max_seq() == events_before, "a second seed changes nothing"
+
+
+async def test_the_demo_fakes_create_a_plans_resources_in_its_destination_project(tmp_path, store):
+    """SDD §10 "The demo's tenant projects", §27.6 (plan task TC9): the tenant plan's cutovers
+    create its servers in rhoso18's payments project - the finance plan's in the provider's own
+    project -, and pay-web-01's floating IP, which rhoso18's own credential reserves for that
+    project (its member credential may not choose an address), lands there and moves to the new
+    server's port. Another project's credential finds none of them; the provider's own reads
+    them by id."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    by_name = await _run_seeded(services, store, TENANT_VMS | {"web-01"})
+    providers = {p.id: p for p in store.list("provider", Provider)}
+    [plan] = [p for p in store.list("plan", Plan) if p.destination_project]
+    registry = services.orchestrator.providers
+    source, destination = (
+        registry.get(providers["rhosp17-finance"]),
+        registry.get(providers["rhoso18"]),
+    )
+    assert {name: m.phase for name, m in by_name.items()} == dict.fromkeys(
+        TENANT_VMS | {"web-01"}, Phase.completed
+    )
+
+    servers = {name: m.destination_server_id for name, m in by_name.items()}
+    assert {
+        name: destination._cloud.server_projects[server] for name, server in servers.items()
+    } == {**dict.fromkeys(TENANT_VMS, plan.destination_project), "web-01": "project-demo"}
+    [move] = by_name["pay-web-01"].fip_moves
+    assert (move.address, move.state) == ("203.0.113.20", "moved")
+    assert destination._cloud.floating_projects["203.0.113.20"] == plan.destination_project
+    assert destination._cloud.floating["203.0.113.20"] == f"port-{servers['pay-web-01']}"
+    assert source._floating["203.0.113.20"] is None
+    assert _actions(store, by_name["pay-web-01"], "floating_ip") == [
+        ("reserve", "succeeded"),
+        ("move", "succeeded"),
+    ]
+
+    treasury = registry.get(
+        providers["rhoso18"], _tenant_projects(providers["rhoso18"])["treasury"]
+    )
+    for name in sorted(TENANT_VMS):
+        with pytest.raises(ProviderError, match="not found"):
+            await treasury.get_server(servers[name])
+        assert (await destination.get_server(servers[name]))["status"] == "ACTIVE"
+    assert await treasury.floating_ip_port("203.0.113.20") is None
+
+
+async def test_each_fake_call_records_the_credential_it_came_with(tmp_path, store, monkeypatch):
+    """SDD §10 "The demo's tenant projects", §27.5, §27.10 (plan task TC9): each fake call is
+    recorded with the credential it came with - the provider's own as its id, a project
+    credential as {provider id}/{project id} -, so a step that used the provider's credential
+    where §27.5 names the plan's, or the reverse, fails here. With the tenant plan alone seeded,
+    the seed's checks act with the providers' own credentials and sign in with each project
+    credential, and its validation reads the VMs and both inventories with the payments
+    credentials, Placement with rhoso18's own. Its run acts with the payments credentials alone,
+    but for rhoso18's admin reserving the floating IP for its member project: the source
+    provider's own credential reaches no step, and the treasury credentials none at all."""
+    import seamless_migrate.demo as demo
+
+    every_plan = demo._plans
+
+    async def tenant_plan_alone(settings):
+        return [p for p in await every_plan(settings) if p.source_project]
+
+    monkeypatch.setattr(demo, "_plans", tenant_plan_alone)
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    providers = {p.id: p for p in store.list("provider", Provider)}
+    [plan] = store.list("plan", Plan)
+    registry = services.orchestrator.providers
+    fakes = registry.get(providers["rhosp17-finance"]), registry.get(providers["rhoso18"])
+    src_plan = f"rhosp17-finance/{plan.source_project}"
+    dst_plan = f"rhoso18/{plan.destination_project}"
+    held = {
+        f"{provider_id}/{project_id}"
+        for provider_id in ("rhosp17-finance", "rhoso18")
+        for project_id in providers[provider_id].project_credentials
+    }
+    assert {src_plan, dst_plan} < held and len(held) == 4
+
+    seeded = _by_credential(*fakes)
+    assert {c for c, methods in seeded.items() if "check" in methods} == {
+        "rhosp17-finance",
+        "rhoso18",
+    }
+    assert {c for c, methods in seeded.items() if "check_project" in methods} == held
+    assert {"inventory", "get_vm"} <= seeded[src_plan]
+    assert "inventory" in seeded[dst_plan] and "gpu_capacity" in seeded["rhoso18"]
+    plan_reads = {"inventory", "get_vm", "list_vms"}
+    assert not plan_reads & (seeded["rhosp17-finance"] | seeded["rhoso18"])
+    assert not {"check", "gpu_capacity"} & (seeded[src_plan] | seeded[dst_plan])
+    assert {c: seeded[c] for c in held - {src_plan, dst_plan}} == dict.fromkeys(
+        held - {src_plan, dst_plan}, {"check_project"}
+    )
+
+    for fake in fakes:
+        fake.calls.clear()
+    by_name = await _run_seeded(services, store, TENANT_VMS)
+    assert {m.phase for m in by_name.values()} == {Phase.completed}
+    ran = _by_credential(*fakes)
+    assert set(ran) <= {src_plan, dst_plan, "rhoso18"}
+    assert ran["rhoso18"] == {"reserve_floating_ip"}
+    assert {"power_off", "disassociate_floating_ip"} <= ran[src_plan]
+    assert {"create_server", "get_server", "associate_floating_ip", "server_port"} <= ran[dst_plan]
+    created = [c for c, method in fakes[1].calls if method == "create_server"]
+    assert created == [dst_plan] * len(TENANT_VMS)
+
+
+async def test_a_demo_seeded_before_tc9_gets_its_tenant_projects_on_the_next_start(
+    tmp_path, store, monkeypatch
+):
+    """SDD §10 "The demo's tenant projects" (plan task TC9): a demo database seeded before TC9 -
+    its providers without project credentials, no tenant plan - gets the tenant projects'
+    credentials, their check and the tenant plan on its next start; once the store holds the
+    tenant plan, a restart keeps the providers as an admin left them."""
+    import seamless_migrate.demo as demo
+
+    every_plan = demo._plans
+
+    async def before_tc9(settings):
+        return [p for p in await every_plan(settings) if not p.source_project]
+
+    async def no_credentials(*args, **kwargs):
+        return None
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    with monkeypatch.context() as patched:
+        patched.setattr(demo, "_plans", before_tc9)
+        patched.setattr(demo, "_seed_tenant_credentials", no_credentials)
+        await seed_demo(store, settings, services.orchestrator)
+    assert [p.project_credentials for p in store.list("provider", Provider)] == [{}] * 4
+    assert len(store.list("plan", Plan)) == 2
+
+    await seed_demo(store, settings, services.orchestrator)
+    providers = {p.id: p for p in store.list("provider", Provider)}
+    assert {pid: len(p.project_credentials) for pid, p in providers.items()} == {
+        "rhosp17-finance": 2,
+        "vcenter-dc2": 0,
+        "rhoso18": 2,
+        "hibiscus-dc3": 0,
+    }
+    [plan] = [p for p in store.list("plan", Plan) if p.source_project]
+    assert plan.status == PlanStatus.running
+
+    # an admin deletes a credential no plan needs: the next start leaves it deleted
+    destination = providers["rhoso18"]
+    treasury = _tenant_projects(destination)["treasury"]
+    kept = {p: c for p, c in destination.project_credentials.items() if p != treasury}
+    store.put("provider", destination.model_copy(update={"project_credentials": kept}))
+    await seed_demo(store, settings, services.orchestrator)
+    assert treasury not in store.get("provider", "rhoso18", Provider).project_credentials
 
 
 # -- the demo's notifications (SDD §7.4, §10, §24.9, plan task NT10) ---------------------------

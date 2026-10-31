@@ -130,7 +130,7 @@ class SimulatedExecutor:
             # the step's credential at the destination (SDD §27.5)
             client = for_step(self.providers, _step_of(ctx), ctx.destination, ctx.plan)
         except ProviderError:
-            return None  # a fake that holds no such credential (plan task TC9): nothing simulated
+            return None  # no credential for the plan's project (SDD §27.5): nothing simulated
         return getattr(client, name, None)
 
     def supports(self, strategy: Strategy) -> bool:

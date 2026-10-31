@@ -4079,6 +4079,8 @@ def test_no_user_facing_text_assumes_rhoso_for_a_community_destination():
 #: RHOSO 18.0 provider and the plan that moves to it
 PRODUCT_TEXTS = {
     ("demo.py", "Finance apps (RHOSP 17.1 → RHOSO)"),
+    # the demo's tenant plan names the products as the finance plan does (SDD §10, plan task TC9)
+    ("demo.py", "Payments tenant (RHOSP 17.1 → RHOSO)"),
     ("demo.py", "RHOSO 18.0"),
     # what leaves for Jev names an RHOSO destination by the product itself (SDD §13.4, RV20-01)
     ("planning/platforms.py", "RHOSO 18.0"),
