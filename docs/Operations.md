@@ -501,6 +501,12 @@ Where to see which replica leads:
   shorter than 20 s deposes nobody; the database's own times are to be measured in the lab (QASuite LAB-HA03).
 * **After a failover**, the Events page shows `leader.acquired` with the new holder, its cause and the migrations it
   resumed; check that a VM whose cutover was cut off stopped once at the source and has one destination server.
+* **To drill a failover** on a lab (QASuite LAB-HA01, LAB-HA02), `tests/e2e/ha-failover.sh openshift node` - or
+  `kubernetes`, and `db` or `delete`: the mode is always given - takes the leading pod away during a cutover whose
+  source is stopped, waits for another replica to lead and drive, and prints the seconds that took and, for each VM,
+  the source stops, destination servers and phase changes the control plane recorded. Its header says what it needs:
+  a viewer's token in `TOKEN`, the Route's URL, the plan, and for `node` and `db` your own command that powers the
+  node off or cuts the pod off from PostgreSQL.
 
 ### 4.11 The database's settings for the lease
 

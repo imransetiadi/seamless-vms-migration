@@ -45,7 +45,14 @@ kubectl and the API server do (review 38b, read from their sources):
 * the control plane's data claim ``seamless-data`` (``pvc``): a ``get`` of its ``spec.accessModes``
   answers them space-separated, or NotFound while there is none - nothing, exit 0, with
   ``--ignore-not-found`` -, and ``apply -k`` creates a missing one with the access modes the
-  overlay asks for (``overlay_data_modes``, the base's ReadWriteOnce unless set; SDD §17, §17.2).
+  overlay asks for (``overlay_data_modes``, the base's ReadWriteOnce unless set; SDD §17, §17.2);
+* one control plane pod, as the HA failover drill reads it and takes it away
+  (``tests/e2e/ha-failover.sh``, plan task HA8): ``get pod NAME -o jsonpath={.spec.nodeName}`` or
+  ``{.status.podIP}`` answers the pod's ``node`` or ``ip``, NotFound for a pod not there; ``delete
+  pod NAME`` makes it terminating - still listed - and its ReplicaSet starts another at once;
+  ``cordon NODE`` - ``oc adm cordon`` on OpenShift - is kept in ``cordoned``; ``logs NAME`` answers
+  the pod's text in ``logs`` (nothing for any other name), and ``version`` the state's
+  ``version``.
 """
 
 from __future__ import annotations
@@ -187,6 +194,8 @@ def found(kind):  # the object, or kubectl's NotFound
     return st[kind]
 
 
+if words[:1] == ["adm"]:  # oc adm cordon: OpenShift keeps the node commands under adm
+    words = words[1:]
 verb = words[0]
 if verb == "get" and words[1] == "pvc/seamless-data":
     claim = st.get("pvc")
@@ -218,6 +227,24 @@ if verb == "get" and words[1] == "configmap/seamless-config":
     done(st["configmap"].get(key, "<no value>"))
 if verb == "get" and words[1] == "pods":
     done("".join(f"pod/{p['name']}\n" for p in selected(label_kind())))
+if verb in ("get", "delete") and words[1] == "pod":  # a control plane pod, by its name (HA drill)
+    pods = (st["deployment"] or {}).get("pods", [])
+    pod = next((p for p in pods if p["name"] == words[2]), None)
+    if pod is None:
+        done(f'Error from server (NotFound): pods "{words[2]}" not found\n', 1)
+    if verb == "get":
+        fields = {"jsonpath={.spec.nodeName}": "node", "jsonpath={.status.podIP}": "ip"}
+        done(str(pod.get(fields[flags["-o"]], "")))
+    pod["terminating"] = True  # its grace period runs; its ReplicaSet starts another at once
+    reconcile("deployment")
+    done(f'pod "{words[2]}" deleted\n')
+if verb == "cordon":
+    st.setdefault("cordoned", []).append(words[1])
+    done(f"node/{words[1]} cordoned\n")
+if verb == "logs":
+    done(st.get("logs", {}).get(words[1], ""))
+if verb == "version":
+    done(st.get("version", ""))
 if verb == "wait" and flags.get("--for") == "condition=Available":
     if len(active("deployment")) < st["deployment"]["replicas"]:
         done("error: timed out waiting for the condition on deployments/seamless\n", 1)
