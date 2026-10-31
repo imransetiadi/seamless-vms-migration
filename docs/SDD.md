@@ -9428,7 +9428,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | the check of each project credential: the report keys `projects` and `project` | §10, §21.5 (binding) | TC3 |
 | `VMRef.project_id`; the inventory's `project` query; `Plan.source_project` and `destination_project` with their edit rules | §4.2, §10, §12 (binding) | TC4 |
 | the selection of §27.5 in validation, pre-staging (the flavor access), the executors and the helpers; no fallback; the registry's fingerprint | §7.2, §7.3, §8, §8.1, §8.3–§8.5, §10 (binding) | TC5 |
-| the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
+| the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 (binding) | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure; the migration page's naming of the credential that holds a cutover | §5.4, §7.1, §16 (binding) | TC7 |
 | the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 (binding) | TC8 |
 | the demo's tenant projects and its plan with a project pair | §10 (binding) | TC9 |
