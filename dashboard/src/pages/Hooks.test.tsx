@@ -66,6 +66,8 @@ describe('the hook catalog (SDD §16, §23.3, plan task N12a)', () => {
     const drain = within(catalog).getByRole('listitem', { name: 'drain-lb' });
     expect(drain).toHaveTextContent('Reverted by undrain-lb');
     await user.click(within(drain).getByRole('button', { name: 'Edit drain-lb' }));
+    // Edit moves the focus to the name in the next frame: typed before that, the timeout's keys would follow it there
+    await waitFor(() => expect(screen.getByLabelText(/^Name/)).toHaveFocus());
     expect(screen.getByLabelText(/^Name/)).toHaveAttribute('readonly');
     expect(screen.getByLabelText('Kind')).toBeDisabled();
     await user.clear(screen.getByLabelText('Timeout (s)'));
