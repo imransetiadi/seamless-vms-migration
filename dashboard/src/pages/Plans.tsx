@@ -27,7 +27,8 @@ const SORT_KEYS: SortKey[] = ['name', 'status', 'vms', 'done', 'slo', 'updated']
 
 /** Router state used by Inventory to open the dialog with a selection. */
 export interface NewPlanState {
-  newPlan?: { sourceId: string; vmIds: string[] };
+  /** `sourceProject`: the project credential the Inventory read the VMs with, the plan's source project (SDD §16). */
+  newPlan?: { sourceId: string; vmIds: string[]; sourceProject?: string | null };
 }
 
 /** A plan's migrations done, from the counts it carries: the list reads no migration (SDD §16, §8.1). */
@@ -80,7 +81,7 @@ export default function Plans() {
     }
     setParams(next, { replace: true });
   };
-  const [dialog, setDialog] = useState<{ open: boolean; sourceId?: string; vmIds?: string[] }>({ open: false });
+  const [dialog, setDialog] = useState<{ open: boolean; sourceId?: string; vmIds?: string[]; sourceProject?: string | null }>({ open: false });
   const canCreate = hasRole(role, 'operator');
 
   // Opened from Inventory with a VM selection: taken from the navigation's state as the page renders, the state then
@@ -91,7 +92,7 @@ export default function Plans() {
   if (offered && offered !== taken) setTaken(offered);
   else if (!offered && taken) {
     setTaken(null);
-    setDialog({ open: true, sourceId: taken.sourceId, vmIds: taken.vmIds });
+    setDialog({ open: true, sourceId: taken.sourceId, vmIds: taken.vmIds, sourceProject: taken.sourceProject });
   }
   useEffect(() => {
     if (offered) navigate(location.pathname, { replace: true, state: null });
@@ -289,6 +290,7 @@ export default function Plans() {
         onClose={() => setDialog({ open: false })}
         initialSourceId={dialog.sourceId}
         initialVmIds={dialog.vmIds}
+        initialSourceProject={dialog.sourceProject}
       />
     </>
   );

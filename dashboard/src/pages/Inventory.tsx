@@ -436,7 +436,8 @@ export default function Inventory() {
                   icon={ClipboardPlus}
                   disabledReason={!canPlan ? 'Creating a plan requires the operator role.' : selection.size === 0 ? 'Select VMs in the table first.' : null}
                   onClick={() =>
-                    navigate('/plans', { state: { newPlan: { sourceId: provider.id, vmIds: [...selection] } } satisfies NewPlanState })
+                    // with the project credential it read them with, the plan's source project (SDD §16)
+                    navigate('/plans', { state: { newPlan: { sourceId: provider.id, vmIds: [...selection], sourceProject: project } } satisfies NewPlanState })
                   }
                 >
                   Create plan{selection.size ? ` with ${selection.size} VM${selection.size === 1 ? '' : 's'}` : ''}

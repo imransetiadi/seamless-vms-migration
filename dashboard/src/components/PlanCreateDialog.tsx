@@ -112,13 +112,13 @@ const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, '']))
 type FieldKey = 'keepWarm' | 'finalizeReminder' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'cutover' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
-function initialForm(sourceId = '', vmIds: string[] = []): FormState {
+function initialForm(sourceId = '', vmIds: string[] = [], sourceProject: string | null = null): FormState {
   return {
     name: '',
     description: '',
     sourceId,
     destinationId: '',
-    sourceProject: '',
+    sourceProject: sourceProject ?? '',
     destinationProject: '',
     vmIds: new Set(vmIds),
     defaultStrategy: 'auto',
@@ -333,6 +333,8 @@ export interface PlanCreateDialogProps {
   onClose: () => void;
   initialSourceId?: string;
   initialVmIds?: string[];
+  /** The plan's source project the Inventory read the selection with (SDD §16, the owner's decision of 2026-11-01). */
+  initialSourceProject?: string | null;
   /** Edit this plan instead of creating one (PATCH /plans/{id}; only the changed fields are sent). */
   plan?: Plan;
   /** Called once the edited plan was saved, so the page can announce it (SDD §16). */
@@ -342,7 +344,7 @@ export interface PlanCreateDialogProps {
 }
 
 /** Create a draft plan (POST /plans, operator). Validation happens on submit with an error summary. */
-export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved, failedVms = [] }: PlanCreateDialogProps) {
+export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, initialSourceProject, plan, onSaved, failedVms = [] }: PlanCreateDialogProps) {
   const titleId = useId();
   const id = (key: string) => `plan-create-${key}`;
   const providers = useProviders();
@@ -359,7 +361,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const navigate = useNavigate();
   // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
   const canSetPolicy = hasRole(useRole(), 'approver');
-  const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds)));
+  const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds, initialSourceProject)));
   // the form as it opened: Close asks before it discards changes to it
   const [baseline, setBaseline] = useState('');
   const [discarding, setDiscarding] = useState(false);
@@ -370,7 +372,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const [errors, setErrors] = useState<Errors>({});
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
-  const inventory = useInventory(form.sourceId || undefined);
+  // read with the plan's source project's credential, so a tenant's VMs are those offered (SDD §16, §27.4)
+  const inventory = useInventory(form.sourceId || undefined, form.sourceProject || null);
   // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing - read only while
   // the form is open: the page behind it reads no migration (SDD §16)
   const plans = usePlans();
@@ -383,7 +386,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   if (open !== shownOpen) {
     setShownOpen(open);
     if (open) {
-      const initial = plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds);
+      const initial = plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds, initialSourceProject);
       setBaseline(stable({ ...initial, vmIds: [...initial.vmIds].sort() }));
       setForm(initial);
       setDiscarding(false);
@@ -849,7 +852,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     id={id('source-project')}
                     label="Source project"
                     value={form.sourceProject}
-                    onChange={(e) => set('sourceProject', e.target.value)}
+                    // another project offers other VMs: the selection and the per-VM strategies go, as for another source
+                    onChange={(e) => setForm((f) => ({ ...f, sourceProject: e.target.value, vmIds: new Set(), overrides: {} }))}
                     disabled={destinationLocked}
                     hint={destinationLocked ? destinationReason : undefined}
                     options={projectOptions(source, form.sourceProject)}

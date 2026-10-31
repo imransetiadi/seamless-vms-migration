@@ -1259,6 +1259,23 @@ describe("Plans: the plan's project pair (SDD §16, §27.4; plan task TC8)", () 
     expect(created).toMatchObject({ source_project: SHOP, destination_project: null });
   });
 
+  it("offers the VMs of the plan's source project, and clears the selection when it changes", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'Platform tenant', 'rhosp17-dc1');
+    // its own credential reads the VMs it lists, a shop VM and a platform VM among them
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    expect(within(dialog).getByRole('checkbox', { name: 'Select mq-broker-01' })).toBeInTheDocument();
+    // the platform project's credential reads its own VMs alone, and the selection goes with the old project (SDD §16)
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: /^source project/i }), PLATFORM);
+    expect(await within(dialog).findByRole('checkbox', { name: 'Select mq-broker-01' })).not.toBeChecked();
+    expect(within(dialog).queryByRole('checkbox', { name: 'Select web-01' })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select mq-broker-01' }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Platform tenant')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Platform tenant')).toMatchObject({ source_project: PLATFORM, vm_ids: ['os-0b31'] });
+  });
+
   it('offers no project for a VMware source', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
