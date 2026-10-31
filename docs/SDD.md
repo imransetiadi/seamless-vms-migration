@@ -5746,7 +5746,10 @@ is no origin a browser sends (review RV31-03).
   hint says that the plan's steps act in the project with its credential (§27.5) and that an admin adds project
   credentials on the Providers page; unavailable with the destination's reason while a migration of the plan is
   `failed`, as the API refuses a change of either (§12); a VMware source shows neither and sends both `null` (§27.9) —,
-  VMs (a selected VM that is no longer in the
+  VMs - the source inventory as the plan's source project's credential reads it, `GET
+  /providers/{id}/inventory?project=<source project>`, else as the provider's own credential reads it, so a tenant's
+  VMs are those offered; choosing another source project clears the VM selection and the per-VM strategies, as
+  choosing another source provider does (the owner's decision of 2026-11-01) - (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
@@ -6195,7 +6198,9 @@ is no origin a browser sends (review RV31-03).
   `GET /providers/{id}/inventory?project=<project id>` for a project credential and the inventory without the query
   for its own, kept in the address (`?project=`) and switched in place as the Provider select
   switches the provider, which drops it; a project the provider holds no credential for, as an old address may name,
-  reads as the API answers it (404); the VM table's Project filter stays a filter of the rows read;
+  reads as the API answers it (404); the VM table's Project filter stays a filter of the rows read; Create plan opens
+  the plan form with the provider, the VMs selected and that project as the plan's source project (the owner's
+  decision of 2026-11-01);
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
   a GPU column — each of the VM's GPUs as the API reads them (`vm_gpus`, §22.2), on a line of its own: its kind, then
   what names it, "×n" for n identical ones, and for an OpenStack request " · " and what it asks for, its class and
