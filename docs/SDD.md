@@ -4021,9 +4021,12 @@ project, never its own credential. `ProviderRegistry.for_project(provider, proje
 provider's credential for that Keystone project (§13.3, §27.4, plan task TC4): an `OpenStackProvider` on a connection
 of its own, built for the call and never cached - each read signs in afresh, with the credential as an admin last
 wrote it -, which its caller closes after its read (the inventory's `project` query, §12). `forget(provider_id)` drops
-and closes a provider's implementations, its projects' too. The demo's fakes cannot sign in with a project credential
-until plan task TC9 gives them tenant projects (§27.10), nor can a VMware provider, which holds none: a provider
-error. The demo seeds two running plans, both to `rhoso18`:
+and closes a provider's implementations, its projects' too. A VMware provider, which holds no project credential,
+cannot sign in with one: a provider error. In the demo, `get(provider, project_id)` and
+`for_project(provider, project_id)` answer the provider's fake acting with that project's credential - a view of the
+fake's simulated cloud, built for each call, since it holds no connection - after the same refusal of a project the
+provider holds no credential for (below, "The demo's tenant projects", plan task TC9). The demo seeds three running
+plans, all to `rhoso18`: the tenant plan takes the three VMs of the source's `payments` project (below), and
 the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and maps `g1.vgpu` to `g1.a100-4c` (`mappings.flavors`), so `gpu-ml-01` migrates; the VMware
@@ -4032,6 +4035,49 @@ migrates: `dc2-portal-02` stays unplanned, for the operator to plan warm (§7.4)
 `dc2-cuda-01`, for the operator to plan with a GPU mapping (§22.10). The demo providers `rhoso18` and `hibiscus-dc3`
 declare the two vGPU flavors' profiles, `gpu_profiles` `{"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}`.
 No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
+
+**The demo's tenant projects** (plan task TC9, §27.10). Each demo OpenStack cloud holds two tenant projects beside its
+credential's own (`finance` at the source, `demo` at each destination): `payments` and `treasury`, in the domain
+`Default`, each with a Keystone user of its own (§27.11 decision 3) and an id of 32 hex digits, as Keystone makes them
+- the source's and the destinations' different, so a project id of one side is no project of the other. Before its
+plans, while the store holds no tenant plan, the seed gives `rhosp17-finance` and `rhoso18` a project credential of
+each of their side's tenant projects - entries as an admin's write records them (`project_credentials`, §4.2), whose
+secrets the demo neither holds nor needs, as it holds no provider credential (§7.4) - and checks both providers, so
+each project's entry reads ok ("The check of project credentials", below). A database seeded before plan task TC9
+gets them, and the tenant plan, on its next start; a store that holds the tenant plan keeps its providers as they are.
+
+* **What each credential's sign-in reads** (`check_project`): `payments` restricted, with `member` and `reader`, on
+  both sides - the source's never expiring, the destination's expiring 5 days after each read, so the tenant plan's
+  validation warns `PROJECT_CREDENTIAL_EXPIRING` while its cutovers pass the gate (§5.4 rule 6, §27.7); `treasury`
+  with `load-balancer_member` too and unrestricted at the source, never expiring, and restricted with `member` and
+  `reader` at the destinations, expiring 30 days after each read. A credential of a project the fake's cloud does not
+  hold fails its sign-in as Keystone refuses it - `{provider id}: the sign-in failed: HTTP 401` -, at its check and
+  at each call.
+* **What each credential reaches.** The provider's own credential, an admin token, lists its own project's VMs,
+  servers and networks, and reads, stops, starts or deletes a VM or a server of any project by id (§27.1). A project
+  credential lists and acts on its own project's alone - another project's VM, server or floating IP is not found -,
+  and its servers are created there; a floating IP the provider's admin reserves for a project
+  (`reserve_floating_ip(address, project_id)`, §8.3, §27.6) is that project's, which its credential moves. Placement -
+  the GPU capacity and a server's allocations - refuses a project credential, as it refuses a `member` (`forbidden`,
+  HTTP 403, §22.3). The Octavia pools and the Designate zone of the network cut-over (below) are the providers' own
+  projects'.
+* **The VMs.** The source's `payments` project holds `pay-web-01` - its floating IP `203.0.113.20` -, `pay-api-01`
+  and `pay-batch-01` on `payments-app`; `treasury` holds `tsy-app-01` and `tsy-report-01` on `treasury-app`, for the
+  operator to plan with the treasury projects (§27.4). Each carries its project's name and id (`VMRef.project_id`).
+  The source's own credential lists none of them, so its inventory stays the 24 finance VMs. Each destination's
+  tenant project owns a network of the source's name, whose subnet holds the VMs' addresses.
+* **The record of calls.** Each call of a fake is recorded in its simulated cloud with the credential it came with -
+  the provider's own as the provider's id, a project credential as `{provider id}/{project id}`, a sign-in with a
+  project credential (`check_project`) as that credential -, the newest 10,000 kept, so a test fails a step that used
+  the provider's credential where §27.5 names the plan's, or the reverse (§27.10).
+* **The tenant plan.** `Payments tenant (RHOSP 17.1 → RHOSO)` names the source's and `rhoso18`'s `payments` projects
+  (`source_project`, `destination_project`), takes the three `payments` VMs, maps `payments-app` to `payments-app`,
+  cuts over automatically and keeps `pay-web-01`'s floating IP's address (`floating_ips` `keep_address`): its
+  destination credential, `member` alone, may not choose an address, so `rhoso18`'s own credential reserves it for the
+  project at pre-staging, and the project's credential moves it (§8.3, §27.6). Its steps act with the credentials
+  §27.5 names - the checks and Placement with the providers' own, the rest with the payments credentials -, its
+  cutovers create its servers in `rhoso18`'s `payments` project, and a restart hands the new fakes each server with
+  the credential its cutover created it with (§8.1).
 
 **The demo's network cut-over** (plan task N11, §23.9). Every rule of §23 runs in the demo:
 
@@ -4061,7 +4107,7 @@ No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 as an admin adds one, each with its `channel.created` event by `demo`: `app-owners` (email to
 `finance-app-owners@example.com` and `dc2-service-owners@example.org`), `migration-team` (Slack: a Slack channel's URL
 lives only in its secret, which the demo neither holds nor needs, §7.4) and `change-hub` (a webhook to
-`https://change-hub.example.com/hooks/seamless`). It subscribes each to the two seeded plans with the default topics
+`https://change-hub.example.com/hooks/seamless`). It subscribes each to the seeded plans with the default topics
 `approval`, `downtime` and `problem` (§24.4), each subscription with its `subscription.created` event. So each channel
 starts at its own creation, after the seed's other events (§24.6), and every demo cutover notifies its downtime on
 each: its `downtime.started` and `downtime.ended` messages are recorded as `notification.sent` and listed on the
@@ -4273,8 +4319,8 @@ credential has expired.
   An `error` entry carries `message` and `checked_at`, its other fields null: a sign-in that fails or runs past the
   call's bound; a credential whose token's project is not its key, never used further - its record is not read, and
   the message names the token's project; a record that cannot be read, since an expiry not read must never stand for
-  none; and a provider that cannot sign in with a project credential (the demo's fakes, until plan task TC9 gives them
-  tenant projects, §27.10). One project's failure fails neither the provider's check - its `status` and
+  none; and a provider that cannot sign in with a project credential (an implementation without that sign-in). One
+  project's failure fails neither the provider's check - its `status` and
   `status_message` stay its own credential's - nor another project's entry.
 * **What a check keeps.** A check replaces the entries of the projects it signed in with and keeps the other entries of
   the credentials the provider still holds as the last check read them, each with its `checked_at`: a full check
@@ -4284,9 +4330,10 @@ credential has expired.
 * **Secrets.** Nothing of a project credential - its secret, or its application credential's id - reaches the report,
   an event or a log line; `provider.checked` keeps its data (§4.3).
 * **The demo.** The fakes' checks name their credentials' own projects: the OpenStack source's `finance`
-  (`project-finance`), its VMs' project - whose id each of them carries (`VMRef.project_id`, plan task TC4) -, and
-  each destination's `demo` (`project-demo`), which owns its own networks (`network_details`), each in the domain
-  `Default`.
+  (`project-finance`), its finance VMs' project - whose id each of them carries (`VMRef.project_id`, plan task TC4) -,
+  and each destination's `demo` (`project-demo`), which owns its own networks (`network_details`), each in the domain
+  `Default`. Their sign-ins with the credentials of the demo's tenant projects read what "The demo's tenant projects"
+  (above, plan task TC9) says.
 
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
@@ -9069,7 +9116,9 @@ that task; plan task TC6's findings of §27.7 - `PROJECT_CREDENTIAL_EXPIRING`, `
 findings lists in §9.2, §9.3 and §16 since that task; plan task TC7's cutover gate rule 6, the executors' sign-in
 before a step and the migration page's naming of the credential that holds a cutover in §5.4, §7.1 and §16 since that
 task; plan task TC8's dashboard - the provider card's Projects with Add and Delete, the plan form's project pickers and
-the Inventory's Project credential select - in §16 since that task. The
+the Inventory's Project credential select - in §16 since that task; plan task TC9's demo - the fakes' tenant projects
+with their credentials, the record of each fake call's credential and the seeded plan with a project pair - in §10
+("The demo's tenant projects") since that task. The
 facts about Keystone, Nova, Cinder, Neutron, Placement and Octavia come from their documentation and, for Cinder's
 manage, its source, all read 2026-10-23. A fact only an excerpt showed, and a behaviour only a lab can show, is marked
 `TODO(LAB): confirm`.
@@ -9381,7 +9430,7 @@ The owner took each default as written on 2026-10-23 (D20):
 | the findings of §27.7; the role halves of `NET_PORT_NOT_PERMITTED` and `DST_FIP_ADDRESS_UNAVAILABLE`; the handover's eligibility reason; `DST_PROJECT_MISSING`'s remediation | §9.2, §9.3, §16 | TC6 |
 | the cutover gate's rule 6; the executors' sign-in failure; the migration page's naming of the credential that holds a cutover | §5.4, §7.1, §16 (binding) | TC7 |
 | the dashboard: a provider's project credentials, the plan's project pickers, the Inventory's project filter, the findings | §16 (binding) | TC8 |
-| the demo's tenant projects and its plan with a project pair | §10 | TC9 |
+| the demo's tenant projects and its plan with a project pair | §10 (binding) | TC9 |
 | QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
 | the lab; the Technology Preview label goes when LAB-TC01–LAB-TC06 pass | QASuite §13 | TC11 |
 

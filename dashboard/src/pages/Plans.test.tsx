@@ -1221,6 +1221,9 @@ describe("Plans: the plan's project pair (SDD §16, §27.4; plan task TC8)", () 
   // the mock cloud's projects the RHOSP 17.1 source holds credentials for (mockData MOCK_CLOUD_PROJECTS)
   const SHOP = '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6';
   const PLATFORM = '8d2e6b1f4a9c47e3b5d0c8a7f6e1d2c3';
+  // and the RHOSO destination's of the same names, other ids, as the demo seeds them (SDD §10, plan task TC9)
+  const DST_SHOP = '2a7c9e1b3d5f47a8b0c2e4d6f8a1b3c5';
+  const DST_PLATFORM = '7f1e3d5c9b2a46e8a0d4c6b8e2f1a3d5';
   const optionsOf = (select: HTMLElement) => within(select).getAllByRole('option').map((o) => [(o as HTMLOptionElement).value, o.textContent]);
 
   it("offers the provider's own project and its credentials' projects for the plan's project pair", async () => {
@@ -1235,7 +1238,11 @@ describe("Plans: the plan's project pair (SDD §16, §27.4; plan task TC8)", () 
       [PLATFORM, `platform (${PLATFORM})`],
       [SHOP, `shop (${SHOP})`],
     ]);
-    expect(optionsOf(destination)).toEqual([['', "Its own credential's project: demo (project-demo)"]]);
+    expect(optionsOf(destination)).toEqual([
+      ['', "Its own credential's project: demo (project-demo)"],
+      [DST_PLATFORM, `platform (${DST_PLATFORM})`],
+      [DST_SHOP, `shop (${DST_SHOP})`],
+    ]);
     expect((source as HTMLSelectElement).value).toBe('');
     // with the Technology Preview badge (SDD §16, §27.10)
     expect(within(source.closest('[role="group"]') as HTMLElement).getByText('Technology Preview')).toBeInTheDocument();

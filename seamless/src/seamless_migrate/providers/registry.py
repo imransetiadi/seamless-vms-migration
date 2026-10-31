@@ -23,7 +23,7 @@ def build(provider: Provider, settings: Settings) -> Any:
     if settings.demo:
         if provider.role == ProviderRole.destination:
             return FakeDestinationProvider(seed=settings.demo_seed, provider=provider)
-        return FakeSourceProvider(provider.kind, seed=settings.demo_seed)
+        return FakeSourceProvider(provider.kind, seed=settings.demo_seed, provider=provider)
     if provider.kind == ProviderKind.vmware:
         return VMwareProvider(provider, settings)
     return OpenStackProvider(provider, settings)
@@ -97,11 +97,13 @@ class ProviderRegistry:
         """An implementation that acts with the provider's credential for the Keystone project
         ``project_id`` (SDD §10, §13.3, §27.4, plan task TC4): an OpenStackProvider on a connection
         of its own, built for the call and never cached, so each read signs in afresh with the
-        credential as an admin last wrote it; its caller closes it after its read. The demo's fakes
-        cannot sign in with a project credential until plan task TC9 (§27.10), nor can a VMware
-        provider, which holds none: a provider error."""
-        if self.settings.demo or provider.kind == ProviderKind.vmware:
+        credential as an admin last wrote it; its caller closes it after its read. In the demo the
+        provider's fake acting with that credential (plan task TC9). A VMware provider, which
+        holds none, cannot sign in with one: a provider error."""
+        if provider.kind == ProviderKind.vmware:
             raise ProviderError(f"{provider.id}: it cannot sign in with a project credential")
+        if self.settings.demo:
+            return self._demo_project(provider, project_id)
         return OpenStackProvider(provider, self.settings, project_id=project_id)
 
     def _project(self, provider: Provider, project_id: str) -> Any:
@@ -109,8 +111,9 @@ class ProviderRegistry:
         an OpenStackProvider of that project, cached under ``connection_fingerprint`` - a
         credential an admin wrote again signs in at the next step, and the replaced one is closed.
         A project the provider holds no credential for is a provider error, never its own
-        credential; the demo's fakes and a VMware provider sign in with none (plan task TC9)."""
-        if self.settings.demo or provider.kind == ProviderKind.vmware:
+        credential; a VMware provider signs in with none. In the demo the provider's fake acting
+        with that credential (plan task TC9)."""
+        if provider.kind == ProviderKind.vmware:
             raise ProviderError(f"{provider.id}: it cannot sign in with a project credential")
         key = (provider.id, project_id)
         if project_id not in provider.project_credentials:
@@ -119,6 +122,8 @@ class ProviderRegistry:
             if gone is not None:
                 _close(gone[1])  # a deleted credential's connection goes with it
             raise ProviderError(f"{provider.id}: it holds no credential for project {project_id}")
+        if self.settings.demo:
+            return self._demo_project(provider, project_id)
         fingerprint = connection_fingerprint(provider, self.settings, project_id)
         with self._lock:
             cached = self._projects.get(key)
@@ -129,6 +134,12 @@ class ProviderRegistry:
         if cached is not None:
             _close(cached[1])  # the replaced connection must not keep its session
         return impl
+
+    def _demo_project(self, provider: Provider, project_id: str) -> Any:
+        """The demo's fake acting with the provider's credential for the project (SDD §10 "The
+        demo's tenant projects", plan task TC9): a view of the provider's fake - its simulated
+        cloud and its record of calls -, built for each call, since it holds no connection."""
+        return self.get(provider).as_project(project_id)
 
     def forget(self, provider_id: str) -> None:
         with self._lock:

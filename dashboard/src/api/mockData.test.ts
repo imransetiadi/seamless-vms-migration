@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
-import { DEMO_CEPH_FSID, DEMO_PROD_CEPH_FSID, buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, networkContext, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
+import { DEMO_CEPH_FSID, DEMO_PROD_CEPH_FSID, buildFixtures, buildInventories, buildProviders, projectSecretName, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, networkContext, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
 import type { MemberRead, StackRead } from './mockData';
 import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
@@ -926,5 +926,40 @@ describe("the mock's demo seed, as the API's demo (SDD §7.4, §10, §28.4, plan
     expect(tracked.map((p) => p.source_provider_id)).toEqual(['rhosp17-dc1']);
     // a VMware source never tracks extents (SDD §28.9)
     expect(fixtures.plans.filter((p) => p.source_provider_id === 'vcenter-hq').every((p) => !p.extent_tracking)).toBe(true);
+  });
+});
+
+describe("the mock's tenant projects, as the API's demo's (SDD §10, §16, §27.10, plan task TC9)", () => {
+  it("seeds the project credentials of the demo's providers", () => {
+    const fixtures = buildFixtures(now);
+    const byId = new Map(fixtures.providers.map((p) => [p.id, p]));
+    const tenants: Record<string, Record<string, string>> = {};
+    // two tenant projects on each side beside the credentials' own, each with a user of its own, checked ok (SDD §10, §27.11)
+    for (const id of ['rhosp17-dc1', 'rhoso-prod']) {
+      const provider = byId.get(id)!;
+      const held = Object.keys(provider.project_credentials ?? {}).sort();
+      expect(held).toHaveLength(2);
+      for (const project of held) {
+        expect(project).toMatch(/^[0-9a-f]{32}$/);
+        expect(provider.project_credentials![project]).toEqual({ secret: projectSecretName(id, project), updated_at: expect.any(String) });
+      }
+      const report = provider.capabilities.projects as Record<string, { status: string; project_name: string | null; user_id: string | null }>;
+      expect(Object.keys(report).sort()).toEqual(held);
+      expect(held.map((p) => report[p]!.status)).toEqual(['ok', 'ok']);
+      expect(new Set(held.map((p) => report[p]!.user_id)).size).toBe(2);
+      tenants[id] = Object.fromEntries(held.map((p) => [report[p]!.project_name!, p]));
+      expect(Object.keys(tenants[id]!).sort()).toEqual(['platform', 'shop']);
+    }
+    // each cloud's project ids are its own: a project id of one side is no project of the other
+    const destinationIds = Object.values(tenants['rhoso-prod']!);
+    expect(Object.values(tenants['rhosp17-dc1']!).filter((p) => destinationIds.includes(p))).toEqual([]);
+    for (const p of fixtures.providers.filter((p) => !['rhosp17-dc1', 'rhoso-prod'].includes(p.id))) expect(p.project_credentials ?? {}).toEqual({});
+    // the plan of a project pair: the shop projects, its VMs all of the source's shop project (SDD §27.4, §27.5)
+    const paired = fixtures.plans.filter((p) => p.source_project || p.destination_project);
+    expect(paired.map((p) => [p.source_project, p.destination_project])).toEqual([[tenants['rhosp17-dc1']!.shop, tenants['rhoso-prod']!.shop]]);
+    const inventory = fixtures.inventories['rhosp17-dc1'] as VMRef[];
+    const vms = inventory.filter((vm) => paired[0]!.vm_ids.includes(vm.source_id));
+    expect(vms).toHaveLength(paired[0]!.vm_ids.length);
+    expect([...new Set(vms.map((vm) => vm.project))]).toEqual(['shop']);
   });
 });

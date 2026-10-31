@@ -987,7 +987,10 @@ describe("Providers: a provider's project credentials (SDD §16, §27.4; plan ta
     expect(group).not.toHaveTextContent('provider-rhosp17-dc1.project-');
     // a vCenter has no Keystone projects (SDD §27.9); a provider without one says so
     expect(within(await screen.findByRole('article', { name: 'vCenter HQ' })).queryByRole('group', { name: /^projects/i })).not.toBeInTheDocument();
-    expect(within(screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })).getByRole('group', { name: /^projects/i })).toHaveTextContent('No project credential yet.');
+    // the RHOSO destination holds its tenant projects' too, as the demo seeds them (SDD §10, plan task TC9)
+    const production = within(screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })).getByRole('group', { name: /^projects/i });
+    expect(within(within(production).getByRole('list', { name: 'Project credentials' })).getAllByRole('listitem')).toHaveLength(2);
+    expect(within(screen.getByRole('article', { name: 'RHOSO 18.0 — Staging' })).getByRole('group', { name: /^projects/i })).toHaveTextContent('No project credential yet.');
   });
 
   it('writes a project credential and never shows it again', async () => {
@@ -1054,8 +1057,9 @@ describe("Providers: a provider's project credentials (SDD §16, §27.4; plan ta
     const { group } = await projectsOf();
     const shop = within(group).getByRole('button', { name: `Delete the credential of shop (${SHOP})` });
     await waitFor(() => expect(shop).toHaveAttribute('aria-disabled', 'true'));
+    // the seeded pilot plan moved the shop project's VMs and needs it too, one VM not finalized (SDD §10, plan task TC9)
     expect(shop).toHaveAccessibleDescription(
-      'A plan still needs it: “DC1 → RHOSO production rollout” (running). A plan needs its projects until it completes and its VMs are finalized.',
+      'Plans still need it: “DC1 → RHOSO production rollout” (running), “Pilot — static content” (1 VM not finalized). A plan needs its projects until it completes and its VMs are finalized.',
     );
     await user.click(shop);
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();

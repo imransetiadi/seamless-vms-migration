@@ -27,6 +27,7 @@ from seamless_migrate.domain.models import (
     SyncPass,
     utcnow,
 )
+from seamless_migrate.providers.fake import DEMO_DESTINATION_TENANTS, tenant_named
 from seamless_migrate.security.secret_store import project_secret_name
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
@@ -900,9 +901,10 @@ def test_the_inventory_of_a_project_without_a_credential_answers_404(api, monkey
     project that is neither the provider's own - as its last check names it - nor one it holds a
     credential for, and reads nothing: another provider's credential for it does not count, nor a
     project before a check named it as the provider's own, nor any project of a vCenter. A value
-    that is no project id is a 422 that never quotes it. The demo's fakes, which cannot sign in with
-    a project credential until plan task TC9, answer a project they hold one for with a provider
-    error."""
+    that is no project id is a 422 that never quotes it. The demo's fakes sign in with a credential
+    of a project their cloud holds and read its view, and refuse one of a project it does not hold
+    as Keystone refuses it: a provider error (SDD §10 "The demo's tenant projects", plan task
+    TC9)."""
     tenant_a, tenant_b = secrets.token_hex(16), secrets.token_hex(16)
     held = ProjectCredential(secret=project_secret_name("dst-rhoso", tenant_a), updated_at=utcnow())
     destination = api.store.get("provider", "dst-rhoso", Provider)
@@ -952,11 +954,23 @@ def test_the_inventory_of_a_project_without_a_credential_answers_404(api, monkey
     own = inventory("src-osp", "project-finance")
     assert own.status_code == 200 and len(own.json()) == 24, own.text
     assert built == ["src-osp"]
-    # a project the demo's fake holds a credential for: it cannot sign in with it
+    # a credential of a project the demo's cloud does not hold: Keystone refuses it
     held = inventory("dst-rhoso", tenant_a)
     assert held.status_code == 502, held.text
-    assert held.json()["error"]["message"] == (
-        "dst-rhoso: it cannot sign in with a project credential"
+    assert held.json()["error"]["message"] == "dst-rhoso: the sign-in failed: HTTP 401"
+    # one of its tenant projects: that project's view, read with its credential
+    payments = tenant_named(DEMO_DESTINATION_TENANTS, "payments").id
+    destination = api.store.get("provider", "dst-rhoso", Provider)
+    entry = ProjectCredential(
+        secret=project_secret_name("dst-rhoso", payments), updated_at=utcnow()
+    )
+    credentials = {**destination.project_credentials, payments: entry}
+    api.store.put("provider", destination.model_copy(update={"project_credentials": credentials}))
+    tenant = inventory("dst-rhoso", payments)
+    assert tenant.status_code == 200, tenant.text
+    assert (tenant.json()["projects"], tenant.json()["roles"]) == (
+        ["payments"],
+        ["member", "reader"],
     )
 
 
