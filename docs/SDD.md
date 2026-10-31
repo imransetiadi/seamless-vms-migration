@@ -9373,9 +9373,10 @@ another only where a service lets an admin act by id or on the project's behalf.
   * LAB-TC01: a cold and a warm plan per project pair: the servers, volumes, ports and floating IPs land in the plan's
     destination project, and no admin credential is in their steps' run files;
   * LAB-TC02: the handover into a project, its credential with `admin`; its source half by id with the provider's admin;
-  * LAB-TC03: expiry and deletion: a credential that expires during a sync pass fails it before it changes anything,
-    and the next pass runs once an admin wrote a new one; one deleted before a cutover fails it before the source
-    stops; one that expires within 24 hours holds the cutover at the gate; nothing runs with the provider's credential;
+  * LAB-TC03: expiry and deletion: a credential that has expired when a sync pass signs in fails the pass before it
+    changes anything - permanently, as a credential Keystone rejects (§7.1) -, and the next pass runs, after a retry,
+    once an admin wrote a new one; one deleted before a cutover fails it before the source stops; one that expires
+    within 24 hours holds the cutover at the gate; nothing runs with the provider's credential;
   * LAB-TC04: roles under each policy profile: `member` alone; `service` (secure-RBAC) for another project's network;
     the keep-address reservation by the provider's admin; `load-balancer_member` for the member helper;
   * LAB-TC05: keypairs: two project credentials of one user and a key name both tenants use (the finding blocks), then
