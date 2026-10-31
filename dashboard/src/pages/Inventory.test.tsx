@@ -7,6 +7,7 @@ import { Layout } from '../components/Layout';
 import { formatDateTime } from '../lib/format';
 import { createTestServer, renderWithApp, TEST_NOW } from '../test/utils';
 import Inventory from './Inventory';
+import Plans from './Plans';
 
 function NavigationType() {
   return <output data-testid="navigation-type">{useNavigationType()}</output>;
@@ -321,6 +322,29 @@ describe('Inventory', () => {
       wrapFetch: (mock) => (input, init) => (String(input).split('?')[0]!.endsWith('/api/v1/providers') ? pending : mock(input, init)),
     });
     expect(await screen.findByRole('status')).toHaveTextContent(/reading inventory/i);
+  });
+
+  it("starts a plan with the project it reads as the plan's source project", async () => {
+    // the mock cloud's shop project, whose credential the RHOSP 17.1 source holds (mockData MOCK_CLOUD_PROJECTS)
+    const SHOP = '5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6';
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/inventory/:providerId" element={<Inventory />} />
+          <Route path="/plans" element={<Plans />} />
+        </Route>
+      </Routes>,
+      { route: `/inventory/rhosp17-dc1?project=${SHOP}`, token: 'operator' },
+    );
+    const table = await screen.findByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ });
+    await user.click(within(table).getByRole('checkbox', { name: 'Select web-cache-01' }));
+    await user.click(screen.getByRole('button', { name: 'Create plan with 1 VM' }));
+    // the plan form opens with the provider, the VM and that project as the plan's source project (SDD §16)
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    expect(within(dialog).getByLabelText(/source provider/i)).toHaveValue('rhosp17-dc1');
+    expect(within(dialog).getByRole('combobox', { name: /^source project/i })).toHaveValue(SHOP);
+    expect(await within(dialog).findByRole('checkbox', { name: 'Select web-cache-01' })).toBeChecked();
   });
 
   it('filters the inventory by project', async () => {
