@@ -2,14 +2,21 @@
 provider and executor code (clouds.yaml parsing, openstack.connect, OpenStackProvider, the
 readiness report, cutover and rollback), with the strict Cinder/Nova doubles of
 test_executor_handover behind openstack.connect. It proves the lab module's wiring; the lab
-itself proves the clouds (QASuite LAB-H07…H10)."""
+itself proves the clouds (QASuite LAB-H07…H10). The changed-extents lab module (plan task CE13)
+and the project credentials lab module (plan task TC11) are rehearsed below the same way."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
+import threading
+import uuid
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import Any
 
 import pytest
 
@@ -238,3 +245,453 @@ async def test_the_changed_extents_lab_runs_through_the_real_executor_code(
     scripted({"1": _use("scanned", "first_pass"), "default": _use("checked", None, 2)})
     with pytest.raises(AssertionError, match="missed"):
         await module.test_lab_ce02_no_check_misses_a_write_under_io(fresh("ce02-missed"))
+
+
+# ------------------------------------------------- per-tenant credentials (plan task TC11)
+
+#: the in-process clouds' Keystone: each its own auth URL, its catalog's identity endpoint too
+SRC_KEYSTONE = "https://keystone.rhosp17.example/v3"
+DST_KEYSTONE = "https://keystone.rhoso18.example/v3"
+#: the servers a pre-staging's deploy reports it created, by its side's alias (SDD §6.5)
+CREATED_HOSTS = {"os_migrate_conv_src": "conv-src-server", "os_migrate_conv_dst": "conv-dst-server"}
+
+
+def _keystone_tenant(cloud: Any, name: str) -> NS:
+    """A made-up tenant project ``name`` of ``cloud`` - its id 32 hex digits - with a Keystone user
+    of its own and an application credential that user made with ``member`` and ``reader``, as the
+    in-process Keystone holds it (SDD §27.11 decision 3; plan task TC11): ids and secret generated
+    here."""
+    tenant = NS(
+        name=name,
+        project_id=secrets.token_hex(16),
+        user_id=secrets.token_hex(16),
+        credential_id=secrets.token_hex(16),
+        secret=secrets.token_urlsafe(32),
+    )
+    cloud.app_credentials[tenant.credential_id] = {
+        "secret": tenant.secret,
+        "user_id": tenant.user_id,
+        "project": {
+            "id": tenant.project_id,
+            "name": name,
+            "domain": {"id": "default", "name": "Default"},
+        },
+        "roles": ["member", "reader"],
+    }
+    return tenant
+
+
+def _credential_file(path: Path, cloud: Any, credential_id: str) -> Path:
+    """What `openstack application credential create -f json` prints of a credential of
+    ``cloud``'s Keystone, its keys as a newer client names them (Operations.md §7.5 item 2)."""
+    held = cloud.app_credentials[credential_id]
+    printed = {
+        "ID": credential_id,
+        "Name": f"seamless-{held['project']['name']}",
+        "Project ID": held["project"]["id"],
+        "Roles": " ".join(held["roles"]),
+        "Unrestricted": False,
+        "Expires At": held.get("expires_at"),
+        "Secret": held["secret"],
+    }
+    path.write_text(json.dumps(printed))
+    return path
+
+
+class _World:
+    """Two in-process clouds - the source and the destination, each with its own Keystone, the
+    providers' own project and two tenant projects - and what the fake playbooks behind the lab's
+    recorder do to them, played as the real ones do it (SDD §27.6, plan task TC11): os-migrate
+    creates a run's server, volumes, port and floating IP in the project of the run's destination
+    credential - its secrets.yml's -, stops the source at a cutover and starts it again at a
+    rollback, and a deploy creates each conversion host in its side's project. ``sync``, the
+    clouds' ``on_request``, plays what the fake logged since the last request; ``created`` holds
+    each server a cutover created, by its name and its project."""
+
+    def __init__(self, base: Path) -> None:
+        from seamless_migrate.domain.models import utcnow
+        from tests.cloud_support import InProcessCloud
+
+        def cloud(name: str, keystone: str) -> Any:
+            own = {"id": secrets.token_hex(16), "name": "admin", "domain": {"id": "default"}}
+            return InProcessCloud(
+                base / name,
+                auth_url=keystone,
+                catalog={"identity": keystone},
+                roles=("admin", "member", "reader"),
+                project=own,
+            )
+
+        self.log = base / "ansible.log"
+        self.src, self.dst = cloud("src", SRC_KEYSTONE), cloud("dst", DST_KEYSTONE)
+        self.pairs: list[NS] = []
+        for name in ("tenant-a", "tenant-b"):
+            source, destination = _keystone_tenant(self.src, name), _keystone_tenant(self.dst, name)
+            vm = {
+                "id": str(uuid.uuid4()),
+                "name": f"web-{name[-1]}",
+                "project_id": source.project_id,
+                "status": "ACTIVE",
+            }
+            network = {
+                "id": f"net-{name}",
+                "name": f"{name}-net",
+                "project_id": destination.project_id,
+                "mtu": 1450,
+                "shared": False,
+                "router:external": False,
+                "status": "ACTIVE",
+            }
+            self.src.servers.append(vm)
+            self.dst.networks.append(network)
+            self.pairs.append(NS(name=name, source=source, destination=destination, vm=vm))
+        # TC03's: a second credential of the first pair's destination project, made by its user,
+        # that expires within minutes
+        first = self.dst.app_credentials[self.pairs[0].destination.credential_id]
+        self.expiring = secrets.token_hex(16)
+        self.dst.app_credentials[self.expiring] = {
+            **first,
+            "secret": secrets.token_urlsafe(32),
+            "expires_at": (utcnow() + timedelta(minutes=10)).isoformat(),
+        }
+        self.created: list[tuple[str, str | None]] = []
+        #: the destination's sign-ins and the fake's runs when the expiring credential expired
+        self.at_expiry: tuple[int, int] | None = None
+        #: a cloud gone wrong: a cutover's server lands in the providers' own project
+        self.misplaced = False
+        self._seen = 0
+        self._lock = threading.Lock()
+
+    async def expire(self, expiry: Any) -> None:
+        """TC03's wait, rehearsed: the credential expires at once - Keystone refuses it from now on
+        (401), as it refuses one whose expiry passed."""
+        from tests.fake_ansible import read_log
+
+        self.dst.app_credentials[self.expiring]["sign_in"] = 401
+        self.at_expiry = (len(self.dst.sign_ins), len(read_log(self.log)))
+
+    def sync(self) -> None:
+        from tests.fake_ansible import read_log
+
+        with self._lock:
+            records = read_log(self.log)
+            for record in records[self._seen :]:
+                self._play(record)
+            self._seen = len(records)
+
+    def _play(self, record: dict[str, Any]) -> None:
+        from tests.test_executor_ansible import load_ansible_yaml
+
+        playbook, variables = record["playbook"], record.get("vars") or {}
+        held = load_ansible_yaml(record["raw"].get("secrets.yml") or "{}") or {}
+        src = self._project(self.src, held.get("os_migrate_src_auth"))
+        dst = self._project(self.dst, held.get("os_migrate_dst_auth"))
+        if playbook == "deploy_conversion_hosts.yml":
+            for cloud, side, project in ((self.src, "src", src), (self.dst, "dst", dst)):
+                host = {
+                    "id": CREATED_HOSTS[f"os_migrate_conv_{side}"],
+                    "name": variables[f"os_migrate_{side}_conversion_host_name"],
+                    "project_id": project,
+                    "status": "ACTIVE",
+                }
+                cloud.servers.append(host)
+            return
+        wanted = [f["regex"] for f in variables.get("os_migrate_workloads_filter") or []]
+        vm = next(
+            (p.vm for p in self.pairs if any(re.search(w, p.vm["name"]) for w in wanted)), None
+        )
+        if vm is None:
+            return
+        # the warm passes' destination volume (fake_ansible's dest_volumes), a cold import's own
+        disk = f"dst-{vm['id']}-vda" if playbook != "import_workloads.yml" else f"dst-{vm['id']}"
+        if playbook in ("import_workloads_precopy.yml", "import_workloads.yml") and not any(
+            v["id"] == disk for v in self.dst.volumes
+        ):
+            self.dst.volumes.append({"id": disk, "project_id": dst, "attachments": []})
+        if playbook in ("import_workloads.yml", "import_workloads_cutover.yml"):
+            server = f"dst-{vm['id']}"
+            for volume in self.dst.volumes:
+                if volume["id"] == disk:
+                    volume["attachments"] = [server]
+            self.dst.servers.append(
+                {
+                    "id": server,
+                    "name": vm["name"],
+                    "project_id": self.dst.project["id"] if self.misplaced else dst,
+                    "status": "ACTIVE",
+                    "os-extended-volumes:volumes_attached": [{"id": disk}],
+                }
+            )
+            network = next(n["id"] for n in self.dst.networks if n["project_id"] == dst)
+            port = {
+                "id": f"port-{vm['id']}",
+                "project_id": dst,
+                "device_id": server,
+                "device_owner": "compute:nova",
+                "network_id": network,
+                "mac_address": "fa:16:3e:00:00:01",
+                "fixed_ips": [{"ip_address": "10.0.0.5", "subnet_id": f"sub-{network}"}],
+                "status": "ACTIVE",
+            }
+            self.dst.ports.append(port)
+            self.dst.floatingips.append(
+                {
+                    "id": f"fip-{vm['id']}",
+                    "floating_ip_address": f"203.0.113.{10 + len(self.created)}",
+                    "port_id": port["id"],
+                    "project_id": dst,
+                    "fixed_ip_address": "10.0.0.5",
+                    "status": "ACTIVE",
+                }
+            )
+            vm["status"] = "SHUTOFF"
+            self.created.append((vm["name"], dst))
+        elif playbook == "rollback_workloads.yml":
+            gone = {
+                s["id"]
+                for s in self.dst.servers
+                if s["name"] == vm["name"] and s.get("project_id") == dst
+            }
+            ports = {p["id"] for p in self.dst.ports if p["device_id"] in gone}
+            self.dst.servers = [s for s in self.dst.servers if s["id"] not in gone]
+            self.dst.ports = [p for p in self.dst.ports if p["id"] not in ports]
+            self.dst.floatingips = [f for f in self.dst.floatingips if f["port_id"] not in ports]
+            for volume in self.dst.volumes:
+                volume["attachments"] = [s for s in volume["attachments"] if s not in gone]
+            if variables.get("os_migrate_rollback_delete_dest_volumes"):
+                ours = (f"dst-{vm['id']}", f"dst-{vm['id']}-vda")
+                self.dst.volumes = [v for v in self.dst.volumes if v["id"] not in ours]
+            if variables.get("os_migrate_rollback_start_source", True):
+                vm["status"] = "ACTIVE"
+
+    @staticmethod
+    def _project(cloud: Any, auth: Any) -> str | None:
+        """The project a run's credential acts in: an application credential's own; the
+        clouds.yaml user's - the provider's own credential - for a password."""
+        if not isinstance(auth, dict):
+            return None
+        credential = cloud.app_credentials.get(auth.get("application_credential_id") or "")
+        if credential is not None:
+            return credential["project"]["id"]
+        return cloud.project["id"] if auth.get("password") else None
+
+
+@pytest.fixture
+def credentials_rehearsal(tmp_path, tmp_path_factory, monkeypatch):
+    """The project credentials lab module's environment against in-process clouds (plan task
+    TC11): each call builds a new _World and the lab of it - both clouds reached through
+    Seamless's own connect() over the in-process keystoneauth sessions of tests/cloud_support.py,
+    by the provider registry's OpenStackProviders (each step's calls and sign-ins, each check's)
+    and by the lab's own reads alike -, with the fake ansible-playbook behind the lab's
+    recorder."""
+    import functools
+
+    from seamless_migrate.domain.enums import ProviderRole
+    from seamless_migrate.providers import registry as registry_module
+    from seamless_migrate.providers.openstack import OpenStackProvider
+    from tests.fake_ansible import install
+
+    pytest.importorskip("openstack")
+    fake = install(tmp_path / "bin")
+    current: dict[str, _World] = {}
+    made: list[tuple[Any, Any]] = []
+
+    def connecting(provider, settings, project_id=None):
+        world = current["world"]
+        cloud = world.src if provider.role == ProviderRole.source else world.dst
+        return cloud.connect(provider, settings, project_id)
+
+    monkeypatch.setattr(
+        registry_module,
+        "OpenStackProvider",
+        functools.partial(OpenStackProvider, connect_fn=connecting),
+    )
+    for name in (
+        "SEAMLESS_LAB_DATA_DIR",
+        "SEAMLESS_LAB_DEST_KIND",
+        "SEAMLESS_LAB_EXPIRY_WAIT_S",
+        "ANSIBLE_FAKE_CREATED",
+        "ANSIBLE_FAKE_VM_NAME",
+        "ANSIBLE_FAKE_SERVER_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def make(module: Any, name: str = "lab") -> tuple[Any, _World]:
+        base = tmp_path / name
+        world = current["world"] = _World(base)
+        clouds_yaml = base / "clouds.yaml"
+        clouds_yaml.write_text(
+            "clouds:\n"
+            + "".join(
+                f"  {cloud}:\n    auth:\n      auth_url: {keystone}\n"
+                f"      username: admin\n      password: {secrets.token_urlsafe(16)}\n"
+                "      project_name: admin\n      user_domain_name: Default\n"
+                "      project_domain_name: Default\n    region_name: RegionOne\n"
+                for cloud, keystone in (("rhosp17", SRC_KEYSTONE), ("rhoso18", DST_KEYSTONE))
+            )
+        )
+        pairs = [
+            {
+                "name": pair.name,
+                "source": {
+                    "project": pair.source.project_id,
+                    "credential": str(
+                        _credential_file(
+                            base / f"src-{pair.name}.json", world.src, pair.source.credential_id
+                        )
+                    ),
+                    "server": pair.vm["id"],
+                },
+                "destination": {
+                    "project": pair.destination.project_id,
+                    "credential": str(
+                        _credential_file(
+                            base / f"dst-{pair.name}.json",
+                            world.dst,
+                            pair.destination.credential_id,
+                        )
+                    ),
+                },
+                # the fake exports each VM's port on app-net
+                "mappings": {"networks": {"app-net": f"{pair.name}-net"}},
+            }
+            for pair in world.pairs
+        ]
+        tenants = base / "tenants.json"
+        tenants.write_text(json.dumps(pairs))
+        report = {"created": [{"alias": a, "id": i} for a, i in CREATED_HOSTS.items()]}
+        env = {
+            "SEAMLESS_LAB_CLOUDS_YAML": str(clouds_yaml),
+            "SEAMLESS_LAB_SOURCE_CLOUD": "rhosp17",
+            "SEAMLESS_LAB_DEST_CLOUD": "rhoso18",
+            "SEAMLESS_LAB_TENANTS": str(tenants),
+            "SEAMLESS_LAB_TC03_CREDENTIAL": str(
+                _credential_file(base / "tc03.json", world.dst, world.expiring)
+            ),
+            "SEAMLESS_LAB_CONVERSION_HOSTS": json.dumps(
+                {"source": {"name": "seamless-conv-src"}, "destination": {"name": "conv-dst"}}
+            ),
+            "SEAMLESS_LAB_ANSIBLE_PLAYBOOK": str(fake),
+            "SEAMLESS_LAB_DESTRUCTIVE": "1",
+            "ANSIBLE_FAKE_LOG": str(world.log),
+            "ANSIBLE_FAKE_SLEEP": "0.01",
+            "ANSIBLE_FAKE_SERVERS": json.dumps({p.vm["name"]: p.vm["id"] for p in world.pairs}),
+            "ANSIBLE_FAKE_HOSTS_REPORT": json.dumps(report),
+            "ANSIBLE_FAKE_PRELUDE": "1",
+            "ANSIBLE_FAKE_DEST_VOLUMES": "1",
+        }
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        fixture = module.lab.__wrapped__(tmp_path_factory)  # the fixture body, this environment's
+        lab = next(fixture)
+        made.append((lab, fixture))
+        for cloud in (world.src, world.dst):
+            # the lab's clouds.yaml entries and its secret store, as Seamless's connect() reads them
+            cloud.settings = lab.settings
+            cloud.on_request = world.sync
+        lab.connect = connecting
+        lab.wait_for_expiry = world.expire
+        return lab, world
+
+    yield make
+    for lab, fixture in made:
+        fixture.close()  # the lab fixture's teardown
+        assert not lab.settings.secrets_dir.exists(), "the lab's secret store outlived its module"
+
+
+async def test_the_project_credentials_lab_runs_through_the_real_provider_code(
+    credentials_rehearsal, monkeypatch
+):
+    """QASuite LAB-TC01 and LAB-TC03 rehearsed (plan task TC11): each lab test drives the real
+    provider check, the real ProviderRegistry's OpenStackProviders - Keystone sign-ins with each
+    pair's application credentials, Nova's, Cinder's and Neutron's reads through keystoneauth -
+    and the real AnsibleExecutor - its sign-in before a step, its conversion host keys, its run
+    files - against two in-process clouds, the fake ansible-playbook behind the lab's recorder.
+    Each cutover's server lands in its pair's destination project; every run signs in with its
+    pair's two project credentials; an expired credential is refused before a step acts. A lab
+    whose steps act with the providers' own credentials, whose cloud puts a server in another
+    project, or whose steps do not sign in first fails: the lab asserts, never only prints."""
+    from seamless_migrate.executors.ansible import AnsibleExecutor
+    from tests.fake_ansible import read_log
+    from tests.lab import test_lab_project_credentials as module
+    from tests.test_executor_ansible import load_ansible_yaml
+
+    lab, world = credentials_rehearsal(module)
+    await module.test_lab_tc01_a_member_plan_lands_in_its_destination_project(lab)
+    a, b = world.pairs
+    # each cutover - a warm and a cold one per pair - created its server in its pair's
+    # destination project, and each rollback removed it again
+    assert world.created == [
+        (pair.vm["name"], pair.destination.project_id) for pair in world.pairs for _ in "wc"
+    ]
+    hosts = set(CREATED_HOSTS.values())
+    assert [s["name"] for s in world.dst.servers if s["id"] not in hosts] == []
+    assert all(pair.vm["status"] == "ACTIVE" for pair in world.pairs)
+    # each import ran on the VM its workload filter names, the export holding that VM alone - each
+    # pair's in turn -, and the recorder read the clouds.yaml os-migrate's prelude writes after
+    # every run: its check never passed for want of the file
+    imports = [run for run in read_log(world.log) if run["playbook"].startswith("import_")]
+    for run in imports:
+        wanted = run["vars"]["os_migrate_workloads_filter"][0]["regex"]
+        named = [p.vm["name"] for p in world.pairs if re.search(wanted, p.vm["name"])]
+        assert run["servers"] == named and len(named) == 1, run["playbook"]
+    assert {tuple(run["servers"]) for run in imports} == {(p.vm["name"],) for p in world.pairs}
+    assert lab.runs() and all(run["clouds_yaml"] for run in lab.runs())
+
+    await module.test_lab_tc03_an_expired_credential_stops_nothing(lab)
+    # once it had expired, the expiring credential tried twice - the sync pass and the cutover -,
+    # refused by Keystone each time before any playbook
+    assert world.at_expiry is not None
+    signed, ran = world.at_expiry
+    assert world.dst.sign_ins[signed:].count(world.expiring) == 2
+    after = read_log(world.log)[ran:]
+    assert [run["playbook"] for run in after] == [
+        "import_workloads_precopy.yml",
+        "rollback_workloads.yml",
+    ]
+    # every run of both tests - each pair's pre-staging, passes, cutovers and rollbacks - held its
+    # pair's two application credentials in the real executor's run files, the expiring one never
+    names = {
+        **{p.source.credential_id: f"{p.name} source" for p in world.pairs},
+        **{p.destination.credential_id: f"{p.name} destination" for p in world.pairs},
+    }
+    runs = read_log(world.log)
+    assert len(runs) > 10
+    for run in runs:
+        held = load_ansible_yaml(run["raw"]["secrets.yml"])
+        who = [
+            names.get(held[f"os_migrate_{side}_auth"].get("application_credential_id"), "another")
+            for side in ("src", "dst")
+        ]
+        assert "another" not in who and who[0].split()[0] == who[1].split()[0], run["playbook"]
+    # so did every sign-in at the destination but the provider's own check and the lab's reads
+    pairs = {a.destination.credential_id, b.destination.credential_id}
+    assert set(world.dst.sign_ins) == {"admin", world.expiring, *pairs}
+
+    # a lab whose steps act with the providers' own credentials fails at once: the pre-staging's
+    # run files sign in as the providers (TC01) ...
+    with monkeypatch.context() as patched:
+        own = staticmethod(lambda step, plan: (None, None))
+        patched.setattr(AnsibleExecutor, "_projects", own)
+        broken, _ = credentials_rehearsal(module, "own-credentials")
+        with pytest.raises(AssertionError, match="signs in as"):
+            await module.test_lab_tc01_a_member_plan_lands_in_its_destination_project(broken)
+
+    # ... one where a cutover's server lands in the providers' own project fails at that cutover
+    # (TC01) ...
+    broken, elsewhere = credentials_rehearsal(module, "misplaced")
+    elsewhere.misplaced = True
+    with pytest.raises(AssertionError, match="outside its destination project"):
+        await module.test_lab_tc01_a_member_plan_lands_in_its_destination_project(broken)
+    assert len(elsewhere.created) == 1
+
+    # ... and one whose steps do not sign in first runs a pass with the expired credential, its
+    # connection's token cached from the check (TC03)
+    async def unsigned(self, step, plan, source, destination):
+        return None
+
+    with monkeypatch.context() as patched:
+        patched.setattr(AnsibleExecutor, "_sign_in", unsigned)
+        broken, _ = credentials_rehearsal(module, "no-sign-in")
+        with pytest.raises(AssertionError, match="ran with the expired credential"):
+            await module.test_lab_tc03_an_expired_credential_stops_nothing(broken)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,8 +83,17 @@ class InProcessCloud:
     handshake or timeout, which keystoneauth turns into its own). ``sign_ins`` records who
     each sign-in came with - the clouds.yaml user's name or an application credential's id -,
     ``tokens`` the project and the roles of each token it answered (``{project, roles}``), and
-    ``records_read`` each record read. ``connect`` is what OpenStackProvider takes as
-    ``connect_fn``, a project's connection too (``project_id``)."""
+    ``records_read`` each record read. ``volumes`` are Cinder's volumes (``{id, name, project_id,
+    status, size, attachments}``, ``attachments`` the ids of the servers holding it), each one's GET
+    by id answered to a token of its project or holding ``admin`` (Cinder's default policy), 404
+    otherwise; ``ports`` are Neutron's ports (``{id, project_id, device_id, device_owner,
+    network_id, mac_address, fixed_ips}``), which its port list answers - every port to a token
+    holding ``admin``, its project's to another, as Neutron's default policy lists them - filtered
+    by the query's ``device_id``, ``network_id``, ``mac_address`` and ``project_id`` (plan task
+    TC11). ``on_request``, when given, runs before each request is answered: a test's way to bring
+    the cloud up to date with what happened outside it - the servers a fake playbook created.
+    ``connect`` is what OpenStackProvider takes as ``connect_fn``, a project's connection too
+    (``project_id``)."""
 
     root: Path
     compute: str = "2.96"
@@ -121,6 +131,9 @@ class InProcessCloud:
     sign_ins: list[str] = field(default_factory=list)
     tokens: dict[str, dict[str, Any]] = field(default_factory=dict)
     records_read: list[str] = field(default_factory=list)
+    volumes: list[dict[str, Any]] = field(default_factory=list)
+    ports: list[dict[str, Any]] = field(default_factory=list)
+    on_request: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         pytest.importorskip("requests")
@@ -267,12 +280,14 @@ class InProcessCloud:
 
         from seamless_migrate.providers.openstack import connect
 
-        routes, seen = self._routes(), self.seen
+        routes, seen, cloud = self._routes(), self.seen, self
         answers = (
             self._sign_in_answer,
             self._record_answer,
             self._project_answer,
             self._servers_answer,
+            self._volume_answer,
+            self._ports_answer,
             self._flavors_answer,
             self._placement_answer,
             self._service_answer,
@@ -282,6 +297,8 @@ class InProcessCloud:
 
         class Transport(requests.adapters.BaseAdapter):
             def send(self, request, **kwargs):
+                if cloud.on_request is not None:
+                    cloud.on_request()
                 seen.append((request.method, request.url))
                 answer = next((a for a in (f(request) for f in answers) if a), None)
                 if isinstance(answer, BaseException):
@@ -454,11 +471,70 @@ class InProcessCloud:
             return status, body, {}
         return None
 
+    def _scope(self, request: Any) -> dict[str, Any]:
+        """The project and the roles of the token a request came with - the clouds.yaml
+        credential's when it names none this cloud answered."""
+        token = self.tokens.get(request.headers.get("X-Auth-Token", ""))
+        return token or {"project": self.project["id"], "roles": list(self.roles)}
+
+    def _volume_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Cinder's answer to a volume's GET by id - below the catalog's project or below none -:
+        the volume, its project as ``os-vol-tenant-attr:tenant_id``, to a token of its project or
+        holding ``admin`` (Cinder's default policy), 404 otherwise; None for any other request
+        (plan task TC11)."""
+        block = {**CATALOG, **self.catalog}["block-storage"].rstrip("/").split("/v3")[0]
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        found = re.fullmatch(re.escape(block) + r"/v3(?:/[^/]+)?/volumes/([^/]+)", url)
+        if request.method != "GET" or found is None or found.group(1) == "detail":
+            return None
+        scope = self._scope(request)
+        wanted = urllib.parse.unquote(found.group(1))
+        volume = next((v for v in self.volumes if v["id"] == wanted), None)
+        if volume is None or (
+            volume.get("project_id") != scope["project"] and "admin" not in scope["roles"]
+        ):
+            return 404, {"itemNotFound": {"code": 404, "message": "Volume not found"}}, {}
+        held = [
+            {"server_id": server, "volume_id": wanted, "id": wanted, "attachment_id": f"a-{server}"}
+            for server in volume.get("attachments", [])
+        ]
+        body = {
+            "id": wanted,
+            "name": volume.get("name", ""),
+            "status": volume.get("status", "in-use" if held else "available"),
+            "size": volume.get("size", 1),
+            "os-vol-tenant-attr:tenant_id": volume.get("project_id"),
+            "attachments": held,
+            "metadata": {},
+        }
+        return 200, {"volume": body}, {}
+
+    def _ports_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Neutron's answer to the port list: every port to a token holding ``admin``, its
+        project's to another (Neutron's default policy), filtered by the query's ``device_id``,
+        ``network_id``, ``mac_address`` and ``project_id``; None for any other request (plan task
+        TC11)."""
+        network = {**CATALOG, **self.catalog}["network"].rstrip("/")
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        if request.method != "GET" or url != network + "/v2.0/ports":
+            return None
+        scope, query = self._scope(request), urllib.parse.parse_qs(parts.query)
+        keys = ("device_id", "network_id", "mac_address", "project_id")
+        ports = [
+            {**port, "tenant_id": port.get("project_id")}
+            for port in self.ports
+            if ("admin" in scope["roles"] or port.get("project_id") == scope["project"])
+            and all(str(port.get(key)) in query[key] for key in keys if key in query)
+        ]
+        return 200, {"ports": ports}, {}
+
     def _lists_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
-        """Neutron's network, subnet, port (none), floating IP and extension lists, Nova's keypairs
-        and Cinder's volume types - below the catalog's project, or below none, as keystoneauth asks
-        with a token of another project than the catalog's (Cinder takes either from 3.67, plan
-        task TC4) -, as an inventory reads them; None for any other request."""
+        """Neutron's network, subnet, floating IP and extension lists, Nova's keypairs and Cinder's
+        volume types - below the catalog's project, or below none, as keystoneauth asks with a
+        token of another project than the catalog's (Cinder takes either from 3.67, plan task
+        TC4) -, as an inventory reads them; None for any other request."""
         urls = {**CATALOG, **self.catalog}
         parts = urllib.parse.urlsplit(request.url)
         url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
@@ -477,7 +553,6 @@ class InProcessCloud:
         lists = {
             network + "/v2.0/networks": {"networks": self.networks},
             network + "/v2.0/subnets": {"subnets": self.subnets},
-            network + "/v2.0/ports": {"ports": []},
             network + "/v2.0/floatingips": {"floatingips": floatingips},
             network + "/v2.0/extensions": {"extensions": self.extensions},
             compute + "/os-keypairs": {"keypairs": [{"keypair": k} for k in self.keypairs]},

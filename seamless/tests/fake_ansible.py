@@ -21,7 +21,7 @@ KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
 SCRIPT = textwrap.dedent(
     """\
     #!{python}
-    import json, os, stat, sys, time
+    import json, os, re, stat, sys, time
     from pathlib import Path
     import yaml
 
@@ -89,9 +89,24 @@ SCRIPT = textwrap.dedent(
 
     osm = Path(merged.get("os_migrate_data_dir") or merged.get("os_migrate_vmw_data_dir") or ".")
     osm.mkdir(parents=True, exist_ok=True)
-    (osm / "clouds.yaml").write_text("clouds: {{src: {{auth: {{password: leak}}}}}}\\n")
+    if os.environ.get("ANSIBLE_FAKE_PRELUDE"):
+        # the clouds.yaml prelude_common writes from the run's auth variables (its template)
+        clouds = {{side: {{"auth": merged["os_migrate_" + side + "_auth"]}}
+                  for side in ("src", "dst") if merged.get("os_migrate_" + side + "_auth")}}
+        (osm / "clouds.yaml").write_text(yaml.safe_dump({{"clouds": clouds}}))
+    else:
+        (osm / "clouds.yaml").write_text("clouds: {{src: {{auth: {{password: leak}}}}}}\\n")
     name = os.environ.get("ANSIBLE_FAKE_VM_NAME", "web-01")
     server_id = os.environ.get("ANSIBLE_FAKE_SERVER_ID", "srv-1")
+    # one of several VMs, each its own server - a lab's tenant pairs: ANSIBLE_FAKE_SERVERS maps
+    # their names to their ids, and the run's workload filter selects one by its name
+    servers = json.loads(os.environ.get("ANSIBLE_FAKE_SERVERS") or "{{}}")
+    wanted = [f.get("regex") for f in merged.get("os_migrate_workloads_filter") or []
+              if isinstance(f, dict)]
+    for candidate, candidate_id in servers.items():
+        if any(regex and re.search(regex, candidate) for regex in wanted):
+            name, server_id = candidate, candidate_id
+            break
     # the volumes the export lists for the server, by Cinder id (the default VM's boot volume)
     volume_ids = [v for v in os.environ.get("ANSIBLE_FAKE_VOLUME_IDS", "vol-1").split(",") if v]
     base = record["playbook"]
@@ -238,6 +253,11 @@ SCRIPT = textwrap.dedent(
                 "extents": fake_extents(base, n)}})
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
+        if os.environ.get("ANSIBLE_FAKE_DEST_VOLUMES") and not state["dest_volumes"]:
+            # the destination volume the first pass creates for the boot disk, as the warm role
+            # records it (warm_migration's dest_volumes, SDD 6.3)
+            state["dest_volumes"] = {{"/dev/vda": {{"dest_id": "dst-" + server_id + "-vda",
+                "name": "os-migrate-" + server_id, "size": 1, "bootable": True}}}}
         path.write_text(json.dumps(state))
         # the warm role's "Record what the cutover will refuse" (SDD 6.6, 7.2)
         if (base == "import_workloads_precopy.yml" and not skipped_pass
