@@ -148,14 +148,26 @@ function Brand({ compact = false }: { compact?: boolean }) {
  * The grouped items (SDD §16): in the full sidebar each label beside its icon under the group's heading, in the rail
  * each label under its icon and the groups apart by a rule. Plans is described by the failed count from /stats.
  */
-function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: NavMode; onNavigate?: (to: string) => void }) {
+function NavGroups({
+  pathname,
+  mode,
+  onNavigate,
+  compact = false,
+}: {
+  pathname: string;
+  mode: NavMode;
+  onNavigate?: (to: string) => void;
+  /** The desktop column's full sidebar: 36px items, as compact desktop targets are (SDD §16, MASTER.md); the drawer keeps 44px. */
+  compact?: boolean;
+}) {
   const prefix = useId();
   const me = useMe();
   const stats = useStats();
   const failed = stats.data?.failed ?? 0;
   const rail = mode === 'rail';
+  const dense = compact && !rail;
   return (
-    <div className={cn('flex flex-col', rail ? 'gap-2' : 'gap-4')}>
+    <div className={cn('flex flex-col', rail ? 'gap-2' : dense ? 'gap-3' : 'gap-4')}>
       {NAV_GROUPS.map((group, index) => {
         if (group.label === 'Administration' && me.data?.role !== 'admin') return null;
         const headingId = `${prefix}-group-${index}`;
@@ -177,7 +189,8 @@ function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: Nav
                       aria-current={active ? 'page' : undefined}
                       aria-describedby={pill ? pillId : undefined}
                       className={cn(
-                        'flex min-h-11 rounded-md transition-colors duration-200',
+                        'flex rounded-md transition-colors duration-200',
+                        dense ? 'min-h-9' : 'min-h-11',
                         rail
                           ? 'flex-col items-center justify-center gap-1 border-l-2 px-1 py-1.5 text-center text-xs leading-tight'
                           : 'items-center gap-3 border-l-2 px-3 text-sm',
@@ -491,15 +504,17 @@ export function Layout() {
         data-testid="app-navigation"
         data-nav={mode}
         className={cn(
-          'sticky top-0 hidden h-dvh flex-col gap-3 border-r border-border bg-card py-4 md:flex',
+          // the column scrolls as one when its items and session do not fit, the items first (SDD §16)
+          'sticky top-0 hidden h-dvh flex-col gap-3 overflow-y-auto border-r border-border bg-card py-4 md:flex',
           full ? 'w-60 px-3' : 'w-20 px-1.5',
         )}
       >
         <Brand compact={!full} />
-        <nav id={columnNavId} aria-label="Primary" className="flex-1 overflow-y-auto">
-          <NavGroups pathname={pathname} mode={mode} />
+        <nav id={columnNavId} aria-label="Primary" className="shrink-0">
+          <NavGroups pathname={pathname} mode={mode} compact />
         </nav>
-        {full ? <SessionFooter /> : <RailSession />}
+        {/* at the column's foot while there is room, after the items once there is none */}
+        <div className="mt-auto">{full ? <SessionFooter /> : <RailSession />}</div>
         <button
           type="button"
           onClick={toggleMode}
