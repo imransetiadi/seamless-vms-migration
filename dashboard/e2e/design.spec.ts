@@ -41,3 +41,33 @@ test('Overview keeps operational navigation clear on a phone', async ({ page }) 
   await expect(check).toBeVisible();
   expect((await check.boundingBox())!.height).toBeGreaterThanOrEqual(44);
 });
+
+test('the full sidebar shows every navigation item at 1280 × 900, and a shorter column scrolls as one (SDD §16)', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto('/login');
+  await page.getByLabel('API token', { exact: true }).fill('admin');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  const column = page.getByTestId('app-navigation');
+  const nav = column.getByRole('navigation', { name: 'Primary' });
+  await expect(nav.getByRole('link', { name: 'Users', exact: true })).toBeAttached();
+  // every item an admin's navigation holds is on the screen, none scrolled away in a box of its own
+  const links = await nav.getByRole('link').all();
+  expect(links.length).toBeGreaterThanOrEqual(11);
+  for (const link of links) await expect(link).toBeInViewport({ ratio: 1 });
+  expect(await nav.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(0);
+  // the full sidebar's items are compact desktop targets (SDD §16, MASTER.md)
+  expect((await nav.getByRole('link', { name: 'Overview', exact: true }).boundingBox())!.height).toBe(36);
+  // and the session stays at the column's foot, sign out among it
+  await expect(column.getByRole('button', { name: 'Sign out', exact: true })).toBeInViewport();
+  // shorter than its items and session: the column scrolls as one, the items first, never the items alone
+  await page.setViewportSize({ width: 1280, height: 640 });
+  expect(await nav.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(0);
+  expect(await column.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(0);
+  await column.getByRole('button', { name: 'Sign out', exact: true }).scrollIntoViewIfNeeded();
+  await expect(column.getByRole('button', { name: 'Sign out', exact: true })).toBeInViewport();
+  // the rail, from 768 px to 1279 px, keeps its items 44 px tall
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await expect(column).toHaveAttribute('data-nav', 'rail');
+  expect((await nav.getByRole('link', { name: 'Overview', exact: true }).boundingBox())!.height).toBeGreaterThanOrEqual(44);
+});

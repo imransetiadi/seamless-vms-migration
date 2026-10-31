@@ -5501,7 +5501,10 @@ is no origin a browser sends (review RV31-03).
   edge — from 1280 px the full sidebar (15rem: the brand, the items with their labels beside their icons, the
   session at the bottom: live indicator, Demo, orchestrator, version, user and role, theme, sign out), from 768 px
   to 1279 px a rail (5rem: the brand mark, each item's icon with its label under it, never a label shown only on
-  hover, and at the bottom the live indicator, the theme and sign out as labelled icons). "Collapse navigation" /
+  hover, and at the bottom the live indicator, the theme and sign out as labelled icons). A column whose items and
+  session do not fit the screen's height scrolls as one, the items first and the session after them, never the
+  items alone in a box of their own, which hid the last groups at 1280 px (the design review of 2026-10-29); the full
+  sidebar's items are compact desktop targets of 36 px, the rail's and the drawer's stay 44 px. "Collapse navigation" /
   "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
   in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
   only forgets it). The items stand in five labelled groups, in this order: Migrations — Overview (`/`), Plans
