@@ -319,7 +319,8 @@ what protects the data. For every MINOR, and for a PATCH that touches `store.py`
    plans again afterwards ([docs/Operations.md](docs/Operations.md) §5).
 3. **Roll the image**: set the new tag or digest in the kustomization (or `SEAMLESS_VERSION` on Compose) and
    apply; with the two-role PostgreSQL setup of Security.md §9.4, start the new version once with the owner
-   role's URL so `create_schema()` can add indexes, then switch back to the application role.
+   role's URL so `create_schema()` can add tables and indexes, grant the application role a new table as
+   Security.md §9.4 lists (0.5.0 adds `leases`), then switch back to the application role.
 4. **Verify**: `GET /api/v1/health` reports the new `version` and `db: ok`; the dashboard lists the plans;
    resume the paused plans.
 5. **Roll back** if step 4 fails: the previous tag plus the dump of step 1 (the restore runbook).

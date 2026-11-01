@@ -725,9 +725,10 @@ section 7.1.
 on by default; SDD §26.8): drain first (section 5). A cutover the upgrade cuts off resumes only once its hosts are
 pinned - it checks them before the stop, and one whose source VM was already stopped is rolled back. After the
 upgrade, run the check on each provider, or let the first pre-staging do it: a host 0.4.0 made is pinned once from
-its console. A host whose console no longer prints the block blocks its plans with `CONV_HOST_KEY_UNKNOWN` until you
-declare its keys (section 7.2). 0.4.0's link keys go with the first 0.5.0 run on each host pair; a link you made by
-hand stays yours to remove.
+its console. A host whose console no longer prints the block blocks its plans until you declare its keys (section
+7.2), or delete it and pre-stage again: a run to a host Seamless manages fails with "host key unknown", and a plan
+whose host Seamless does not create gets `CONV_HOST_KEY_UNKNOWN`. 0.4.0's link keys go with the first 0.5.0 run on
+each host pair; a link you made by hand stays yours to remove.
 
 0.5.0 also brings the orchestrator's lease (SDD §25): every server takes it before it runs the orchestrator, and
 `seamless status` and `GET /api/v1/health` name the leader (section 4.9). With the two-role database model, the
@@ -791,7 +792,7 @@ call; QASuite FR-25).
 ### 7.1 The conversion key: one per installation (issue #112)
 
 Every OpenStack plan reaches the managed conversion hosts with one conversion key, `/data/conversion/ssh.key` and
-`ssh.key.pub` (directory 0700, key 0600). The link key between the two hosts stays per plan.
+`ssh.key.pub` (directory 0700, key 0600). The link key between the two hosts is one per run (section 7.2).
 
 Before a pre-staging that deploys conversion hosts, the control plane reads the `os_migrate_conv` keypair on each side
 whose host it manages (`conversion_host.manage: true`). It compares keys by type and base64, never by the comment.
