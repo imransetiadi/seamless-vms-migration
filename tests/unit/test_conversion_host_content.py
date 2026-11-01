@@ -233,7 +233,9 @@ def test_the_content_install_allows_local_forwarding_only_on_a_source_host(tmp_p
     if effective.returncode != 0 and "Include" in effective.stderr:
         pytest.skip("this sshd reads no Include: %s" % effective.stderr.strip())
     assert effective.returncode == 0, effective.stderr
-    lines = effective.stdout.splitlines()
+    # sshd -T prints its keywords in lower case on the images' OpenSSH, as they are written on
+    # OpenSSH 10.5 (a macOS host's): the values are what this test reads
+    lines = [line.lower() for line in effective.stdout.splitlines()]
     assert "allowtcpforwarding local" in lines and "permittunnel no" in lines
 
 
