@@ -89,7 +89,7 @@ a VM that keeps a fixed IP on another project's network needs the `service` or `
 `advsvc` no longer does —, and the validation judges each destination by its policy profile
 ([SDD §21.5](docs/SDD.md)). Conversion host images: the RHEL family (RHEL, CentOS Stream 9 and 10, Rocky Linux 9,
 AlmaLinux 9) and Ubuntu 24.04 ([SDD §21.6](docs/SDD.md)). The lab validation of community destinations (plan task
-T10) is planned for 0.2.0.
+T10) has not run yet.
 
 ## Guest OS support
 
@@ -198,6 +198,139 @@ pool to the destination's, and acknowledges the autoscaling group's `app-01` and
 ([QASuite §7.2](docs/QASuite.md)) have not run yet. They need two clouds on one external VLAN, a BGP fabric with the
 OVN BGP agent, Designate and BIND with TSIG, Octavia's amphora and OVN providers, and a Heat autoscaling group. The
 Technology Preview label goes when they pass ([SDD §23.10](docs/SDD.md)).
+
+## Notifications
+
+0.5.0 tells the people who do not watch the dashboard what concerns them: a change approver that a cutover waits, an
+application owner that a VM is down and up again, an operator that a migration failed ([SDD §24](docs/SDD.md),
+FR-48–FR-51).
+
+* **Channels:** an admin keeps them on the Notifications page (`/notifications`): `email` through the installation's
+  SMTP relay, `slack` incoming webhooks, and `webhook` receivers, each message signed as Standard Webhooks specifies.
+  **Send test** tries a channel once and shows the outcome.
+* **Subscriptions:** an operator subscribes a channel to a plan on the plan's page, and an admin subscribes one to
+  every plan. The topics `approval`, `downtime` and `problem` are on by default, `outcome` and `progress` on request.
+  A subscription never changes a plan's status.
+* **Fixed messages:** names, ids, the phase, times, the downtime, the estimate and the SLO - never a credential, an
+  address, an error's text or who acted. `redact_names` sends ids instead of names.
+* **Delivery off the migration path:** at least once, in order per channel, at most 5 tries over about 5 minutes, one
+  message a second, and none whose event is more than an hour old. No message delays or fails a migration.
+* **Secrets and settings:** a Slack URL or a signing key is written once into the secret `notify-{name}` and never
+  shown again. `SEAMLESS_SMTP_HOST` and `SEAMLESS_SMTP_FROM` turn email on (with `SEAMLESS_SMTP_PORT`,
+  `SEAMLESS_SMTP_SECURITY`, `SEAMLESS_SMTP_CA_FILE` and `SEAMLESS_SMTP_SECRET`), `SEAMLESS_PUBLIC_URL` adds a link to
+  the dashboard, and the NetworkPolicy opens TCP 587 and 465 ([Operations.md §7.4](docs/Operations.md)).
+
+**In the demo** (`make seamless-demo`), every sender records instead of sending, so nothing leaves the process. The
+channels `app-owners` (email), `migration-team` (Slack) and `change-hub` (webhook) are subscribed to the seeded plans
+with the default topics: each cutover's downtime start and end show on the Events page as `notification.sent`, and the
+Notifications page reads each channel's last outcome. A demo database seeded earlier gets the channels on its next
+start.
+
+**Not yet run live.** The tests send to fakes inside the test process. The live smoke of
+[QASuite §13.1d](docs/QASuite.md) - a Slack incoming webhook, an SMTP relay on 587 (STARTTLS) and one on 465 (implicit
+TLS) with a test mailbox, and a receiver that verifies the signature with a Standard Webhooks library - has not run;
+it must pass before the final 0.5.0 ([SDD §24.11](docs/SDD.md), decision 12).
+
+## SSH trust on the data path
+
+0.5.0 checks every conversion host's SSH host key on every hop of the data path, and narrows the link between the two
+hosts to what one run needs ([SDD §26](docs/SDD.md), NFR-06; [Security.md](docs/Security.md) SEC-02, SEC-06).
+
+* **Known before the first connection:** a host Seamless creates gets an ed25519 host key injected through cloud-init;
+  one it did not create is pinned from the keys block its console printed. Keys you declare on the provider
+  (**Host keys**, `conversion_host.ssh_host_keys`) win over both. Seamless never learns a key from an SSH connection.
+* **Checked on every hop:** the provider keeps its host's pin (`conversion_host_pin`), each run writes its own
+  `known_hosts`, and ssh, scp, Ansible and the link run with `StrictHostKeyChecking=yes`.
+* **Refused at once:** another key fails the run for good ("host key refused: ..."), never after a 15-minute SSH
+  timeout, and records `conversion_host.key_refused`. A cutover checks both hosts and its link before the source stops.
+* **A link per run:** each run makes its own key on the destination host, and the source host admits it under
+  `restrict`, with a forced command that runs blocksync's `gate` alone, `from=`, an `expiry-time` and, for a cold run,
+  its own export ports. The run removes it when it ends.
+* **VMware:** the destination's conversion host, which you bring, is pinned by its declared keys, else by its console.
+* **Validation:** `CONV_HOST_KEY_UNKNOWN` blocks a plan whose host Seamless will not create and whose key it cannot
+  know; `CONV_HOST_KEYS_UNCHECKED` warns while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`.
+
+**Existing installations.** `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is now `true` by default; `false` keeps 0.4.0's
+options. Drain before the upgrade (`--drain`). The provider check, or the next pre-staging or run, pins each host
+0.4.0 made from its console; a host whose console no longer shows the block is refused until you declare its keys, or
+delete it and pre-stage again. The first 0.5.0 run on a host pair removes 0.4.0's link key
+([Operations.md §7.2](docs/Operations.md), [SDD §26.8](docs/SDD.md)).
+
+**In the demo** (`make seamless-demo`), the Providers page's **Host keys** show declared, synthetic keys for
+`RHOSO 18.0` and `OpenStack 2026.2 Hibiscus (DC3)`, and `RHOSP 17.1 Finance (DC1)` reads "Not pinned yet"; simulated
+runs open no SSH.
+
+**Not yet run on the lab.** LAB-SSH01…LAB-SSH08 ([QASuite §7.2](docs/QASuite.md)) need the conversion host images of
+SDD §21.6, a rogue sshd, floating-IP, routed and SNAT topologies, a 0.4.0 installation and a VMware destination host.
+They gate the final 0.5.0: should they not run, it ships with the setting off by default
+([SDD §26.10](docs/SDD.md), decision 1).
+
+## Per-tenant credentials (Technology Preview, validated in simulation)
+
+0.5.0 lets one OpenStack or RHOSO provider hold, beside its own credential, a Keystone application credential per
+project ([SDD §27](docs/SDD.md), FR-52). Moving many tenants then takes one provider per cloud, not one per tenant. A
+plan that names no project runs as before.
+
+* **Project credentials:** an admin writes them on the provider card's **Projects** - an application credential's id
+  and secret, never a password. They are write-only and live in the secret store as `provider-{id}.project-<h>`.
+* **A project pair per plan:** a plan names a `source_project` and a `destination_project`. Their credentials read the
+  inventory, pre-stage, and run every `cold` and `warm` step, the rollback, finalize, the floating IP move, Octavia and
+  DNS; servers, volumes, ports and floating IPs are created in the destination project. The provider's own credential
+  keeps the check, the GPU capacity reads, the flavor import and a storage handover's source half
+  ([SDD §27.5](docs/SDD.md)). A project credential is never replaced by the provider's own.
+* **Checks and the gate:** the provider check signs in with each project credential and reads its roles, its
+  `restricted` flag and its expiry. Validation refuses a plan whose credential is missing, failed or expired, warns with
+  `PROJECT_CREDENTIAL_EXPIRING` and `PROJECT_CREDENTIAL_UNRESTRICTED`, and blocks on `PROJECT_CREDENTIAL_ROLE_MISSING`.
+  The cutover gate holds a cutover, its source still running, while a credential it or its rollback would use expires
+  within 24 hours or has not been checked since it was written.
+* **Keypairs belong to users:** give each project credential a Keystone user of its own (`DST_KEYPAIR_KEY_MISMATCH`,
+  [Operations.md §7.5](docs/Operations.md)).
+* **VMware** sources name no project ([SDD §27.9](docs/SDD.md)).
+
+**In the demo** (`make seamless-demo`), `RHOSP 17.1 Finance (DC1)` and `RHOSO 18.0` hold credentials for the tenant
+projects `payments` and `treasury`. The plan `Payments tenant (RHOSP 17.1 → RHOSO)` moves `pay-web-01`, `pay-api-01`
+and `pay-batch-01` into RHOSO's `payments` project, warns with `PROJECT_CREDENTIAL_EXPIRING` and keeps `pay-web-01`'s
+floating IP address. A provider card's **Projects** show each credential's roles, expiry and restricted flag, the
+Inventory's *Project credential* lists a tenant's VMs, and the plan form's *Project pair* plans `treasury`'s
+`tsy-app-01` and `tsy-report-01`. A demo database seeded earlier gets the tenant plan on its next start.
+
+**Not yet run on the lab's clouds.** LAB-TC01…LAB-TC06 ([QASuite §7.2](docs/QASuite.md)) need RHOSO 18.0 and a Tier 1
+community cloud, each with two tenant projects whose own Keystone users made an application credential with the
+`member` role. The Technology Preview label goes when they pass ([SDD §27.10](docs/SDD.md)).
+
+## Changed-extent tracking (Technology Preview, validated in simulation)
+
+0.5.0 lets a warm migration's final pass read only what changed, instead of scanning every disk on both sides
+([SDD §28](docs/SDD.md), FR-26). The downtime loses its scan term; a disk that cannot use it scans in full, as before.
+
+* **Ceph-direct:** on the source conversion host, `rbd diff` lists what changed between the Cinder snapshots of two
+  passes. Unencrypted Cinder RBD volumes of the provider's Ceph cluster qualify; other disks scan in full.
+* **Check, then read:** pre-copy and keep-warm passes still scan in full and count what the extents missed
+  (`checked`). After a clean check the final pass reads only the listed chunks (`read`). Any doubt - no base, a resize,
+  a failed query, a miss - scans the disk in full and records why. Tracking never fails a pass.
+* **What the manifest proves:** for a `read` pass, that the listed chunks arrived; the rest rests on a base pass that
+  proved the whole disk and on the checks of every interval since. A miss in the final interval stays unseen in 0.5.0.
+* **Two opt-ins:** the plan's `extent_tracking` (off by default; refused for a VMware source), and the source
+  provider's Ceph access - `ceph` (fsid, monitors, client) and a metadata-only Ceph user's key, written with
+  `PUT /providers/{id}/ceph-key` and never read back. The pre-staging installs `ceph-common` on the source conversion
+  host, which needs a route to the monitors and OSDs ([Operations.md §7.3](docs/Operations.md)).
+  `CEPH_ACCESS_MISSING` warns when the access, the key or an `rbd` pool of the cluster is missing.
+* **Estimates:** the final pass costs one query (`extent_query_s`, 10 s, calibrated from checked passes) plus the
+  delta: on 1 Gbit/s, a 200 GiB disk's final pass takes about 287 s ([Performance.md](docs/Performance.md),
+  SM-1b; [SDD §28.6](docs/SDD.md)).
+* **Not in 0.5.0:** libvirt dirty bitmaps ([SDD §28.7](docs/SDD.md)), encrypted volumes, Nova ephemeral disks,
+  `boot_disk_copy` images and other storage backends.
+
+**In the demo** (`make seamless-demo`), the RHOSP 17.1 source declares Ceph access and the finance plan tracks
+extents: its migrations scan in their first pass, check in the later ones and read in the final one, per disk on the
+migration page. The NetApp VMs (`portal-01`, `app-01`, `app-02`) scan in full, and `EXTENT_TRACKING_PARTIAL` names
+their volumes. A demo database seeded before 0.5.0 holds none of this: `make seamless-reset CONFIRM=yes` deletes the
+stack's containers and volumes, and the next `make seamless-demo` seeds it afresh.
+
+**Not yet run on the lab's Ceph clusters.** Everything above runs against simulated clouds, file-backed devices and a
+fake `rbd`. LAB-CE01…LAB-CE07 and PERF-E2E-SM1b ([QASuite §7.2, §9](docs/QASuite.md)) need RHOSP 17.1 with RHCS 6.1
+as it ships and a community source with Ceph Quincy or Reef. The Technology Preview label goes when they pass
+([SDD §28.10](docs/SDD.md)).
 
 ## Quick start — Linux server with Docker (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux)
 
@@ -409,6 +542,11 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
   cluster - 2 only with the HA component and a ReadWriteMany `seamless-data`, while `scale 1` turns HA off and
   keeps the component (Operations.md §4.13) -; a second replica adds availability, not capacity: scale up with
   `capacity` instead.
+* **What HA needs:** a ReadWriteMany `seamless-data` and a PostgreSQL that outlives a node - the bundled one is a
+  single pod, and while its node is down no replica leads. Enable the component by the overlay's two commented
+  `components:` lines once `/data` has moved (Operations.md §4.7, §4.8); `up` refuses a claim whose access modes it
+  would change. Every server takes the lease, a lone replica too: a database outage of more than 20 s deposes it, and
+  its steps resume afterwards. The 35 s takeover is a design figure until LAB-HA01…LAB-HA05 run (QASuite §13.1f).
 * **Stopping is safe.** Running steps end within the stop grace and every migration resumes from its checkpoint
   when the control plane runs again. Before planned maintenance, `--drain FILE` pauses the running plans and
   waits until no cutover is in flight, and `resume` starts them again afterwards (the operator's token is read
