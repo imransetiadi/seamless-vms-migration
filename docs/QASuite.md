@@ -1121,7 +1121,9 @@ Twenty-three further iterations after the integration run, each verified with th
 
 ### 13.1c Lab run records — 0.5.0 SSH trust and changed-extent tracking (*to be filled on the lab*)
 
-Both features ship as Technology Previews until these records are filled (SDD §26.9, §28.10). The commands:
+Changed-extent tracking ships as a Technology Preview until its records are filled (SDD §28.10). SSH trust is not a
+Technology Preview: its records gate the final 0.5.0, which ships with host-key checking off by default should they not
+run (SDD §26.9, §26.10 decision 1). The commands:
 `tests/e2e/ssh-trust.sh` (its environment in the script's header; one run per image, `IMAGE_HOSTS` set) and
 `.venv/bin/pytest -m lab seamless/tests/lab/test_lab_changed_extents.py -v -s` (its `SEAMLESS_LAB_*` variables in the
 module's docstring; `SEAMLESS_LAB_DESTRUCTIVE=1` for the cutovers). Record the versions the drill prints and

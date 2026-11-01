@@ -13,8 +13,8 @@
 #
 # Deploy:
 #   1. Build and push the image (repository root; it builds the dashboard when dashboard/dist is absent):
-#        docker build -f seamless/Containerfile -t <registry>/seamless-migrate:0.4.0-rc.1 .   # or: podman build …
-#        docker push <registry>/seamless-migrate:0.4.0-rc.1
+#        docker build -f seamless/Containerfile -t <registry>/seamless-migrate:0.5.0-rc.1 .   # or: podman build …
+#        docker push <registry>/seamless-migrate:0.5.0-rc.1
 #   2. Set newName/newTag (or a digest) for seamless-migrate below, the Ingress host in ingress.yaml and,
 #      if your ingress controller or DNS run elsewhere, the namespaces in the patches.
 #   3. Create the Secrets of ../openshift/secret-example.yaml (seamless-db, seamless-tokens; optional
@@ -42,7 +42,7 @@ resources:
 images:
   - name: image-registry.openshift-image-registry.svc:5000/seamless-migrate/seamless-migrate
     newName: registry.example.com/seamless/seamless-migrate
-    newTag: 0.4.0-rc.1
+    newTag: 0.5.0-rc.1
   - name: registry.redhat.io/rhel9/postgresql-16
     newName: quay.io/sclorg/postgresql-16-c9s
     # pinned (multi-arch index of :latest on 2026-10-09); refresh with
