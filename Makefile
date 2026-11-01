@@ -630,7 +630,7 @@ lab-handover:
 # so). SEAMLESS_VERSION, the control-plane image the stack runs, is read as Compose reads it: the shell or the
 # command line, else deploy/compose/.env read by Compose's dotenv rules (SEAMLESS_DOTENV), else the release - an empty
 # value is ${SEAMLESS_VERSION:-…}'s default, the release - so the check inspects that image (reviews RV37B-04, 38b).
-SEAMLESS_RELEASE := 0.4.0-rc.1
+SEAMLESS_RELEASE := 0.5.0-rc.1
 ifeq ($(origin SEAMLESS_VERSION),undefined)
 SEAMLESS_VERSION := $(call SEAMLESS_DOTENV,SEAMLESS_VERSION)
 endif

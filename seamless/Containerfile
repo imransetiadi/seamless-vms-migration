@@ -2,8 +2,8 @@
 # Seamless Migrate control plane (SDD §17).
 #
 # Build context is the REPOSITORY ROOT:
-#   podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:0.4.0-rc.1 .
-#   docker build -f seamless/Containerfile -t seamless:0.4.0-rc.1 .   # uses Containerfile.dockerignore
+#   podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:0.5.0-rc.1 .
+#   docker build -f seamless/Containerfile -t seamless:0.5.0-rc.1 .   # uses Containerfile.dockerignore
 #
 # The dashboard (SDD §17.1): the built one in the context (dashboard/dist, or --build-arg
 # DASHBOARD_DIST=path/to/dist) is copied when present, else it is built here from dashboard/ with the
@@ -24,7 +24,7 @@ ARG ANSIBLE_CORE_VERSION=">=2.16,<2.19"
 
 LABEL org.opencontainers.image.title="seamless-migrate" \
       org.opencontainers.image.description="Seamless Migrate control plane: VM migration to RHOSO 18.0" \
-      org.opencontainers.image.version="0.4.0-rc.1" \
+      org.opencontainers.image.version="0.5.0-rc.1" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/imransetiadi/seamless-vms-migration" \
       org.opencontainers.image.revision="${SOURCE_COMMIT}"
