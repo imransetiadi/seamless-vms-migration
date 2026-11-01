@@ -256,15 +256,18 @@ def test_a_cluster_down_stops_the_control_plane_before_postgresql_and_deletes_no
 def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
     tmp_path, platform, tool, overlay
 ):
-    """SDD §17.2: up looks at PostgreSQL first - out of band scaled out, it is back to one before
-    the apply (review RV43A-01) -, applies the overlay, then scales PostgreSQL and the control
-    plane to one replica each - an apply restores no replica count an earlier down set - and
-    waits for both rollouts."""
+    """SDD §17.2: up reads seamless-data's access modes first, which its apply cannot change (the
+    owner's decision of 2026-11-01), then looks at PostgreSQL - out of band scaled out, it is back
+    to one before the apply (review RV43A-01) -, applies the overlay, then scales PostgreSQL and
+    the control plane to one replica each - an apply restores no replica count an earlier down
+    set - and waits for both rollouts."""
     rules = [{"cmd": tool, "has": ["get statefulset"], "answers": [{"stdout": "1"}]}]
     proc, calls, tree = _run(tmp_path, platform, "up", "--namespace", "migrations", rules=rules)
     assert proc.returncode == 0, proc.stderr
     ns = "-n migrations"
     assert _args(calls, tool) == [
+        # a claim not there yet reads as nothing: the apply creates it (SDD §17.2)
+        f"{ns} get pvc/seamless-data --ignore-not-found -o jsonpath={{.spec.accessModes[*]}}",
         # a first up's NotFound reads as nothing, any other failure stops up (review RV44A-04)
         f"{ns} get statefulset/seamless-postgres --ignore-not-found -o jsonpath={{.spec.replicas}}",
         f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
@@ -283,6 +286,8 @@ def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
 #: component (SDD §17)
 HA_COMMENTED = "# components:\n#   - ha\n"
 HA_ENABLED = "components:\n  - ha\n"
+#: the HA component, whose replicas field is the count up and start restore (SDD §17.2)
+HA_KUSTOMIZATION = "deploy/openshift/ha/kustomization.yaml"
 
 
 def _overlays(tmp_path, enabled_in: str | None = None) -> None:
@@ -510,6 +515,101 @@ def test_a_cluster_scale_two_needs_a_readwritemany_data_volume(
     else:
         assert "ReadWriteMany" in proc.stderr and "it is ReadWriteOnce" in proc.stderr, proc.stderr
         assert "nothing was changed" in proc.stderr, proc.stderr
+
+
+#: an up whose overlay asks for other access modes than seamless-data holds - ReadWriteMany with the
+#: HA component at either count, else the base's ReadWriteOnce (pvc.yaml) - is refused before its
+#: apply, which would fail on the claim (SDD §17.2, the owner's decision of 2026-11-01):
+#: (the HA component enabled, its count, the claim's access modes - None: no claim yet -, what a
+#: refusal says - None: applied as before -; "scale 1" stands for the platform's scale 1)
+CLAIM_KEPT = [
+    # the component's lines commented again on its claim
+    (
+        False,
+        2,
+        ["ReadWriteMany"],
+        ["seamless-data is ReadWriteMany", "scale 1", "docs/Operations.md"],
+    ),
+    # the component at one replica on a ReadWriteOnce claim
+    (True, 1, ["ReadWriteOnce"], ["ReadWriteMany", "it is ReadWriteOnce", "docs/Operations.md"]),
+    # any other access modes than the base's
+    (False, 2, ["ReadOnlyMany"], ["seamless-data is ReadOnlyMany", "asks for ReadWriteOnce"]),
+    (False, 2, ["ReadWriteOnce"], None),  # the base on its own claim
+    (True, 1, ["ReadWriteMany"], None),  # HA off, the component's count 1 on its claim
+    (True, 2, ["ReadWriteMany"], None),
+    (False, 2, None, None),  # a first up: the apply creates the claim the overlay asks for
+]
+
+
+@pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
+@pytest.mark.parametrize(
+    ("enabled", "count", "claim", "says"),
+    CLAIM_KEPT,
+    ids=[
+        "no component on RWX",
+        "component 1 on RWO",
+        "base on ROX",
+        "base",
+        "component 1",
+        "component 2",
+        "first",
+    ],
+)
+def test_a_cluster_up_refuses_a_claim_whose_access_modes_its_overlay_would_change(
+    tmp_path, platform, tool, overlay, enabled, count, claim, says
+):
+    """SDD §17.2 (the owner's decision of 2026-11-01): a claim's access modes never change, so an
+    up whose overlay asks for other access modes than seamless-data holds - ReadWriteMany with the
+    HA component, at a count of 1 as of 2, else the base's ReadWriteOnce - would fail on the claim
+    after its apply changed the objects before it. It is refused with 2 before anything changed,
+    naming the way out: without the component, scale 1 with the component kept, or the move of
+    /data; with it, /data moved to a ReadWriteMany claim first. A claim that matches, or none yet,
+    is applied as before."""
+    if claim is None:
+        state = fake_kube.empty()
+        state["overlay_data_modes"] = ["ReadWriteOnce"]
+    else:
+        state = fake_kube.cluster(replicas=1, data_modes=tuple(claim))
+        state["overlay_data_modes"] = ["ReadWriteMany"] if enabled else ["ReadWriteOnce"]
+    _overlays(tmp_path, overlay.split("/")[1] if enabled else None)
+    component = tmp_path / "tree" / HA_KUSTOMIZATION
+    component.write_text(component.read_text().replace("count: 2", f"count: {count}"))
+    proc, calls, _ = _run(tmp_path, platform, "up", cluster=state)
+    after = _cluster_after(tmp_path)
+    lines = _args(calls, tool)
+    writes = [line for line in lines if line.split()[2] in ("scale", "apply", "patch")]
+    if says is None:
+        assert proc.returncode == 0, proc.stderr
+        assert writes, lines
+        return
+    assert proc.returncode == 2, proc.stderr
+    assert after == state  # nothing changed
+    assert writes == [], lines
+    assert "a claim's access modes never change" in proc.stderr, proc.stderr
+    assert "nothing was changed" in proc.stderr, proc.stderr
+    for words in says:
+        words = f"scripts/seamless-ctl.sh {platform} scale 1" if words == "scale 1" else words
+        assert words in proc.stderr, (words, proc.stderr)
+
+
+@pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
+def test_a_cluster_up_that_cannot_read_its_claim_changes_nothing(tmp_path, platform, tool, overlay):
+    """SDD §17.2 (the owner's decision of 2026-11-01): a read of seamless-data that fails - not a
+    NotFound, which a first up reads as nothing - is refused with 2 before anything changed, as
+    up cannot tell whether its apply would fail on the claim; a dry run prints the read with what
+    it refuses, and runs nothing."""
+    rules = [{"cmd": tool, "has": ["get pvc/seamless-data"], "answers": [{"exit": 1}]}]
+    proc, calls, _ = _run(tmp_path, platform, "up", rules=rules)
+    assert proc.returncode == 2, proc.stderr
+    assert "cannot read pvc/seamless-data" in proc.stderr, proc.stderr
+    assert "nothing was changed" in proc.stderr, proc.stderr
+    assert [c for c in _args(calls, tool) if c.split()[2] in ("scale", "apply", "patch")] == []
+    proc, calls, _ = _run(tmp_path / "dry", platform, "up", "--dry-run")
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    read = f"{tool} -n seamless-migrate get pvc/seamless-data --ignore-not-found"
+    assert f"{read} -o 'jsonpath={{.spec.accessModes[*]}}'" in proc.stdout, proc.stdout
+    refused = "# refused unless seamless-data's claim is ReadWriteOnce - or not there yet"
+    assert refused in proc.stdout, proc.stdout
 
 
 #: where an installation enabled the HA component, and whether the platform's overlay then has it
@@ -2355,7 +2455,13 @@ def test_a_first_up_reads_no_statefulset_and_applies_the_overlay(tmp_path, platf
     proc, calls, _ = _run(tmp_path, platform, "up", cluster=fake_kube.empty())
     after = _cluster_after(tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert [c["args"][2] for c in calls][:2] == ["get", "apply"], _args(calls, tool)
+    lines = _args(calls, tool)
+    # the claim's access modes and PostgreSQL's StatefulSet, neither there yet, then the apply
+    assert [line.split()[2:4] for line in lines][:3] == [
+        ["get", "pvc/seamless-data"],
+        ["get", "statefulset/seamless-postgres"],
+        ["apply", "-k"],
+    ], lines
     [pod] = fake_kube.running(after)
     assert pod["databases"] == ["seamless-postgres-0"]
 
