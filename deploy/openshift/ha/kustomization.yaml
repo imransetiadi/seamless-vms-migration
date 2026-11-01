@@ -22,7 +22,8 @@
 #
 # Turning HA off is scripts/seamless-ctl.sh scale 1: this component stays, and one replica runs on its ReadWriteMany
 # claim; up and start restore the count below, which 1 keeps at one. Removing the component moves /data back to a
-# ReadWriteOnce claim first - commenting its lines again makes the apply fail on the claim (docs/Operations.md).
+# ReadWriteOnce claim first - with its lines commented again on the ReadWriteMany claim, scripts/seamless-ctl.sh up
+# refuses before its apply, which would fail on the claim (SDD 17.2, docs/Operations.md).
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

@@ -613,9 +613,11 @@ which the script reads. HA is on again with `scale 2`, or with the count back at
 
 **Removing the component** moves `/data` back to a ReadWriteOnce claim first. A claim's access modes never change:
 with the component's `components:` lines commented again, the overlay asks for a ReadWriteOnce `seamless-data`, and
-`up`'s apply fails on the ReadWriteMany one - `The PersistentVolumeClaim "seamless-data" is invalid: spec: Forbidden:
-spec is immutable after creation ...` - after it applied the rest. Move it as section 4.8 moved it, the other way
-round, with the control plane stopped. No lab has run this procedure yet: rehearse it in a namespace of its own first.
+`scripts/seamless-ctl.sh ... up` refuses it on the ReadWriteMany one before its apply (exit 2, nothing changed),
+naming `scale 1` and this procedure: the apply would fail on the claim - `The PersistentVolumeClaim "seamless-data"
+is invalid: spec: Forbidden: spec is immutable after creation ...` - after applying the rest (SDD §17.2; the owner's
+decision of 2026-11-01). `up` refuses the component on a ReadWriteOnce claim the same way, at either count. Move it as
+section 4.8 moved it, the other way round, with the control plane stopped. No lab has run this procedure yet: rehearse it in a namespace of its own first.
 
 1. **Drain and stop the control plane** (section 5):
    `scripts/seamless-ctl.sh openshift stop --drain ~/.seamless/operator.token --url https://seamless.apps.example.com`.

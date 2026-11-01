@@ -501,26 +501,77 @@ overlay_replicas() {
 }
 # Two replicas share seamless-data from two nodes - the new leader reads the run directories the old one wrote -, so a
 # count of 2 takes a ReadWriteMany claim, read from its spec: a class that binds at the first consumer leaves a new
-# claim unbound until a pod uses it (SDD §17.2, §25.7). Refused, naming why, while nothing changed. up asks before its
-# apply, which could not change a claim's access modes, and a claim not there yet is the one its apply creates.
+# claim unbound until a pod uses it (SDD §17.2, §25.7). Refused, naming why, while nothing changed - scale 2's and
+# start's check; up's, before its apply, is data_volume_matches.
 data_volume_shared() {
-  local modes first=()
-  [ "${1-}" != before_apply ] || first=(--ignore-not-found)
+  local modes
   if [ "$DRY" = 1 ]; then
-    kube get pvc/seamless-data ${first[@]+"${first[@]}"} -o 'jsonpath={.spec.accessModes[*]}'
-    say "# refused unless seamless-data's claim is ReadWriteMany${first[*]:+ - or not there yet}"
+    kube get pvc/seamless-data -o 'jsonpath={.spec.accessModes[*]}'
+    say "# refused unless seamless-data's claim is ReadWriteMany"
     return
   fi
-  modes=$("$KUBE" -n "$NS" get pvc/seamless-data ${first[@]+"${first[@]}"} -o 'jsonpath={.spec.accessModes[*]}') ||
+  modes=$("$KUBE" -n "$NS" get pvc/seamless-data -o 'jsonpath={.spec.accessModes[*]}') ||
     check_failed "cannot read pvc/seamless-data in namespace $NS, whose access modes two replicas need: nothing was" \
       "changed"
-  [ -n "$modes" ] || [ ${#first[@]} -eq 0 ] || return 0 # a first up: the apply creates it as the overlay asks
   case " $modes " in
     *" ReadWriteMany "*) ;;
     *) check_failed "two replicas share seamless-data from two nodes - the new leader reads the run directories" \
       "the old one wrote (SDD §17.2, §25.7) -, which takes a ReadWriteMany claim, and it is ${modes// /, }: move" \
       "/data to a ReadWriteMany claim first - a claim's access modes never change -, with the HA component, which" \
       "asks for one (docs/Operations.md); nothing was changed" ;;
+  esac
+}
+# The access modes the overlay asks seamless-data for (SDD §17, §17.2), sorted and space-separated: the HA component's
+# ReadWriteMany, else the base's as deploy/openshift/pvc.yaml declares them - ReadWriteOnce -, read from the files.
+overlay_data_modes() {
+  if overlay_has_ha; then
+    printf 'ReadWriteMany'
+    return
+  fi
+  [ -f "$ROOT/deploy/openshift/pvc.yaml" ] || { printf 'ReadWriteOnce'; return; }
+  awk '
+    /^[ \t]*accessModes:/ { listed = 1; next }
+    listed && /^[ \t]*-[ \t]*/ { sub(/^[ \t]*-[ \t]*/, ""); sub(/[ \t]*(#.*)?$/, ""); print; next }
+    listed { exit }' "$ROOT/deploy/openshift/pvc.yaml" | sort | paste -sd ' ' -
+}
+# A claim's access modes never change (SDD §17, §17.2; the owner's decision of 2026-11-01): up's apply would fail on a
+# seamless-data that holds other access modes than the overlay asks for, after changing the objects before it - the HA
+# component's lines commented again on its ReadWriteMany claim, or the component on a ReadWriteOnce one at either count.
+# Refused before anything ran, naming the way out; a claim not there yet is the one the apply creates.
+data_volume_matches() {
+  local modes wanted parts=()
+  wanted=$(overlay_data_modes)
+  [ -n "$wanted" ] || wanted=ReadWriteOnce
+  if [ "$DRY" = 1 ]; then
+    kube get pvc/seamless-data --ignore-not-found -o 'jsonpath={.spec.accessModes[*]}'
+    say "# refused unless seamless-data's claim is ${wanted// /, } - or not there yet"
+    return
+  fi
+  modes=$("$KUBE" -n "$NS" get pvc/seamless-data --ignore-not-found -o 'jsonpath={.spec.accessModes[*]}') ||
+    check_failed "cannot read pvc/seamless-data in namespace $NS, whose access modes up's apply cannot change:" \
+      "nothing was changed"
+  [ -n "$modes" ] || return 0 # a first up: the apply creates it as the overlay asks
+  read -r -a parts <<<"$modes"
+  modes=$(printf '%s\n' "${parts[@]}" | sort | paste -sd ' ' -)
+  [ "$modes" != "$wanted" ] || return 0
+  if overlay_has_ha; then
+    check_failed "the HA component asks for a ReadWriteMany seamless-data, and it is ${modes// /, }: a claim's" \
+      "access modes never change, so up's apply would fail on it after changing the objects before it. Move /data" \
+      "to a ReadWriteMany claim first, with the control plane stopped (docs/Operations.md), or comment the" \
+      "components: lines of $OVERLAY/kustomization.yaml again; nothing was changed"
+  fi
+  case " $modes " in
+    *" ReadWriteMany "*)
+      check_failed "seamless-data is ${modes// /, } - the HA component's claim -, and $OVERLAY/kustomization.yaml" \
+        "does not include the component, so up's apply asks for ${wanted// /, }: a claim's access modes never" \
+        "change, so the apply would fail on it after changing the objects before it. To turn HA off, keep the" \
+        "component and run scripts/seamless-ctl.sh $PLATFORM scale 1; to remove it, move /data back to a" \
+        "ReadWriteOnce claim first, with the control plane stopped (docs/Operations.md); nothing was changed" ;;
+    *)
+      check_failed "seamless-data is ${modes// /, }, and up's apply asks for ${wanted// /, }: a claim's access" \
+        "modes never change, so the apply would fail on it after changing the objects before it. Move /data to a" \
+        "claim of those access modes first, with the control plane stopped (docs/Operations.md); nothing was" \
+        "changed" ;;
   esac
 }
 # The leading pod, named by /health's leader (SDD §12, §17.2, §25.6): its holder is the leader's host name - a pod's
@@ -800,7 +851,7 @@ cluster() {
   case $ACTION in
     up)
       overlay_replicas
-      [ "$REPLICAS" != 2 ] || data_volume_shared before_apply
+      data_volume_matches
       postgres_one_before_apply
       kube apply -k "$ROOT/$OVERLAY"
       # an apply restores no replica count an earlier down set: the overlay's, read from its files (SDD §17.2)
