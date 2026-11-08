@@ -2615,6 +2615,8 @@ export class MockServer {
     }
     const secret = `provider-${provider.id}.ceph`;
     provider.ceph = { ...provider.ceph, key_updated_at: new Date(this.now()).toISOString() };
+    // the status and the check report reset as by PATCH, like the API (SDD §12)
+    Object.assign(provider, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `ceph key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['key'] } });
     return ok(provider);
   }

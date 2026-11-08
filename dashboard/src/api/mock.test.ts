@@ -4177,6 +4177,8 @@ describe("the mock's Ceph access and tracked passes (SDD §12, §28.4, §28.5, p
     await expect(client.put('/providers/rhosp17-dc1/ceph-key', { key: 'AQ==' })).rejects.toMatchObject({ status: 422 });
     const keyed = await client.put<Provider>('/providers/rhosp17-dc1/ceph-key', { key: CEPH_KEY });
     expect(keyed.ceph?.key_updated_at).not.toBe(before);
+    // the status and the check report reset as by PATCH (SDD §12): the next check reads the cluster again
+    expect(keyed).toMatchObject({ status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     expect(JSON.stringify(keyed)).not.toContain('AQBrK3Nn');
     expect(server.events.filter((e) => e.kind === 'provider.credentials_updated').at(-1)?.data).toMatchObject({
       provider_id: 'rhosp17-dc1',
