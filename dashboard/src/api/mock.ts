@@ -1183,6 +1183,17 @@ function channelProblem(body: Record<string, unknown>): string | null {
   return null;
 }
 
+/**
+ * A topic named twice: the API judges it when it builds the subscription, after the every-plan role check (SDD §12,
+ * §24.4), so an operator asking for every plan gets 403 and an auth.denied first, as from the API.
+ */
+function repeatedTopicsProblem(body: Record<string, unknown>): string | null {
+  const topics = body.topics;
+  if (!Array.isArray(topics)) return null;
+  const twice = [...new Set(topics.filter((topic, i) => topics.indexOf(topic) !== i))].sort();
+  return twice.length ? `topics: Value error, topics: ${twice.join(', ')} more than once` : null;
+}
+
 /** What the API's SubscriptionCreate refuses in `body` (SDD §12, §24.4), in pydantic's words. */
 function subscriptionProblem(body: Record<string, unknown>): string | null {
   const extra = Object.keys(body).filter((key) => !SUBSCRIPTION_FIELDS.includes(key)).sort();
@@ -1199,8 +1210,6 @@ function subscriptionProblem(body: Record<string, unknown>): string | null {
     else {
       topics.forEach((topic, i) => NOTIFY_TOPICS.includes(topic as NotifyTopic) || fields.push(`topics.${i}: Input should be 'approval', 'downtime', 'problem', 'outcome' or 'progress'`));
       if (topics.length === 0) fields.push('topics: List should have at least 1 item after validation, not 0');
-      const twice = [...new Set(topics.filter((topic, i) => topics.indexOf(topic) !== i))].sort();
-      if (twice.length) fields.push(`topics: Value error, topics: ${twice.join(', ')} more than once`);
     }
   }
   return fields.length ? fields.slice(0, 5).join('; ') : null;
@@ -3124,6 +3133,8 @@ export class MockServer {
       const channel = input.channel as string;
       const planId = input.plan_id as string | null;
       if (planId === null) everyPlanIsAnAdmins(me);
+      const twice = repeatedTopicsProblem(input);
+      if (twice) throw new HttpError(422, 'validation_error', twice);
       if (!this.channels.has(channel)) throw new HttpError(422, 'validation_error', `channel: no channel ${pyRepr(channel)} in the catalog`);
       if (planId !== null && !this.plans.some((plan) => plan.id === planId)) throw new HttpError(422, 'validation_error', `plan_id: no plan ${pyRepr(planId)}`);
       const other = [...this.subscriptions.values()].filter((sub) => sub.channel === channel).sort(byId).find((sub) => sub.plan_id === planId);

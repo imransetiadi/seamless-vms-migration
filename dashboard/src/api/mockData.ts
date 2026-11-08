@@ -211,7 +211,8 @@ export function decisionEventOf(rec: AdvisorRecommendation, before: AdvisorRecom
     kind: d.status === 'fallback_rules' ? 'decision.fallback' : `decision.${d.status}`,
     message: `${rec.subject.name}: decision ${d.final_option ?? 'pending'} (${d.status}) by ${actor}`,
     actor,
-    data: { target_id: rec.id, model_version: rec.model.version, before: before ? stateOf(before) : null, after: stateOf(d) },
+    // decision_type: approval.advisor names it (SDD §14.5, §24.5)
+    data: { target_id: rec.id, model_version: rec.model.version, decision_type: rec.decision_type, before: before ? stateOf(before) : null, after: stateOf(d) },
   };
 }
 
