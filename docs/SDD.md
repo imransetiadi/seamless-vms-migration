@@ -9702,7 +9702,10 @@ present, a live migration, the scratch storage of a pull-mode job, and the read 
   (409); its event is `plan.updated` with `fields` `["extent_tracking"]`. It is safe at any point of a migration
   because the pass decides each disk's mode (§28.5): one turned on mid-way finds no `checked` pass yet
   (`unchecked`) or no base (`no_base`) and scans in full, so a final pass never reads extents nobody checked. The
-  findings of this section follow at the plan's next validation. `seamless plan apply` takes the same body the
+  findings of this section follow at the plan's next validation. While the plan does not track, the estimate, the
+  convergence rule (§5.3), a Force cutover's figure and the simulated executor's passes (§7.4) count every disk's
+  scan, whatever the migration's `tracked_disks` (§28.6) name - so a plan switched off never converges, nor promises a
+  downtime, on extents its passes no longer read. `seamless plan apply` takes the same body the
   same way (§15). (Known issue of v0.5.0-rc.1: the route took it only in `draft`/`validated`.)
 * **Findings** (binding in §9.3 since plan task CE9, each with its catalog entry, its tests and the mock):
   * CEPH_ACCESS_MISSING, warning (warm): the plan tracks extents, and its source has no Ceph access, no key, or no
