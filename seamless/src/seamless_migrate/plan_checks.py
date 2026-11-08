@@ -97,3 +97,18 @@ def unknown_hook(spec: PlanSpec, catalog: Collection[str]) -> str | None:
             if name not in catalog:
                 return f"network_cutover.hooks.{point}: no hook {name!r} in the catalog"
     return None
+
+
+def notify_tsig_secret(spec: PlanSpec) -> str | None:
+    """Why ``spec`` cannot be stored: a DNS target's ``tsig_secret`` that is a notification
+    channel's secret name (SDD §13.3, §24.3) - one refusal for POST/PATCH /plans and
+    ``seamless plan apply`` (§15); None otherwise."""
+    from .domain.models import is_notify_secret_name
+
+    for vm_id, target in spec.network_cutover.dns_targets.items():
+        if is_notify_secret_name(target.tsig_secret):
+            return (
+                f"network_cutover.dns_targets.{vm_id}.tsig_secret: notify-* names belong to the "
+                "notification channels' secrets"
+            )
+    return None

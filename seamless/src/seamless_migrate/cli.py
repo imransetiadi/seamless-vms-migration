@@ -333,9 +333,11 @@ def _resolve_providers(store: Any, spec: PlanCreate) -> None:
                 raise CliError(refusal)
     # SDD §15: the hooks it names, as POST and PATCH /plans check them (§12, plan task N3)
     from .domain.models import Hook
-    from .plan_checks import unknown_hook
+    from .plan_checks import notify_tsig_secret, unknown_hook
 
     why = unknown_hook(spec, {h.name for h in store.list("hook", Hook)})
+    if why is None:
+        why = notify_tsig_secret(spec)  # SDD §13.3: never a notification channel's secret
     if why is not None:
         raise CliError(why)
 

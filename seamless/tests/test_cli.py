@@ -1193,6 +1193,40 @@ def test_plan_apply_names_catalog_hooks_alone_like_post(env, capsys):
     assert plan.network_cutover.hooks == {"pre_stop": ["drain-lb"]}
 
 
+def test_plan_apply_refuses_a_notification_secret_as_tsig_secret_like_post(env, capsys):
+    """SDD §13.3, §15: a DNS target's tsig_secret named notify-* belongs to a notification
+    channel; plan apply refuses it as POST /plans does, and stores nothing - else the DNS step
+    would read a channel's webhook URL as its TSIG key."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    target = {
+        "kind": "rfc2136",
+        "zone": "example.com.",
+        "record": "web",
+        "server": "ns1",
+        "tsig_secret": "notify-ops-slack",
+    }
+    doc = {
+        "name": "Finance web tier",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "network_cutover": {"dns_targets": {"vm-1": target}},
+    }
+    path = env / "plan.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "notify-" in capsys.readouterr().err
+    assert store.list("plan", Plan) == []
+    doc["network_cutover"]["dns_targets"]["vm-1"]["tsig_secret"] = "tsig-notify"
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+
+
 def test_plan_apply_carries_extent_tracking(env, capsys):
     """SDD §28.9 (plan task CE7): a plan's YAML turns extent tracking on and off like PATCH, and
     a VMware source refuses it as the API does."""

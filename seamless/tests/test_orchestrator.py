@@ -8552,6 +8552,7 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
     assert decided.data == {
         "target_id": rec.id,
         "model_version": "jev-1.13.0",
+        "decision_type": "migration_strategy",  # SDD §14.5: approval.advisor names it (§24.5)
         "before": None,
         "after": {
             "status": status,

@@ -18,7 +18,7 @@ from ..domain.models import (
     is_notify_secret_name,
 )
 from ..events import emit
-from ..plan_checks import unknown_hook
+from ..plan_checks import notify_tsig_secret, unknown_hook
 from ..security.auth import Principal
 from ..store import ConflictError
 from .deps import ApiError, require_role, services, validation_message
@@ -87,14 +87,9 @@ async def check_plan_hooks(request: Request, spec: PlanSpec) -> None:
     if why is not None:
         raise ApiError(422, "validation_error", why)
     # a DNS target's TSIG secret is never a notification channel's (SDD §13.3, §24.3)
-    for vm_id, target in spec.network_cutover.dns_targets.items():
-        if is_notify_secret_name(target.tsig_secret):
-            raise ApiError(
-                422,
-                "validation_error",
-                f"network_cutover.dns_targets.{vm_id}.tsig_secret: notify-* names belong to the "
-                "notification channels' secrets",
-            )
+    why = notify_tsig_secret(spec)
+    if why is not None:
+        raise ApiError(422, "validation_error", why)
 
 
 async def _emit(request: Request, kind: str, hook: Hook, actor: str, **data: Any) -> None:

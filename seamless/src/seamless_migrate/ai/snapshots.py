@@ -99,6 +99,8 @@ def decision_event(
         {
             "target_id": rec.id,
             "model_version": rec.model.version,
+            # SDD §14.5: approval.advisor names the decision's type (§24.5)
+            "decision_type": str(rec.decision_type),
             "before": _state(before) if before is not None else None,
             "after": _state(decision),
         },
