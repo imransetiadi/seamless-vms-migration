@@ -10,7 +10,7 @@ from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, Provi
 from seamless_migrate.domain.models import Event, Plan
 from seamless_migrate.security.auth import DashboardUser, hash_token
 from seamless_migrate.store import Store
-from tests.factories import make_migration, make_provider, make_vm
+from tests.factories import make_migration, make_plan, make_provider, make_vm
 
 GIB = 2**30
 
@@ -1232,3 +1232,37 @@ def test_plan_apply_carries_extent_tracking(env, capsys):
     bad.write_text(yaml.safe_dump({**doc, "name": "vmware", "source_provider_id": "vc-dc2"}))
     assert cli.main(["plan", "apply", "-f", str(bad)]) == 1
     assert "extent_tracking" in capsys.readouterr().err
+
+
+def test_plan_apply_switches_extent_tracking_on_a_running_plan(env, capsys):
+    """SDD §15, §28.9: a file that changes extent_tracking alone is taken while the plan runs with
+    a migration in flight, and keeps the status; one that changes more is refused as before."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    plan = make_plan(status=PlanStatus.running)
+    store.put("plan", plan)
+    store.put("migration", make_migration(plan_id=plan.id, phase=Phase.syncing))
+    doc = {
+        "id": plan.id,
+        "name": plan.name,
+        "source_provider_id": plan.source_provider_id,
+        "destination_provider_id": plan.destination_provider_id,
+        "vm_ids": plan.vm_ids,
+        "extent_tracking": True,
+    }
+    path = env / "plan.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    stored = store.get("plan", plan.id, Plan)
+    assert stored.extent_tracking is True and stored.status == PlanStatus.running
+    [event] = [e for e in store.events() if e.kind == "plan.updated"]
+    assert event.data == {"fields": ["extent_tracking"]}
+    path.write_text(yaml.safe_dump({**doc, "extent_tracking": False, "description": "more"}))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "cannot be changed" in capsys.readouterr().err
+    assert store.get("plan", plan.id, Plan).extent_tracking is True

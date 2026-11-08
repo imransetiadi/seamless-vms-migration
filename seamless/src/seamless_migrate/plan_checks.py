@@ -3,16 +3,45 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
-from typing import Literal
+from collections.abc import Collection, Mapping
+from typing import Any, Literal
 
-from .domain.models import PROJECT_FIELDS, PlanSpec, invalid_plan_settings, repeated_vm_ids
+from pydantic import ValidationError
+
+from .domain.models import (
+    PLAN_EDITABLE_FIELDS,
+    PROJECT_FIELDS,
+    REQUEST_BODY,
+    Plan,
+    PlanCreate,
+    PlanSpec,
+    invalid_plan_settings,
+    repeated_vm_ids,
+)
 from .planning.estimator import invalid_estimator_overrides
 
 #: SDD §12: the longest plan name and description a request may set; the stored model stays
 #: permissive so plans written before the check keep loading
 PLAN_NAME_MAX = 200
 PLAN_DESCRIPTION_MAX = 2000
+
+
+def changes_extent_tracking_alone(body: Mapping[str, Any], plan: Plan) -> bool:
+    """Whether an edit's body changes ``extent_tracking`` alone (SDD §28.9, §12, §15): it carries
+    the field, and every other field it carries is at the plan's value once both are read as a
+    ``PlanCreate``. Such an edit is taken at any time and keeps the plan's status; a body that is
+    not a valid ``PlanCreate`` is not one, and takes the ordinary edit's path and refusals."""
+    if "extent_tracking" not in body or not set(body) <= PLAN_EDITABLE_FIELDS:
+        return False
+    current = plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS)
+    try:
+        before = PlanCreate.model_validate(current).model_dump(mode="json")
+        after = PlanCreate.model_validate({**current, **body}, context=REQUEST_BODY).model_dump(
+            mode="json"
+        )
+    except ValidationError:
+        return False
+    return all(after[f] == before[f] for f in after if f != "extent_tracking")
 
 
 class PlanSpecError(ValueError):
