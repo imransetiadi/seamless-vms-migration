@@ -6,6 +6,7 @@ holds one (§24.5, §24.8)."""
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -288,7 +289,8 @@ def build_message(
     elif trigger == NotifyTrigger.problem_failed:
         title = f"{vm} failed in {data.get('from', phase)}"
         if data.get("source_stopped"):
-            if plan.verification.auto_rollback:
+            # a failed rollback starts no other: the source waits for a person (SDD §8, §24.5)
+            if plan.verification.auto_rollback and data.get("from") != Phase.rolling_back:
                 lines = [
                     "The source VM is stopped, and the plan's automatic rollback starts it again."
                 ]
@@ -349,8 +351,10 @@ def build_message(
 
 
 def _header_safe(text: str) -> str:
-    """Every control character a space: a name must never end a header (CVE-2024-6923)."""
-    return "".join(" " if ord(ch) < 32 or ch == "\x7f" else ch for ch in text)
+    """Every control character a space: a name must never end a header (CVE-2024-6923) - the C0
+    and C1 controls and U+2028/U+2029, every character ``str.splitlines()`` breaks on, which the
+    email package refuses in a header (SDD §24.5)."""
+    return "".join(" " if unicodedata.category(ch) in ("Cc", "Zl", "Zp") else ch for ch in text)
 
 
 def email_message(

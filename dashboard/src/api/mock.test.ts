@@ -2161,7 +2161,8 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({
       kind: 'decision.overridden',
       actor: 'user:rina',
-      data: { before: { status: 'pending_approval', reason_text: null }, after: { status: 'overridden', reason_text: 'The change window fits a cold cutover' } },
+      // decision_type too, which approval.advisor names (SDD §14.5, §24.5)
+      data: { decision_type: rec.decision_type, before: { status: 'pending_approval', reason_text: null }, after: { status: 'overridden', reason_text: 'The change window fits a cold cutover' } },
     });
   });
 
@@ -2294,6 +2295,7 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
     expect(audit[1]!.data).toEqual({
       target_id: rec!.id,
       model_version: 'jev-1.13.0',
+      decision_type: 'migration_strategy',
       before: null,
       after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', reason_text: null, policy_id: 'global-default', threshold_used: 0.6 },
     });
@@ -4350,6 +4352,10 @@ describe('mock notifications: the catalog an admin keeps and the subscriptions (
     await expect(operator.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: planId })).rejects.toMatchObject({ status: 409, message: `channel team-slack already has subscription ${sub.id} to plan ${planId}` });
     await expect(operator.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: null })).rejects.toMatchObject({ status: 403, message: 'a subscription to every plan requires the admin role' });
     expect(server.events.at(-1)).toMatchObject({ kind: 'auth.denied', actor: 'bayu', data: { required_role: 'admin', reason: 'a subscription to every plan requires the admin role' } });
+    // the role comes before a repeated topic, as in the API, which judges the topics when it builds the subscription (review N5)
+    const deniedBefore = server.events.filter((e) => e.kind === 'auth.denied').length;
+    await expect(operator.post('/notifications/subscriptions', { channel: 'team-slack', plan_id: null, topics: ['outcome', 'outcome'] })).rejects.toMatchObject({ status: 403 });
+    expect(server.events.filter((e) => e.kind === 'auth.denied')).toHaveLength(deniedBefore + 1);
     await expect(as('viewer').post('/notifications/subscriptions', { channel: 'team-slack', plan_id: planId })).rejects.toMatchObject({ status: 403, message: 'this action requires the operator role' });
     const subRefusals: Array<[Record<string, unknown>, string]> = [
       [{ channel: 'gone', plan_id: planId }, "channel: no channel 'gone' in the catalog"],

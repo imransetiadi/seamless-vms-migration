@@ -225,6 +225,14 @@ def test_a_downtime_message_says_where_the_vm_runs_and_how_long_it_was_down():
         "The source VM is stopped and waits for a person, who rolls the migration back or "
         "retries it."
     ]
+    # a failed rollback starts no other: the source waits for a person (SDD §8, §24.5)
+    rollback_failed = event(
+        "migration.phase", m, **{"from": "rolling_back", "to": "failed", "source_stopped": True}
+    )
+    assert build_message(NotifyTrigger.problem_failed, rollback_failed, p, m).lines == [
+        "The source VM is stopped and waits for a person, who rolls the migration back or "
+        "retries it."
+    ]
     running = event(
         "migration.phase", m, **{"from": "precopy", "to": "failed", "source_stopped": False}
     )
@@ -572,3 +580,24 @@ def test_the_webhook_document_is_the_standard_webhooks_payload():
     assert doc["data"]["vm_name"] is None and doc["data"]["topic"] == "progress"
     with pytest.raises(KeyError):
         _ = doc["data"]["error"]
+
+
+@pytest.mark.parametrize("brk", ["\u2028", "\u2029", "\x85", "\x1c", "\x0b"])
+def test_an_email_subject_survives_every_line_break_a_name_holds(brk):
+    """SDD §24.5, §24.8: a VM name holding any character str.splitlines() breaks on - C1
+    controls and the line and paragraph separators too - becomes a space in the subject, so the
+    email package never refuses the header and the channel still gets the message."""
+    p = plan()
+    m = migration(p, vm=make_vm(name=f"web{brk}01"))
+    msg = build_message(
+        NotifyTrigger.outcome_finalized, event("migration.phase", m, to="finalized"), p, m
+    )
+    mail = email_message(
+        msg,
+        sender="seamless@example.com",
+        recipients=["owners@example.com"],
+        key=f"app-owners_{msg.event_seq}",
+        domain="seamless.example.com",
+    )
+    assert mail["Subject"] == "[Seamless] web 01 finalized"
+    assert len(mail.as_string().split("Subject:")[1].splitlines()[0]) > 0
