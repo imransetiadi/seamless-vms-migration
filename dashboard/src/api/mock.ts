@@ -59,6 +59,7 @@ import {
   serverGpuFlavor,
   vmwareCheck,
   HELD_VOLUMES_REASON,
+  validatedTrackedDisks,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -1878,10 +1879,14 @@ export class MockServer {
       shares: Object.fromEntries(this.migrations.filter((x) => x.plan_id === plan.id).map((x) => [x.vm.source_id, quotaShare(x.phase, keptAfterRollback(x))])),
       // the profiles the source declares for its flavors, which make a CUSTOM_ class a vGPU (SDD §22.2)
       gpuProfiles: source.gpu_profiles,
+      // a plan that tracks extents: its source and this migration's passes, whose misses it names (SDD §9.3, §28.9)
+      extents: { source, syncPasses: m.sync_passes },
     });
+    // the disks the final pass is expected to read from extents, as the API's validation sets them (SDD §28.5, §28.6)
+    m.tracked_disks = validatedTrackedDisks(m.vm, plan, source, m.sync_passes);
     // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, keptAfterRollback(m));
-    m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
+    m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? [], m.tracked_disks));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;
     // what the rules would probe (SDD §9.6): inactive until a person adds it to the plan

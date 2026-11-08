@@ -1863,6 +1863,54 @@ export function networkContext(
 const KIT_TWIN_REMEDIATION =
   'Rename one of the VMs in vCenter: the migration kit names a VM\'s server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.';
 
+/** Cinder pool to Ceph pool, from the source check's rbd entries whose ceph_fsid is the provider's (SDD §10, §28.4): the API's
+ * ceph_pools - {} without a Ceph access or a pool of its cluster. */
+export function cephPools(source: Pick<Provider, 'ceph' | 'capabilities'>): Record<string, string> {
+  if (!source.ceph) return {};
+  const backends = ((source.capabilities ?? {}).storage_backends as Array<Record<string, unknown>> | undefined) ?? [];
+  const pools: Record<string, string> = {};
+  for (const b of backends) {
+    if (b && b.family === 'rbd' && b.ceph_fsid === source.ceph.fsid && b.pool && b.ceph_pool) pools[String(b.pool)] = String(b.ceph_pool);
+  }
+  return pools;
+}
+
+/** A plan that tracks extents with a source that can be read - a Ceph access with its key and an rbd pool of its fsid,
+ * never a VMware source: the API's tracking_ready (SDD §28.4, §28.9). */
+export function trackingReady(plan: Pick<Plan, 'extent_tracking'>, source: Pick<Provider, 'kind' | 'ceph' | 'capabilities'>): boolean {
+  if (!plan.extent_tracking || source.kind === 'vmware') return false;
+  return !!source.ceph && source.ceph.key_updated_at !== null && Object.keys(cephPools(source)).length > 0;
+}
+
+/** Why `disk` does not qualify for extent tracking, null when it does: the API's disk_tracking_problem (SDD §28.3, §28.4). */
+function diskTrackingProblem(disk: Disk, pools: Record<string, string>): string | null {
+  const label = disk.name || disk.id;
+  if (disk.kind !== 'volume') return `${label} is no Cinder volume (${disk.kind})`;
+  if (disk.encrypted) return `${label} is encrypted`;
+  if (!disk.pool) return `${label} has a host the source credential cannot read`;
+  if (!Object.hasOwn(pools, disk.pool)) return `${label} is on ${disk.pool}, no rbd pool of the cluster`;
+  return null;
+}
+
+/** The devices a check of the migration found changes outside the extents of (SDD §28.5), sorted. */
+function missedDevices(syncPasses: readonly SyncPass[]): string[] {
+  const devices = new Set<string>();
+  for (const p of syncPasses) for (const [dev, use] of Object.entries(p.extents ?? {})) if (use.missed > 0) devices.add(dev);
+  return [...devices].sort(byCodePoint);
+}
+
+/**
+ * The disks a tracked plan's final pass is expected to read from extents, as the API's validation sets tracked_disks (SDD
+ * §28.5, §28.6): the qualifying disks of a source that can be read, less any whose device a check of this migration found
+ * missing changes on - a miss turns tracking off for the disk until the migration ends.
+ */
+export function validatedTrackedDisks(vm: VMRef, plan: Pick<Plan, 'extent_tracking'>, source: Pick<Provider, 'kind' | 'ceph' | 'capabilities'>, syncPasses: readonly SyncPass[] = []): string[] {
+  if (!trackingReady(plan, source)) return [];
+  const pools = cephPools(source);
+  const missed = new Set(missedDevices(syncPasses));
+  return vm.disks.filter((d) => diskTrackingProblem(d, pools) === null && !missed.has(d.device ?? d.id)).map((d) => d.id);
+}
+
 export function preflight(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -1899,6 +1947,9 @@ export function preflight(
     floatingIps?: string[];
     dns?: DnsRead;
     announcers?: string[];
+    /** A plan that tracks extents: its source provider and the migration's recorded passes, whose misses the findings
+     * name (SDD §9.3, §28.9); no extent finding when not given. */
+    extents?: { source: Pick<Provider, 'id' | 'name' | 'kind' | 'ceph' | 'capabilities'>; syncPasses?: readonly SyncPass[] };
   } = {},
 ): Finding[] {
   const findings: Finding[] = [];
@@ -2119,6 +2170,29 @@ export function preflight(
   if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
     const suggested = suggestProbes(vm);
     add('APP_PROBE_MISSING', `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`);
+  }
+  // a warm plan that tracks extents, as the API's _extent_findings words them (SDD §9.3, §28.9)
+  const ext = context.extents;
+  if (ext && plan.extent_tracking && ext.source.kind !== 'vmware') {
+    const { source: src } = ext;
+    const pools = cephPools(src);
+    const why = !src.ceph
+      ? 'no Ceph access'
+      : src.ceph.key_updated_at === null
+        ? 'no Ceph key'
+        : !Object.keys(pools).length
+          ? `no rbd pool of its cluster ${src.ceph.fsid} in its check report`
+          : null;
+    if (why !== null) {
+      add('CEPH_ACCESS_MISSING', `The plan tracks extents, but ${providerLabel(src)} has ${why}: every pass of ${vm.name} scans its disks in full.`);
+    } else {
+      const problems = vm.disks.map((d) => diskTrackingProblem(d, pools)).filter((p): p is string => p !== null);
+      if (problems.length)
+        add('EXTENT_TRACKING_PARTIAL', `${problems.length} disk(s) of ${vm.name} do not qualify for extent tracking and scan in full on every pass: ${problems.join('; ')}.`);
+    }
+    const missed = missedDevices(ext.syncPasses ?? []);
+    if (missed.length)
+      add('EXTENT_TRACKING_MISSED', `A check of ${vm.name} found changes outside the extents of ${missed.join(', ')}: the disk scans in full for the rest of the migration.`);
   }
   return findings;
 }

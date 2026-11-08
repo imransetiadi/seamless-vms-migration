@@ -67,9 +67,10 @@ test('network, audit and input scrollers have named keyboard access', async ({ p
 test('a definition near the viewport bottom stays fully visible', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
   await signIn(page, '/advisor');
-  // the demo's first tick finishes api-gw-02's validation and lists its recommendation at the top: wait for it, so the
-  // list has stopped moving before the term is measured and hovered (it moved from under the pointer now and then)
-  await expect(page.getByRole('link', { name: 'Details for api-gw-02' })).toBeVisible();
+  // wait for the seeded recommendations, so the list is in place before the term is measured and hovered (it moved from
+  // under the pointer now and then). The demo's first tick finishes api-gw-02's validation, but its disk is tracked on the
+  // demo's Ceph cluster, so warm no longer ties with cold and no recommendation joins the list (SDD §14.4, §28.6)
+  await expect(page.getByRole('link', { name: 'Details for db-pg-01' })).toBeVisible();
   const term = page.getByRole('button', { name: 'confidence', exact: true }).nth(3);
   const tooltip = page.getByRole('tooltip').filter({ visible: true });
   // a later tick can still move the list from under the pointer (twice in one run of PR #49's CI): place the term at
