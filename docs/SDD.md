@@ -5249,7 +5249,8 @@ them (`seamless events prune` is the only deletion, by hand, §15, Security.md �
 * `decision.<status>` — one per decision status change, the first one included: `auto_applied`,
   `pending_approval`, `approved`, `overridden`, `below_threshold`, and `decision.fallback` for
   `fallback_rules`. Actor `<kind>:<id>` of the decision's actor (`policy:global-default`, `system:fallback`,
-  `user:<name>`); data `{target_id, model_version, before, after}`, where `before` (null for the first
+  `user:<name>`); data `{target_id, model_version, decision_type, before, after}` (`decision_type` the
+  recommendation's, so `approval.advisor` names it, §24.5; earlier events lack it), where `before` (null for the first
   decision) and `after` are `{status, final_option, reason_code, reason_text, policy_id, threshold_used}` —
   `reason_text` the decision's reason in words: the reason a person gave with an override (§14.6), or why the
   advisor's answer could not be used (`fallback_rules`), null otherwise — so the trail itself records why a
@@ -7952,7 +7953,7 @@ Two event data additions close the gap of §24.1 (plan task NT4; binding in §4.
 | `downtime.started` | {vm} is down for its cutover | The source VM stopped at {at}. Estimated downtime {estimate}; SLO {slo}. |
 | `downtime.ended`, `verified` | {vm} is up on the destination after {downtime} | Verified at {at}. Downtime {downtime}; SLO {slo}: met, or exceeded. |
 | `downtime.ended`, `source_started` | {vm} runs again at the source after {downtime} | The cutover did not complete; the source VM runs again since {at}. |
-| `problem.failed` | {vm} failed in {phase} | The source VM is stopped, and the plan's automatic rollback starts it again; or: the source VM is stopped and waits for a person, who rolls the migration back or retries it; or: the source VM runs. |
+| `problem.failed` | {vm} failed in {phase} | The source VM is stopped, and the plan's automatic rollback starts it again; or: the source VM is stopped and waits for a person, who rolls the migration back or retries it; or: the source VM runs. (The first only when the plan's `verification.auto_rollback` is on and the failure did not come from `rolling_back` - a failed rollback leaves the source stopped and starts no other, §8.) |
 | `problem.data_inconsistent` | {vm}: its migration's figures do not hold together | Its downtime is left out of the statistics until a person reviews it (§5.5). |
 | `problem.source_running` | {vm} runs again at the source after its migration | Seen running at {at}: it writes data the destination no longer receives. Stop it or roll the migration back; finalize refuses meanwhile (§8.1). |
 | `outcome.completed` | {vm} migrated | Verified on the destination at {at}; downtime {downtime}; SLO {slo}. The source VM stays until the migration is finalized. |
@@ -7981,7 +7982,9 @@ Two event data additions close the gap of §24.1 (plan task NT4; binding in §4.
 
 **Formats:**
 * **Email.** Plain text in UTF-8.
-  * `Subject: [Seamless] {title}`, with every control character of a name replaced by a space. Before 3.11.10 and
+  * `Subject: [Seamless] {title}`, with every control character of a name replaced by a space - the C0 and C1
+    controls and the line and paragraph separators (U+2028, U+2029), every character Python's `str.splitlines()`
+    breaks on, which the `email` package refuses in a header. Before 3.11.10 and
     3.12.5, Python's `email` package did not quote a newline in a header it wrote (CVE-2024-6923).
   * `From` is `SEAMLESS_SMTP_FROM`, `To` the channel's recipients, and `Message-ID` `<{key}@{the sender's domain}>`.
   * `Auto-Submitted: auto-generated` tells responders not to answer (RFC 3834).
