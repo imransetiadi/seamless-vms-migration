@@ -3229,8 +3229,13 @@ export class MockServer {
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     this.refuseLongPlanTexts(input);
-    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
-    this.refuseInFlight(plan, 'editing the plan');
+    // like the API (SDD §28.9): extent_tracking alone changes at any time and keeps the status
+    const current = plan as unknown as Record<string, unknown>;
+    const switchOnly = 'extent_tracking' in input && Object.keys(input).every((key) => key === 'extent_tracking' || JSON.stringify(input[key] ?? null) === JSON.stringify(current[key] ?? null));
+    if (!switchOnly) {
+      if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
+      this.refuseInFlight(plan, 'editing the plan');
+    }
     // like the API (SDD §12): a failed migration's rollback acts on the clouds its attempt used
     const providers = ['source_provider_id', 'destination_provider_id'] as const;
     const projects = ['source_project', 'destination_project'] as const;
@@ -3251,9 +3256,9 @@ export class MockServer {
     refusePlanProjects({ ...(plan as unknown as Record<string, unknown>), ...input }, this.providers.find((p) => p.id === (input.source_provider_id ?? plan.source_provider_id)));
     this.refuseUnknownHooks({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
-    plan.status = 'draft';
+    if (!switchOnly) plan.status = 'draft';
     plan.updated_at = new Date(this.now()).toISOString();
-    this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" updated`, data: { fields: Object.keys(input) } });
+    this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" updated`, data: { fields: switchOnly ? ['extent_tracking'] : Object.keys(input) } });
     return ok(plan);
   }
 

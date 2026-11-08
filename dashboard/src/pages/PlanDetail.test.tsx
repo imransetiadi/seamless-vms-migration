@@ -145,6 +145,37 @@ describe('PlanDetail', () => {
     expect(await within(screen.getByRole('region', { name: /settings/i })).findByText(/mac and fixed ips kept/i)).toBeInTheDocument();
   });
 
+  it("switches a running plan's changed-extent tracking from its settings and keeps it running (SDD §16, §28.9)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    expect(plan).toMatchObject({ status: 'running', extent_tracking: true });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    expect(await within(settings).findByText(/tracked on the source ceph cluster/i)).toBeInTheDocument();
+    await user.click(within(settings).getByRole('button', { name: /^stop tracking$/i }));
+    expect(await within(settings).findByText(/not tracked: every pass scans in full/i)).toBeInTheDocument();
+    expect(plan).toMatchObject({ status: 'running', extent_tracking: false });
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['extent_tracking'] });
+    await user.click(within(settings).getByRole('button', { name: /^track changed extents$/i }));
+    expect(await within(settings).findByText(/tracked on the source ceph cluster/i)).toBeInTheDocument();
+    expect(plan).toMatchObject({ status: 'running', extent_tracking: true });
+  });
+
+  it('offers no extent switch to a viewer, nor for a VMware source (SDD §16, §28.9)', async () => {
+    const server = createTestServer();
+    const view = renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'viewer', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    expect(await within(settings).findByText(/tracked on the source ceph cluster/i)).toBeInTheDocument();
+    expect(within(settings).queryByRole('button', { name: /^stop tracking$/i })).not.toBeInTheDocument();
+    view.unmount();
+    const vmware = server.plans.find((p) => server.providers.find((s) => s.id === p.source_provider_id)?.kind === 'vmware')!;
+    renderWithApp(<PlanDetail />, { route: `/plans/${vmware.id}`, path: '/plans/:planId', token: 'operator', server });
+    const vmSettings = await screen.findByRole('region', { name: /settings/i });
+    expect(within(vmSettings).queryByText(/changed extents/i)).not.toBeInTheDocument();
+    expect(within(vmSettings).queryByRole('button', { name: /track changed extents/i })).not.toBeInTheDocument();
+  });
+
   it('counts the VMs with network overrides in the settings summary (SDD §16)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
