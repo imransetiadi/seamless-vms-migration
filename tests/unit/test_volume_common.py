@@ -2436,6 +2436,37 @@ def test_a_link_the_source_host_refuses_fails_the_cold_transfer_at_once(
     assert len(waits) == 5
 
 
+#: ssh's stderr when the source host presents a key the link's known_hosts does not pin
+HOST_KEY_REFUSED_SAID = (
+    "The fingerprint for the ED25519 key sent by the remote host is\n"
+    "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg.\n"
+    "Host key verification failed.\n"
+)
+
+
+def test_a_host_key_the_link_refuses_fails_the_cold_transfer_at_once(tmp_path, monkeypatch):
+    """Seamless Migrate SDD 26.5, 26.6, 6.6: the forward from the destination host to the source
+    host is a pinned hop; ssh's "Host key verification failed." there is a refusal, not an outage -
+    HostKeyRefused at once, in the words the control plane reads for conversion_host.key_refused,
+    where the transfer waited out its timeout with the source stopped and failed as "Timed out"."""
+    waits = []
+    monkeypatch.setattr(volume_common.time, "sleep", waits.append)
+    volume_map = {"/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([cloud()])):
+        moved = transfer_module.OpenStackDestinationVolume(
+            cloud(), "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10",
+            dict(volume_map), workload(), timeout=5, ssh_known_hosts=str(tmp_path / "known_hosts")
+        )
+    moved.shell = RefusedLink(HOST_KEY_REFUSED_SAID)
+    with pytest.raises(volume_common.HostKeyRefused) as refused:
+        moved._create_forwarding_process()
+    assert str(refused.value).startswith(
+        "host key refused: the source conversion host (os_migrate_conv_src at 10.0.0.10) "
+        "presented the ED25519 key SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg"
+    ), str(refused.value)
+    assert waits == []
+
+
 #: a run's link as conversion_host_link returns it (SDD 6.4, 26.6): paths on the destination host
 RUN_LINK = {
     "id": "0123456789abcdef0123456789abcdef",
