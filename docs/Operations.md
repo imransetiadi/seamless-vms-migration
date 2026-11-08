@@ -988,8 +988,9 @@ quota before the first tracked plan: `openstack quota set --snapshots <n> --proj
 rollback, a cancel and a change of strategy delete them too.
 
 **5. The plan.** `extent_tracking: true` on the plan (`PATCH /api/v1/plans/{id}`, `seamless plan apply`, or the plan's
-page); refused with 422 on a VMware source. It may change at any time: off, the next pass scans; on, the next pass
-checks. The validation warns with `CEPH_ACCESS_MISSING` when the source has no Ceph access, no key or no `rbd` pool of
+page, whose settings switch it for an operator); refused with 422 on a VMware source. It may change at any time - a
+running or paused plan keeps its status and nothing needs validating again (SDD §28.9): off, the next pass scans; on,
+the next pass checks, and a disk turned on mid-way scans in full until a check of it passed (SDD §28.5). The validation warns with `CEPH_ACCESS_MISSING` when the source has no Ceph access, no key or no `rbd` pool of
 its fsid: every pass scans in full then.
 
 **6. Reading each pass's extent use.** `GET /api/v1/migrations/{id}` carries `sync_passes[].extents`, one entry per
