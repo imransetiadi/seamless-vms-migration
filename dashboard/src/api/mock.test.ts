@@ -13,7 +13,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { poolLabel } from '../lib/gpu';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS, PROVIDER_EDITABLE } from './mock';
-import { HELD_VOLUMES_REASON, sourceReads } from './mockData';
+import { HELD_VOLUMES_REASON, makeVm, sourceReads } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
@@ -4487,5 +4487,99 @@ describe("the mock's project credentials (SDD §12, §16, §27.4, §27.7, plan t
       deleted: true,
     });
     await expect(client.delete(`/providers/rhosp17-dc1/projects/${UNKNOWN}/credentials`)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+
+describe('mock extent findings at validation, like the API (SDD §9.3, §28.5, §28.6, §28.9)', () => {
+  /** A free VM of the demo source with a qualifying RBD volume, an encrypted one and one whose host is unknown. */
+  function trackedPlanSetup() {
+    const { server, client } = setup('operator');
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    inventory.unshift(
+      makeVm({
+        id: 'ext-01',
+        name: 'ext-01',
+        project: 'finance',
+        disks: [
+          { id: 'vol-a', name: 'ext-01-root', size_gb: 40, used_gb: 10, volume_type: 'ceph-hdd', pool: 'overcloud@tripleo_ceph#ceph-hdd' },
+          { id: 'vol-b', name: 'ext-01-secret', size_gb: 20, used_gb: 5, volume_type: 'ceph-hdd', pool: 'overcloud@tripleo_ceph#ceph-hdd', encrypted: true },
+          { id: 'vol-c', name: 'ext-01-data', size_gb: 20, used_gb: 5, volume_type: 'ceph-hdd', pool: null },
+        ],
+      }),
+    );
+    return { server, client };
+  }
+  const migrationOf = (server: MockServer, planId: string) => server.migrations.find((m) => m.plan_id === planId && m.vm.source_id === 'ext-01')!;
+  const codes = (m: Migration) => m.findings.map((f) => f.code).filter((c) => c.startsWith('CEPH_') || c.startsWith('EXTENT_'));
+
+  it('names the disks that do not qualify, and tracks the others', async () => {
+    const { server, client } = trackedPlanSetup();
+    const plan = await client.post<Plan>('/plans', { name: 'Tracked', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['ext-01'], extent_tracking: true });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = migrationOf(server, plan.id);
+    expect(codes(m)).toEqual(['EXTENT_TRACKING_PARTIAL']);
+    const partial = m.findings.find((f) => f.code === 'EXTENT_TRACKING_PARTIAL')!;
+    expect(partial).toMatchObject({ severity: 'info', strategies: ['warm'] });
+    expect(partial.message).toBe(
+      '2 disk(s) of ext-01 do not qualify for extent tracking and scan in full on every pass: ext-01-secret is encrypted; ext-01-data has a host the source credential cannot read.',
+    );
+    expect(m.tracked_disks).toEqual(['vol-a']);
+  });
+
+  it('warns that every pass scans when the source has no Ceph key, and tracks nothing', async () => {
+    const { server, client } = trackedPlanSetup();
+    const source = server.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    source.ceph = { ...source.ceph!, key_updated_at: null };
+    const plan = await client.post<Plan>('/plans', { name: 'No key', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['ext-01'], extent_tracking: true });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = migrationOf(server, plan.id);
+    expect(codes(m)).toEqual(['CEPH_ACCESS_MISSING']);
+    expect(m.findings.find((f) => f.code === 'CEPH_ACCESS_MISSING')).toMatchObject({
+      severity: 'warning',
+      message: `The plan tracks extents, but ${source.name} has no Ceph key: every pass of ext-01 scans its disks in full.`,
+    });
+    expect(m.tracked_disks).toEqual([]);
+  });
+
+  it.each([
+    ['no Ceph access', (p: Provider) => { p.ceph = null; }],
+    ['no rbd pool of its cluster', (p: Provider) => { p.ceph = { ...p.ceph!, fsid: '00000000-0000-4000-8000-000000000000' }; }],
+  ] as const)('says the source has %s, and tracks nothing', async (why, change) => {
+    const { server, client } = trackedPlanSetup();
+    const source = server.providers.find((p) => p.id === 'rhosp17-dc1')!;
+    change(source);
+    const plan = await client.post<Plan>('/plans', { name: `Case ${why}`, source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['ext-01'], extent_tracking: true });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = migrationOf(server, plan.id);
+    expect(codes(m)).toEqual(['CEPH_ACCESS_MISSING']);
+    const expected = why === 'no Ceph access' ? 'no Ceph access' : 'no rbd pool of its cluster 00000000-0000-4000-8000-000000000000 in its check report';
+    expect(m.findings.find((f) => f.code === 'CEPH_ACCESS_MISSING')!.message).toBe(`The plan tracks extents, but ${source.name} has ${expected}: every pass of ext-01 scans its disks in full.`);
+    expect(m.tracked_disks).toEqual([]);
+  });
+
+  it('reports a miss of an earlier check and never tracks that disk again on re-validation', async () => {
+    const { server, client } = trackedPlanSetup();
+    const plan = await client.post<Plan>('/plans', { name: 'Missed', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['ext-01'], extent_tracking: true });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = migrationOf(server, plan.id);
+    expect(m.tracked_disks).toEqual(['vol-a']);
+    const use = { mode: 'checked' as const, reason: null, query_s: 9.6, missed: 3, assumed_zero: false };
+    m.sync_passes = [{ ...(m.sync_passes[0] ?? {}), number: 1, kind: 'full', started_at: '2026-10-01T00:00:00Z', ended_at: '2026-10-01T00:10:00Z', bytes_scanned: 0, bytes_changed: 0, bytes_transferred: 0, duration_s: 600, extents: { '/dev/vda': use } } as Migration['sync_passes'][number]];
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(codes(m)).toEqual(['EXTENT_TRACKING_PARTIAL', 'EXTENT_TRACKING_MISSED']);
+    expect(m.findings.find((f) => f.code === 'EXTENT_TRACKING_MISSED')!.message).toBe(
+      'A check of ext-01 found changes outside the extents of /dev/vda: the disk scans in full for the rest of the migration.',
+    );
+    expect(m.tracked_disks).toEqual([]);
+  });
+
+  it('finds nothing for a plan that does not track extents', async () => {
+    const { server, client } = trackedPlanSetup();
+    const plan = await client.post<Plan>('/plans', { name: 'Untracked', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['ext-01'] });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = migrationOf(server, plan.id);
+    expect(codes(m)).toEqual([]);
+    expect(m.tracked_disks).toEqual([]);
   });
 });
