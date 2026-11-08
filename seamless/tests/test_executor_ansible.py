@@ -32,6 +32,7 @@ from seamless_migrate.executors.ansible import (
     STOP_TASK,
     AnsibleExecutor,
     Deferred,
+    ansible_env,
     ansible_yaml,
     apply_mappings,
     build_inventory,
@@ -5994,6 +5995,39 @@ async def test_output_lines_reach_the_log_whole(env, monkeypatch):
     ctx, rec = ctx_for(env, strategy=Strategy.warm)
     await env.executor.run(StepName.PRECOPY, ctx)
     assert "ok: [localhost] => " + "x" * 5000 in rec.logs
+
+
+@pytest.mark.parametrize(
+    ("given", "kept"),
+    [
+        (
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30",
+            "-o ServerAliveInterval=30",
+        ),
+        ("-oStrictHostKeyChecking=no -oServerAliveInterval=30", "-oServerAliveInterval=30"),
+        ("-o stricthostkeychecking=accept-new -C", "-C"),
+        (
+            "-o 'UserKnownHostsFile /dev/null' -o ServerAliveInterval=30",
+            "-o ServerAliveInterval=30",
+        ),
+        (
+            "-o GlobalKnownHostsFile=/x -o HostKeyAlias=a -o CheckHostIP=no -o UpdateHostKeys=yes "
+            "-o VerifyHostKeyDNS=yes -o KnownHostsCommand=/bin/true",
+            None,
+        ),
+        ("-o StrictHostKeyChecking=no -o 'unclosed", None),
+    ],
+)
+def test_ansible_ssh_args_cannot_turn_host_key_checking_off(env, monkeypatch, given, kept):
+    """SDD §7.2, §15.1, §26.4: Ansible puts ssh_args before the inventory's ssh_common_args and
+    OpenSSH keeps an option's first value, so while checking is on the playbooks' ANSIBLE_SSH_ARGS
+    keeps its other options and loses every host-key option, in any case and form; a value shlex
+    cannot split is dropped whole. With checking off it passes as given."""
+    monkeypatch.setenv("ANSIBLE_SSH_ARGS", given)
+    on = ansible_env(env.settings.model_copy(update={"ansible_host_key_checking": True}))
+    assert on.get("ANSIBLE_SSH_ARGS") == kept
+    off = ansible_env(env.settings.model_copy(update={"ansible_host_key_checking": False}))
+    assert off["ANSIBLE_SSH_ARGS"] == given
 
 
 async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkeypatch):

@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -1367,6 +1368,44 @@ def _collections_path(settings: Settings) -> str:
     return f"{base}:{existing}"
 
 
+#: the ssh options that decide host-key checking, lower-case (SDD §7.2, §26.4)
+HOST_KEY_OPTIONS = frozenset(
+    {
+        "stricthostkeychecking", "userknownhostsfile", "globalknownhostsfile", "hostkeyalias",
+        "checkhostip", "updatehostkeys", "verifyhostkeydns", "knownhostscommand",
+    }
+)  # fmt: skip
+
+
+def without_host_key_options(value: str) -> str | None:
+    """``ANSIBLE_SSH_ARGS`` without its host-key options (SDD §7.2, §15.1, §26.4): Ansible puts
+    ``ssh_args`` before the inventory's ``ssh_common_args`` and OpenSSH keeps an option's first
+    value, so one there would win over the pinned options. Each ``-o K=V``, ``-oK=V`` or
+    ``-o "K V"`` whose key is one of them goes, in any case; the other arguments stay. None when
+    nothing stays, or when ``shlex`` cannot split the value (dropped whole)."""
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return None
+    kept: list[str] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == "-o" and i + 1 < len(words):
+            option, step = words[i + 1], 2
+        elif word.startswith("-o") and len(word) > 2:
+            option, step = word[2:], 1
+        else:
+            kept.append(word)
+            i += 1
+            continue
+        key = re.split(r"[=\s]", option.strip(), maxsplit=1)[0].lower()
+        if key not in HOST_KEY_OPTIONS:
+            kept.extend(words[i : i + step])
+        i += step
+    return shlex.join(kept) if kept else None
+
+
 def ansible_env(settings: Settings) -> dict[str, str]:
     """The environment of every ansible-playbook the control plane runs - a step's and a hook's
     (SDD §7.2, §10): the passthrough variables and the allowed ``ANSIBLE_*``, never a secret, a
@@ -1378,6 +1417,11 @@ def ansible_env(settings: Settings) -> dict[str, str]:
     }
     home = Path(settings.data_dir) / ".ansible"
     checking = settings.ansible_host_key_checking
+    if checking and "ANSIBLE_SSH_ARGS" in env:
+        # SDD §15.1, §26.4: the environment never turns the pinned host-key checking off
+        ssh_args = without_host_key_options(env.pop("ANSIBLE_SSH_ARGS"))
+        if ssh_args is not None:
+            env["ANSIBLE_SSH_ARGS"] = ssh_args
     env.update(
         {
             "ANSIBLE_COLLECTIONS_PATH": _collections_path(settings),

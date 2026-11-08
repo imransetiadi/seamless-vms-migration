@@ -2470,7 +2470,13 @@ while its replica does not lead and opened by its takeover (§8); the CLI's is n
   * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
     `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
     resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
-    `ANSIBLE_HOST_KEY_CHECKING=True`, and gives the VMware inventory's `conversion_host` entry what
+    `ANSIBLE_HOST_KEY_CHECKING=True` and with the control plane's `ANSIBLE_SSH_ARGS` stripped of every host-key
+    option - Ansible puts `ssh_args` before `ssh_common_args` and OpenSSH keeps an option's first value, so
+    `-o StrictHostKeyChecking=no` there would win over §26.4's options: `StrictHostKeyChecking`,
+    `UserKnownHostsFile`, `GlobalKnownHostsFile`, `HostKeyAlias`, `CheckHostIP`, `UpdateHostKeys`,
+    `VerifyHostKeyDNS` and `KnownHostsCommand` go, in any case and as `-o K=V`, `-oK=V` or `-o "K V"`, the other
+    options stay, and a value `shlex` cannot split is dropped whole (§15.1: the environment never decides the
+    checking; a hook's playbook gets the same environment) - and gives the VMware inventory's `conversion_host` entry what
     `conv_host_inventory.yml` gives an OpenStack host (§6.5): `ansible_ssh_common_args` with §26.4's options,
     `HostKeyAlias=conversion_host` and the pinned keys' `HostKeyAlgorithms`, and `ansible_ssh_host_key_checking: true`.
   * **A host without a pin** - no declared keys, no pin of the credential the run reaches it with - has its console
