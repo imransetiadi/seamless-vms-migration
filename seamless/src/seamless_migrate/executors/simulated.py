@@ -204,6 +204,12 @@ class SimulatedExecutor:
             return 0.0
         return whole_pass_seconds(passes[-1], ctx.migration.strategy, params_for_plan(ctx.plan))
 
+    @staticmethod
+    def _tracked(ctx: StepContext) -> list[str]:
+        """The migration's tracked disks while its plan tracks extents, else none: off, every
+        pass scans (SDD §28.5, §28.9)."""
+        return list(ctx.migration.tracked_disks) if ctx.plan.extent_tracking else []
+
     def _pass_times(self, ctx: StepContext, changed: float, first: bool) -> tuple[float, float]:
         """The pass's whole model time and the duration it records (SDD §7.4): a warm pass takes
         the model's snapshot + max(scan, Δ/L), its scan as §9.1 models it - a tracked migration's
@@ -214,7 +220,7 @@ class SimulatedExecutor:
             took = changed / p.link_bps if first else VMWARE_PASS_OVERHEAD_S + changed / p.link_bps
             return took, took
         sync = max(scan_seconds(ctx.migration.vm, p), changed / p.link_bps)
-        if not first and ctx.migration.tracked_disks:
+        if not first and self._tracked(ctx):
             sync += p.extent_query_s
         return p.snapshot_s + sync, sync
 
@@ -223,10 +229,10 @@ class SimulatedExecutor:
         without tracked disks; else its first pass scans every disk, a later one checks or reads
         the tracked disks and scans the others, which are no volume of the cluster."""
         m = ctx.migration
-        if m.strategy != Strategy.warm or not m.tracked_disks:
+        tracked = set(self._tracked(ctx))
+        if m.strategy != Strategy.warm or not tracked:
             return {}
         p = params_for_plan(ctx.plan)
-        tracked = set(m.tracked_disks)
         uses: dict[str, ExtentUse] = {}
         for disk in m.vm.disks:
             dev = disk.device or disk.id
@@ -302,7 +308,7 @@ class SimulatedExecutor:
                 # the model's final pass: its snapshot, then its scan as §9.1 models it or its
                 # transfer (SDD §7.4, review RV38A-05); over the tracked disks' extents, §28.6's
                 # term (plan task CE11)
-                copy_s = final_copy_seconds(vm, p, changed, m.tracked_disks)
+                copy_s = final_copy_seconds(vm, p, changed, self._tracked(ctx))
             else:
                 copy_s = changed / p.link_bps + p.v2v_inplace_s
             kind, number = SyncPassKind.final, next_pass_number(m)

@@ -545,6 +545,34 @@ async def test_a_simulated_tracked_migration_checks_its_pre_copy_passes_and_read
     assert (await ex.run(StepName.PRECOPY, ctx)).sync_pass.extents == {}
 
 
+async def test_a_simulated_migration_of_a_plan_switched_off_scans_every_pass(monkeypatch):
+    """SDD §28.9, §28.5: off, the next pass scans - a migration whose plan no longer tracks
+    records no extent use, its passes query nothing, and its final pass takes the scan term,
+    though validation's tracked_disks still name the Ceph disk."""
+    from seamless_migrate.planning.estimator import final_copy_seconds, scan_seconds
+
+    monkeypatch.setattr(SimulatedExecutor, "_jitter", lambda self, rng: 1.0)
+    ex = SimulatedExecutor(FAST)
+    m = tracked_mig()
+    plan = make_plan(extent_tracking=False)
+    p = params_for_plan(plan)
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+        done = (await ex.run(step, ctx)).sync_pass
+        assert done.extents == {}
+        m.sync_passes.append(done)
+    last = m.sync_passes[-1]  # no query q: the scan or the transfer alone (§28.6)
+    assert last.duration_s == pytest.approx(
+        max(scan_seconds(m.vm, p), last.bytes_changed / p.link_bps), rel=0.01
+    )
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    final = (await ex.run(StepName.CUTOVER, ctx)).sync_pass
+    assert final.extents == {}
+    assert final_copy_seconds(m.vm, p, final.bytes_changed) > final_copy_seconds(
+        m.vm, p, final.bytes_changed, m.tracked_disks
+    )
+
+
 async def test_a_simulated_final_pass_takes_the_tracked_term(monkeypatch):
     """SDD §7.4, §28.6: with no jitter, a tracked migration's final pass takes snapshot +
     max(scan_U, q + max(Δf/S, Δf/L)) - the NetApp disk's scan alone against the Ceph disk's
