@@ -629,9 +629,12 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
                 "size": entry.get("size"),
                 "name_id": entry.get("name_id"),
                 "dest_volume_id": recorded["dest_id"],
-                # read in full unless the pass assumed zeros; a pass that recorded no extent
-                # use is never read from either (SDD 28.5)
-                "full_read": dev in use and not use[dev].get("assumed_zero", False),
+                # read in full unless the pass assumed zeros or read only the listed chunks
+                # (a read pass's own interval was never checked); a pass that recorded no
+                # extent use is never read from either (SDD 28.5, 6.3)
+                "full_read": dev in use
+                and use[dev].get("mode") != "read"
+                and not use[dev].get("assumed_zero", False),
             }
             kept.add(entry["snap_id"])
             self.state.save()

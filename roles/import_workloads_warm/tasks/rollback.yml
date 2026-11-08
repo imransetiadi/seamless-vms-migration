@@ -17,11 +17,16 @@
       {{ (import_workloads_warm_state_file.content | b64decode | from_json)
          if 'content' in import_workloads_warm_state_file else {} }}
 
-# Left behind only when a pass was interrupted without its own cleanup.
-# Removing it needs the source conversion host; a failure is reported but
-# does not stop the rollback (the warm state keeps the record).
-- name: Remove a temporary snapshot left by an interrupted pass
-  when: import_workloads_warm_state.pending_snapshot | default(none) is not none
+# Left behind when a pass was interrupted without its own cleanup, and the
+# extent bases a tracked migration keeps between passes (SDD 6.4, 28.4: a
+# rollback and a cancel's cleanup delete them, or they stay on the tenant's
+# source volumes). Removing them needs the source conversion host; a failure is
+# reported but does not stop the rollback (the warm state keeps the record).
+- name: Remove a temporary snapshot left by an interrupted pass, and the extent bases
+  when: >-
+    import_workloads_warm_state.pending_snapshot | default(none) is not none
+    or (import_workloads_warm_state.extent_bases | default({}) | length > 0)
+    or (import_workloads_warm_state.extents_off | default([]) | length > 0)
   block:
     - name: Get the source conversion host
       os_migrate.os_migrate.os_conversion_host_info:
@@ -54,8 +59,11 @@
     - name: Report the temporary snapshot that is left behind
       ansible.builtin.debug:
         msg: >-
-          WARNING: {{ item['params']['name'] }}: the temporary snapshot of transfer
-          {{ import_workloads_warm_state.pending_snapshot.transfer_uuid }} could not be
+          WARNING: {{ item['params']['name'] }}:
+          {{ ('the temporary snapshot of transfer '
+              ~ import_workloads_warm_state.pending_snapshot.transfer_uuid)
+             if import_workloads_warm_state.pending_snapshot | default(none) is not none
+             else 'the extent base snapshots' }} could not be
           removed ({{ ansible_failed_result.msg | default('unknown error') }}). It stays
           recorded in the warm state; the next pass or rollback removes it.
 
