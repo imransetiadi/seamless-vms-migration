@@ -1845,6 +1845,17 @@ class Orchestrator:
             tracked = (
                 qualifying_disks(vm, checked_source) if tracking_ready(plan, checked_source) else []
             )
+            if current is not None and tracked:
+                # a miss turns tracking off for the disk until the migration ends (SDD §28.5,
+                # §28.6): a validation after a retry never tracks it again
+                by_device = {d.device: d.id for d in vm.disks if d.device}
+                missed = {
+                    by_device.get(dev, dev)
+                    for sync_pass in current.sync_passes
+                    for dev, use in sync_pass.extents.items()
+                    if use.missed > 0
+                }
+                tracked = [d for d in tracked if d not in missed]
             estimates = [
                 estimate(
                     vm,

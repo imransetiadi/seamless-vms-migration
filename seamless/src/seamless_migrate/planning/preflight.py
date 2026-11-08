@@ -2488,8 +2488,14 @@ def run_preflight(
                 f"reach the old address for up to {dns_ttl} s.",
             )
         )
-    # a warm plan that tracks extents (SDD §9.3, §28.9; plan task CE9)
-    out.extend(_extent_findings(vm, plan, source, sync_passes))
+    # a warm plan that tracks extents (SDD §9.3, §28.9; plan task CE9), judged by the report the
+    # validation's check just read - a key write resets the stored one (§12) -, as tracked_disks
+    checked_source = (
+        source.model_copy(update={"capabilities": dict(src_caps)})
+        if source is not None and src_caps is not None
+        else source
+    )
+    out.extend(_extent_findings(vm, plan, checked_source, sync_passes))
     return out
 
 

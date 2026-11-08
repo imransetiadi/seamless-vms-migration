@@ -14197,6 +14197,62 @@ async def test_a_miss_puts_the_disks_scan_back_into_the_estimate(tmp_path, store
     )
 
 
+async def test_validation_judges_the_ceph_access_by_the_check_it_just_ran(tmp_path, store):
+    """SDD §9.3, §12, §28.9: right after PUT …/ceph-key, which resets the source's check report,
+    a validation judges CEPH_ACCESS_MISSING by the report its own check just read - the rbd pool
+    of the provider's fsid - not by the emptied one it loaded first, and tracks the disk."""
+    settings = make_settings(tmp_path)
+    h, plan = await tracked_setup(tmp_path, store, ScriptedExecutor(settings), settings)
+    source = store.get("provider", SRC_PROVIDER.id, Provider)
+    store.put("provider", source.model_copy(update={"capabilities": {}, "status": "unknown"}))
+    await h.orch.validate_plan(plan.id, "tester")
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.stop()
+    assert "CEPH_ACCESS_MISSING" not in [f.code for f in m.findings]
+    assert m.tracked_disks == ["vol-1"]
+
+
+async def test_a_disk_that_missed_stays_untracked_when_validated_again(tmp_path, store):
+    """SDD §28.5, §28.6: a miss turns tracking off for the disk until the migration ends - a
+    validation of the migration after a retry (back in ready) keeps the disk out of tracked_disks,
+    so the estimate counts its scan, as the module's final pass does."""
+    settings = make_settings(tmp_path)
+    base = recent_base()
+    missed = {
+        "/dev/vda": {
+            "mode": "checked",
+            "reason": None,
+            "query_s": 4.5,
+            "missed": 2,
+            "assumed_zero": False,
+        }
+    }
+    executor = ScriptedExecutor(
+        settings,
+        hooks={
+            StepName.PRECOPY: scripted_pass(
+                base, 0, 983.0, 120 * 2**30, "full", scanned=200 * 2**30
+            ),
+            StepName.SYNC: scripted_pass(
+                base, 1013, 420.0, 2 * 2**30, "delta", scanned=200 * 2**30, extents=missed
+            ),
+        },
+    )  # fmt: skip
+    h, plan = await tracked_setup(tmp_path, store, executor, settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    await h.orch.stop()
+    assert m.tracked_disks == []
+    # as after a rollback and a retry: the migration is ready again, its passes kept
+    store.put("migration", m.model_copy(update={"phase": P.ready}))
+    stored = store.get("plan", plan.id, Plan)
+    store.put("plan", stored.model_copy(update={"status": PlanStatus.validated}))
+    await h.orch.validate_plan(plan.id, "tester")
+    again = store.get("migration", m.id, Migration)
+    assert "EXTENT_TRACKING_MISSED" in [f.code for f in again.findings]
+    assert again.tracked_disks == []
+
+
 async def test_a_channel_that_never_answers_delays_no_migration(tmp_path, store):
     """SDD §8.7, §24.6 (plan task NT5): the notifier is never in a migration's path - with a
     channel whose sender never answers, the migrations finish as they would without it, and
