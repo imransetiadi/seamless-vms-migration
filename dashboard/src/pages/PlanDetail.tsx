@@ -20,7 +20,7 @@ import {
 import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useMigrationSummaries, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
+import { useMigrationSummaries, usePatchPlan, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorPolicy, Plan, Provider, ValidationReport } from '../api/types';
 import { AdvisorApprovals } from '../components/AdvisorApprovals';
@@ -50,6 +50,7 @@ import { finalizedText, finalizeQueue, isOverdue, skippedVms, type SkippedVm } f
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
+import { hasRole } from '../lib/roles';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { NOTHING_MIGRATED_NEXT, nothingMigrated } from '../lib/planDone';
@@ -129,6 +130,30 @@ function policyModeText(policy: AdvisorPolicy): string {
   return policy.mode === 'always_require_approval'
     ? `Asks a person for every ${what} decision`
     : `Applies a ${what} decision at ${formatPct(policy.threshold * 100, thresholdDecimals(policy.threshold))} confidence or more`;
+}
+
+/**
+ * The plan's changed-extent tracking and, for an operator, its switch (SDD §16, §28.9): taken at any time, a running
+ * or paused plan keeping its status - the next pass scans or checks; the API's refusal shows beside it.
+ */
+function ExtentTrackingSwitch({ plan }: { plan: Plan }) {
+  const role = useRole();
+  const patch = usePatchPlan(plan.id);
+  const on = plan.extent_tracking;
+  return (
+    <span className="flex flex-col gap-2">
+      <span className="inline-flex flex-wrap items-center gap-2">
+        {/* an extent element: its Technology Preview badge (SDD §16, §28.11, plan task CE10) */}
+        {on ? 'Tracked on the source Ceph cluster' : 'Not tracked: every pass scans in full'} <TechPreviewBadge feature="extents" />
+      </span>
+      {hasRole(role, 'operator') && (
+        <Button size="sm" className="self-start" loading={patch.isPending} onClick={() => patch.mutate({ extent_tracking: !on })}>
+          {on ? 'Stop tracking' : 'Track changed extents'}
+        </Button>
+      )}
+      {patch.error && <ErrorBanner error={patch.error} title="The tracking did not change" />}
+    </span>
+  );
 }
 
 function SettingsSummary({
@@ -221,13 +246,18 @@ function SettingsSummary({
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
       {plan.port_creation_mode === 'neutron' && <Setting label="Ports">MAC and fixed IPs kept</Setting>}
-      {plan.extent_tracking && (
+      {source && source.kind !== 'vmware' ? (
         <Setting label="Changed extents">
-          {/* an extent element: its Technology Preview badge (SDD §16, §28.11, plan task CE10) */}
-          <span className="inline-flex flex-wrap items-center gap-2">
-            Tracked on the source Ceph cluster <TechPreviewBadge feature="extents" />
-          </span>
+          <ExtentTrackingSwitch plan={plan} />
         </Setting>
+      ) : (
+        plan.extent_tracking && (
+          <Setting label="Changed extents">
+            <span className="inline-flex flex-wrap items-center gap-2">
+              Tracked on the source Ceph cluster <TechPreviewBadge feature="extents" />
+            </span>
+          </Setting>
+        )
       )}
       {Object.keys(plan.nic_overrides ?? {}).length > 0 && (
         <Setting label="Network overrides">

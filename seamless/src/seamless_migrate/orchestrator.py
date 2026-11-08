@@ -2524,7 +2524,7 @@ class Orchestrator:
                 params,
                 # the post_create hooks' part of its estimate (SDD §9.1)
                 hooks_part(m.estimate),
-                m.tracked_disks,
+                self._tracked(m, plan),
             )
             now = self._now()
             m.force_cutover = ForceCutover(
@@ -4667,6 +4667,12 @@ class Orchestrator:
                 continue
             raise exc
 
+    @staticmethod
+    def _tracked(m: Migration, plan: Plan) -> list[str]:
+        """The disks the final pass is expected to read from extents (SDD §28.6): none while the
+        plan does not track - off, the next pass scans (§28.9), whatever validation found."""
+        return list(m.tracked_disks) if plan.extent_tracking else []
+
     def _params(self, m: Migration, plan: Plan) -> EstimatorParams:
         """Plan estimator parameters with this migration's calibrated scan rate."""
         params = params_for_plan(plan)
@@ -4710,7 +4716,7 @@ class Orchestrator:
             plan.downtime_slo_s,
             hooks_s=hooks_part(m.estimate),
             dns_tail_s=m.estimate.dns_tail_s if m.estimate is not None else None,
-            tracked=m.tracked_disks,
+            tracked=self._tracked(m, plan),
         )
         if m.estimate is not None:
             fresh = fresh.model_copy(
@@ -4759,7 +4765,7 @@ class Orchestrator:
             whole_pass_seconds(last, m.strategy, params),
             params,
             hooks_part(m.estimate),
-            m.tracked_disks,
+            self._tracked(m, plan),
         )
         if final <= plan.downtime_slo_s:
             return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
@@ -4784,7 +4790,7 @@ class Orchestrator:
             whole_pass_seconds(last, m.strategy, params),
             params,
             hooks_part(m.estimate),
-            m.tracked_disks,
+            self._tracked(m, plan),
         )
         if m.estimate is not None:
             downtime = sum(parts.values())

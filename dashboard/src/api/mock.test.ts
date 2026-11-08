@@ -969,6 +969,21 @@ describe('mock API', () => {
     });
   });
 
+  it.each(['running', 'paused'] as const)('switches extent_tracking alone on a %s plan with a migration in flight and keeps its status, like the API (SDD §12, §28.9)', async (status) => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.status = status;
+    const flag = plan.extent_tracking;
+    server.migrations.find((x) => x.plan_id === plan.id)!.phase = 'syncing';
+    // a field at the plan's value is no change
+    const switched = await client.patch<Plan>(`/plans/${plan.id}`, { extent_tracking: !flag, name: plan.name });
+    expect(switched).toMatchObject({ extent_tracking: !flag, status });
+    expect(server.events.at(-1)).toMatchObject({ kind: 'plan.updated', data: { fields: ['extent_tracking'] } });
+    // any other change still waits for draft or validated
+    await expect(client.patch(`/plans/${plan.id}`, { extent_tracking: flag, description: 'and more' })).rejects.toMatchObject({ status: 409 });
+    expect(plan.extent_tracking).toBe(!flag);
+  });
+
   it('lets only an approver change the approval policy of a plan (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const base = { name: 'Policy', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['os-0a11'] };

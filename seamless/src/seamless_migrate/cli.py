@@ -359,7 +359,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         if unknown:
             raise CliError(f"fields cannot be changed: {', '.join(unknown)}") from None
         raise CliError(f"invalid plan: {exc}") from None
-    from .plan_checks import PlanSpecError, check_plan_spec
+    from .plan_checks import PlanSpecError, changes_extent_tracking_alone, check_plan_spec
 
     try:
         check_plan_spec(spec)  # SDD §15: what POST /plans refuses, the CLI refuses too
@@ -393,10 +393,13 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
 
         # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
         existing, version = store.get_versioned("plan", existing.id, Plan)
-        if str(existing.status) not in ("draft", "validated"):
+        # SDD §15, §28.9: a file that changes extent_tracking alone is taken at any time and
+        # keeps the status, as PATCH takes it
+        switch = changes_extent_tracking_alone(document, existing)
+        if not switch and str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
         migrations = store.list("migration", Migration, plan_id=existing.id)
-        busy = [m for m in migrations if blocks_plan_change(m)]
+        busy = [] if switch else [m for m in migrations if blocks_plan_change(m)]
         if busy:
             raise CliError(in_flight_refusal(busy, "editing the plan"))
         # SDD §12, §27.4: a failed migration's rollback acts on the clouds its attempt used, with
@@ -428,7 +431,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
             {
                 **existing.model_dump(mode="json"),
                 **merged.model_dump(mode="json"),
-                "status": "draft",
+                "status": existing.status if switch else "draft",
                 "updated_at": utcnow(),
             }
         )
@@ -440,7 +443,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
                 f"plan {existing.id} changed while it was being applied; run plan apply again"
             ) from None
         kind, verb = "plan.updated", "updated"
-        data = {"fields": sorted(document)}
+        data = {"fields": ["extent_tracking"] if switch else sorted(document)}
     asyncio.run(
         emit(
             store,

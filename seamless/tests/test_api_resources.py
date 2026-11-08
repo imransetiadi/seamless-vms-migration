@@ -2627,7 +2627,7 @@ async def test_a_provider_edit_and_a_plan_start_never_interleave(tmp_path):
 
 def test_a_plan_turns_extent_tracking_on_and_off(api):
     """SDD §4.2, §28.9 (plan task CE7): extent_tracking is false unless chosen, round-trips on
-    create and edit, and may change at any time a plan can be edited."""
+    create and edit (at any time: test_extent_tracking_changes_at_any_time_and_keeps_the_status)."""
     body = {
         "name": "tracked",
         "source_provider_id": "src-osp",
@@ -2682,3 +2682,42 @@ def test_extent_tracking_is_refused_for_a_vmware_source(api):
     )
     assert patched.status_code == 422 and "extent_tracking" in patched.json()["error"]["message"]
     assert api.get(f"/api/v1/plans/{created.json()['id']}").json()["extent_tracking"] is False
+
+
+@pytest.mark.parametrize("status", [PlanStatus.running, PlanStatus.paused])
+def test_extent_tracking_changes_at_any_time_and_keeps_the_status(api, status):
+    """SDD §28.9, §12: a body that changes extent_tracking alone is taken while the plan runs or
+    is paused with a migration in flight, and keeps the status; any other change still waits for
+    draft/validated, and the event names the one field."""
+    vm_ids = first_clean_vms(api, n=1)
+    body = {
+        "name": "switch",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan_id = api.post("/api/v1/plans", Role.operator, json=body).json()["id"]
+    assert api.post(f"/api/v1/plans/{plan_id}/validate", Role.operator).status_code == 200
+    [waiting] = api.store.list("migration", Migration, plan_id=plan_id)
+    waiting.phase = Phase.syncing
+    api.store.put("migration", waiting)
+    plan = api.store.get("plan", plan_id, Plan)
+    plan.status = status
+    api.store.put("plan", plan)
+
+    def patch(json):
+        return api.client.patch(f"/api/v1/plans/{plan_id}", headers=api.h(Role.operator), json=json)
+
+    on = patch({"extent_tracking": True, "name": "switch"})  # a field at its value is no change
+    assert on.status_code == 200, on.text
+    assert on.json()["extent_tracking"] is True and on.json()["status"] == status
+    stored = api.store.get("plan", plan_id, Plan)
+    assert stored.extent_tracking is True and stored.status == status
+    [event] = [e for e in api.store.events() if e.kind == "plan.updated"]
+    assert event.data == {"fields": ["extent_tracking"]}
+    refused = patch({"extent_tracking": False, "description": "and something else"})
+    assert refused.status_code == 409, refused.text
+    assert api.store.get("plan", plan_id, Plan).extent_tracking is True
+    off = patch({"extent_tracking": False})
+    assert off.status_code == 200 and off.json()["status"] == status, off.text
+    assert api.store.get("plan", plan_id, Plan).extent_tracking is False

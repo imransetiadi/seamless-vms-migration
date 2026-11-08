@@ -21,7 +21,12 @@ from ..domain.models import (
 )
 from ..events import emit
 from ..orchestrator import PROVIDER_FIELDS, changed_clouds_refusal, in_flight_refusal
-from ..plan_checks import PlanSpecError, check_plan_spec, vmware_project_refusal
+from ..plan_checks import (
+    PlanSpecError,
+    changes_extent_tracking_alone,
+    check_plan_spec,
+    vmware_project_refusal,
+)
 from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
@@ -215,9 +220,13 @@ async def update_plan(
     async with svc.orchestrator.plan_lock(plan_id):
         plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
         await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
-        if plan.status not in (PlanStatus.draft, PlanStatus.validated):
+        # SDD §28.9: extent_tracking alone changes at any time - a running or paused plan's
+        # next pass scans or checks (§28.5 keeps a final pass from reading unchecked extents)
+        # - and keeps the status; every other edit waits for draft/validated (§12)
+        switch = changes_extent_tracking_alone(body, plan)
+        if not switch and plan.status not in (PlanStatus.draft, PlanStatus.validated):
             raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
-        busy = await svc.orchestrator.in_flight(plan_id)
+        busy = [] if switch else await svc.orchestrator.in_flight(plan_id)
         if busy:
             raise ApiError(409, "conflict", in_flight_refusal(busy, "editing the plan"))
         changed = [
@@ -248,7 +257,7 @@ async def update_plan(
             {
                 **plan.model_dump(mode="json"),
                 **merged.model_dump(mode="json"),
-                "status": PlanStatus.draft,
+                "status": plan.status if switch else PlanStatus.draft,
                 "updated_at": svc.orchestrator.now(),
             }
         )
@@ -263,7 +272,7 @@ async def update_plan(
         f"plan {updated.name} updated",
         plan_id=plan_id,
         actor=principal.name,
-        data={"fields": sorted(body)},
+        data={"fields": ["extent_tracking"] if switch else sorted(body)},
     )
     return await _one(request, updated)
 
