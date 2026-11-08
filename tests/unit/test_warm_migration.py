@@ -1679,6 +1679,22 @@ def test_a_final_pass_reads_extents_after_a_clean_check(tmp_path):
     assert sender[sender.index("--extents-mode") + 1] == "read"
 
 
+def test_a_base_from_a_read_pass_is_never_read_from(tmp_path):
+    """SDD 28.5, 6.3: a read pass copied only the listed chunks, so it did not read the
+    destination in full; when its snapshot stays as a base (a cutover failing after its final
+    pass keeps the bases), the next pass scans (assumed_zero), never reading extents from a base
+    whose own interval was not checked."""
+    scenario = tracked(tmp_path)
+    tracked_pass(scenario, "uuid-1")
+    tracked_pass(scenario, "uuid-2")
+    final = tracked_pass(scenario, "uuid-3", pass_kind="final", extents="read", keep_base=True)
+    assert final["extents"]["/dev/vda"]["mode"] == "read"
+    assert scenario.state().extent_bases["/dev/vda"]["full_read"] is False
+    retry = tracked_pass(scenario, "uuid-4", pass_kind="final", extents="read", keep_base=False)
+    use = retry["extents"]["/dev/vda"]
+    assert (use["mode"], use["reason"]) == ("scanned", "assumed_zero")
+
+
 def test_a_final_pass_without_a_clean_check_scans_in_full(tmp_path):
     """SDD 28.5: with no checked pass of the disk yet, the final pass scans it in full (reason
     unchecked), given read or not."""

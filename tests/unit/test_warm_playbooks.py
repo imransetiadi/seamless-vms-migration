@@ -1340,3 +1340,40 @@ def test_the_cutover_deletes_the_bases_after_its_final_pass(env):
     )
     assert rc == 0, out
     assert env.state("srv-1")["extent_bases"] == {} and env.state("srv-1")["extents_off"] == []
+
+
+def test_a_rollback_deletes_the_bases_a_pre_copy_left(env):
+    """SDD 28.4, 6.4: between passes a tracked migration keeps its bases with no pending snapshot;
+    a rollback (and a cancel's cleanup, which runs it) deletes them, so no snapshot stays on the
+    tenant's source volumes - Cinder would refuse to delete them, and a storage handover too."""
+    rc, out, calls = env.run(
+        "import_workloads_precopy", os_migrate_warm_extents_precopy="check", **CEPH_VARS
+    )
+    assert rc == 0, out
+    state = env.state("srv-1")
+    assert state["extent_bases"] and state["pending_snapshot"] is None
+    rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_all=True)
+    assert rc == 0, out
+    cleanups = [
+        c["args"]
+        for c in calls
+        if c["module"] == "import_workload_warm_snapshot" and c["args"].get("state") == "absent"
+    ]
+    assert cleanups and not any(c.get("keep_base") for c in cleanups)
+    assert env.state("srv-1")["extent_bases"] == {} and env.state("srv-1")["extents_off"] == []
+
+
+def test_a_rollback_that_cannot_delete_the_bases_reports_them_and_goes_on(env):
+    """SDD 28.4, 6.4: the bases' cleanup needs the source conversion host; when it fails the
+    rollback still deletes the destination server and starts the source, and its warning names
+    the extent bases - there is no pending snapshot to name."""
+    rc, out, calls = env.run(
+        "import_workloads_precopy", os_migrate_warm_extents_precopy="check", **CEPH_VARS
+    )
+    assert rc == 0, out
+    env.world["fail"] = [["import_workload_warm_snapshot", "vm1"]]
+    rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_all=True)
+    assert rc == 0, out
+    assert "the extent base snapshots could not be" in " ".join(out.split())
+    assert [c for c in calls if c["module"] == "import_workload_rollback"]
+    assert env.state("srv-1")["extent_bases"]  # still recorded: the next rollback removes them
