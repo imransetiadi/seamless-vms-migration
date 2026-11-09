@@ -1269,6 +1269,20 @@ def link_refused(address, reason):
     )
 
 
+def link_host_key_refused(said, address, ssh_user, known_hosts):
+    """HostKeyRefused for the source conversion host at ``address`` when the link's ssh output
+    ``said`` shows it refusing the host's key - the hop from the destination host to the source
+    host is pinned like every other (SDD 26.5, 26.6) -, else None. Its message is the one the
+    control plane reads for conversion_host.key_refused (Seamless Migrate SDD 6.6)."""
+    if not known_hosts:
+        return None
+    offered = refused_host_key(said)
+    if offered is None:
+        return None
+    pinned = RemoteShell(address, ssh_user, known_hosts=known_hosts, side="source")
+    return HostKeyRefused(pinned._refusal(offered))  # pylint: disable=protected-access
+
+
 def link_shell(address, ssh_user, link=None, known_hosts=None, shell_factory=None):
     """The shell whose ssh_preamble() the destination conversion host runs to reach the source
     host at ``address`` as ``ssh_user`` - the cold transfer's forward, the warm sync's sender.
@@ -2003,7 +2017,15 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         transient (Seamless Migrate SDD 6.6)."""
         if self.link_output is None:
             return
-        reason = refused_link(self._link_said(), self.source_conversion_host_address)
+        said = self._link_said()
+        # a key the source host presented that the link's file does not pin: a refusal, never
+        # an outage to wait out with the source stopped (SDD 26.5, 26.6)
+        refused = link_host_key_refused(
+            said, self.source_conversion_host_address, self.src_ssh_user, self.ssh_known_hosts
+        )
+        if refused is not None:
+            raise refused from None
+        reason = refused_link(said, self.source_conversion_host_address)
         if reason is not None:
             raise link_refused(self.source_conversion_host_address, reason) from None
 

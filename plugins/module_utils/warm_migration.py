@@ -45,6 +45,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     destination_volume_sdk_params,
     detach_volume_bounded,
     image_volume_size,
+    link_host_key_refused,
     link_refused,
     link_shell,
     refused_link,
@@ -1362,7 +1363,16 @@ class OpenstackWarmSync(_WarmVolumeBase):
                 self._receivers.pop(dev, None)
         if returncode != 0 and (self.ssh_known_hosts or self.link):
             # the sender's ssh - the link - speaks on the receiver's stderr: the source host
-            # refusing it is a refusal, never a failed pass to retry (SDD 6.6)
+            # refusing it - its login, a forward or its host key - is a refusal, never a failed
+            # pass to retry (SDD 6.6, 26.5, 26.6)
+            refused = link_host_key_refused(
+                "".join(said),
+                self.source_conversion_host_address,
+                self.src_ssh_user,
+                self.ssh_known_hosts,
+            )
+            if refused is not None:
+                raise refused
             reason = refused_link("".join(said), self.source_conversion_host_address)
             if reason is not None:
                 raise link_refused(self.source_conversion_host_address, reason)

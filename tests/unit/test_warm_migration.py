@@ -1417,6 +1417,33 @@ def test_a_link_the_source_host_refuses_fails_the_warm_sync_at_once(tmp_path):
     assert not isinstance(other_host.value, volume_common.SshRefused)
 
 
+def test_a_host_key_the_link_refuses_fails_the_warm_sync_at_once(tmp_path):
+    """Seamless Migrate SDD 26.5, 26.6, 6.6: the sender's ssh - destination host to source host -
+    is a pinned hop; "Host key verification failed." on the receiver's stderr is HostKeyRefused for
+    the source side, in the words the control plane reads for conversion_host.key_refused, never
+    a failed pass; without the file the sync fails as before."""
+    said = (
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg.\n"
+        "Host key verification failed.\n"
+    )
+
+    def receive(command):
+        return fake.FakeProcess(3, "", said + "blocksync: error: the sender ended\n")
+
+    scenario = Scenario(tmp_path, receive=receive)
+    scenario.snapshot().create()
+    with pytest.raises(volume_common.HostKeyRefused) as refused:
+        scenario.sync(ssh_known_hosts=str(tmp_path / "known_hosts")).sync()
+    assert str(refused.value).startswith(
+        "host key refused: the source conversion host (os_migrate_conv_src at %s) presented the "
+        "ED25519 key SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg" % SRC_CONV
+    ), str(refused.value)
+    with pytest.raises(RuntimeError, match="blocksync failed") as unpinned:
+        scenario.sync().sync()
+    assert not isinstance(unpinned.value, volume_common.SshRefused)
+
+
 def test_each_hosts_copy_of_blocksync_is_private_and_checked_before_sudo(tmp_path):
     """R-02 (Security.md C3-07; SDD 6.4, 26.10 owner decision 10): each host's copy of blocksync
     goes into a directory mktemp makes there - 0700, its name random, which no other user can

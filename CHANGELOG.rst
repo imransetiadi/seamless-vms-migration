@@ -715,7 +715,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   cold forward names ``127.0.0.1``; ``import_workload_transfer_volumes`` and
   ``import_workload_warm_sync`` take the ``link``, and given
   ``ssh_known_hosts`` check the source host's key against the link's pin on
-  the destination host. ``conversion_host_content`` then sets sshd's
+  the destination host; a key the source host presents there that the pin
+  does not hold fails the cold forward and the warm sync at once with the
+  ``host key refused`` message of the probe (SDD 26.5), never a wait to the
+  timeout with the source stopped. ``conversion_host_content`` then sets sshd's
   ``AllowTcpForwarding`` (``local`` on the source host, ``no`` on the
   destination host) and ``PermitTunnel no``. Without the variable, every role
   and module behaves as before.
