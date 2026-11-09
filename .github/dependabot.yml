@@ -29,6 +29,15 @@ updates:
       dashboard:
         patterns: ["*"]
         update-types: [minor, patch]
+    # ESLint 10 waits for eslint-plugin-jsx-a11y: 6.10.2, its latest, peers eslint up to ^9, so the
+    # major's PR cannot install (ERESOLVE, PR #189) - and the a11y lint is part of the WCAG 2.2 AA
+    # gate (SDD §16), never to be skipped with --legacy-peer-deps. Remove this once jsx-a11y
+    # supports ESLint 10, then migrate eslint and @eslint/js together in their own PR.
+    ignore:
+      - dependency-name: eslint
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/js"
+        update-types: ["version-update:semver-major"]
     labels: [dependencies, dashboard]
 
   - package-ecosystem: github-actions
