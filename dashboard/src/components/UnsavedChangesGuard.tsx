@@ -17,7 +17,10 @@ function NavigationGuard({
   description = 'Your changes have not been saved. Discard them or return to editing.',
   confirmLabel = 'Discard changes',
 }: Props) {
-  const blocker = useBlocker(dirty);
+  // Section jumps keep the same draft on the page; leaving its route or query can replace it.
+  const blocker = useBlocker(({ currentLocation, nextLocation }) => dirty && (
+    currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search
+  ));
   return blocker.state === 'blocked' ? (
     <ConfirmDialog
       open

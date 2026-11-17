@@ -24,6 +24,59 @@ const test = base.extend<{ server: MockServer }>({
   },
 });
 
+for (const [path, endpoint] of [
+  ['/', '/stats'],
+  ['/plans', '/plans'],
+  ['/plans/plan-c81d44a0', '/plans/plan-c81d44a0'],
+  ['/migrations/mig-5d7e2b4a12', '/migrations/mig-5d7e2b4a12'],
+  ['/providers', '/providers'],
+  ['/inventory/rhosp17-dc1', '/providers/rhosp17-dc1/inventory'],
+  ['/events', '/events'],
+  ['/hooks', '/hooks'],
+  ['/notifications', '/notifications/channels'],
+  ['/advisor', '/advisor/status'],
+  ['/advisor/policies', '/advisor/policies'],
+  ['/advisor/recommendations/rec-d4e6f8a09001', '/advisor/recommendations/rec-d4e6f8a09001'],
+  ['/users', '/users'],
+]) {
+  test(`a refused load on ${path} offers Retry and recovers without losing focus`, async ({ page, server }) => {
+    expect(server.health.auth_disabled).toBe(false);
+    let failing = true;
+    await page.route('**/api/v1/**', async (route) => {
+      if (failing && new URL(route.request().url()).pathname === `/api/v1${endpoint}`) {
+        await route.fulfill({ status: 503, json: { detail: 'Audit service unavailable' } });
+      } else await route.fallback();
+    });
+    await page.goto(path!);
+    const error = page.getByRole('alert').filter({ hasText: 'Audit service unavailable' }).first();
+    await expect(error).toBeVisible({ timeout: 15_000 });
+    failing = false;
+    await error.getByRole('button', { name: 'Retry', exact: true }).click();
+    await expect(error).toHaveCount(0);
+    await expect(page.getByRole('heading', { level: 1 })).toBeFocused();
+  });
+}
+
+test('the plan notification panel recovers a failed catalog without hiding its subscriptions', async ({ page, server }) => {
+  expect(server.subscriptions.size).toBeGreaterThan(0);
+  let failing = true;
+  await page.route('**/api/v1/notifications/channels', async (route) => {
+    if (failing) await route.fulfill({ status: 503, json: { detail: 'Catalog unavailable' } });
+    else await route.fallback();
+  });
+  await page.goto('/plans/plan-4f2a9c1e');
+  const panel = page.getByRole('region', { name: 'Notifications', exact: true });
+  await expect(panel.getByRole('listitem', { name: 'ops-slack', exact: true })).toBeVisible();
+  const error = panel.getByRole('alert');
+  await expect(error).toContainText('Channels are unavailable');
+  await expect(panel.getByLabel('Channel', { exact: true })).toContainText('Channels unavailable');
+  failing = false;
+  await error.getByRole('button', { name: 'Retry', exact: true }).click();
+  await expect(error).toHaveCount(0);
+  await expect(panel.getByLabel('Channel', { exact: true })).toBeEnabled();
+  await expect(panel.getByRole('button', { name: 'Add subscription', exact: true })).not.toHaveAttribute('aria-disabled');
+});
+
 test('one-time token requires acknowledgement and warns before navigation', async ({ page, server }) => {
   expect(server.health.auth_disabled).toBe(false);
   await page.goto('/users');

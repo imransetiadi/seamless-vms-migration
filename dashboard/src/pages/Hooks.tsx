@@ -1,4 +1,4 @@
-import { Pencil, Plus, Save, Trash2 } from 'lucide-react';
+import { CircleCheck, Pencil, Plus, Save, Trash2 } from 'lucide-react';
 import { useRef, useState, type FormEvent } from 'react';
 import { useCreateHook, useDeleteHook, useHooks, useUpdateHook } from '../api/hooks';
 import { useRole } from '../api/session';
@@ -9,10 +9,13 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField, TextField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { SectionNav } from '../components/SectionNav';
 import { LoadingBlock } from '../components/Skeleton';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { HOOK_KIND_LABELS } from '../lib/cutover';
 import { usePageTitle } from '../lib/usePageTitle';
+import { useDraftGuard } from '../lib/useDraftGuard';
+import { useHashLanding } from '../lib/useHashLanding';
 
 interface HookForm {
   name: string;
@@ -55,30 +58,43 @@ function fieldsOf(form: HookForm): HookPatch {
 /** The hook catalog (SDD §16, §23.3, plan task N12a): every role reads it, an admin keeps it. */
 export default function Hooks() {
   usePageTitle('Hooks');
+  useHashLanding(true);
   const canManage = useRole() === 'admin';
   const hooks = useHooks();
   const create = useCreateHook();
   const update = useUpdateHook();
   const remove = useDeleteHook();
   const [form, setForm] = useState<HookForm>(EMPTY);
+  const [initial, setInitial] = useState<HookForm>(EMPTY);
+  const [announcement, setAnnouncement] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Hook | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const catalogRef = useRef<HTMLHeadingElement>(null);
+  const deleteReturnRef = useRef<HTMLElement | null>(null);
   const write = editing ? update : create;
+  const pending = create.isPending || update.isPending || remove.isPending;
+  const waitReason = pending ? 'Wait for the current hook operation to finish.' : null;
+  const draft = useDraftGuard(JSON.stringify(form) !== JSON.stringify(initial), pending, reset);
   const set = (key: keyof HookForm) => (event: { target: { value: string } }) => setForm((current) => ({ ...current, [key]: event.target.value }));
 
-  function reset() {
+  function reset(focus = true) {
     setForm(EMPTY);
+    setInitial(EMPTY);
     setEditing(null);
     create.reset();
     update.reset();
+    if (focus) requestAnimationFrame(() => nameRef.current?.focus());
   }
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    if (write.isPending) return;
+    if (pending) return;
+    // Enter can submit from a field: move focus before its fieldset becomes disabled.
+    event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]')?.focus({ preventScroll: true });
+    setAnnouncement('');
     const fields = fieldsOf(form);
-    const done = { onSuccess: () => { reset(); requestAnimationFrame(() => nameRef.current?.focus()); } };
+    const done = { onSuccess: () => { setAnnouncement(`Hook ${form.name.trim()} ${editing ? 'saved' : 'registered'}.`); reset(); } };
     if (editing) update.mutate({ name: editing, patch: fields }, done);
     else create.mutate({ name: form.name.trim(), kind: form.kind, ...fields }, done);
   }
@@ -91,53 +107,62 @@ export default function Hooks() {
         description="Playbooks and webhooks a plan runs at the points of its network cut-over. A hook runs code with the control plane's reach, so only an admin registers one."
         meta={<TechPreviewBadge feature="network" />}
       />
+      {canManage && (
+        <p role="status" className="mb-3 flex items-start gap-2 text-sm text-status-success empty:hidden">
+          {announcement && <><CircleCheck aria-hidden className="mt-0.5 size-4 shrink-0" />{announcement}</>}
+        </p>
+      )}
+      <SectionNav label="Hook sections" sections={[['hook-catalog', 'Catalog'], ...(canManage ? [['hook-form', editing ? 'Edit hook' : 'Register hook'] as const] : [])]} />
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         {canManage ? (
-          <Panel title={editing ? `Edit hook ${editing}` : 'Register hook'} className="[overflow-wrap:anywhere]">
+          <Panel id="hook-form" title={editing ? `Edit hook ${editing}` : 'Register hook'} className="[overflow-wrap:anywhere]">
             <form onSubmit={submit} className="flex flex-col gap-4">
-              <TextField
-                ref={nameRef}
-                label="Name"
-                value={form.name}
-                onChange={set('name')}
-                readOnly={editing !== null}
-                required
-                autoComplete="off"
-                maxLength={63}
-                hint={editing ? 'A hook keeps its name.' : '2-63 lowercase letters, digits and hyphens, starting with a letter or a digit.'}
-              />
-              <SelectField
-                label="Kind"
-                value={form.kind}
-                onChange={(event) => setForm((current) => ({ ...current, kind: event.target.value as Hook['kind'] }))}
-                options={(['playbook', 'webhook'] as const).map((value) => ({ value, label: HOOK_KIND_LABELS[value] }))}
-                disabled={editing !== null}
-                hint={editing ? 'A hook keeps its kind.' : form.kind === 'playbook' ? 'The AnsibleExecutor runs the playbook with the context document.' : 'The webhook is POSTed the context document with its bearer token.'}
-              />
-              <TextField label="Description" value={form.description} onChange={set('description')} autoComplete="off" />
-              {form.kind === 'playbook' ? (
-                <TextField label="Playbook path" value={form.playbook} onChange={set('playbook')} required autoComplete="off" spellCheck={false} hint="An absolute path to a .yml or .yaml file." />
-              ) : (
-                <>
-                  <TextField label="URL" value={form.url} onChange={set('url')} required autoComplete="off" spellCheck={false} inputMode="url" hint="https://, with no user information." />
-                  <TextField label="Secret" value={form.secret} onChange={set('secret')} required autoComplete="off" spellCheck={false} hint="The name of the secret whose key token is the webhook's bearer token." />
-                </>
-              )}
-              <TextField label="Timeout (s)" value={form.timeout} onChange={set('timeout')} inputMode="numeric" autoComplete="off" hint="1-1800 seconds; 300 by default." />
-              <SelectField
-                label="Revert"
-                value={form.revert}
-                onChange={set('revert')}
-                options={[{ value: '', label: 'None' }, ...others.map((hook) => ({ value: hook.name, label: hook.name }))]}
-                hint="The hook a rollback runs to undo this one."
-              />
-              {write.error && <ErrorBanner error={write.error} title={editing ? 'The hook was not saved' : 'The hook was not registered'} />}
+              <fieldset disabled={pending} className="flex min-w-0 flex-col gap-4">
+                <legend className="sr-only">Hook details</legend>
+                <TextField
+                  ref={nameRef}
+                  label="Name"
+                  value={form.name}
+                  onChange={set('name')}
+                  readOnly={editing !== null}
+                  required
+                  autoComplete="off"
+                  maxLength={63}
+                  hint={editing ? 'A hook keeps its name.' : '2-63 lowercase letters, digits and hyphens, starting with a letter or a digit.'}
+                />
+                <SelectField
+                  label="Kind"
+                  value={form.kind}
+                  onChange={(event) => setForm((current) => ({ ...current, kind: event.target.value as Hook['kind'] }))}
+                  options={(['playbook', 'webhook'] as const).map((value) => ({ value, label: HOOK_KIND_LABELS[value] }))}
+                  disabled={editing !== null}
+                  hint={editing ? 'A hook keeps its kind.' : form.kind === 'playbook' ? 'The AnsibleExecutor runs the playbook with the context document.' : 'The webhook is POSTed the context document with its bearer token.'}
+                />
+                <TextField label="Description" value={form.description} onChange={set('description')} autoComplete="off" />
+                {form.kind === 'playbook' ? (
+                  <TextField label="Playbook path" value={form.playbook} onChange={set('playbook')} required autoComplete="off" spellCheck={false} hint="An absolute path to a .yml or .yaml file." />
+                ) : (
+                  <>
+                    <TextField label="URL" value={form.url} onChange={set('url')} required autoComplete="off" spellCheck={false} inputMode="url" hint="https://, with no user information." />
+                    <TextField label="Secret" value={form.secret} onChange={set('secret')} required autoComplete="off" spellCheck={false} hint="The name of the secret whose key token is the webhook's bearer token." />
+                  </>
+                )}
+                <TextField label="Timeout (s)" value={form.timeout} onChange={set('timeout')} inputMode="numeric" autoComplete="off" hint="1-1800 seconds; 300 by default." />
+                <SelectField
+                  label="Revert"
+                  value={form.revert}
+                  onChange={set('revert')}
+                  options={[{ value: '', label: 'None' }, ...others.map((hook) => ({ value: hook.name, label: hook.name }))]}
+                  hint="The hook a rollback runs to undo this one."
+                />
+              </fieldset>
+              {write.error && <ErrorBanner error={write.error} title={editing ? 'The hook was not saved' : 'The hook was not registered'} reveal />}
               <div className="flex flex-wrap gap-2">
-                <Button size="lg" variant="primary" type="submit" icon={editing ? Save : Plus} loading={write.isPending}>
+                <Button size="lg" variant="primary" type="submit" icon={editing ? Save : Plus} loading={write.isPending} disabledReason={remove.isPending ? waitReason : null}>
                   {editing ? 'Save hook' : 'Register hook'}
                 </Button>
                 {editing && (
-                  <Button size="lg" onClick={reset}>
+                  <Button size="lg" onClick={draft.close} disabledReason={waitReason}>
                     Cancel
                   </Button>
                 )}
@@ -149,7 +174,7 @@ export default function Hooks() {
             Registering hooks requires the admin role.
           </p>
         )}
-        <Panel title="Catalog" className="[overflow-wrap:anywhere]">
+        <Panel id="hook-catalog" headingRef={catalogRef} title="Catalog" className="[overflow-wrap:anywhere]">
           {hooks.isPending && <LoadingBlock label="Loading hooks" rows={3} />}
           {hooks.error && <ErrorBanner error={hooks.error} title="Hooks are unavailable" onRetry={() => void hooks.refetch()} />}
           {hooks.data &&
@@ -176,22 +201,28 @@ export default function Hooks() {
                       <div className="flex flex-wrap gap-2 pt-1">
                         <Button
                           icon={Pencil}
+                          disabledReason={waitReason}
                           aria-label={`Edit ${hook.name}`}
-                          onClick={() => {
+                          onClick={() => draft.request(() => {
                             create.reset();
                             update.reset();
                             setEditing(hook.name);
-                            setForm(formOf(hook));
+                            const values = formOf(hook);
+                            setForm(values);
+                            setInitial(values);
                             requestAnimationFrame(() => nameRef.current?.focus());
-                          }}
+                          })}
                         >
                           Edit
                         </Button>
                         <Button
                           icon={Trash2}
                           variant="danger"
+                          disabledReason={waitReason}
                           aria-label={`Delete ${hook.name}`}
-                          onClick={() => {
+                          onClick={(event) => {
+                            deleteReturnRef.current = event.currentTarget;
+                            setAnnouncement('');
                             remove.reset();
                             setDeleting(hook);
                           }}
@@ -218,17 +249,21 @@ export default function Hooks() {
         icon={Trash2}
         pending={remove.isPending}
         error={remove.error}
+        returnFocusRef={deleteReturnRef}
         onCancel={() => setDeleting(null)}
         onConfirm={() => {
           if (!deleting) return;
           remove.mutate(deleting.name, {
             onSuccess: () => {
-              if (editing === deleting.name) reset();
+              if (editing === deleting.name) reset(false);
+              deleteReturnRef.current = catalogRef.current;
+              setAnnouncement(`Hook ${deleting.name} deleted.`);
               setDeleting(null);
             },
           });
         }}
       />
+      {draft.guard}
     </>
   );
 }

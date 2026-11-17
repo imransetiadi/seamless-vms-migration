@@ -1,10 +1,10 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Migration } from '../api/types';
 import { formatPct } from '../lib/format';
 import { TONE_CLASSES } from '../lib/status';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp, TEST_NOW } from '../test/utils';
 import Overview from './Overview';
 
 /** Every GET the page makes, as its path and query under /api/v1. */
@@ -254,6 +254,9 @@ describe('Overview page (mock data)', () => {
   });
 
   it('runs the Downtime now clocks in model time in demo mode, as the migration page does (SDD §16, ADV-16)', async () => {
+    // A render delayed by a busy machine must not turn the initial five seconds into eight: at 60× speed that
+    // left the old 5–6 minute assertion behind before it could run. Keep wall time fixed and assert exact scaling.
+    vi.spyOn(Date, 'now').mockReturnValue(TEST_NOW);
     const server = createTestServer();
     server.health = { ...server.health, demo_speed: 60 };
     const web03 = server.migrations.find((m) => m.vm.name === 'web-03')!;
@@ -261,8 +264,8 @@ describe('Overview page (mock data)', () => {
     renderWithApp(<Overview />, { server });
     const down = await screen.findByRole('region', { name: /downtime now/i });
     const item = (await within(down).findByRole('link', { name: 'web-03' })).closest('li')!;
-    // about 5 s of wall time: about 5 minutes of model time
-    await waitFor(() => expect(item).toHaveTextContent(/\b[5-6]:\d{2}of /));
+    // Five seconds of wall time are exactly five minutes of model time.
+    await waitFor(() => expect(item).toHaveTextContent(/\b5:00of /));
     expect(down).toHaveTextContent('Demo time: 60× faster than real time.');
   });
 

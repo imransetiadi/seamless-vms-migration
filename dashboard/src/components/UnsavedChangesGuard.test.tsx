@@ -28,3 +28,15 @@ it('keeps pending requests on the page instead of discarding their result', asyn
   expect(screen.getByRole('button', { name: 'Discard changes' })).toHaveAttribute('aria-disabled', 'true');
   expect(router.state.location.pathname).toBe('/edit');
 });
+
+it('allows section jumps that keep the draft, including returning through Back', async () => {
+  const user = userEvent.setup();
+  const router = createMemoryRouter([{ path: '/edit', element: <><UnsavedChangesGuard dirty /><Link to="#catalog">Catalog</Link></> }], { initialEntries: ['/edit'] });
+  render(<RouterProvider router={router} />);
+  await user.click(screen.getByText('Catalog'));
+  expect(router.state.location.hash).toBe('#catalog');
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  await act(() => router.navigate(-1));
+  expect(router.state.location.hash).toBe('');
+  expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+});

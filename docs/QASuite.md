@@ -1382,6 +1382,11 @@ npm ci
 npm test                      # Vitest (jsdom): 4 workers and 30 s per test locally, so a machine busy with other
                               # work does not time the plan-form tests out; CI (CI set) keeps the default workers
 npm run typecheck             # src, the Vite/Tailwind configs and the Playwright specs (tsconfig.e2e.json)
+npx playwright install --with-deps chromium webkit
+npm run test:e2e              # built mock-mode dashboard, both engines; catalog drafts, secrets, focus and shortcuts
+npx playwright test --config playwright.api.config.ts
+                              # production fetch paths with synthetic API responses: failure/Retry, roles, audit
+                              # history and one-time tokens; both browser suites run in the dashboard-e2e CI job
 npm run build                 # same as `make dashboard-build`; type-checks the app only (typecheck:app), so a broken
                               # test spec never blocks a build; CI also runs `npm run lint` and `npm run typecheck`;
                               # ends with scripts/check-bundle.mjs: fails if the entry's static imports reach `charts`

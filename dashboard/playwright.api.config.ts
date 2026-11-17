@@ -4,6 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './e2e',
   testMatch: 'api-audit.spec.ts',
+  outputDir: 'test-results/api-audit',
   timeout: 30_000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

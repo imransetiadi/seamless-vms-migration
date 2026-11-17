@@ -388,6 +388,7 @@ describe('axe-core: no WCAG violations', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Generate key' }));
     expect(await violations()).toEqual([]);
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await user.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Discard changes' }));
     await user.click(within(mailbox).getByRole('button', { name: 'Delete ops-mailbox' }));
     await screen.findByRole('alertdialog');
     expect(await violations()).toEqual([]);
@@ -534,4 +535,3 @@ describe('changed-extent tracking (SDD §16, §28, plan task CE10)', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 });
-

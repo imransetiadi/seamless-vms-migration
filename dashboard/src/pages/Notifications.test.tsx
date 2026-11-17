@@ -53,6 +53,8 @@ describe('the notification catalog (SDD §16, §24.9, plan task NT9)', () => {
 
     // Edit opens the form with the channel's values, its name and kind read only
     await user.click(within(within(catalog).getByRole('listitem', { name: 'app-owners' })).getByRole('button', { name: 'Edit app-owners' }));
+    // The refused registration is still a draft: explicitly discard it before switching to this channel.
+    await user.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Discard changes' }));
     // the form takes the focus a frame later, as the Hooks page's does: type once it has
     await waitFor(() => expect(screen.getByLabelText(/^Name/)).toHaveFocus());
     expect(screen.getByLabelText(/^Name/)).toHaveValue('app-owners');
