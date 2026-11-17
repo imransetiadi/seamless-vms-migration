@@ -2,21 +2,24 @@ import { useRef, useState } from 'react';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { UnsavedChangesGuard } from '../components/UnsavedChangesGuard';
 
-export function useDraftGuard(dirty: boolean, pending: boolean, onClose: () => void) {
+export function useDraftGuard(dirty: boolean, pending: boolean, onClose: () => void, { navigation = true } = {}) {
   const [discarding, setDiscarding] = useState(false);
   const focus = useRef<HTMLElement | null>(null);
-  const close = () => {
+  const next = useRef<() => void>(onClose);
+  const request = (action: () => void) => {
     if (pending) return;
     if (!dirty) {
-      onClose();
+      action();
       return;
     }
+    next.current = action;
     focus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setDiscarding(true);
   };
+  const close = () => request(onClose);
   const guard = (
     <>
-      <UnsavedChangesGuard dirty={dirty || pending} pending={pending} />
+      {navigation && <UnsavedChangesGuard dirty={dirty || pending} pending={pending} />}
       {discarding && (
         <ConfirmDialog
           open
@@ -29,11 +32,11 @@ export function useDraftGuard(dirty: boolean, pending: boolean, onClose: () => v
           onCancel={() => setDiscarding(false)}
           onConfirm={() => {
             setDiscarding(false);
-            onClose();
+            next.current();
           }}
         />
       )}
     </>
   );
-  return { close, guard };
+  return { close, request, guard };
 }

@@ -1,5 +1,5 @@
-import { Globe, Plus, X } from 'lucide-react';
-import { useState, type FormEvent } from 'react';
+import { CircleCheck, Globe, Plus, X } from 'lucide-react';
+import { useRef, useState, type FormEvent } from 'react';
 import { useCreateNotificationSubscription, useDeleteNotificationSubscription, useNotificationChannels, useNotificationSubscriptions } from '../api/hooks';
 import { useRole } from '../api/session';
 import { DEFAULT_NOTIFY_TOPICS, NOTIFY_TOPICS, type NotificationChannelView, type NotificationSubscription, type NotifyTopic } from '../api/types';
@@ -44,6 +44,7 @@ export function SubscriptionForm({ planId, channels, channelsError, disabledReas
     disabledReason ??
     (channelsError ? 'The channel catalog could not be loaded.' : channels === undefined ? 'The channel catalog is not loaded yet.' : null) ??
     (options.length === 0 ? 'Register a channel on the Notifications page first.' : topics.length === 0 ? 'Choose at least one topic.' : null);
+  const placeholder = channelsError ? 'Channels unavailable' : channels === undefined ? 'Loading channels…' : 'No channels registered';
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -68,7 +69,7 @@ export function SubscriptionForm({ planId, channels, channelsError, disabledReas
           create.reset();
           setChannel(event.target.value);
         }}
-        options={options.length ? options : [{ value: '', label: 'No channels registered' }]}
+        options={options.length ? options : [{ value: '', label: placeholder }]}
         disabled={options.length === 0}
         hint={planId === null ? 'A channel of the catalog, to follow every plan.' : 'A channel of the catalog, to follow this plan.'}
       />
@@ -106,13 +107,16 @@ export interface SubscriptionItemProps {
   removeReason: string | null;
   /** The Remove button, when the role may see it at all. */
   removable: boolean;
+  onRemoved?: (channel: string) => void;
 }
 
 /** One subscription (SDD §16): its channel with its kind, its topics in words, and Remove. */
-export function SubscriptionItem({ subscription, kind, everyPlanMark, removeReason, removable }: SubscriptionItemProps) {
+export function SubscriptionItem({ subscription, kind, everyPlanMark, removeReason, removable, onRemoved }: SubscriptionItemProps) {
   const remove = useDeleteNotificationSubscription();
+  const itemRef = useRef<HTMLLIElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   return (
-    <li aria-label={subscription.channel} className="flex flex-wrap items-start justify-between gap-2 py-2">
+    <li ref={itemRef} aria-label={subscription.channel} className="flex flex-wrap items-start justify-between gap-2 py-2">
       <div className="min-w-0 [overflow-wrap:anywhere]">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">{subscription.channel}</span>
@@ -123,7 +127,17 @@ export function SubscriptionItem({ subscription, kind, everyPlanMark, removeReas
         {remove.error ? <ErrorBanner error={remove.error} title="The subscription was not removed" className="mt-2" /> : null}
       </div>
       {removable ? (
-        <Button icon={X} aria-label={`Remove ${subscription.channel}`} loading={remove.isPending} disabledReason={removeReason} onClick={() => remove.mutate(subscription.id)}>
+        <Button ref={buttonRef} icon={X} aria-label={`Remove ${subscription.channel}`} loading={remove.isPending} disabledReason={removeReason} onClick={() => remove.mutate(subscription.id, {
+          onSuccess: () => {
+            // The focused trigger leaves with its row; never steal focus if the user already moved on.
+            if (document.activeElement === buttonRef.current) {
+              const heading = itemRef.current?.closest('section')?.querySelector<HTMLElement>('h2, h3');
+              heading?.setAttribute('tabindex', '-1');
+              heading?.focus();
+            }
+            onRemoved?.(subscription.channel);
+          },
+        })}>
           Remove
         </Button>
       ) : null}
@@ -140,12 +154,16 @@ export function PlanNotificationsPanel({ planId }: { planId: string }) {
   const own = useNotificationSubscriptions({ plan_id: planId });
   const all = useNotificationSubscriptions();
   const channels = useNotificationChannels();
+  const [announcement, setAnnouncement] = useState('');
   const canEdit = hasRole(role, 'operator');
   const kindOf = new Map((channels.data ?? []).map((c) => [c.name, c.kind]));
   const rows = own.data && all.data ? [...own.data, ...all.data.filter((sub) => sub.plan_id === null)] : null;
   const loadError = own.error ?? all.error;
   return (
     <Panel title="Notifications" description="The channels that follow this plan, for their topics. Adding or removing one leaves the plan as it is.">
+      <p role="status" className="mb-2 flex items-start gap-2 text-sm text-status-success empty:hidden">
+        {announcement && <><CircleCheck aria-hidden className="mt-0.5 size-4 shrink-0" />{announcement}</>}
+      </p>
       {(own.isPending || all.isPending) && <LoadingBlock label="Loading subscriptions…" rows={2} />}
       {loadError ? (
         <ErrorBanner
@@ -168,6 +186,7 @@ export function PlanNotificationsPanel({ planId }: { planId: string }) {
                 everyPlanMark={sub.plan_id === null}
                 removable
                 removeReason={!canEdit ? OPERATOR_REASON : sub.plan_id === null ? EVERY_PLAN_REASON : null}
+                onRemoved={(name) => setAnnouncement(`Subscription to ${name} removed.`)}
               />
             ))}
           </ul>
@@ -176,7 +195,8 @@ export function PlanNotificationsPanel({ planId }: { planId: string }) {
         ))}
       <div className="mt-4 border-t border-border pt-4">
         <h3 className="mb-3 text-sm font-semibold text-foreground">Add subscription</h3>
-        <SubscriptionForm planId={planId} channels={channels.data} channelsError={channels.error} disabledReason={canEdit ? null : OPERATOR_REASON} />
+        {channels.error && <ErrorBanner error={channels.error} title="Channels are unavailable" onRetry={() => void channels.refetch()} className="mb-3" />}
+        <SubscriptionForm planId={planId} channels={channels.data} channelsError={channels.error} disabledReason={canEdit ? null : OPERATOR_REASON} onAdded={() => setAnnouncement('Subscription added.')} />
       </div>
     </Panel>
   );

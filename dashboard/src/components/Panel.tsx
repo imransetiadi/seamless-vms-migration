@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from 'react';
+import { useId, type ReactNode, type RefObject } from 'react';
 import { cn } from '../lib/cn';
 
 export interface PanelProps {
@@ -12,10 +12,12 @@ export interface PanelProps {
   level?: 2 | 3;
   /** Makes the panel a place a link lands on (`#id`, SDD §16): scrolled to and focused. */
   id?: string;
+  /** Recovery focus when a catalog action removes its own trigger (SDD §16). */
+  headingRef?: RefObject<HTMLHeadingElement | null>;
 }
 
 /** A titled card section; the heading labels the region for assistive technology. */
-export function Panel({ title, description, actions, children, className, bodyClassName, level = 2, id }: PanelProps) {
+export function Panel({ title, description, actions, children, className, bodyClassName, level = 2, id, headingRef }: PanelProps) {
   const headingId = useId();
   const Heading = level === 2 ? 'h2' : 'h3';
   return (
@@ -27,7 +29,7 @@ export function Panel({ title, description, actions, children, className, bodyCl
     >
       <div className="flex flex-wrap items-start justify-between gap-3 rounded-t-xl border-b border-border bg-muted/20 px-4 py-3">
         <div className="min-w-0">
-          <Heading id={headingId} className="text-sm font-semibold text-foreground">
+          <Heading ref={headingRef} tabIndex={headingRef ? -1 : undefined} id={headingId} className="text-sm font-semibold text-foreground">
             {title}
           </Heading>
           {description && <div className="mt-0.5 text-xs text-muted-foreground">{description}</div>}
