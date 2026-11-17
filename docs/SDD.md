@@ -5653,6 +5653,18 @@ is no origin a browser sends (review RV31-03).
   navigation recovery, while temporary failures retain Retry. Advisor has section shortcuts for recommendations,
   incident search, notes and the data explanation. Browser regressions cover Chromium and WebKit; this is not
   a claim of testing Safari settings, assistive technology or physical devices in every supported environment.
+* Catalog UI audit remediation (2026-11-17): changed Hooks and Notifications forms warn before cancelling,
+  replacing the form with another catalog item, route navigation, Back or reload. A changed notification-secret
+  dialog also warns before Escape or Cancel; its value stays in memory until saved or explicitly discarded.
+  Each page has one route blocker, including while its secret dialog is open; section jumps within the same
+  route and query preserve input without a discard warning. Hooks and Notifications provide named section
+  shortcuts to their catalog, form and, for Notifications, subscriptions. A pending catalog operation keeps
+  conflicting actions unavailable with a reason and prevents edits to submitted fields. Successful catalog
+  writes announce their result; deleting an item returns focus to its catalog heading. Removing a subscription
+  returns focus to the panel heading when its trigger still held focus. Subscription channel pickers distinguish
+  loading, unavailable and empty catalogs; a failed catalog on a plan offers Retry beside its subscription form,
+  retaining the subscriptions already read. These changes close the findings recorded in
+  `docs/UI-UX-AUDIT-2026-11-17.md` using the existing APIs and role policy.
 * Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
   if it had not been asked — the result names each item whose request failed, with Retry for those
   items, which stay named while their Retry runs, and the announcement counts them ("Checked 2 of 3 providers: 2
