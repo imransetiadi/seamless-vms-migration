@@ -11,7 +11,7 @@ export interface Metric {
   /** Colours the value only when the number itself is the signal (failures, compliance). */
   tone?: Tone;
   /** Opens the records behind a current figure. */
-  inspect?: { label: string; onClick: () => void };
+  inspect?: { label: string; onClick: () => void; id?: string };
 }
 
 function MetricValue({ metric, busy }: { metric: Metric; busy: boolean }) {
@@ -19,7 +19,7 @@ function MetricValue({ metric, busy }: { metric: Metric; busy: boolean }) {
   const style = cn('num text-xl font-semibold leading-tight sm:text-2xl', color);
   if (metric.inspect && !busy) {
     return (
-      <button type="button" aria-haspopup="dialog" aria-label={metric.inspect.label}
+      <button type="button" id={metric.inspect.id} aria-haspopup="dialog" aria-label={metric.inspect.label}
         onClick={(event) => {
           event.currentTarget.focus({ preventScroll: true });
           metric.inspect?.onClick();

@@ -105,8 +105,53 @@ for (const width of [390, 1440]) {
     await result.click();
     await expect(page).toHaveURL(new RegExp(destination! + '$'));
     await expect(page.getByRole('heading', { level: 1 })).toContainText('web-03');
+    await page.goBack();
+    await expect(search).toHaveValue('web-03');
+    await expect(search).toBeFocused();
+    await expect(result).toHaveAttribute('href', destination!);
+    await expect(page.getByLabel('Plan', { exact: true })).toHaveValue('plan-4f2a9c1e');
+    await page.keyboard.press('Escape');
+    await expect(find).toBeFocused();
+    await find.click();
+    await expect(search).toHaveValue('');
   });
 }
+
+test('a fresh Overview visit starts with its own search after a queue jump', async ({ page }) => {
+  await page.goto('/login');
+  await page.getByLabel('API token', { exact: true }).fill('viewer');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  const attention = page.getByRole('navigation', { name: 'Migration queues' }).getByRole('link', { name: /Needs attention/ });
+  await attention.click();
+  const find = page.getByRole('button', { name: 'Find migration', exact: true });
+  await find.click();
+  const dialog = page.getByRole('dialog', { name: 'Find migration' });
+  await dialog.getByRole('searchbox').fill('web-03');
+  await dialog.getByRole('link', { name: /web-03/ }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('web-03');
+  await page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Overview' }).click();
+  await attention.click();
+  await expect(page.getByRole('region', { name: 'Needs attention' })).toBeFocused();
+  await expect(dialog).toHaveCount(0);
+  await find.click();
+  await expect(dialog.getByRole('searchbox')).toHaveValue('');
+});
+
+test('the migration finder keeps results reachable at 200% text on a short screen', async ({ page }) => {
+  await page.setViewportSize({ width: 844, height: 320 });
+  await page.goto('/login');
+  await page.getByLabel('API token', { exact: true }).fill('viewer');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+  await page.getByRole('button', { name: 'Find migration', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Find migration' });
+  await dialog.getByRole('searchbox').fill('web-03');
+  const result = dialog.getByRole('link', { name: /web-03/ });
+  await result.scrollIntoViewIfNeeded();
+  await expect(result).toBeInViewport();
+  await result.click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('web-03');
+});
 
 test('a failure count opens the matching VMs and Escape returns to the metric', async ({ page }) => {
   await page.goto('/login');
@@ -121,6 +166,13 @@ test('a failure count opens the matching VMs and Escape returns to the metric', 
   await dialog.getByRole('button', { name: 'Remove Failed phase filter' }).click();
   await dialog.getByRole('button', { name: 'Next', exact: true }).click();
   await expect(dialog.getByRole('status')).toContainText(/9–16/);
+  const firstOnPage = dialog.getByRole('link').first();
+  const destination = await firstOnPage.getAttribute('href');
+  await firstOnPage.click();
+  await expect(page).toHaveURL(new RegExp(destination! + '$'));
+  await page.goBack();
+  await expect(dialog.getByRole('status')).toContainText(/9–16/);
+  await expect(firstOnPage).toHaveAttribute('href', destination!);
   await page.keyboard.press('Escape');
   await expect(failed).toBeFocused();
 });

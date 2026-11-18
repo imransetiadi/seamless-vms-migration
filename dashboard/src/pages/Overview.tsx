@@ -14,10 +14,10 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useDemoSpeed, useMigrationSummaries, usePlans, useStats } from '../api/hooks';
-import type { MigrationSummary, Phase, Plan } from '../api/types';
+import { PHASES, type MigrationSummary, type Phase, type Plan } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -312,7 +312,12 @@ export default function Overview() {
   usePageTitle('Overview');
   const [params, setParams] = useSearchParams();
   const planId = params.get('plan') ?? '';
-  const [finderPhase, setFinderPhase] = useState<Phase | 'all' | null>(null);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const from = location.state?.finderPhase;
+  const finderPhase: Phase | 'all' | null = from === 'all' || PHASES.includes(from) ? from : null;
+  const findButton = useRef<HTMLButtonElement>(null);
+  const returnFocus = useRef<HTMLElement>(null);
   const plansQuery = usePlans();
   const stats = useStats(planId || null);
   // summaries: what the page's rules read, not every migration whole (SDD §16, perf audit PF-02)
@@ -355,11 +360,27 @@ export default function Overview() {
     setParams(next, { replace: true });
   };
 
+  // Replacing this entry gives even a native #queue jump its own router key. The finder keeps
+  // its search and pagination in memory for that entry when a result leads to another page.
+  const setFinderPhase = (phase: Phase | 'all' | null) => {
+    const { pathname, search, hash, state } = location;
+    void navigate({ pathname, search, hash }, { replace: true, state: { ...state, finderPhase: phase }, preventScrollReset: true });
+  };
+  const closeFinder = () => {
+    // Live updates may have removed the metric that opened the finder.
+    returnFocus.current = document.getElementById(`overview-metric-${finderPhase}`) ?? findButton.current;
+    setFinderPhase(null);
+  };
+
   const phaseMetric = (phase: Phase, count: number) => {
     const value = formatNumber(count);
     if (!count || !migrationsQuery.data || stats.isPlaceholderData) return { value };
     const action = phase === 'completed' ? 'View migrations awaiting finalize' : `View ${phaseMeta(phase).label.toLowerCase()} migrations`;
-    return { value, inspect: { label: `${action} (${value})`, onClick: () => setFinderPhase(phase) } };
+    return { value, inspect: {
+      label: `${action} (${value})`,
+      id: `overview-metric-${phase}`,
+      onClick: () => setFinderPhase(phase),
+    } };
   };
 
   const header = (
@@ -384,7 +405,7 @@ export default function Overview() {
               ]}
             />
             {!unknownPlan && (
-              <Button icon={Search} size="lg" variant="primary" aria-haspopup="dialog"
+              <Button ref={findButton} icon={Search} size="lg" variant="primary" aria-haspopup="dialog"
                 disabledReason={migrationsQuery.isPending ? 'Loading migrations…' : migrationsUnknown ? 'Retry the migration list to search.' : null}
                 onClick={() => setFinderPhase('all')}>
                 Find migration
@@ -400,13 +421,14 @@ export default function Overview() {
           </nav>
         )}
       </header>
-      {finderPhase !== null && !unknownPlan && migrationsQuery.data && (
+      {finderPhase && !unknownPlan && migrationsQuery.data && (
         <MigrationFinder
           migrations={migrations}
           plans={plansById}
           scope={planId ? plansById.get(planId)?.name ?? planId : 'All plans'}
           initialPhase={finderPhase}
-          onClose={() => setFinderPhase(null)}
+          returnFocusRef={returnFocus}
+          onClose={closeFinder}
         />
       )}
 

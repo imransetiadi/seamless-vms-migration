@@ -11,6 +11,7 @@ export function useHashLanding(ready: boolean): void {
   useEffect(() => {
     if (!ready || hash.length < 2) return;
     const target = hashTarget(hash);
+    if (target?.closest('[inert]')) return;
     target?.scrollIntoView?.({ block: 'start' });
     target?.focus({ preventScroll: true });
   }, [hash, ready]);

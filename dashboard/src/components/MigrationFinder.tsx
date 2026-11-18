@@ -1,7 +1,8 @@
 import { ArrowRight, Search, Server, X } from 'lucide-react';
-import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import type { MigrationSummary, Phase, Plan } from '../api/types';
+import { useListState } from '../lib/useListState';
 import { phaseMeta } from '../lib/phase';
 import { Button } from './Button';
 import { Modal } from './Modal';
@@ -9,19 +10,27 @@ import { PhaseBadge } from './StatusBadge';
 
 const PAGE_SIZE = 8;
 
-export function MigrationFinder({ migrations, plans, scope, initialPhase, onClose }: {
+export function MigrationFinder({ migrations, plans, scope, initialPhase, returnFocusRef, onClose }: {
   migrations: readonly MigrationSummary[];
   plans: ReadonlyMap<string, Plan>;
   scope: string;
   initialPhase: Phase | 'all';
+  returnFocusRef: RefObject<HTMLElement | null>;
   onClose: () => void;
 }) {
   const titleId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLUListElement>(null);
-  const [phase, setPhase] = useState(initialPhase);
-  const [query, setQuery] = useState('');
-  const [page, setPage] = useState(0);
+  useEffect(() => {
+    // History traversal can reset focus after the restored dialog has already focused its input.
+    const frame = requestAnimationFrame(() => {
+      if (document.activeElement === document.body) inputRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
+  const visit = useListState('overview-finder');
+  const [phase, setPhase] = visit.field('phase', initialPhase);
+  const [query, setQuery] = visit.field('query', '');
+  const [page, setPage] = visit.field('page', 1);
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return migrations.filter((m) => (phase === 'all' || m.phase === phase) && [
@@ -29,18 +38,15 @@ export function MigrationFinder({ migrations, plans, scope, initialPhase, onClos
     ].some((field) => field?.toLowerCase().includes(q)))
       .sort((a, b) => a.vm.name.localeCompare(b.vm.name) || a.id.localeCompare(b.id));
   }, [migrations, phase, plans, query]);
-  const last = Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1);
+  const last = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const current = Math.min(page, last);
-  const start = current * PAGE_SIZE;
+  const start = (current - 1) * PAGE_SIZE;
   const shown = rows.slice(start, start + PAGE_SIZE);
-  useLayoutEffect(() => {
-    if (listRef.current) listRef.current.scrollTop = 0;
-  }, [current, query, phase]);
   const count = `${rows.length} migration${rows.length === 1 ? '' : 's'}`;
-  const resultCount = last > 0 ? `${start + 1}–${start + shown.length} of ${count}` : count;
+  const resultCount = last > 1 ? `${start + 1}–${start + shown.length} of ${count}` : count;
   const emptyMessage = query.trim() || phase !== 'all' ? 'No matching migrations' : 'No migrations in this scope';
   return (
-    <Modal open placement="top" onClose={onClose} labelledBy={titleId} initialFocusRef={inputRef} closeOnBackdrop>
+    <Modal open placement="top" onClose={onClose} labelledBy={titleId} initialFocusRef={inputRef} returnFocusRef={returnFocusRef} closeOnBackdrop>
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <h2 id={titleId} className="text-lg font-semibold">Find migration</h2>
@@ -51,18 +57,32 @@ export function MigrationFinder({ migrations, plans, scope, initialPhase, onClos
       <div className="relative mx-4 my-3">
         <Search aria-hidden className="pointer-events-none absolute top-3 left-3 size-5 text-muted-foreground" />
         <input type="search" ref={inputRef} aria-label="Search migrations" placeholder="VM, plan, phase, project or ID"
-          className="input pl-10" value={query} onChange={(e) => { setQuery(e.target.value); setPage(0); }} />
+          className="input pl-10" value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} />
       </div>
       {phase !== 'all' && (
         <div className="mb-3 px-4">
           <Button size="sm" aria-label={`Remove ${phaseMeta(phase).label} phase filter`}
-            onClick={() => { setPhase('all'); setPage(0); inputRef.current?.focus(); }}>
+            onClick={() => { setPhase('all'); setPage(1); inputRef.current?.focus(); }}>
             {phaseMeta(phase).label}<X aria-hidden className="size-3.5" />
           </Button>
         </div>
       )}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-3">
+        <p role="status" className="text-sm text-muted-foreground">
+          {rows.length > 0 ? resultCount : emptyMessage}
+        </p>
+        {rows.length === 0 && query && (
+          <Button onClick={() => { setQuery(''); setPage(1); inputRef.current?.focus(); }}>Clear search</Button>
+        )}
+        {last > 1 && (
+          <div className="flex flex-wrap gap-1">
+            <Button disabledReason={current === 1 ? 'First page' : null} onClick={() => setPage(current - 1)}>Previous</Button>
+            <Button disabledReason={current === last ? 'Last page' : null} onClick={() => setPage(current + 1)}>Next</Button>
+          </div>
+        )}
+      </div>
       {rows.length > 0 && (
-        <ul ref={listRef} className="min-h-0 overflow-y-auto border-y border-border">
+        <ul className="border-t border-border">
           {shown.map((m) => (
             <li key={m.id} className="border-b border-border last:border-0">
               <Link to={`/migrations/${encodeURIComponent(m.id)}`}
@@ -78,18 +98,6 @@ export function MigrationFinder({ migrations, plans, scope, initialPhase, onClos
           ))}
         </ul>
       )}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
-        <p role="status" className="text-sm text-muted-foreground">
-          {rows.length > 0 ? resultCount : emptyMessage}
-        </p>
-        {rows.length === 0 && query && <Button onClick={() => { setQuery(''); inputRef.current?.focus(); }}>Clear search</Button>}
-        {last > 0 && (
-          <div className="flex flex-wrap gap-1">
-            <Button disabledReason={current === 0 ? 'First page' : null} onClick={() => setPage(current - 1)}>Previous</Button>
-            <Button disabledReason={current === last ? 'Last page' : null} onClick={() => setPage(current + 1)}>Next</Button>
-          </div>
-        )}
-      </div>
     </Modal>
   );
 }

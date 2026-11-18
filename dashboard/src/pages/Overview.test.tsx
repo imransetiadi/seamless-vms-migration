@@ -1,7 +1,8 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import type { Migration } from '../api/types';
+import { queryKeys } from '../api/hooks';
+import type { Migration, Stats } from '../api/types';
 import { formatPct } from '../lib/format';
 import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp, TEST_NOW } from '../test/utils';
@@ -61,6 +62,21 @@ describe('Overview page (mock data)', () => {
     await user.click(dialog.getByRole('button', { name: 'Remove Failed phase filter' }));
     expect(dialog.getAllByRole('link').length).toBeGreaterThan(failures.length);
     expect(dialog.getByRole('searchbox')).toHaveFocus();
+  });
+
+  it('returns to Find migration if a live update removes the metric that opened the finder', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { queryClient } = renderWithApp(<Overview />);
+    const failed = await screen.findByRole('button', { name: /^View failed migrations/ });
+    const find = screen.getByRole('button', { name: 'Find migration' });
+    await user.click(failed);
+    await screen.findByRole('dialog', { name: 'Find migration' });
+    act(() => {
+      queryClient.setQueryData<Stats>(queryKeys.stats(), (stats) => stats && { ...stats, failed: 0 });
+    });
+    await waitFor(() => expect(failed).not.toBeInTheDocument());
+    await user.keyboard('{Escape}');
+    expect(find).toHaveFocus();
   });
 
   it('expands the complete attention queue in place and folds it back', async () => {
