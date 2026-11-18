@@ -25,7 +25,7 @@ import {
   TimerOff,
   type LucideIcon,
 } from 'lucide-react';
-import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { exportEventTrail, jsonLineParts } from '../api/eventExport';
 import { fetchEventTail, useApi, useEventTail, usePlans } from '../api/hooks';
@@ -178,6 +178,7 @@ export default function Events() {
   const [category, setCategory] = listState.field('category', 'all');
   const [query, setQuery] = listState.field('query', '');
   const searchRef = useRef<HTMLInputElement>(null);
+  const searchHintId = useId();
   const filtersActive = query !== '' || category !== 'all' || planId !== '' || showProgress;
   const clearFilters = () => {
     setQuery('');
@@ -231,14 +232,18 @@ export default function Events() {
   const filtered = useMemo(() => {
     const match = EVENT_CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
     const q = query.trim().toLowerCase();
+    const sequence = /^#\d+$/.test(q) ? q.slice(1) : null;
     return items.filter(({ event }) => {
       if (planId && event.plan_id !== planId) return false;
       if (!match(event.kind)) return false;
       if (event.seq === 0 && !showProgress) return false;
       if (!q) return true;
-      return [event.message, event.kind, event.actor, event.plan_id ?? '', event.migration_id ?? ''].some((v) => v.toLowerCase().includes(q));
+      if (sequence !== null) return event.seq > 0 && String(event.seq) === sequence;
+      const planName = event.plan_id ? planNames.get(event.plan_id) : undefined;
+      return [event.message, event.kind, event.actor, planName ?? '', event.plan_id ?? '', event.migration_id ?? '']
+        .some((value) => value.toLowerCase().includes(q));
     });
-  }, [items, category, query, showProgress, planId]);
+  }, [items, category, query, showProgress, planId, planNames]);
   // a failed history load with nothing cached: the trail is unknown, not empty (SDD §16)
   const historyUnknown = Boolean(history.error) && !history.data;
   // the shown audit events (SDD §16): the page as shown, without progress updates (never persisted)
@@ -247,9 +252,11 @@ export default function Events() {
     ? null
     : historyUnknown
       ? 'The audit trail could not be loaded.'
-      : filtered.length
-        ? 'Only progress updates are shown; they are not part of the audit trail.'
-        : 'No events match the filters.';
+      : history.isPending
+        ? 'The audit trail is loading.'
+        : filtered.length
+          ? 'Only progress updates are shown; they are not part of the audit trail.'
+          : 'No events match the filters.';
 
   /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
@@ -264,9 +271,17 @@ export default function Events() {
   // Load older events (SDD §12, §16): the page before the oldest event loaded, for the chosen plan; the same
   // button as Show older events, so the focus stays on it
   const moreRef = useRef<HTMLButtonElement>(null);
+  const restoreAfterLoad = useRef(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<unknown>(null);
   const canLoadOlder = Boolean(history.data) && (older.planId === planId ? older.more : (history.data?.length ?? 0) >= HISTORY);
+  const showMore = filtered.length > limit || canLoadOlder;
+  useLayoutEffect(() => {
+    if (loadingOlder || !restoreAfterLoad.current) return;
+    restoreAfterLoad.current = false;
+    // Restore focus after React has removed the button, unless the operator moved focus.
+    if (!showMore && document.activeElement === document.body) (listRef.current ?? searchRef.current)?.focus();
+  }, [loadingOlder, showMore]);
   const loadOlder = async () => {
     const oldest = [...olderItems, ...historyItems].reduce((min, { event }) => (event.seq > 0 ? Math.min(min, event.seq) : min), Infinity);
     if (!Number.isFinite(oldest)) return;
@@ -274,17 +289,13 @@ export default function Events() {
     setOlderError(null);
     try {
       const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
-      const restoreFocus = document.activeElement === moreRef.current;
+      restoreAfterLoad.current = document.activeElement === moreRef.current;
       const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
       // the history it was read below stays loaded too: when the newest history is read again, its window moves up
       // and would otherwise leave a gap between it and these pages
       setOlder((prev) => ({ planId, items: [...pageItems, ...(prev.planId === planId ? prev.items : []), ...historyItems], more: page.length >= HISTORY }));
       setLimit((n) => n + PAGE);
       setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
-      // the start of the trail removes the button: focus moves to the list, never to the page (SDD §16)
-      requestAnimationFrame(() => {
-        if (restoreFocus && !moreRef.current && document.activeElement === document.body) (listRef.current ?? searchRef.current)?.focus();
-      });
     } catch (error) {
       setOlderError(error);
     } finally {
@@ -374,8 +385,8 @@ export default function Events() {
         }
       />
 
-      <div className="mb-3 grid grid-cols-2 gap-2 md:flex md:flex-wrap md:items-end">
-        <div className="col-span-2 min-w-0 md:w-72">
+      <div className="card mb-3 grid grid-cols-2 gap-x-3 gap-y-2 p-3 sm:p-4 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)]">
+        <div className="col-span-2 min-w-0 md:col-span-1">
           <label htmlFor={searchId} className="field-label">
             Search events
           </label>
@@ -384,7 +395,7 @@ export default function Events() {
             id={searchId}
             type="search"
             className="input"
-            placeholder="Message, VM, actor, kind or id"
+            aria-describedby={searchHintId}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -394,7 +405,7 @@ export default function Events() {
         </div>
         <SelectField
           label="Category"
-          className="md:w-52"
+          className="min-w-0"
           value={category}
           onChange={(e) => {
             setCategory(e.target.value);
@@ -404,7 +415,7 @@ export default function Events() {
         />
         <SelectField
           label="Plan"
-          className="md:w-60"
+          className="min-w-0"
           value={planId}
           onChange={(e) => {
             const next = new URLSearchParams(params);
@@ -420,11 +431,19 @@ export default function Events() {
             ...(planId && !(plans.data ?? []).some((p) => p.id === planId) ? [{ value: planId, label: planId }] : []),
           ]}
         />
-        <label className="flex min-h-11 cursor-pointer items-center gap-2 text-sm text-foreground md:mb-0.5">
-          <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => setShowProgress(e.target.checked)} />
-          Show progress updates
-        </label>
-        {filtersActive && <Button size="lg" onClick={clearFilters}>Clear filters</Button>}
+        <p id={searchHintId} className="col-span-full text-xs text-muted-foreground">
+          Search loaded events by message, plan, actor, kind, ID or event number (e.g. #123).
+        </p>
+        <div className="col-span-full flex min-h-11 flex-wrap items-center justify-between gap-x-3">
+          <label className="flex min-h-11 cursor-pointer items-center gap-2 text-sm text-foreground">
+            <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => {
+              setShowProgress(e.target.checked);
+              setLimit(PAGE);
+            }} />
+            Show progress updates
+          </label>
+          {filtersActive && <Button size="lg" onClick={clearFilters}>Clear filters</Button>}
+        </div>
       </div>
 
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
@@ -448,22 +467,34 @@ export default function Events() {
           region already on the page — the count is not, as it moves with every live event (SDD §16) */}
       <div role="status">
         {history.data && filtered.length === 0 && (
-          <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
+          <EmptyState
+            icon={ScrollText}
+            title={filtersActive ? 'No events match' : 'No events yet'}
+            description={canLoadOlder
+              ? 'Load older events to search more of the audit trail, or change the filters.'
+              : filtersActive ? 'Change or clear the filters to broaden the search.' : 'New activity will appear here.'}
+          />
         )}
       </div>
 
       {filtered.length > 0 && (
-        <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
-          {filtered.slice(0, limit).map(({ key, event }) => (
-            <EventRow key={key} event={event} planName={event.plan_id ? planNames.get(event.plan_id) : undefined} />
-          ))}
-        </ol>
+        <>
+          <p className="mb-2 text-sm text-muted-foreground">
+            Showing {formatNumber(Math.min(filtered.length, limit))} of {formatNumber(filtered.length)} {filtersActive ? 'matching' : 'loaded'} events
+            {canLoadOlder && ' · Older events available'}
+          </p>
+          <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
+            {filtered.slice(0, limit).map(({ key, event }) => (
+              <EventRow key={key} event={event} planName={event.plan_id ? planNames.get(event.plan_id) : undefined} />
+            ))}
+          </ol>
+        </>
       )}
-      {(filtered.length > limit || canLoadOlder) && (
+      {showMore && (
         <div className="mt-3">
           <Button
             ref={moreRef}
-            disabledReason={loadingOlder ? 'Loading older events…' : null}
+            loading={loadingOlder}
             onClick={() => {
               if (filtered.length <= limit) {
                 void loadOlder();
@@ -475,7 +506,7 @@ export default function Events() {
               setLimit((n) => n + PAGE);
             }}
           >
-            {filtered.length > limit ? `Show ${Math.min(PAGE, filtered.length - limit)} older events` : 'Load older events'}
+            {loadingOlder ? 'Loading older events…' : filtered.length > limit ? `Show ${Math.min(PAGE, filtered.length - limit)} older events` : 'Load older events'}
           </Button>
         </div>
       )}

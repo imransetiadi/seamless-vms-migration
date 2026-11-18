@@ -202,6 +202,7 @@ for (const width of [320, 1440]) {
       await page.getByLabel('Plan', { exact: true }).selectOption('plan-c81d44a0');
       await page.getByLabel('Show progress updates', { exact: true }).check();
       const search = page.getByLabel('Search events', { exact: true });
+      await expect(search).toHaveAccessibleDescription(/search loaded events/i);
       await search.fill('no-matching-event');
       await expect(page.getByText('No events match', { exact: true })).toBeVisible();
       const clear = page.getByRole('button', { name: 'Clear filters', exact: true });
@@ -215,6 +216,7 @@ for (const width of [320, 1440]) {
       await expect(page).not.toHaveURL(/plan=/);
       await expect(page.getByRole('button', { name: 'Resume live updates', exact: true })).toBeVisible();
       await expect(page.getByRole('list', { name: 'Events, newest first', exact: true })).toBeVisible();
+      await expect(page.getByText(/Showing [\d,]+ of [\d,]+ loaded events/)).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
 
       await page.goto('/advisor/audit');
