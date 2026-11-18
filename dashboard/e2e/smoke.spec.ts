@@ -156,13 +156,13 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await expect(page.locator('body')).not.toContainText('browser-secret');
 });
 
-test("on a phone the Overview's first downtime clock is on the first screen, under compact key figures (SDD §16)", async ({ page }) => {
+test("on a phone the Overview's first downtime clock is on the first screen, with a shortcut to key figures (SDD §16)", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page, 'viewer');
   await page.goto('/');
   const strip = page.getByRole('region', { name: 'Key metrics' });
   await expect(strip.getByRole('group', { name: 'Migrations' })).toBeVisible();
-  // every figure and its hint still shown, in less height
+  // the performance section keeps every figure and its hint
   for (const name of ['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance']) {
     await expect(strip.getByRole('group', { name })).toBeVisible();
   }

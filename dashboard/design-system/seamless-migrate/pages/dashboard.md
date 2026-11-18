@@ -3,9 +3,9 @@
 SDD §16 wins. Shared tokens and typography follow `../MASTER.md`.
 
 - Max content width 1400px; page gutters 16px mobile and 24px desktop.
-- Overview starts with a compact scope header and eight key figures. All figures and hints remain visible.
+- Overview starts with the plan scope, Find migration, and three queue links with current counts. View metrics reaches all eight key figures and their hints.
 - Downtime now is the main operational card. Clocks, SLO, source state and warning labels remain readable.
-- From 1024px, clocks/history and human action queues use a 3:2 split. Below it, read clocks, approvals,
+- From 1024px, clocks and approvals sit beside Needs attention in a 3:2 split. Below it, read clocks, approvals,
   attention, then history. First clock and SLO remain inside the first 844px at 390px width.
 - Cards use 12px radius and quiet shadows; headers have a restrained tint. Static cards do not pretend to be links.
 - Use existing task CTAs and native links. The Plans summary offers View all plans; primary creation actions

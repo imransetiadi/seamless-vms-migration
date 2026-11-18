@@ -1,18 +1,23 @@
 import {
   Activity,
   ArrowRight,
+  ChartNoAxesCombined,
+  ChevronRight,
   CircleCheck,
   CircleHelp,
   CircleX,
   ClipboardList,
+  Search,
   SearchX,
+  ShieldCheck,
+  Timer,
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
-import { useMemo } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useDemoSpeed, useMigrationSummaries, usePlans, useStats } from '../api/hooks';
-import type { MigrationSummary, Phase, Plan } from '../api/types';
+import { PHASES, type MigrationSummary, type Phase, type Plan } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -20,7 +25,7 @@ import { DowntimeSloChart } from '../components/DowntimeSloChart';
 import { SelectField } from '../components/Field';
 import { MetricStrip } from '../components/MetricStrip';
 import { PendingApprovals } from '../components/PendingApprovals';
-import { PageHeader } from '../components/PageHeader';
+import { MigrationFinder } from '../components/MigrationFinder';
 import { Panel } from '../components/Panel';
 import { PhaseDistribution } from '../components/PhaseDistribution';
 import { ProgressBar } from '../components/ProgressBar';
@@ -29,9 +34,12 @@ import { PhaseBadge, PlanStatusBadge } from '../components/StatusBadge';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { ThroughputChart } from '../components/ThroughputChart';
 import { Unavailable } from '../components/Unavailable';
-import { attentionItems } from '../lib/attention';
+import { pendingApprovals } from '../lib/approvals';
+import { useHashLanding } from '../lib/useHashLanding';
+import { attentionItems, type AttentionItem } from '../lib/attention';
 import { cn } from '../lib/cn';
 import { buttonClassName } from '../lib/buttonStyles';
+import { phaseMeta } from '../lib/phase';
 import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
@@ -53,6 +61,32 @@ const BAR_CLASSES: Record<'success' | 'warning' | 'danger', string> = {
   danger: 'bg-status-danger',
 };
 
+const NO_MIGRATIONS: MigrationSummary[] = [];
+
+function QueueShortcut({ id, label, count, loading, icon: Icon, tone }: {
+  id: string;
+  label: string;
+  count: number | null;
+  loading: boolean;
+  icon: LucideIcon;
+  tone: 'info' | 'warning' | 'danger';
+}) {
+  return (
+    <a href={`#${id}`} className="group grid min-w-0 grid-cols-[auto_minmax(0,1fr)] content-start items-center gap-2 rounded-lg border border-border bg-card p-2.5 transition-colors hover:border-ring sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:gap-x-3 sm:gap-y-1 sm:px-4 sm:py-3">
+      <span className={cn('col-start-1 row-start-1 flex size-7 items-center justify-center rounded-md sm:row-span-2 sm:size-10', count ? TONE_CLASSES[tone].badge : 'bg-muted text-muted-foreground')}>
+        <Icon aria-hidden className="size-4 sm:size-5" />
+      </span>
+      <span className="col-span-2 row-start-2 wrap-anywhere text-xs font-medium text-muted-foreground sm:col-span-1 sm:col-start-2 sm:row-start-1 sm:text-sm">{label}</span>
+      {count === null ? (
+        <span className="col-span-2 row-start-3 text-xs font-semibold sm:col-span-1 sm:col-start-2 sm:row-start-2">{loading ? 'Loading…' : 'Unknown'}</span>
+      ) : (
+        <span className="num col-start-2 row-start-1 min-w-0 wrap-anywhere text-right text-2xl sm:text-left font-semibold leading-none tracking-tight sm:row-start-2 sm:text-3xl">{formatNumber(count)}</span>
+      )}
+      <ChevronRight aria-hidden className="col-start-3 row-span-2 row-start-1 hidden size-4 text-muted-foreground group-hover:text-foreground sm:block" />
+    </a>
+  );
+}
+
 /**
  * Down right now: in the cutover window (the stop may not be reported yet) or with an open downtime
  * clock — a failed cutover or a rollback keeps the source stopped until it runs again (SDD §5.2).
@@ -72,11 +106,12 @@ const DOWN_DETAIL: Partial<Record<Phase, string>> = {
  * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
  * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
  */
-function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: MigrationSummary[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
-  const active = migrations
-    .filter(isDown)
-    .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
-  const waiting = migrations.filter((m) => m.phase === 'awaiting_cutover').length;
+function DowntimeNow({ active, waiting, plans, plansUnknown }: {
+  active: readonly MigrationSummary[];
+  waiting: number;
+  plans: ReadonlyMap<string, Plan>;
+  plansUnknown: boolean;
+}) {
   // in demo mode the clocks run in model time, as on the migration page (SDD §16, ADV-16)
   const speed = speedOf(useDemoSpeed());
   const now = useNow(speed > 1 ? 250 : 1000, active.length > 0);
@@ -84,6 +119,7 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
 
   return (
     <Panel
+      id="downtime"
       title="Downtime now"
       className="border-t-2 border-t-status-info shadow-sm"
       description={
@@ -181,13 +217,11 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
   );
 }
 
-function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: MigrationSummary[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
-  // the time, read once per render (useNow): a cutover window that opens or closes shows within a minute
-  const now = useNow(60_000);
-  const items = attentionItems(migrations, plans, now, { plansUnknown });
-  const shown = items.slice(0, 8);
+function NeedsAttention({ items, plansUnknown }: { items: AttentionItem[]; plansUnknown: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const shown = expanded ? items : items.slice(0, 8);
   return (
-    <Panel title="Needs attention" description="The next human action, most urgent first">
+    <Panel id="attention" title="Needs attention" description="The next human action, most urgent first">
       {/* without the plans, approvals and cutover requests cannot be told: never "nothing" (SDD §16) */}
       {plansUnknown && <Unavailable what="plans" className={items.length ? 'mb-2' : undefined} />}
       {items.length === 0 ? (
@@ -198,18 +232,18 @@ function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migra
             {shown.map((item) => {
               const Icon = ATTENTION_ICONS[item.tone];
               return (
-                <li key={item.migration.id} className="flex gap-3 py-2.5">
+                <li key={item.migration.id} className="group relative flex gap-3 rounded-md py-2.5 hover:bg-muted/60 focus-within:bg-muted/60">
                   <Icon aria-hidden className={cn('mt-0.5 size-4 shrink-0', TONE_CLASSES[item.tone].text)} />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <Link
                         to={`/migrations/${item.migration.id}`}
-                        className="font-mono text-sm font-semibold text-foreground underline-offset-4 hover:underline"
+                        className="font-mono text-sm font-semibold text-foreground underline-offset-4 after:absolute after:inset-0 after:rounded-md group-hover:underline"
                       >
                         {item.migration.vm.name}
                       </Link>
                       <PhaseBadge phase={item.migration.phase} />
-                      {item.techPreview && <TechPreviewBadge />}
+                      {item.techPreview && <TechPreviewBadge className="relative" />}
                     </div>
                     <p className="mt-0.5 wrap-break-word text-sm text-foreground">{item.reason}</p>
                     <p className="text-xs text-muted-foreground">Next: {item.nextAction}</p>
@@ -218,10 +252,10 @@ function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migra
               );
             })}
           </ul>
-          {items.length > shown.length && (
-            <p className="mt-3 text-xs text-muted-foreground">
-              {items.length - shown.length} more in the <Link to="/plans" className="underline underline-offset-4">plans</Link>.
-            </p>
+          {items.length > 8 && (
+            <Button className="mt-3" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+              {expanded ? 'Show fewer' : `Show all ${items.length} migrations`}
+            </Button>
           )}
         </>
       )}
@@ -278,14 +312,20 @@ export default function Overview() {
   usePageTitle('Overview');
   const [params, setParams] = useSearchParams();
   const planId = params.get('plan') ?? '';
+  const location = useLocation();
+  const navigate = useNavigate();
+  const from = location.state?.finderPhase;
+  const finderPhase: Phase | 'all' | null = from === 'all' || PHASES.includes(from) ? from : null;
+  const findButton = useRef<HTMLButtonElement>(null);
+  const returnFocus = useRef<HTMLElement>(null);
   const plansQuery = usePlans();
   const stats = useStats(planId || null);
   // summaries: what the page's rules read, not every migration whole (SDD §16, perf audit PF-02)
-  const migrationsQuery = useMigrationSummaries(planId ? { plan_id: planId } : {}, { keepPrevious: true });
+  const migrationsQuery = useMigrationSummaries(planId ? { plan_id: planId } : {});
 
   const plans = useMemo(() => plansQuery.data ?? [], [plansQuery.data]);
   const plansById = useMemo(() => new Map(plans.map((p) => [p.id, p])), [plans]);
-  const migrations = migrationsQuery.data ?? [];
+  const migrations = migrationsQuery.data ?? NO_MIGRATIONS;
   const scopedPlans = planId ? plans.filter((p) => p.id === planId) : plans;
   // a draft has not started and a cancelled plan never will (SDD §12): neither sets the SLO the chart reads
   const activePlans = scopedPlans.filter((p) => p.derived_status !== 'draft' && p.derived_status !== 'cancelled');
@@ -302,6 +342,17 @@ export default function Overview() {
   // a plan id in the address that the loaded plans do not hold (mistyped, or an old link)
   const unknownPlan = Boolean(planId) && Boolean(plansQuery.data) && !plansById.has(planId);
 
+  const now = useNow(60_000);
+  const attention = useMemo(() => attentionItems(migrations, plansById, now, { plansUnknown }), [migrations, plansById, plansUnknown, now]);
+  const approvals = useMemo(() => pendingApprovals(migrations, plansById, { plansUnknown }), [migrations, plansById, plansUnknown]);
+  const down = useMemo(() => migrations.filter(isDown).sort((a, b) =>
+    Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at),
+  ), [migrations]);
+  const waiting = down.length ? 0 : migrations.filter((m) => m.phase === 'awaiting_cutover').length;
+  const queuesLoading = migrationsQuery.isPending || plansQuery.isPending;
+  const countsKnown = !queuesLoading && !plansUnknown && !migrationsUnknown;
+  useHashLanding(!queuesLoading && !unknownPlan);
+
   const setPlan = (value: string) => {
     const next = new URLSearchParams(params);
     if (value) next.set('plan', value);
@@ -309,27 +360,77 @@ export default function Overview() {
     setParams(next, { replace: true });
   };
 
+  // Replacing this entry gives even a native #queue jump its own router key. The finder keeps
+  // its search and pagination in memory for that entry when a result leads to another page.
+  const setFinderPhase = (phase: Phase | 'all' | null) => {
+    const { pathname, search, hash, state } = location;
+    void navigate({ pathname, search, hash }, { replace: true, state: { ...state, finderPhase: phase }, preventScrollReset: true });
+  };
+  const closeFinder = () => {
+    // Live updates may have removed the metric that opened the finder.
+    returnFocus.current = document.getElementById(`overview-metric-${finderPhase}`) ?? findButton.current;
+    setFinderPhase(null);
+  };
+
+  const phaseMetric = (phase: Phase, count: number) => {
+    const value = formatNumber(count);
+    if (!count || !migrationsQuery.data || stats.isPlaceholderData) return { value };
+    const action = phase === 'completed' ? 'View migrations awaiting finalize' : `View ${phaseMeta(phase).label.toLowerCase()} migrations`;
+    return { value, inspect: {
+      label: `${action} (${value})`,
+      id: `overview-metric-${phase}`,
+      onClick: () => setFinderPhase(phase),
+    } };
+  };
+
   const header = (
     <>
-      <PageHeader
-        title="Overview"
-        // the live state of migrations, never "live migration": a move without downtime is a non-goal (SDD §1)
-        description={`Live state of VM migrations into ${DESTINATIONS}.`}
-        actions={
-          <SelectField
-            label="Plan"
-            className="w-full sm:w-72"
-            value={planId}
-            onChange={(e) => setPlan(e.target.value)}
-            options={[
-              { value: '', label: 'All plans' },
-              ...plans.map((p) => ({ value: p.id, label: p.name })),
-              // a plan in the address that the list does not hold stays chosen (SDD §16), as on Events
-              ...(planId && !plansById.has(planId) ? [{ value: planId, label: planId }] : []),
-            ]}
-          />
-        }
-      />
+      <header className="mb-4 rounded-xl border border-border bg-linear-to-br from-status-info/10 via-card to-accent/5 p-3 sm:p-5">
+        <div className="flex flex-wrap items-end justify-between gap-x-5 gap-y-3">
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold tracking-tight sm:text-3xl">Overview</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Live state of VM migrations into {DESTINATIONS}.</p>
+          </div>
+          <div className="flex w-full min-w-0 flex-wrap items-end gap-2 sm:w-auto">
+            <SelectField
+              label="Plan"
+              className="min-w-[min(8rem,100%)] flex-1 sm:w-64"
+              value={planId}
+              onChange={(e) => setPlan(e.target.value)}
+              options={[
+                { value: '', label: 'All plans' },
+                ...plans.map((p) => ({ value: p.id, label: p.name })),
+                // a plan in the address that the list does not hold stays chosen (SDD §16), as on Events
+                ...(planId && !plansById.has(planId) ? [{ value: planId, label: planId }] : []),
+              ]}
+            />
+            {!unknownPlan && (
+              <Button ref={findButton} icon={Search} size="lg" variant="primary" aria-haspopup="dialog"
+                disabledReason={migrationsQuery.isPending ? 'Loading migrations…' : migrationsUnknown ? 'Retry the migration list to search.' : null}
+                onClick={() => setFinderPhase('all')}>
+                Find migration
+              </Button>
+            )}
+          </div>
+        </div>
+        {!unknownPlan && (
+          <nav aria-label="Migration queues" className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,5.3rem),1fr))] gap-1.5 sm:grid-cols-3 sm:gap-3">
+            <QueueShortcut id="downtime" label="VMs down" count={migrationsQuery.data ? down.length : null} loading={migrationsQuery.isPending} icon={Timer} tone="info" />
+            <QueueShortcut id="attention" label="Needs attention" count={countsKnown ? attention.length : null} loading={queuesLoading} icon={TriangleAlert} tone={attention[0]?.tone ?? 'info'} />
+            <QueueShortcut id="approvals" label="Pending approvals" count={countsKnown ? approvals.items.length : null} loading={queuesLoading} icon={ShieldCheck} tone="warning" />
+          </nav>
+        )}
+      </header>
+      {finderPhase && !unknownPlan && migrationsQuery.data && (
+        <MigrationFinder
+          migrations={migrations}
+          plans={plansById}
+          scope={planId ? plansById.get(planId)?.name ?? planId : 'All plans'}
+          initialPhase={finderPhase}
+          returnFocusRef={returnFocus}
+          onClose={closeFinder}
+        />
+      )}
 
       {plansQuery.error && <ErrorBanner error={plansQuery.error} title="Plans are unavailable" onRetry={() => void plansQuery.refetch()} className="mb-4" />}
     </>
@@ -359,6 +460,41 @@ export default function Overview() {
       {header}
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
 
+      {migrationsQuery.error && <ErrorBanner error={migrationsQuery.error} title="Migrations are unavailable" onRetry={() => void migrationsQuery.refetch()} className="mt-4" />}
+
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <h2 className="text-lg font-semibold">Operations</h2>
+        <a href="#performance" className={buttonClassName('ghost', 'md')}>
+          <ChartNoAxesCombined aria-hidden className="size-4" /> View metrics
+        </a>
+      </div>
+      <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+        <div className="grid min-w-0 gap-4">
+          {migrationsQuery.isPending ? (
+            <LoadingBlock label="Loading the downtime clocks…" />
+          ) : migrationsUnknown ? (
+            <Panel id="downtime" title="Downtime now" description="VMs whose source is stopped appear here with a running clock.">
+              <Unavailable what="migrations" />
+            </Panel>
+          ) : (
+            <DowntimeNow active={down} waiting={waiting} plans={plansById} plansUnknown={plansUnknown} />
+          )}
+          {queuesLoading ? <LoadingBlock label="Loading pending approvals…" /> : (
+            <PendingApprovals key={planId} queue={migrationsUnknown ? null : approvals} />
+          )}
+        </div>
+        {queuesLoading ? (
+          <LoadingBlock label="Loading items that need attention…" />
+        ) : migrationsUnknown ? (
+          <Panel id="attention" title="Needs attention" description="The next human action, most urgent first">
+            <Unavailable what="migrations" />
+          </Panel>
+        ) : (
+          <NeedsAttention key={planId} items={attention} plansUnknown={plansUnknown} />
+        )}
+      </div>
+
+      <h2 id="performance" tabIndex={-1} className="mt-6 mb-3 scroll-mt-20 rounded-sm text-lg font-semibold">Performance</h2>
       {!s ? (
         statsUnknown ? (
           <MetricStrip
@@ -382,13 +518,13 @@ export default function Overview() {
             },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, unfinished' },
             // Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19)
-            { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; source VM kept' },
-            { label: 'Finalized', value: formatNumber(s.finalized), hint: counted ? `${formatPct((s.finalized / counted) * 100)} of all` : undefined },
-            { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
+            { label: 'Awaiting finalize', ...phaseMetric('completed', s.awaiting_finalize), hint: 'verified; source VM kept' },
+            { label: 'Finalized', ...phaseMetric('finalized', s.finalized), hint: counted ? `${formatPct((s.finalized / counted) * 100)} of all` : undefined },
+            { label: 'Failed', ...phaseMetric('failed', s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
             // its source VM runs again and a person retries or cancels it: never all clear while one waits (SDD §16)
             {
               label: 'Rolled back',
-              value: formatNumber(s.by_phase.rolled_back ?? 0),
+              ...phaseMetric('rolled_back', s.by_phase.rolled_back ?? 0),
               tone: (s.by_phase.rolled_back ?? 0) > 0 ? 'warning' : undefined,
               hint: (s.by_phase.rolled_back ?? 0) > 0 ? 'source running: retry or cancel' : 'none',
             },
@@ -402,37 +538,7 @@ export default function Overview() {
         />
       )}
 
-      {migrationsQuery.error && <ErrorBanner error={migrationsQuery.error} title="Migrations are unavailable" onRetry={() => void migrationsQuery.refetch()} className="mt-4" />}
-
-      {/* DOM order is the phone order: live clocks, then the human actions, then the history.
-          On wide screens the actions take the right column beside both downtime panels. */}
-      <div className="mt-2 grid items-start gap-4 sm:mt-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:grid-rows-[auto_1fr]">
-        {migrationsQuery.isPending ? (
-          <LoadingBlock label="Loading the downtime clocks…" />
-        ) : migrationsUnknown ? (
-          <Panel title="Downtime now" description="VMs whose source is stopped appear here with a running clock.">
-            <Unavailable what="migrations" />
-          </Panel>
-        ) : (
-          <DowntimeNow migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
-        )}
-        <div className="flex min-w-0 flex-col gap-4 lg:col-start-2 lg:row-span-2 lg:row-start-1">
-          {migrationsQuery.isPending || plansQuery.isPending ? (
-            <LoadingBlock label="Loading items that need attention…" />
-          ) : (
-            <>
-              {/* a pending approval is listed once, here, not in Needs attention (SDD §16, ADV-20) */}
-              <PendingApprovals migrations={migrationsUnknown ? null : migrations} plans={plansById} plansUnknown={plansUnknown} />
-              {migrationsUnknown ? (
-                <Panel title="Needs attention" description="The next human action, most urgent first">
-                  <Unavailable what="migrations" />
-                </Panel>
-              ) : (
-                <NeedsAttention migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
-              )}
-            </>
-          )}
-        </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
         <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
           {s ? (
             <>
@@ -445,20 +551,18 @@ export default function Overview() {
             <Skeleton className="h-40" />
           )}
         </Panel>
-      </div>
-
-      <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        <Panel
-          title="Throughput"
-          description={s ? `Last 60 minutes, ${formatBytes(s.bytes_transferred)} transferred in total` : 'Last 60 minutes'}
-          className="xl:col-span-2"
-        >
-          {s ? <ThroughputChart series={s.throughput_series} /> : statsUnknown ? <Unavailable what="statistics" /> : <Skeleton className="h-56" />}
-        </Panel>
         <Panel title="Phase distribution" description={s ? `${formatNumber(s.total)} migrations by phase` : undefined}>
           {s ? <PhaseDistribution byPhase={s.by_phase} /> : statsUnknown ? <Unavailable what="statistics" /> : <LoadingBlock rows={6} />}
         </Panel>
       </div>
+
+      <Panel
+        title="Throughput"
+        description={s ? `Last 60 minutes, ${formatBytes(s.bytes_transferred)} transferred in total` : 'Last 60 minutes'}
+        className="mt-4"
+      >
+        {s ? <ThroughputChart series={s.throughput_series} /> : statsUnknown ? <Unavailable what="statistics" /> : <Skeleton className="h-56" />}
+      </Panel>
 
       <Panel title="Plans" description="Completion per plan" className="mt-4" actions={
         <Link to="/plans" className={buttonClassName('secondary', 'lg')}>

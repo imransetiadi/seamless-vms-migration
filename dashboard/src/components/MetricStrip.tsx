@@ -1,3 +1,4 @@
+import { ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { cn } from '../lib/cn';
 import type { Tone } from '../lib/phase';
@@ -9,6 +10,26 @@ export interface Metric {
   hint?: ReactNode;
   /** Colours the value only when the number itself is the signal (failures, compliance). */
   tone?: Tone;
+  /** Opens the records behind a current figure. */
+  inspect?: { label: string; onClick: () => void; id?: string };
+}
+
+function MetricValue({ metric, busy }: { metric: Metric; busy: boolean }) {
+  const color = busy ? 'text-muted-foreground' : metric.tone ? TONE_CLASSES[metric.tone].text : 'text-foreground';
+  const style = cn('num text-xl font-semibold leading-tight sm:text-2xl', color);
+  if (metric.inspect && !busy) {
+    return (
+      <button type="button" id={metric.inspect.id} aria-haspopup="dialog" aria-label={metric.inspect.label}
+        onClick={(event) => {
+          event.currentTarget.focus({ preventScroll: true });
+          metric.inspect?.onClick();
+        }}
+        className={cn(style, 'inline-flex cursor-pointer items-center gap-1 self-start rounded-sm underline decoration-border underline-offset-4 after:absolute after:inset-0 hover:decoration-current')}>
+        {metric.value}<ChevronRight aria-hidden className="size-4" />
+      </button>
+    );
+  }
+  return <span className={style}>{metric.value}</span>;
 }
 
 /** Columns per breakpoint by the number of metrics: one row on wide screens, up to seven. */
@@ -49,19 +70,12 @@ export function MetricStrip({ metrics, label, busy = false, className }: { metri
           aria-label={metric.label}
           // tighter on a phone, so the live panels below start on the first screen; every figure and hint stays
           className={cn(
-            'flex min-w-0 flex-col wrap-anywhere gap-0.5 bg-card px-3 py-1 outline-1 outline-border sm:px-4 sm:py-3',
+            'relative flex min-w-0 flex-col wrap-anywhere gap-0.5 bg-card px-3 py-1 outline-1 outline-border sm:px-4 sm:py-3',
             index === metrics.length - 1 && LAST_SPAN[metrics.length],
           )}
         >
           <span className="text-xs text-muted-foreground sm:text-sm">{metric.label}</span>
-          <span
-            className={cn(
-              'num text-xl font-semibold leading-tight sm:text-2xl',
-              busy ? 'text-muted-foreground' : metric.tone ? TONE_CLASSES[metric.tone].text : 'text-foreground',
-            )}
-          >
-            {metric.value}
-          </span>
+          <MetricValue metric={metric} busy={busy} />
           {metric.hint && <span className="text-xs text-muted-foreground">{metric.hint}</span>}
         </div>
       ))}

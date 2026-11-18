@@ -486,7 +486,7 @@ export function Layout() {
     lastPath.current = pathname;
     // a control that switches the view in place (the inventory's Provider select) keeps the focus: moving it on
     // each choice would be a change of context on input (WCAG 3.2.2, SDD §16)
-    if (keepsFocus(state)) return;
+    if (keepsFocus(state) || mainRef.current?.closest('[inert]')) return;
     const target = hashTarget(hash);
     if (target && document.activeElement === target) return;
     if (!drawerWasOpen) mainRef.current?.focus({ preventScroll: true });

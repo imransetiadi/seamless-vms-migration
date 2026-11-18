@@ -5740,6 +5740,16 @@ is no origin a browser sends (review RV31-03).
   new id once the cutover deleted it (§7.3, review RV34B-05); `vmware_cold`/`vmware_warm` the server, the kit's
   ports and the kit's volumes the next attempt cannot reuse — every one once the destination VM ran (§7.2) — and
   each starts the source VM again (review RV32A-06).
+* Overview puts current operations first. The plan selector scopes the downtime, attention and approval counts.
+  Each count links to its queue. Needs attention shows eight entries initially and can expand in place.
+  Find migration searches the scoped summaries by VM name, source ID, migration ID, project, plan or phase and
+  links directly to each VM's migration. View metrics reaches the eight figures and their hints. Positive
+  Failed, Rolled back, Awaiting finalize and Finalized counts open the finder filtered to that phase.
+  Returning from a migration with browser Back restores the finder, search text, phase and result page
+  for that Overview visit. Closing the finder returns focus to its trigger (or Find migration if a live
+  count removed the trigger). Opening a new search starts on the first page. The result count and page
+  controls precede the matches in one scrolling dialog, including on short screens with enlarged text.
+  A scope change waits for its own summaries before showing actionable rows or counts.
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
