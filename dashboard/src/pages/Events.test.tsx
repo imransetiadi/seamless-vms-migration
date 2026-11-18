@@ -37,8 +37,10 @@ describe('Events page', () => {
     const user = userEvent.setup({ delay: null });
     await screen.findByRole('list', { name: /events, newest first/i });
     await user.type(screen.getByLabelText('Search events'), 'retained older record');
+    expect(screen.getByText(/load older events to search more/i)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Load older events' }));
     expect(await screen.findByText('retained older record')).toBeInTheDocument();
+    expect(screen.getByText('Showing 1 of 1 matching events')).toBeInTheDocument();
     await user.click(screen.getByText('Leave older list'));
     await user.click(screen.getByText('Back older list'));
     expect(screen.getByText('retained older record')).toBeInTheDocument();
@@ -103,6 +105,7 @@ describe('Events page', () => {
     const search = screen.getByLabelText('Search events');
     await user.type(search, 'policy edit 1');
     await user.click(screen.getByRole('button', { name: 'Load older events' }));
+    expect(screen.getByRole('button', { name: 'Loading older events…' })).toHaveAttribute('aria-busy', 'true');
     await user.clear(search);
     await user.type(search, 'policy edit 2');
     release();
@@ -294,6 +297,30 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'all');
     await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'legacy-rhel6-app');
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
+  });
+
+  it('finds loaded events by the displayed plan name and event number', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((item) => item.id === 'plan-4f2a9c1e')!;
+    emitPhase(server, 'test event without a plan name in its message');
+    const event = server.events.find((item) => item.message === 'test event without a plan name in its message')!;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Events />, { route: '/events', server });
+    const search = screen.getByRole('searchbox', { name: 'Search events' });
+    await screen.findAllByRole('link', { name: plan.name });
+
+    await user.type(search, plan.name.toUpperCase());
+    expect(screen.getByText(event.message)).toBeInTheDocument();
+    const list = screen.getByRole('list', { name: 'Events, newest first' });
+    for (const row of within(list).getAllByRole('listitem')) {
+      expect(within(row).getByRole('link', { name: plan.name })).toBeInTheDocument();
+    }
+
+    await user.clear(search);
+    await user.type(search, `#${event.seq}`);
+    const exactResults = within(screen.getByRole('list', { name: 'Events, newest first' }));
+    expect(exactResults.getAllByRole('listitem')).toHaveLength(1);
+    expect(exactResults.getByText(event.message)).toBeInTheDocument();
   });
 
   it('clears search, category, plan and progress filters without resuming paused updates', async () => {
