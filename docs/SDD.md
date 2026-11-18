@@ -6262,7 +6262,11 @@ is no origin a browser sends (review RV31-03).
   PCI aliases are configured in nova.conf" (§22.11)), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; once every loaded event is shown,
   Load older events reads the 500 before the oldest (`GET /events?tail=true&before=`), so the trail reads back to its start
-  in place; the shown audit events download as JSON
+  in place. Search covers loaded events, including their displayed plan names and exact event numbers such as `#123`.
+  The list reports how many loaded matches it shows. If the search returns no matches and older history is available,
+  the page points to Load older events. That button shows when a request is in progress and keeps keyboard focus
+  until it disappears. If it still holds focus then, focus moves to the results or the search field when there are
+  no results. The shown audit events download as JSON
   lines, the format of `seamless events export`; Export the whole trail writes every persisted event (the chosen plan's
   when one is) into one such file by paging `GET /events?since=` 1,000 at a time, as that command does — the trail an
   operator archives to write-once storage (Security.md) — saying how many events it has read and stoppable meanwhile; its stream line counts the new events without announcing each, and Pause
