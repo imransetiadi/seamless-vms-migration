@@ -1,8 +1,7 @@
 import { Bot, ShieldCheck } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { Plan } from '../api/types';
-import { APPROVALS_SHOWN, approvalKindLabel, pendingApprovals, type ApprovalKind, type ApprovalMigration } from '../lib/approvals';
+import { APPROVALS_SHOWN, approvalKindLabel, type pendingApprovals, type ApprovalKind } from '../lib/approvals';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
 import { Panel } from './Panel';
@@ -14,10 +13,7 @@ type Filter = 'all' | ApprovalKind;
 const KIND_ICONS = { cutover: ShieldCheck, advisor_decision: Bot } as const;
 
 export interface PendingApprovalsProps {
-  /** Null when the migrations could not be loaded: every pending approval is unknown. */
-  migrations: readonly ApprovalMigration[] | null;
-  plans: ReadonlyMap<string, Plan>;
-  plansUnknown: boolean;
+  queue: ReturnType<typeof pendingApprovals> | null;
 }
 
 /**
@@ -25,16 +21,16 @@ export interface PendingApprovalsProps {
  * kind, the VM, its plan and what it waits for, linking to where it is decided; filtered by kind. The first
  * APPROVALS_SHOWN rows of the kind, the rest behind "Show all"; choosing another kind folds them back.
  */
-export function PendingApprovals({ migrations, plans, plansUnknown }: PendingApprovalsProps) {
+export function PendingApprovals({ queue }: PendingApprovalsProps) {
   const [filter, setFilter] = useState<Filter>('all');
   const [all, setAll] = useState(false);
   const panel = (body: ReactNode, actions?: ReactNode) => (
-    <Panel title="Pending approvals" description="Cutover approvals and advisor decisions waiting for a person" actions={actions}>
+    <Panel id="approvals" title="Pending approvals" description="Cutover approvals and advisor decisions waiting for a person" actions={actions}>
       {body}
     </Panel>
   );
-  if (migrations === null) return panel(<Unavailable what="migrations" />);
-  const { items, cutoverUnknown } = pendingApprovals(migrations, plans, { plansUnknown });
+  if (queue === null) return panel(<Unavailable what="migrations" />);
+  const { items, cutoverUnknown } = queue;
   const count = (kind: ApprovalKind) => items.filter((i) => i.kind === kind).length;
   const ofKind = filter === 'all' ? items : items.filter((i) => i.kind === filter);
   const shown = all ? ofKind : ofKind.slice(0, APPROVALS_SHOWN);

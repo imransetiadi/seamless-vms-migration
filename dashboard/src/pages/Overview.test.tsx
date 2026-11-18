@@ -17,6 +17,88 @@ function recordingReads(reads: string[]) {
 }
 
 describe('Overview page (mock data)', () => {
+  it('finds a VM by migration ID within the selected plan and restores focus on Escape', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'web-03')!;
+    const other = server.migrations.find((m) => m.plan_id !== migration.plan_id)!;
+    renderWithApp(<Overview />, { server, route: `/?plan=${migration.plan_id}` });
+    await screen.findByRole('region', { name: 'Downtime now' });
+    const trigger = screen.getByRole('button', { name: 'Find migration' });
+    await user.click(trigger);
+    const dialog = within(screen.getByRole('dialog', { name: 'Find migration' }));
+    const search = dialog.getByRole('searchbox');
+    expect(search).toHaveFocus();
+    await user.type(search, other.id);
+    expect(dialog.getByText('No matching migrations')).toBeInTheDocument();
+    await user.clear(search);
+    await user.type(search, migration.id.toUpperCase());
+    expect(dialog.getByRole('link', { name: /web-03/i })).toHaveAttribute('href', `/migrations/${migration.id}`);
+    await user.keyboard('{Escape}');
+    expect(trigger).toHaveFocus();
+  });
+
+  it('reports unknown action counts when migration summaries fail', async () => {
+    renderWithApp(<Overview />, {
+      wrapFetch: (mock) => (input, init) => String(input).includes('/api/v1/migrations?')
+        ? Promise.resolve(new Response(null, { status: 403 })) : mock(input, init),
+    });
+    await screen.findByText('Migrations are unavailable');
+    const summary = within(screen.getByRole('navigation', { name: 'Migration queues' }));
+    expect(summary.getAllByText('Unknown')).toHaveLength(3);
+  });
+
+  it('opens the failed metric as an exact phase filter and lets the operator search the rest', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    renderWithApp(<Overview />, { server });
+    const metric = await screen.findByRole('group', { name: 'Failed' });
+    await user.click(await within(metric).findByRole('button', { name: /^View failed migrations/ }));
+    const dialog = within(screen.getByRole('dialog', { name: 'Find migration' }));
+    const failures = server.migrations.filter((m) => m.phase === 'failed');
+    expect(dialog.getAllByRole('link').map((link) => link.getAttribute('href')).sort())
+      .toEqual(failures.map((m) => `/migrations/${m.id}`).sort());
+    await user.click(dialog.getByRole('button', { name: 'Remove Failed phase filter' }));
+    expect(dialog.getAllByRole('link').length).toBeGreaterThan(failures.length);
+    expect(dialog.getByRole('searchbox')).toHaveFocus();
+  });
+
+  it('expands the complete attention queue in place and folds it back', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const failed = server.migrations.find((m) => m.phase === 'failed')!;
+    for (let i = 0; i < 10; i++) {
+      server.migrations.push({ ...failed, id: `extra-${i}`, vm: { ...failed.vm, name: `extra-vm-${i}` } });
+    }
+    renderWithApp(<Overview />, { server });
+    const list = within(await screen.findByRole('region', { name: 'Needs attention' }));
+    expect(list.getAllByRole('listitem')).toHaveLength(8);
+    const count = Number(list.getByRole('button', { name: /Show all/ }).textContent?.match(/\d+/)?.[0]);
+    expect(count).toBeGreaterThan(8);
+    await user.click(list.getByRole('button', { name: /Show all/ }));
+    expect(list.getAllByRole('listitem')).toHaveLength(count);
+    await user.click(list.getByRole('button', { name: 'Show fewer' }));
+    expect(list.getAllByRole('listitem')).toHaveLength(8);
+  });
+
+  it('waits for a new plan before offering its queues or VM search', async () => {
+    const user = userEvent.setup({ delay: null });
+    const planId = 'plan-4f2a9c1e';
+    const pending = new Promise<Response>(() => {});
+    renderWithApp(<Overview />, {
+      wrapFetch: (mock) => (input, init) => {
+        const url = new URL(String(input), 'http://localhost');
+        return url.pathname.endsWith('/migrations') && url.searchParams.get('plan_id') === planId ? pending : mock(input, init);
+      },
+    });
+    await screen.findByRole('region', { name: 'Needs attention' });
+    await user.selectOptions(screen.getByLabelText('Plan'), planId);
+    const queues = within(screen.getByRole('navigation', { name: 'Migration queues' }));
+    expect(queues.getAllByText('Loading…')).toHaveLength(3);
+    expect(screen.getByRole('button', { name: 'Find migration' })).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.queryByRole('link', { name: 'legacy-rhel6-app' })).not.toBeInTheDocument();
+  });
+
   it('reads the migrations as summaries, never every migration whole (SDD §16, perf audit PF-02)', async () => {
     const reads: string[] = [];
     renderWithApp(<Overview />, { wrapFetch: recordingReads(reads) });

@@ -55,8 +55,8 @@ export interface ModalProps {
   /** When false, Escape does nothing (e.g. while a request is in flight). */
   dismissible?: boolean;
   size?: 'md' | 'lg';
-  /** `left`: a drawer along the left edge, the full height of the window (the phone navigation, SDD §16). */
-  placement?: 'center' | 'left';
+  /** Left opens a navigation drawer. Top keeps a search field stationary while its results change. */
+  placement?: 'center' | 'left' | 'top';
   /** A tap on the dimmed page closes the dialog (when it is dismissible). */
   closeOnBackdrop?: boolean;
   children: ReactNode;
@@ -172,7 +172,9 @@ export function Modal({
     <div
       className={cn(
         'fixed inset-0 z-modal flex',
-        placement === 'left' ? 'items-stretch justify-start' : 'items-end justify-center p-3 sm:items-center sm:p-6',
+        placement === 'left' && 'items-stretch justify-start',
+        placement === 'center' && 'items-end justify-center p-3 sm:items-center sm:p-6',
+        placement === 'top' && 'items-start justify-center p-3 sm:px-6 sm:pt-[10dvh]',
       )}
     >
       <div
@@ -195,7 +197,7 @@ export function Modal({
           'relative flex flex-col overflow-y-auto shadow-xl outline-hidden',
           placement === 'left'
             ? 'animate-drawer-in h-dvh w-72 max-w-[85vw] border-r border-border bg-card'
-            : cn('card animate-dialog-in max-h-[calc(100dvh-1.5rem)] w-full', size === 'md' ? 'max-w-lg' : 'max-w-3xl'),
+            : cn('card animate-dialog-in max-h-[calc(100dvh-1.5rem)] w-full', placement === 'top' && 'sm:max-h-[calc(90dvh-1.5rem)]', size === 'md' ? 'max-w-lg' : 'max-w-3xl'),
         )}
       >
         {children}

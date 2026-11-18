@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration } from '../api/types';
+import { pendingApprovals } from '../lib/approvals';
 import { TEST_NOW } from '../test/utils';
 import { PendingApprovals } from './PendingApprovals';
 
@@ -18,7 +19,7 @@ function renderInbox(extra: number) {
   const plans = new Map(fx.plans.map((p) => [p.id, p]));
   render(
     <MemoryRouter>
-      <PendingApprovals migrations={[...fx.migrations, ...clones]} plans={plans} plansUnknown={false} />
+      <PendingApprovals queue={pendingApprovals([...fx.migrations, ...clones], plans)} />
     </MemoryRouter>,
   );
   return screen.getByRole('region', { name: 'Pending approvals' });
