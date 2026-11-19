@@ -263,6 +263,8 @@ class Provider(_Model):
     credentials_secret: str | None = None
     region: str | None = None
     verify_tls: bool = True
+    #: plain http:// is refused for a new endpoint unless its admin opts in (SDD §13.5): a lab
+    allow_plain_http: bool = False
     ca_cert_path: str | None = None
     conversion_host: ConversionHostConfig | None = None
     capabilities: dict[str, Any] = Field(default_factory=dict)

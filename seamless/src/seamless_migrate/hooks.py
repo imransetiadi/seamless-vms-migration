@@ -32,6 +32,7 @@ from .domain.models import (
 from .events import new_event
 from .executors.ansible import ansible_env, ansible_yaml, stop_process_group
 from .executors.base import ProcessGroups
+from .security.destinations import NOT_ALLOWED, DestinationNotAllowed, check_destination_async
 from .security.secret_store import SecretStoreError, secret_store
 from .security.secrets import SecretNotFound, read_secret
 from .store import ConflictError, NotFound
@@ -222,6 +223,13 @@ class HookRunner:
             "Authorization": f"Bearer {token}",
             "Idempotency-Key": str(context["idempotency_key"]),
         }
+        if self.transport is None:
+            # the token goes only where the control plane may connect (SDD §13.5); a test's
+            # transport stands in for the network, which it never reaches
+            try:
+                await check_destination_async(str(hook.url), self.settings, field="url")
+            except DestinationNotAllowed:
+                raise _Failed(NOT_ALLOWED) from None
         try:
             async with httpx.AsyncClient(
                 transport=self.transport, follow_redirects=False, timeout=hook.timeout_s

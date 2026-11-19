@@ -23,6 +23,7 @@ from ..domain.models import (
 from ..events import emit
 from ..plan_checks import reserved_tsig_secret, unknown_hook
 from ..security.auth import Principal
+from ..security.destinations import DestinationNotAllowed, check_stored
 from ..security.secret_store import SecretStoreError, secret_store
 from ..store import ConflictError
 from .deps import ApiError, require_role, services, validation_message
@@ -81,8 +82,14 @@ async def _write_token(request: Request, hook: Hook, token: str) -> None:
 
 
 async def _check_hook(request: Request, hook: Hook) -> None:
-    """What the catalog decides of a hook (SDD §12): its revert is another hook of the catalog."""
+    """What the catalog decides of a hook (SDD §12): its revert is another hook of the catalog,
+    and a webhook's URL names no destination the control plane refuses (§13.5)."""
     db = services(request).db
+    if hook.url is not None:
+        try:
+            check_stored(hook.url, services(request).settings)
+        except DestinationNotAllowed as exc:
+            raise ApiError(422, "validation_error", str(exc)) from None
     if hook.revert is not None and hook.revert not in {h.name for h in await db.list("hook", Hook)}:
         raise ApiError(422, "validation_error", f"revert: no hook {hook.revert!r} in the catalog")
 

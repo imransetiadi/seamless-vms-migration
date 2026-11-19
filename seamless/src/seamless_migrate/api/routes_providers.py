@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import ValidationError
 
+from ..config import Settings
 from ..credentials import host_pin, inventory_project
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
@@ -36,6 +37,7 @@ from ..events import emit
 from ..orchestrator import RELEASES_VM, cleanup_pending
 from ..providers.base import ProviderError
 from ..security.auth import Principal
+from ..security.destinations import DestinationNotAllowed, check_stored
 from ..security.secret_store import (
     SecretStoreError,
     ceph_key_secret_name,
@@ -78,6 +80,7 @@ PROVIDER_EDITABLE_FIELDS = frozenset(
         "credentials_secret",
         "region",
         "verify_tls",
+        "allow_plain_http",
         "ca_cert_path",
         "conversion_host",
         "distribution",
@@ -201,6 +204,31 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
         )
 
 
+def _check_destinations(provider: Provider, fields: set[str], settings: Settings) -> None:
+    """SDD §13.5 (pentest 2026-11-19 P3): an endpoint or a brought conversion host's address the
+    control plane never connects to is refused as it is stored - a literal address or a name of
+    the deployment's own DNS; a name's addresses are judged when the control plane connects -,
+    and plain ``http://`` needs ``allow_plain_http``. Only the fields the request sets are
+    checked, so a provider stored before stays editable. Not in demo mode: nothing is reached."""
+    if settings.demo:
+        return
+    try:
+        if fields & {"endpoint", "allow_plain_http"}:
+            check_stored(provider.endpoint, settings, "endpoint")
+            if provider.endpoint.strip().lower().startswith("http://") and not (
+                provider.allow_plain_http
+            ):
+                raise DestinationNotAllowed(
+                    "endpoint: plain http:// sends the credentials unencrypted; use https://, "
+                    "or set allow_plain_http to true for a lab"
+                )
+        host = provider.conversion_host
+        if "conversion_host" in fields and host is not None and host.address:
+            check_stored(host.address, settings, "conversion_host.address")
+    except DestinationNotAllowed as exc:
+        raise ApiError(422, "validation_error", str(exc)) from None
+
+
 def _secret_names(provider: Provider) -> dict[str, str]:
     """The secrets a provider reads, by name, for its audit events (never a value; SDD §13.3)."""
     names = {}
@@ -220,6 +248,7 @@ async def create_provider(
     svc = services(request)
     await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
+    _check_destinations(body, {"endpoint", "conversion_host", "allow_plain_http"}, svc.settings)
     # the server-owned fields are ignored: the pin is the provider check's alone, the project
     # credentials their routes' (SDD §10, §12, §27.4)
     provider = body.model_copy(
@@ -324,6 +353,7 @@ async def update_provider(
                 422, "validation_error", validation_message(exc.errors(), "invalid provider")
             ) from None
         _check_secret_names(updated, set(body))
+        _check_destinations(updated, set(body), svc.settings)
         # key_updated_at is the key's write alone (SDD §4.2): a client's value is ignored
         updated = _with_ceph_key_time(
             updated, provider.ceph.key_updated_at if provider.ceph is not None else None

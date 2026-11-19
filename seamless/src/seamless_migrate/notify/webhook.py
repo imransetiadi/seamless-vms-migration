@@ -19,6 +19,7 @@ import httpx
 
 from ..config import Settings
 from ..domain.models import NotificationChannel, utcnow
+from ..security.destinations import DestinationNotAllowed, check_destination_async
 from .messages import Message, webhook_document
 from .notifier import SendResult
 
@@ -110,6 +111,13 @@ class WebhookSender:
             "webhook-timestamp": timestamp,
             "webhook-signature": sign(signing_key, key, timestamp, body),
         }
+        if self.transport is None:
+            # sent only where the control plane may connect (SDD §13.5, §24.6): final, as a
+            # receiver that refuses the message is
+            try:
+                await check_destination_async(str(channel.url), self.settings, field="url")
+            except DestinationNotAllowed:
+                return SendResult("failed", "destination_not_allowed")
         try:
             async with httpx.AsyncClient(
                 transport=self.transport, follow_redirects=False, timeout=self.timeout_s

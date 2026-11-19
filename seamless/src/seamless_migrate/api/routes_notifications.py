@@ -31,6 +31,7 @@ from ..events import emit
 from ..notify.catalog import channel_event, subscription_event
 from ..notify.email import relay_configured
 from ..security.auth import Principal
+from ..security.destinations import DestinationNotAllowed, check_stored
 from ..security.secret_store import SecretStoreError, secret_store
 from ..store import ConflictError, NotFound
 from .deps import ApiError, _audit_denied, require_role, services, validation_message
@@ -70,6 +71,11 @@ def _channel(body: dict[str, Any], request: Request) -> NotificationChannel:
         raise ApiError(
             422, "validation_error", validation_message(exc.errors(), "invalid channel")
         ) from None
+    if channel.url is not None:
+        try:  # a webhook's URL names no destination the control plane refuses (SDD §13.5)
+            check_stored(channel.url, services(request).settings)
+        except DestinationNotAllowed as exc:
+            raise ApiError(422, "validation_error", str(exc)) from None
     if channel.kind == "email" and not relay_configured(services(request).settings):
         raise ApiError(
             422,

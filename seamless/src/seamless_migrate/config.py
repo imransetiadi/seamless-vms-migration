@@ -169,6 +169,13 @@ class Settings(BaseModel):
     auth_disabled: bool = False
     tokens_file: Path | None = None
     cors_origins: list[str] = Field(default_factory=list)
+    #: networks the control plane never connects to on an admin's word - the cluster's pod and
+    #: service networks (SDD §13.5, §15.1)
+    egress_deny_cidrs: list[str] = Field(default_factory=list)
+    #: when set, the only private networks a provider, a hook or a channel may be in (SDD §13.5)
+    egress_allow_private_cidrs: list[str] = Field(default_factory=list)
+    #: the bound of one provider check in seconds; 0 leaves it to the provider call's (SDD §10)
+    provider_check_timeout_s: float = Field(default=30.0, ge=0)
     clouds_yaml: Path | None = None
     secrets_dir: Path = Path("/var/run/secrets/seamless")
     #: where dashboard-entered credentials are written (SDD §13.3)
@@ -227,6 +234,19 @@ class Settings(BaseModel):
     def model_post_init(self, __context: object) -> None:
         if not self.db_url:
             object.__setattr__(self, "db_url", f"sqlite:///{self.data_dir / 'seamless.db'}")
+
+    @field_validator("egress_deny_cidrs", "egress_allow_private_cidrs")
+    @classmethod
+    def _networks(cls, values: list[str]) -> list[str]:
+        """Each entry is a network in CIDR form (SDD §13.5, §15.1)."""
+        import ipaddress
+
+        for value in values:
+            try:
+                ipaddress.ip_network(value, strict=False)
+            except ValueError:
+                raise ValueError(f"{value!r} is not a network (CIDR)") from None
+        return values
 
     @field_validator("cors_origins")
     @classmethod
@@ -326,6 +346,7 @@ class Settings(BaseModel):
             "STEP_TIMEOUT_S": ("step_timeout_s", float),
             "LEADER_LEASE_S": ("leader_lease_s", float),
             "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),
+            "PROVIDER_CHECK_TIMEOUT_S": ("provider_check_timeout_s", float),
             "JEV_TIMEOUT_S": ("jev_timeout_s", float),
             "JEV_MIN_CONFIDENCE": ("jev_min_confidence", float),
         }
@@ -349,6 +370,12 @@ class Settings(BaseModel):
         cors = get("CORS_ORIGINS")
         if cors is not None:
             values["cors_origins"] = _csv(cors)
+        deny = get("EGRESS_DENY_CIDRS")
+        if deny is not None:
+            values["egress_deny_cidrs"] = _csv(deny)
+        allow = get("EGRESS_ALLOW_PRIVATE_CIDRS")
+        if allow is not None:
+            values["egress_allow_private_cidrs"] = _csv(allow)
         if "jev_mode" in values:
             values["jev_mode"] = str(values["jev_mode"]).lower()
         if "jev_deployment" in values:
