@@ -15,7 +15,7 @@ commit before the code**; TDD; Jev decides between options and gates each change
 | D3 | Input snapshots: write-once document kind `advisor_snapshot`, id = SHA-256 of the redacted payload. | Content-addressed = immutable and verifiable. | — |
 | D4 | The engine keeps reading `migration.strategy`; `_validate_plan` writes it from `decision.final_option` (the deterministic choice while `pending_approval`, and the migration does not start until the decision is approved or overridden). | Smallest change to the migration engine; the spec's "engine reads only the final decision". | — |
 | D5 | Old strategy notes are not copied: the recommendations listing adapts each strategy note left in `Migration.advisor_notes` into a `legacy: true` entry when it reads it (fields parsed where possible); validation keeps existing notes. | No data migration at all, so nothing to roll back and the counts match by construction (refined while writing the SDD for PR-1; it replaces a one-time copy). | — |
-| D6 | Permissions are named in the API and mapped to a minimum role: `advisor.policy.manage` → `admin`, `advisor.approve` → `admin`. | Existing role model (SDD §13); spec default "Admin". `TODO(ADV-04): confirm` (`approver` is the alternative). | — |
+| D6 | Permissions are named in the API and mapped to a minimum role: `advisor.policy.manage` → `admin`, `advisor.approve` → `admin`. | Existing role model (SDD §13); spec default "Admin". `ADV-04: confirmed by the owner 2026-11-19` (`approver` is the alternative). | — |
 
 ## Open questions — defaults in force
 
@@ -30,13 +30,13 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 
 | PR | Item | Scope here | Status |
 |---|---|---|---|
-| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | done — 22a318d, 9719b27, 7331687, 7b5cbdc, ab29332, d8f2fb0, eec70db |
+| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `ADV-03: confirmed by the owner 2026-11-19` | done — 22a318d, 9719b27, 7331687, 7b5cbdc, ab29332, d8f2fb0, eec70db |
 | PR-2 | ADV-06 core | one redaction gateway every Jev call and memory write passes; fixture test (password, bearer, PEM, clouds.yaml `auth`) | done — 4cf3f31, ed99de7 (`ai/redaction.py`, jev_decide 0.99 over keeping it in the agentmemory client) |
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | done — e652375, 013b627, b313ce2 (`ai/snapshots.py`, `/advisor/audit`, `/advisor/recommendations/:id`; jev_decide 0.91 replace `advisor.strategy`, 0.92 dedicated audit route) |
 | PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | done — 791c259, c18699a (confidence once, rounded down; reason without numbers; `Term` tooltip; Details tab; old-notes replay test). After the review of 10 Oct the Decision line carries the comparison ("below threshold (57% < 60%), default kept"; c6f62c9 SDD and the dashboard commit after it; jev_decide 0.64) |
 | PR-5 | ADV-04 | `advisor_policy` kind, resolution (plan > source provider > global; ties → strictest), CRUD (admin), approve/override (admin, reason ≥ 10 chars when required), pending approval holds the migration, Demo policy "Finance — approval required" | done — 33f7d09 (SDD), 7054651 (API: `ai/policies.py`, `advisor_hold`, `/advisor/policies`, approve/override), the dashboard commit after it (`/advisor/policies`, Approve/Override in the feed, the plan's "Waiting for advisor approval" panel, the migration's hold banner and next step, the detail page; `lib/policies.ts` resolves like the API) |
 | PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | done — da3ca1b, 0cb9dd3 (SDD), 05bfe22, d406720, acec272 (API: `ai/evidence.py`, eleven keys measured against the recommended option else the deterministic one, `decide()` counts what supports or opposes, incidents stored at creation, Jev's keyed reasons filtered — none today; a new policy asks for 3, the built-in default for none), d99d1e5 (dashboard: Evidence panel, list line, `?vm=` and `#findings`/`#estimates` links, mock port on the shared six-case table). jev_decide 1.0 ×5, 0.96 (placement) |
-| PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | done — 72c0bee (SDD), 67df4c3 (API: `ai/payloads.py` field specs with golden tests, `/advisor/data-sent`, the console stays local with a remote model), the dashboard commit after it (badge on the Jev card and on each recommendation, the panel; jev_decide 0.99 declared specs). `TODO(ADV-06): confirm` — default remote, endpoint host unset until configured |
+| PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | done — 72c0bee (SDD), 67df4c3 (API: `ai/payloads.py` field specs with golden tests, `/advisor/data-sent`, the console stays local with a remote model), the dashboard commit after it (badge on the Jev card and on each recommendation, the panel; jev_decide 0.99 declared specs). `ADV-06: confirmed by the owner 2026-11-19` — default remote, endpoint host unset until configured |
 
 Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
 
@@ -62,7 +62,7 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    approval refused with 409 and not counted by the gate; `AdvisorPolicy.require_distinct_approver`,
    `AdvisorRecommendation.requested_by` = the validating user), 2a749d6 (dashboard), the e2e scripts' second approver
    (`APPROVER_TOKEN`). jev_decide 0.82: a request is not an approval; 0.96: the validating user requests a decision.
-   `TODO(ADV-17): confirm` — approver = anyone with the role other than the requester; break-glass off.
+   `ADV-17: confirmed by the owner 2026-11-19` — approver = anyone with the role other than the requester; break-glass off.
 3. Rest of Phase 1 — the threshold value in the Decision line (ADV-03), approve/override and the Finance policy
    visible on the demo stack (ADV-04, PR-5), the deployment badge and "Data sent to advisor" (ADV-06, PR-7); then
    a new demo for the owner.
@@ -72,7 +72,7 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    review for a database VM without a probe; "Boot verified; no review needed"; rules-based suggestions in
    `Migration.suggested_probes`; demo: billing-db-01 carries `demo-fault: app-down` and rolls back), 0bc821e (dashboard:
    probe editor in the plan form and per VM, the Verification panel, the plan's "Application probes" warning with Use
-   suggested probe). jev_decide 0.98 for the model. `TODO(ADV-18): confirm` — the advisor's part of the suggestions waits
+   suggested probe). jev_decide 0.98 for the model. `ADV-18: confirmed by the owner 2026-11-19` — the advisor's part of the suggestions waits
    for ADV-11 (the rules suggest for now). The demo stack keeps its data: the new demo plans (probes, the fault) show
    on a fresh demo only.
 5. ADV-19 plan status and the finalize queue. Done — b3d87a9, f58a8d1 (SDD), 59cefe6 (API: `derive_plan_status`
@@ -84,7 +84,7 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    Completed plan and no Start once a plan runs, the finalize queue by wave with Finalize wave, "Finalize overdue" and
    "Source VM running", Awaiting finalize and Finalized where Completed was, the source alert and the next step on
    the migration page, the demo power control, the reminder in the plan form, the Overview's attention items).
-   jev_decide 0.99 (derive, never store), 0.96 (bulk finalize through each VM's finalize). `TODO(ADV-19): confirm` —
+   jev_decide 0.99 (derive, never store), 0.96 (bulk finalize through each VM's finalize). `ADV-19: confirmed by the owner 2026-11-19` —
    the 72 h reminder (open question 14). Beyond the spec's wording: Pause is hidden on a finished plan too, a
    completed VM whose source runs again gets no finalize advice until it is stopped, and both finalize dialogs warn
    about it.
@@ -109,15 +109,15 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
 * Option labels (ADV-03): the spec's table is used — "Cold migration", "Needs your input", "Needs investigation",
   `none` as "Other" in Details only — except that "(CBT)" is kept for VMware warm only: the OpenStack warm
   strategy pre-copies snapshots and scans the whole device, so "Warm migration (CBT)" would be untrue for it
-  (jev_decide 0.99). `none` reads "no clear option" in a note's lines. `TODO(ADV-03): confirm`.
+  (jev_decide 0.99). `none` reads "no clear option" in a note's lines. `ADV-03: confirmed by the owner 2026-11-19`.
 * The confidence is shown rounded down to a whole percent, so 0.595 reads "59% (threshold 60%)" rather than a
   contradictory "60% (threshold 60%)" next to "below threshold".
 * `decision.pending_approval` is an audit event kind too (ADV-05's list omits it, its acceptance criterion needs
   it).
 * Policy scopes (ADV-04) are plans and source providers: the product has no plan tags or environments, so the
-  spec's "plan tag > provider > environment > global" reads "plan > source provider > global". `TODO(ADV-04): confirm`.
+  spec's "plan tag > provider > environment > global" reads "plan > source provider > global". `ADV-04: confirmed by the owner 2026-11-19`.
 * Approve and Override (ADV-04) need `advisor.approve`, mapped to admin like `advisor.policy.manage`
-  (`TODO(ADV-04): confirm`; `approver` is the alternative). Override offers the other eligible options: running
+  (`ADV-04: confirmed by the owner 2026-11-19`; `approver` is the alternative). Override offers the other eligible options: running
   the recommended one is approving it.
 
 ## PR-1 (ADV-01) — acceptance

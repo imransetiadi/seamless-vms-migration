@@ -148,7 +148,7 @@ function initialForm(sourceId = '', vmIds: string[] = [], sourceProject: string 
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
-    // TODO(ADV-19): confirm 72 h — the owner's open question 14 (the API's default, SDD §4.2)
+    // 72 h confirmed by the owner 2026-11-19 (ADV-19) — the owner's open question 14 (the API's default, SDD §4.2)
     finalizeWarningH: '72',
     projects: '',
     probeAddress: DEFAULT_VERIFICATION.probe_address,

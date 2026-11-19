@@ -232,7 +232,8 @@ async def authenticate(request: Request) -> Principal | None:
     return principal
 
 
-#: Named permissions and the minimum role that holds each (SDD §13.2; TODO(ADV-04): confirm admin).
+#: Named permissions and the minimum role that holds each (SDD §13.2; admin, confirmed by the
+#: owner 2026-11-19, ADV-04).
 PERMISSIONS: dict[str, Role] = {
     "advisor.policy.manage": Role.admin,
     "advisor.approve": Role.admin,

@@ -40,7 +40,7 @@ export const DECISION_TYPE_LABELS: Record<DecisionType, string> = {
   console_screening: 'Console screening',
 };
 
-/** An option in a note's lines. `none` has no settled meaning yet (TODO(ADV-03): confirm - open question #1). */
+/** An option in a note's lines. `none` reads "Other", in Details only (ADV-03: confirmed by the owner 2026-11-19; open question #1). */
 export function optionLabel(option: string): string {
   return option === 'none' ? 'no clear option' : (OPTION_LABELS[option] ?? option);
 }

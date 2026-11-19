@@ -1102,7 +1102,7 @@ class PlanSpec(_Model):
     #: per VM (source id): its application probes instead of verification.app_probes; [] = none
     probe_overrides: dict[str, list[AppProbe]] = Field(default_factory=dict)
     #: hours a migration may wait in completed before it is flagged for finalize (SDD §8.1, ADV-19);
-    #: TODO(ADV-19): confirm 72 h — the owner's open question 14
+    #: 72 h confirmed by the owner 2026-11-19 (ADV-19) — the owner's open question 14
     finalize_warning_h: int = Field(default=72, ge=1)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
     #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its

@@ -956,7 +956,7 @@ requested this cutover. Another approver must approve it.", and an approval the 
 stays in the history without counting. The approver who forces the cutover (`force_cutover.actor`) is held to the same
 rule, also when another user requested it first: their approval never counts, and their `POST …/approve` answers 409
 "You forced this cutover. Another approver must approve it." There is no self-approval for emergencies (break-glass is off,
-`TODO(ADV-17): confirm`). A
+`ADV-17: confirmed by the owner 2026-11-19`). A
 repeated request records another approval and may add `force_window` — an approver can force a
 requested cutover that waits for a closed window — but never clears one. `POST …/approve` is accepted
 in `pending`, `validating`, `blocked`, `ready`, `precopy`, `syncing`, `awaiting_cutover`, `failed` and
@@ -3139,7 +3139,7 @@ migrations that are not `cancelled`, in this order:
 
 The **finalize queue** is the plan's `completed` migrations: verified on RHOSO, the source VM still there until
 finalize. Each one's time in `completed` counts from its last transition into it; past `plan.finalize_warning_h`
-hours (default 72, ≥ 1; the owner's open question 14, `TODO(ADV-19): confirm`) it is flagged for finalize or
+hours (default 72, ≥ 1; the owner's open question 14, `ADV-19: confirmed by the owner 2026-11-19`) it is flagged for finalize or
 rollback. `Stats.completed` stays the verified ones; `awaiting_finalize` and `finalized` split it.
 A finalize that deletes the source records `checkpoint: "finalizing"` before its step runs. When the step then
 fails, the migration stays `completed` with that checkpoint: the source may be gone — a deletion that timed out
@@ -3787,7 +3787,7 @@ exporter (PR #64 review).
 Validation records the suggestion in `Migration.suggested_probes`. A suggestion never runs: the verification
 probes only what the plan configures, so a person adds it — the dashboard's "Use suggested probe" saves it as the
 VM's `probe_overrides` entry, a plan edit (§12 `PATCH /plans/{id}`, which returns the plan to draft). The rules make
-the suggestion; the advisor's part waits for ADV-11 (`TODO(ADV-18): confirm`).
+the suggestion; the advisor's part waits for ADV-11 (`ADV-18: confirmed by the owner 2026-11-19`).
 
 ---
 
@@ -4847,7 +4847,7 @@ storage. Editing roles, rotating tokens and deleting users are not exposed by th
 Ordered roles `viewer < operator < approver < admin`; each route declares its minimum role (§12).
 Every mutating call emits an audit event with `actor = principal.name`. Named permissions map to a minimum
 role: `advisor.policy.manage` and `advisor.approve` → `admin` (§14.6; `approver` is the alternative the owner
-may choose, `TODO(ADV-04): confirm`). Notification channels (§24.4): the catalog, its secrets and its tests are an
+may choose, `ADV-04: confirmed by the owner 2026-11-19`). Notification channels (§24.4): the catalog, its secrets and its tests are an
 admin's; an operator subscribes a channel to a plan and removes that subscription; a subscription to every plan is an
 admin's, and an operator who asks for one is refused with 403 and an `auth.denied`, as for an approver-only plan field.
 
@@ -5051,7 +5051,7 @@ What leaves the installation is declared (ADV-06): the strategy evidence and the
 rendered from field specs — key, label, render — in `ai/payloads.py`, so the advisor sends nothing a spec does
 not declare, and `GET /advisor/data-sent` lists those specs per decision type with the Jev tool. Where the model
 runs is configuration: `SEAMLESS_JEV_DEPLOYMENT` (`on_prem` or `remote`, default `remote` — the `jev` sidecar
-forwards to the TypeSafe API; `TODO(ADV-06): confirm`) and `SEAMLESS_JEV_ENDPOINT_HOST` (the host shown on the
+forwards to the TypeSafe API; `ADV-06: confirmed by the owner 2026-11-19`) and `SEAMLESS_JEV_ENDPOINT_HOST` (the host shown on the
 badge, default unset). The console excerpt leaves the installation only when the deployment is `on_prem` or
 `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` is true (default false): otherwise `review_verification` sends neither
 `jev_screen` nor `jev_verify` the excerpt, verifies the check results alone and its note says the console stayed
@@ -5299,7 +5299,7 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   then the higher threshold, the higher minimum evidence, a required override reason, a required distinct approver,
   the lower id. (The
   spec's plan tags and environments do not exist in this product: plans and providers stand in for them,
-  `TODO(ADV-04): confirm`.) A new policy asks for 3 evidence items by default (ADV-02, the owner's spec); stored
+  `ADV-04: confirmed by the owner 2026-11-19`.) A new policy asks for 3 evidence items by default (ADV-02, the owner's spec); stored
   policies keep their minimum and the built-in default keeps 0, so a deployment without policies decides as before.
 * **Hold**: validation decides with the policy in force; a `pending_approval` decision sets
   `migration.advisor_hold` to the recommendation id (§5.4: no start meanwhile). A later validation that records
@@ -6771,7 +6771,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers; decided by the owner 2026-10-23: §28.11's ten defaults as written - Ceph `rbd diff` between Cinder's pass snapshots, queried on the source conversion host with a metadata-only Ceph user; pre-copy and keep-warm passes check the extents and the final pass reads them; a disk that cannot use them scans in full; libvirt dirty bitmaps after a lab spike; a Technology Preview in 0.5.0 | each item binds with its plan task (§28.12, FR-26); the LAB-CE cases and PERF-E2E-SM1b of §28.10 end the Technology Preview |
 | D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; decided by the owner 2026-10-23: §25.11's ten defaults as written - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | each item binds with its plan task (§25.12); the LAB-HA cases of §25.10 end the Technology Preview |
 | D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
-| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
+| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `ADV-06: confirmed by the owner 2026-11-19`) |
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
 | D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
 | D7 | Python floor of the conversion hosts (§6.2: 3.6, RHEL 8 `platform-python`); CI runs the tests on 3.11 and later only | 3.6 kept; `test_blocksync.py` passed on Python 3.6.15 and 3.8.20 in containers on 2026-10-23, run by hand (QASuite §14.2) | a CI job that runs QASuite §14.2's container command, or a 3.9 floor (audit A-12) |

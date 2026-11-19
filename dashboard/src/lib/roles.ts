@@ -9,7 +9,7 @@ export function hasRole(role: Role | null | undefined, minimum: Role): boolean {
   return roleRank(role) >= roleRank(minimum);
 }
 
-/** Named permissions and the minimum role that holds each (SDD §13.2; TODO(ADV-04): confirm admin). */
+/** Named permissions and the minimum role that holds each (SDD §13.2; admin, confirmed by the owner 2026-11-19 (ADV-04)). */
 export const PERMISSIONS = {
   'advisor.policy.manage': 'admin',
   'advisor.approve': 'admin',
