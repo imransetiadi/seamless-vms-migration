@@ -400,3 +400,30 @@ describe("ProviderDialog: a conversion host's declared host keys (SDD §4.2, §1
     expect(within(dialog).queryByLabelText(/^host keys/i)).not.toBeInTheDocument();
   });
 });
+
+describe('ProviderDialog: plain HTTP needs the admin\'s word (SDD §13.5, §16; pentest 2026-11-19 P3)', () => {
+  it('offers Allow plain HTTP only for an http:// endpoint and sends it only when set', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    await user.click(await screen.findByRole('button', { name: /^add provider$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /^add provider$/i });
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    const allow = () => within(dialog).queryByRole('switch', { name: /allow plain http/i }) ?? within(dialog).queryByRole('checkbox', { name: /allow plain http/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Lab DC9');
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-dc9.example.com:5000/v3');
+    expect(allow()).toBeNull();
+    await user.clear(within(dialog).getByLabelText(/keystone url/i));
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'http://kolla-dc9.example.com:5000/v3');
+    const toggle = allow();
+    expect(toggle).not.toBeNull();
+    expect(within(dialog).getByText(/The control plane refuses it unless you allow it here/)).toBeInTheDocument();
+    await user.click(toggle!);
+    expect(within(dialog).getByText(/the credentials travel unencrypted/)).toBeInTheDocument();
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    await waitFor(() => expect(server.providers.find((p) => p.id === 'lab-dc9')).toMatchObject({ endpoint: 'http://kolla-dc9.example.com:5000/v3', allow_plain_http: true }));
+  });
+});
+

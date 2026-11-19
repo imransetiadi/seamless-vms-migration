@@ -32,6 +32,7 @@ interface FormState {
   endpoint: string;
   region: string;
   verifyTls: boolean;
+  allowPlainHttp: boolean;
   caPath: string;
   mode: CredentialMode;
   cloud: string;
@@ -167,6 +168,7 @@ function initialState(provider: Provider | undefined): FormState {
     endpoint: provider?.endpoint ?? '',
     region: provider?.region ?? '',
     verifyTls: provider?.verify_tls ?? true,
+    allowPlainHttp: provider?.allow_plain_http ?? false,
     caPath: provider?.ca_cert_path ?? '',
     mode,
     cloud: provider?.cloud ?? '',
@@ -530,6 +532,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
+  const plainHttp = /^http:\/\//i.test(form.endpoint.trim());
   const create = useCreateProvider();
   const update = useUpdateProvider();
   const setCredentials = useSetProviderCredentials();
@@ -730,6 +733,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         endpoint: form.endpoint.trim(),
         region: form.region.trim() || null,
         verify_tls: form.verifyTls,
+        // plain http:// needs the admin's word (SDD §13.5); an https:// endpoint never carries it
+        allow_plain_http: plainHttp && form.allowPlainHttp,
         ca_cert_path: form.caPath.trim() || null,
         cloud: form.mode === 'clouds_yaml' ? form.cloud.trim() : null,
         // a secret managed outside Seamless is named, never written (SDD §13.3); the other methods write their own
@@ -997,6 +1002,14 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               label="Verify the TLS certificate"
               hint={form.verifyTls ? 'Recommended. Add the CA path above for a private CA.' : 'Off: anyone between Seamless and this endpoint can read the credentials. Use only in a lab.'}
             />
+            {plainHttp && (
+              <Toggle
+                checked={form.allowPlainHttp}
+                onChange={(v) => set('allowPlainHttp', v)}
+                label="Allow plain HTTP for this endpoint"
+                hint={form.allowPlainHttp ? 'On: the credentials travel unencrypted to this endpoint. Use only in a lab.' : 'The endpoint is http://. The control plane refuses it unless you allow it here; prefer https://.'}
+              />
+            )}
             {!form.verifyTls && (
               <p className="flex items-start gap-1.5 text-xs text-status-warning">
                 <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0" />

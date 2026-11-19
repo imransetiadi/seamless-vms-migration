@@ -939,7 +939,7 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
 }
 
 /** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
-export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'allow_plain_http', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
 
 /** A Ceph cluster's fsid and a monitor address, as the API's model reads them (SDD §4.2, §28.4). */
 const CEPH_FSID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -2561,6 +2561,7 @@ export class MockServer {
       credentials_secret: null,
       region: null,
       verify_tls: true,
+      allow_plain_http: false,
       ca_cert_path: null,
       conversion_host: null,
       distribution: null,
