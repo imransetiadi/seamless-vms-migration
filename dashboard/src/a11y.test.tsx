@@ -351,7 +351,7 @@ describe('axe-core: no WCAG violations', () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/hooks', 'admin', (server) => {
       const at = '2026-10-08T12:00:00Z';
-      server.hooks.set('drain-lb', { name: 'drain-lb', kind: 'playbook', description: 'Drain the member', playbook: '/opt/hooks/drain-lb.yml', url: null, secret: null, timeout_s: 120, revert: null, created_at: at, updated_at: at });
+      server.hooks.set('drain-lb', { name: 'drain-lb', kind: 'playbook', description: 'Drain the member', playbook: '/opt/hooks/drain-lb.yml', url: null, url_host: null, secret_set: false, secret_updated_at: null, timeout_s: 120, revert: null, created_at: at, updated_at: at });
     });
     await screen.findByRole('heading', { level: 1, name: 'Hooks' }, { timeout: 8_000 });
     await settled();
@@ -359,7 +359,7 @@ describe('axe-core: no WCAG violations', () => {
     await user.selectOptions(screen.getByLabelText('Kind'), 'webhook');
     await user.type(screen.getByLabelText(/^Name/), 'notify');
     await user.type(screen.getByLabelText(/^URL/), 'http://hooks.example/notify');
-    await user.type(screen.getByLabelText(/^Secret/), 'notify-token');
+    await user.type(screen.getByLabelText(/^Bearer token/), 'smg_notify-token');
     await user.click(screen.getByRole('button', { name: 'Register hook' }));
     await screen.findByRole('alert');
     expect(await violations()).toEqual([]);
@@ -410,7 +410,7 @@ describe('axe-core: no WCAG violations', () => {
     renderAt('/plans', 'operator', (server) => {
       const at = '2026-10-08T12:00:00Z';
       for (const name of ['drain-lb', 'smoke'])
-        server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, secret: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
+        server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, url_host: null, secret_set: false, secret_updated_at: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
     });
     await screen.findByRole('heading', { level: 1, name: 'Plans' }, { timeout: 8_000 });
     await settled();

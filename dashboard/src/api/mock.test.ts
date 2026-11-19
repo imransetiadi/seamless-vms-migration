@@ -3226,7 +3226,8 @@ describe('mock hooks: the catalog an admin keeps (SDD §12, §23.3, plan task N1
     const { client } = setup('admin');
     expect(await client.get('/hooks')).toEqual([]);
     const created = await client.post<Hook>('/hooks', drain);
-    expect(created).toMatchObject({ ...drain, description: null, url: null, secret: null, timeout_s: 300, revert: null });
+    expect(created).toMatchObject({ ...drain, description: null, url: null, url_host: null, secret_set: false, secret_updated_at: null, timeout_s: 300, revert: null });
+    expect(created).not.toHaveProperty('secret');
     await expect(client.post('/hooks', drain)).rejects.toMatchObject({ status: 409, message: "hook 'drain-lb' already exists" });
     const refusals: Array<[Record<string, unknown>, string]> = [
       [{}, 'name: Field required; kind: Field required'],
@@ -3239,12 +3240,12 @@ describe('mock hooks: the catalog an admin keeps (SDD §12, §23.3, plan task N1
       [{ name: 'x1', kind: 'webhook', secret: 'hook-token' }, 'Value error, url: a webhook hook needs it'],
       [{ name: 'x1', kind: 'webhook', url: 'http://h.example/x', secret: 'hook-token' }, 'Value error, url: an https:// URL with a host'],
       [{ name: 'x1', kind: 'webhook', url: 'https://u:p@h.example/x', secret: 'hook-token' }, "Value error, url: no user information - put the credential in the hook's secret"],
-      [{ name: 'x1', kind: 'webhook', url: 'https://h.example/x', secret: '../etc' }, "Value error, secret: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit"],
+      [{ name: 'x1', kind: 'webhook', url: 'https://h.example/x', secret: 'a token' }, 'secret: the bearer token, 1-4096 visible ASCII characters without a space'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', secret: 'hook-token' }, 'secret: a playbook hook takes none'],
       [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', revert: 'x1' }, 'Value error, revert: a hook cannot revert itself'],
       [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', timeout_s: 1801 }, 'timeout_s: Input should be less than or equal to 1800'],
       [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', nope: 1, also: 2 }, 'not a field of this object: also, nope'],
       [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', revert: 'gone' }, "revert: no hook 'gone' in the catalog"],
-      [{ name: 'x1', kind: 'webhook', url: 'https://h.example/x', secret: 'provider_dc1' }, 'secret: provider-* names belong to the secrets Seamless stores for each provider; a webhook would send it to its URL'],
     ];
     for (const [body, message] of refusals) await expect(client.post('/hooks', body)).rejects.toMatchObject({ status: 422, message });
     await expect(client.patch('/hooks/drain-lb', { kind: 'webhook' })).rejects.toMatchObject({ status: 422, message: 'fields cannot be changed: kind' });

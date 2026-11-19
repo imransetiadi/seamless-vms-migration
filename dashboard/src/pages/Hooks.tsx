@@ -37,19 +37,19 @@ function formOf(hook: Hook): HookForm {
     description: hook.description ?? '',
     playbook: hook.playbook ?? '',
     url: hook.url ?? '',
-    secret: hook.secret ?? '',
+    secret: '',
     timeout: String(hook.timeout_s),
     revert: hook.revert ?? '',
   };
 }
 
-/** The fields the API takes for the form's kind (SDD §4.2, §12): the other kind's stay unset, an empty text is none. */
+/** The fields the API takes for the form's kind (SDD §4.2, §12): the other kind's stay unset, an empty text is none; the bearer token is sent only when typed - it is write-only, and an empty field keeps the one set. */
 function fieldsOf(form: HookForm): HookPatch {
   const text = (value: string) => (value.trim() ? value.trim() : null);
   const timeout = Number(form.timeout);
   return {
     description: text(form.description),
-    ...(form.kind === 'playbook' ? { playbook: text(form.playbook) } : { url: text(form.url), secret: text(form.secret) }),
+    ...(form.kind === 'playbook' ? { playbook: text(form.playbook) } : { url: text(form.url), ...(form.secret ? { secret: form.secret } : {}) }),
     timeout_s: form.timeout.trim() && Number.isFinite(timeout) ? timeout : 300,
     revert: text(form.revert),
   };
@@ -144,7 +144,19 @@ export default function Hooks() {
                 ) : (
                   <>
                     <TextField label="URL" value={form.url} onChange={set('url')} required autoComplete="off" spellCheck={false} inputMode="url" hint="https://, with no user information." />
-                    <TextField label="Secret" value={form.secret} onChange={set('secret')} required autoComplete="off" spellCheck={false} hint="The name of the secret whose key token is the webhook's bearer token." />
+                    <TextField
+                      label="Bearer token"
+                      type="password"
+                      value={form.secret}
+                      onChange={set('secret')}
+                      autoComplete="new-password"
+                      spellCheck={false}
+                      hint={
+                        editing && hooks.data?.find((hook) => hook.name === editing)?.secret_set
+                          ? 'A token is set. Leave empty to keep it; type a new one to replace it. It is never shown again.'
+                          : 'Sent to the URL as Authorization: Bearer. Stored in the secret store and never shown again.'
+                      }
+                    />
                   </>
                 )}
                 <TextField label="Timeout (s)" value={form.timeout} onChange={set('timeout')} inputMode="numeric" autoComplete="off" hint="1-1800 seconds; 300 by default." />
@@ -191,7 +203,8 @@ export default function Hooks() {
                       <code className="text-sm">{hook.playbook}</code>
                     ) : (
                       <p className="text-sm">
-                        <code>{hook.url}</code> <span className="text-muted-foreground">with the secret</span> <code>{hook.secret}</code>
+                        {hook.url ? <code>{hook.url}</code> : <span>Receiver {hook.url_host ?? 'unknown'}</span>}{' '}
+                        <span className="text-muted-foreground">{hook.secret_set ? 'with a bearer token set' : 'with no bearer token set'}</span>
                       </p>
                     )}
                     <p className="text-sm text-muted-foreground">

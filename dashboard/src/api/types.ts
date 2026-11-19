@@ -553,16 +553,20 @@ export interface Hook {
   kind: 'playbook' | 'webhook';
   description: string | null;
   playbook: string | null;
+  /** A webhook's URL: in full for an admin, null for any other role, which reads `url_host` (SDD §12). */
   url: string | null;
-  secret: string | null;
+  url_host: string | null;
+  /** Whether the API holds a bearer token for the webhook: the token itself is write-only (SDD §12, §13.3). */
+  secret_set: boolean;
+  secret_updated_at: Timestamp | null;
   timeout_s: number;
   revert: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
 
-/** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable. */
-export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'secret' | 'timeout_s' | 'revert'>>;
+/** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable; `secret` is the bearer token, write-only. */
+export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'timeout_s' | 'revert'>> & { secret?: string };
 
 /** What a notification subscription chooses (SDD §4.1, §24.5). */
 export type NotifyTopic = 'approval' | 'downtime' | 'problem' | 'outcome' | 'progress';
