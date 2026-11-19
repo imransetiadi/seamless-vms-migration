@@ -427,8 +427,10 @@ Hook { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which
        kind: "playbook"|"webhook", description: str|null = null,
        playbook: str|null = null,   # playbook: the playbook's absolute path, a .yml or .yaml file (required); else none
        url: str|null = null,        # webhook: an https:// URL without user information (required); else none
-       secret: str|null = null,     # webhook: the secret (§13.3) whose key `token` is its bearer token (required); else
-                                    # none; never a provider-* name nor a secret a provider names (§13.3)
+       secret: str|null = null,     # server-owned, never answered: the name of the secret a hook stored before 0.5.0
+                                    # read its token from, until a start moved the token to hook-{name} (§13.3). In a
+                                    # request, `secret` is the webhook's bearer token itself: write-only (§12)
+       secret_updated_at: datetime|null = null,   # server-owned: when the API last wrote the bearer token (§12)
        timeout_s: int = 300,        # 1-1800 (§23.3)
        revert: str|null = null,     # the hook a rollback runs to undo this one: another hook of the catalog
        created_at: datetime, updated_at: datetime }   # server-owned
@@ -659,7 +661,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 never a value; a project credential's write (§12, §27.4, plan task TC2) carries its `project_id` and the secret's
 name too, and its deletion the provider id, `project_id`, the secret's name and `deleted` true, without key names.
 `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
-`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
+`name` and `kind`, and `hook.updated` the fields it set (`fields`; `secret` when the bearer token was written) - never a URL or a token; `hook.deleted` names the secret the store could not remove (`secret_left`). `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
 the source again); `migration.phase` to `failed` carries `source_stopped`, whether the downtime clock was open at the
 failure (§24.5, plan task NT4). The `channel.*` events
 carry the channel's `name` and `kind`; `channel.updated` the fields it set (`fields`), `secret` among them when the secret
@@ -4640,11 +4642,12 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry - its project's conversion host pin with it, so a later credential for the project starts without one (§26.4) - and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin checked against its project's host, looked up by its name alone: a pin of another server, or a host no server of the project bears the name of ("conversion host not found: ..."), reported in that project's entry of `projects`, no console of a project's host read, §10) |
-| GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
-| POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
-| GET | `/hooks/{name}` | viewer | — | `Hook` |
-| PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); the merged hook is checked as `POST /hooks` checks one | `Hook`; event `hook.updated` with the fields set |
-| DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. Event `hook.deleted` |
+| GET | `/hooks` | viewer | — | `HookView[]` by name (§23.3). `HookView` = `Hook` without `secret`, plus `secret_set: bool` (the API wrote a bearer token, or a hook of an earlier version still names its secret) and `url_host`; a role below admin reads `url` as null - a webhook's URL may hold a token in its path - and its host in `url_host`. No route returns a token or a secret's name (pentest 2026-11-19, P1) |
+| POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at`, `secret_updated_at` ignored; a field `Hook` does not have: 422); `secret`, optional for a webhook, is its bearer token - 1-4096 visible ASCII characters -, written to the secret store under `hook-{name}` (§13.3) and never stored in the document nor answered | `201 HookView`; 409 when the name exists (no token is written); 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, `secret` is no such token or the hook is a playbook - the refusal never repeats the value -, or `revert` names the hook itself or no hook of the catalog; 503 `unavailable` when the secret store cannot take the token (nothing is registered). Event `hook.created` |
+| GET | `/hooks/{name}` | viewer | — | `HookView` |
+| PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); `secret` is a new bearer token, as `POST /hooks` takes one; the merged hook is checked as `POST /hooks` checks one | `HookView`; event `hook.updated` with the fields set |
+| PUT | `/hooks/{name}/secret` | admin | `{"token"}` alone: the webhook's bearer token, as `POST /hooks` takes `secret` | `HookView` (write-only: no route returns the token); 404 for an unknown hook; 422 for another body, a value that is no token or a playbook hook; 503 `unavailable` when the secret store cannot take it. Event `hook.updated` with `fields: ["secret"]` |
+| DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. The secret the store holds for the hook (`hook-{name}`) is deleted with it. Event `hook.deleted` |
 | GET | `/notifications/channels` | viewer | — | `NotificationChannelView[]` by name (§24.3): each channel with `recipient_count`, `url_host` and its `cursor` (null before it handled an event). Recipients are personal data and a webhook's URL may hold a token (§24.8), so a role below admin reads `recipients` as `[]` and `url` as null |
 | POST | `/notifications/channels` | admin | `NotificationChannel` (the server-owned fields ignored; a field it does not have: 422) | `201 NotificationChannelView`; 409 when the name exists; 422 when the kind's fields are missing or another kind's are set, a recipient is no addr-spec or there are more than 50, or a webhook's URL is not `https://` or holds user information (§4.2); with plan task NT6, 422 for an email channel while the relay is unset. Event `channel.created` |
 | GET | `/notifications/channels/{name}` | viewer | — | `NotificationChannelView`, as the list shows it to the role |
@@ -4887,9 +4890,16 @@ holds the new value, the provider does not record it yet, and the operator sends
 deleted meanwhile answers 404, and the secret just written is removed again. A connection to a provider is built
 again once its document (its state fields aside) or the mounted `clouds.yaml` changed — the provider registry's and
 the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
-credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret holds its bearer token as the
-key `token`, read each time the hook runs, and an RFC 2136 DNS target's TSIG key is a secret alike (§7.2, §23.3,
-§23.5); a hook's or a target's secret is never a provider's (§12). An RFC 2136 target's TSIG secret holds the key as
+credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret is `hook-{name}` - the admin
+never chooses the name -: it holds the bearer token as the key `token`, read each time the hook runs, and is written
+through `POST`/`PATCH /hooks` (`secret`) or `PUT /hooks/{name}/secret`, write-only, or created outside the control plane
+under that name (pentest 2026-11-19, P1: before 0.5.0 the hook named its secret, every role read the name, and a token
+typed in its place was answered to every role). At each start of the orchestrator a hook that still names a secret
+has its token copied to `hook-{name}` and the name dropped from its document; a name whose secret holds no token is
+dropped alike, and one the store cannot read or take then is kept for the next start, the hook reading it there
+meanwhile. Names that fold to one starting with `hook-` belong to the hooks: a `credentials_secret`, a
+`conversion_host.ssh_key_secret` or a DNS target's `tsig_secret` that folds to one is refused (422). An RFC 2136 DNS
+target's TSIG key is a secret alike (§7.2, §23.3, §23.5); a target's secret is never a provider's (§12). An RFC 2136 target's TSIG secret holds the key as
 `name`, `secret` (base64) and, optionally, `algorithm` (`hmac-sha256` by default) (§8.4). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory, each key written
@@ -4919,7 +4929,7 @@ Windows) opens `provider-x` for `Provider-x`, and the variables upper-case the n
 into `_` - lower-cased, with every character other than a letter or digit taken as `-`: a name that folds to one
 starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). Names that fold to one
 starting with `notify-` belong to the notification channels (`notify-{name}`, §24.3), which the store writes through
-`PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`, a hook's `secret`
+`PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`
 or a DNS target's `tsig_secret` that folds to one is refused (422), so writing a channel's secret never replaces theirs,
 and a channel never reads theirs. `SEAMLESS_SMTP_SECRET` names the secret whose `username` and `password` the email sender
 authenticates to the relay with (§15.1, §24.3); it is read each time a message is sent. A webhook channel's `signing_key`
@@ -6156,18 +6166,20 @@ is no origin a browser sends (review RV31-03).
   `/hooks` (Hooks, plan task N12a, §23.3 — "Playbooks and webhooks a plan runs at the points of its network cut-over.
   A hook runs code with the control plane's reach, so only an admin registers one.", with the Technology Preview badge
   — on `GET /hooks` for every role and its writes for an admin alone, §12. The catalog, in name order: each hook's
-  name, kind (Playbook, Webhook), description, what it runs - the playbook's path, or the webhook's URL and the name
-  of its secret, never a value the API does not hold -, timeout and the hook that reverts it; "No hooks registered."
+  name, kind (Playbook, Webhook), description, what it runs - the playbook's path, or the webhook's URL (an admin;
+  any other role reads "Receiver {host}") and whether a bearer token is set, never the token -, timeout and the hook
+  that reverts it; "No hooks registered."
   when there are none, unavailable with Retry when the catalog cannot be loaded. For an admin, Register hook: Name
   (the API's rule, its hint: 2-63 lowercase letters, digits and hyphens, starting with a letter or a digit), Kind
   (Playbook by default), Description, the kind's own fields - Playbook path (an absolute path to a .yml or .yaml
-  file), or URL (https://, with no user information) and Secret (the name of the secret §13.3 reads, its key `token`
-  the bearer token) -, Timeout (seconds; 300 by default, 1-1800) and Revert (another hook of the catalog, or none);
+  file), or URL (https://, with no user information) and Bearer token (a password field, write-only: sent as
+  `secret`, never shown again; on Edit it is empty, and left empty it keeps the token set) -, Timeout (seconds; 300 by default, 1-1800) and Revert (another hook of the catalog, or none);
   a refused registration keeps what was typed and shows the API's reason. A hook's Edit opens that form with its
   values, its name and kind read only (§12: immutable), saved with `PATCH /hooks/{name}`; its Delete asks to confirm
   in a `ConfirmDialog` naming the hook, and a refused one shows the API's reason - the plans that name it, the hooks it
   reverts. Any other role reads the catalog and is told that registering hooks requires the admin role. The offline
-  mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` with §12's rules and refusals
+  mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` and `PUT /hooks/{name}/secret`
+  with §12's rules and refusals
   in the API's words, an admin's writes alone, and a plan naming catalog hooks alone - and holds none at first),
   `/notifications` (Notifications, the Activity group's page beside Events, plan task NT9, §24.9 — "Where the
   installation's events go: email, Slack and webhook channels, and the plans each one follows. A channel decides where
@@ -7540,7 +7552,8 @@ Not in 0.4.0:
   * A `playbook` hook is an Ansible playbook the AnsibleExecutor runs with the migration's context as extra vars. It
     gets the executor's rules (§7.2, §13.4): secret files with mode 0600, `!unsafe` values, and output through
     `redact()`.
-  * A `webhook` hook is an HTTPS POST of the context document, with a bearer secret from the secret store (§13.3), and
+  * A `webhook` hook is an HTTPS POST of the context document, with the bearer token of its secret `hook-{name}`
+    (§13.3; write-only through the API), and
     any 2xx answer counts as success.
 * **Who defines them.** An admin registers hooks in a catalog by name, and a plan references them by name per point. A
   hook is code that runs with the control plane's reach (owner decision 2).
@@ -8234,7 +8247,9 @@ The owner took each default as written on 2026-10-23 (D19):
    * Pasting a Slack URL is how an admin sets one up.
    * The fixed name keeps a channel from reading or replacing another's secret.
 
-   The alternative is the hook catalog's way: only a secret made outside the control plane, named by the admin.
+   The alternative was the hook catalog's way until 0.5.0: only a secret made outside the control plane, named by the
+   admin. The hooks follow the channels since the pentest of 2026-11-19 (P1, §13.3): every role read the name, and an
+   admin who typed the token in its place showed it to every role.
 6. **Who subscribes:** an admin keeps the catalog; an operator subscribes a channel to a plan at any time; an admin
    subscribes one to every plan. There are no personal subscriptions in 0.5.0 (§24.4).
 7. **What is sent, and when:** `approval`, `downtime` and `problem` by default, with `outcome` and `progress` opt-in;
