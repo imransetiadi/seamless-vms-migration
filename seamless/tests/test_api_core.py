@@ -406,6 +406,7 @@ ROUTES = [
     ("GET", "/api/v1/hooks/nope-1", Role.viewer, None),
     ("PATCH", "/api/v1/hooks/nope-1", Role.admin, {"timeout_s": 60}),
     ("DELETE", "/api/v1/hooks/nope-1", Role.admin, None),
+    ("PUT", "/api/v1/hooks/nope-1/secret", Role.admin, {"token": "matrix-token"}),
     ("GET", "/api/v1/notifications/channels", Role.viewer, None),
     (
         "POST",

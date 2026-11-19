@@ -848,7 +848,8 @@ class Hook(_Model):
     playbook: str | None = None
     #: webhook: an https:// URL without user information
     url: str | None = None
-    #: webhook: the secret (SDD §13.3) whose key `token` is its bearer token
+    #: server-owned and never answered (SDD §13.3): the name of the secret a hook stored before
+    #: 0.5.0 read its token from, until the start that moves the token to ``hook-{name}`` drops it
     secret: str | None = None
     timeout_s: int = Field(default=300, ge=1, le=1800)
     #: the hook a rollback runs to undo this one: another hook of the catalog
@@ -856,15 +857,23 @@ class Hook(_Model):
     #: server-owned
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
+    #: server-owned: when the API last wrote the hook's bearer token (SDD §12, §13.3)
+    secret_updated_at: UTCDateTime | None = None
 
     @property
     def id(self) -> str:
         """The store's key: the hook's name (SDD §11)."""
         return self.name
 
+    @property
+    def secret_name(self) -> str:
+        """The secret the hook's bearer token is read from (SDD §13.3): ``hook-{name}``, its key
+        ``token`` - or, until a start moved it, the secret a hook of an earlier version named."""
+        return self.secret or hook_secret_name(self.name)
+
     @model_validator(mode="after")
     def _kind_fields(self) -> Hook:
-        own = {"playbook": ("playbook",), "webhook": ("url", "secret")}[self.kind]
+        own = {"playbook": ("playbook",), "webhook": ("url",)}[self.kind]
         other = {"playbook": ("url", "secret"), "webhook": ("playbook",)}[self.kind]
         for name in own:
             if getattr(self, name) is None:
@@ -899,6 +908,59 @@ def _https_url(url: str) -> None:
         raise ValueError("url: an https:// URL with a host")
     if parts.username is not None or parts.password is not None:
         raise ValueError("url: no user information - put the credential in the hook's secret")
+
+
+class HookView(_Model):
+    """What the hook routes answer (SDD §4.2, §12, §13.3): the hook without its secret - write-only,
+    ``secret_set`` says whether the API holds a bearer token for it -; a role below admin reads a
+    webhook's URL as null beside its host, since a URL may hold a token in its path."""
+
+    name: str
+    kind: Literal["playbook", "webhook"]
+    description: str | None = None
+    playbook: str | None = None
+    url: str | None = None
+    url_host: str | None = None
+    secret_set: bool = False
+    secret_updated_at: UTCDateTime | None = None
+    timeout_s: int
+    revert: str | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+
+
+def hook_view(hook: Hook, full: bool) -> HookView:
+    """``hook`` as a role reads it (SDD §12): its URL in full for an admin, else its host alone;
+    never its secret, nor the name of one."""
+    from urllib.parse import urlsplit
+
+    host = urlsplit(hook.url).hostname if hook.url else None
+    return HookView(
+        **hook.model_dump(exclude={"url", "secret"}),
+        url=hook.url if full else None,
+        url_host=host,
+        secret_set=hook.secret_updated_at is not None or hook.secret is not None,
+    )
+
+
+#: a webhook hook's bearer token is held as ``hook-{name}`` (SDD §13.3): the admin never chooses
+#: the name
+HOOK_SECRET_PREFIX = "hook-"
+#: a hook's bearer token (SDD §12): what an Authorization header carries - visible ASCII
+HOOK_TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")
+
+
+def hook_secret_name(hook: str) -> str:
+    """The secret the store holds for hook ``hook`` (SDD §13.3)."""
+    return f"{HOOK_SECRET_PREFIX}{hook}"
+
+
+def is_hook_secret_name(name: str | None) -> bool:
+    """Whether a secret name folds to one of the hooks' (SDD §13.3): a provider's or a DNS
+    target's secret never does, compared as the readers fold a name (audit AP-04)."""
+    if name is None:
+        return False
+    return re.sub(r"[^a-z0-9]", "-", name.lower()).startswith(HOOK_SECRET_PREFIX)
 
 
 #: the pre-flight codes a plan may acknowledge for a VM (SDD §4.2, §9.3): a blocker it then reports

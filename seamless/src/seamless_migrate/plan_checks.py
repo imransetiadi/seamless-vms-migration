@@ -99,16 +99,21 @@ def unknown_hook(spec: PlanSpec, catalog: Collection[str]) -> str | None:
     return None
 
 
-def notify_tsig_secret(spec: PlanSpec) -> str | None:
+def reserved_tsig_secret(spec: PlanSpec) -> str | None:
     """Why ``spec`` cannot be stored: a DNS target's ``tsig_secret`` that is a notification
-    channel's secret name (SDD §13.3, §24.3) - one refusal for POST/PATCH /plans and
+    channel's or a hook's secret name (SDD §13.3, §24.3) - one refusal for POST/PATCH /plans and
     ``seamless plan apply`` (§15); None otherwise."""
-    from .domain.models import is_notify_secret_name
+    from .domain.models import is_hook_secret_name, is_notify_secret_name
 
     for vm_id, target in spec.network_cutover.dns_targets.items():
         if is_notify_secret_name(target.tsig_secret):
             return (
                 f"network_cutover.dns_targets.{vm_id}.tsig_secret: notify-* names belong to the "
                 "notification channels' secrets"
+            )
+        if is_hook_secret_name(target.tsig_secret):
+            return (
+                f"network_cutover.dns_targets.{vm_id}.tsig_secret: hook-* names belong to the "
+                "hooks' secrets"
             )
     return None

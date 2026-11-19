@@ -27,6 +27,7 @@ from ..domain.models import (
     Provider,
     ProviderCreate,
     is_blank,
+    is_hook_secret_name,
     is_notify_secret_name,
     is_project_id,
     utcnow,
@@ -188,6 +189,15 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
             422,
             "validation_error",
             f"{', '.join(channels)}: notify-* names belong to the notification channels' secrets",
+        )
+    # hook-* names are the hooks' (SDD §13.3): a check would send a hook's bearer token to this
+    # provider's endpoint
+    hooks = [field for field, name in names.items() if is_hook_secret_name(name)]
+    if hooks:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(hooks)}: hook-* names belong to the hooks' secrets",
         )
 
 

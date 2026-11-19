@@ -527,9 +527,10 @@ def test_the_catalogs_events_carry_no_url_recipient_or_secret(api):
 
 def test_a_notify_secret_name_is_refused_for_a_provider_a_hook_and_a_dns_target(api):
     """SDD §13.3, §24.3: names that fold to notify-* belong to the channels' secrets, so a
-    provider's credentials_secret or conversion_host.ssh_key_secret, a hook's secret and a DNS
-    target's tsig_secret that folds to one are refused (422): writing a channel's secret must
-    never replace theirs, and a channel must never read theirs."""
+    provider's credentials_secret or conversion_host.ssh_key_secret and a DNS target's tsig_secret
+    that folds to one are refused (422): writing a channel's secret must never replace theirs, and
+    a channel must never read theirs. A hook names no secret since 0.5.0: its own is hook-{name}
+    (§13.3, tests/test_api_hooks.py)."""
     for name in ("notify-ops-slack", "Notify-x", "notify_x", "NOTIFY.x"):
         refused = patch(api, "/providers/dst-rhoso", {"credentials_secret": name})
         assert refused.status_code == 422, (name, refused.text)
@@ -538,16 +539,6 @@ def test_a_notify_secret_name_is_refused_for_a_provider_a_hook_and_a_dns_target(
             api,
             "/providers/src-osp",
             {"conversion_host": {"ssh_key_secret": name}},
-        )
-        assert refused.status_code == 422 and "notify-" in message(refused), (name, refused.text)
-        refused = api.post(
-            "/api/v1/hooks",
-            json={
-                "name": "dns-swap",
-                "kind": "webhook",
-                "url": "https://h.example.org/",
-                "secret": name,
-            },
         )
         assert refused.status_code == 422 and "notify-" in message(refused), (name, refused.text)
         target = {

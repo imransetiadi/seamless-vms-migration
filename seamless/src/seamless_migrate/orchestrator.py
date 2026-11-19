@@ -138,7 +138,13 @@ from .executors.base import (
     TransientStepError,
     outlive_cancel,
 )
-from .hooks import HookRun, HookRunner, context_document, hook_action_event
+from .hooks import (
+    HookRun,
+    HookRunner,
+    adopt_hook_secrets,
+    context_document,
+    hook_action_event,
+)
 from .invariants import check_invariants
 from .lb_helper import (
     LbHelperError,
@@ -3819,6 +3825,11 @@ class Orchestrator:
         self._forget()
         self._stopping = False
         self._wake = asyncio.Event()
+        # SDD §13.3: a hook of an earlier version named its secret; its token moves to hook-{name}
+        try:
+            await adopt_hook_secrets(self.db, self.settings)
+        except Exception:  # noqa: BLE001 - a start never fails on it: the next start tries again
+            log.warning("the hooks' secrets could not be moved to the secret store", exc_info=True)
         migrations = await self.db.list("migration", Migration)
         for m in migrations:
             if m.phase in fsm.RESUMABLE_PHASES:
