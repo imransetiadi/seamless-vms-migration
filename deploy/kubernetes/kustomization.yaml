@@ -129,6 +129,14 @@ patches:
           - 10.244.0.0/16
           - 10.96.0.0/12
           - 169.254.0.0/16
+  # the destination guard's networks (SDD 13.5): the same pod and service networks, in the application's own check
+  - target:
+      kind: ConfigMap
+      name: seamless-config
+    patch: |
+      - op: replace
+        path: /data/SEAMLESS_EGRESS_DENY_CIDRS
+        value: "10.244.0.0/16,10.96.0.0/12"
   # 6443 is the API server on the control-plane node addresses (after kube-proxy DNAT); keep pods and
   # Services out. TIGHTEN BEFORE PRODUCTION: set the cidr to those nodes (kubectl get endpoints kubernetes).
   - target:

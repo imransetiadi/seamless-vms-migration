@@ -25,6 +25,10 @@ data:
   SEAMLESS_AUTH_DISABLED: "false"
   SEAMLESS_DEMO: "false"
   SEAMLESS_METRICS_PUBLIC: "false"
+  # the destination guard (SDD 13.5): the control plane never connects to a provider endpoint, a hook or a channel
+  # inside the cluster's pod and service networks. ADJUST with networkpolicy.yaml's "except" ranges (the OpenShift
+  # defaults). Optional: SEAMLESS_EGRESS_ALLOW_PRIVATE_CIDRS, the only private networks they may be in (your clouds').
+  SEAMLESS_EGRESS_DENY_CIDRS: "10.128.0.0/14,172.30.0.0/16"
   # orchestrator (SDD 8)
   SEAMLESS_MAX_CONCURRENT_MIGRATIONS: "10"
   SEAMLESS_MAX_CONCURRENT_CUTOVERS: "3"
