@@ -38,7 +38,7 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 | PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | done — da3ca1b, 0cb9dd3 (SDD), 05bfe22, d406720, acec272 (API: `ai/evidence.py`, eleven keys measured against the recommended option else the deterministic one, `decide()` counts what supports or opposes, incidents stored at creation, Jev's keyed reasons filtered — none today; a new policy asks for 3, the built-in default for none), d99d1e5 (dashboard: Evidence panel, list line, `?vm=` and `#findings`/`#estimates` links, mock port on the shared six-case table). jev_decide 1.0 ×5, 0.96 (placement) |
 | PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | done — 72c0bee (SDD), 67df4c3 (API: `ai/payloads.py` field specs with golden tests, `/advisor/data-sent`, the console stays local with a remote model), the dashboard commit after it (badge on the Jev card and on each recommendation, the panel; jev_decide 0.99 declared specs). `ADV-06: confirmed by the owner 2026-11-19` — default remote, endpoint host unset until configured |
 
-Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
+Phases 2–4 (PR-8 … PR-16): **dropped by the owner on 2026-11-19** (no longer needed); not planned.
 
 **Order after the owner's review of 10 October 2026** (`docs/Seamless Migrate — Advisor Improvement Spec
 (PHASE-2).md`, the owner's file, untracked like the first one; it adds Phase 1b, ADV-16 … ADV-21):
@@ -101,8 +101,8 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    (SDD 434fc23, API 1fd2ad2, dashboard d5b188b; jev_decide 0.99).
 7. PR-6 ADV-02 evidence card. Done — see the table above. Recommendations recorded before ADV-02 (the live demo's) show
    "No evidence was recorded with this recommendation."; evidence appears with the next validation.
-8. Then the original order (after PR-6); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
-   review of Phase 1.
+8. Then the original order (after PR-6); ADV-21 goes with ADV-14. Phase 2 was dropped by the owner
+   on 2026-11-19 (no longer needed).
 
 **For the owner's review (deviations from the spec's wording, each with its reason):**
 
