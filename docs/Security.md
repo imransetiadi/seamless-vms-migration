@@ -298,7 +298,7 @@ The main routes by role; SDD §12 lists every route with its minimum role (`test
 | `POST /notifications/subscriptions` to a plan, `DELETE /notifications/subscriptions/{id}` of a plan's (SDD §24.4) | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /migrations/{id}/approve`, `…/cutover`, `…/finalize` | approver | ✗ | ✗ | ✓ | ✓ |
 | `POST /providers`, `PATCH /providers/{id}`, `PUT /providers/{id}/credentials`, `PUT /providers/{id}/conversion-key`, `DELETE /providers/{id}` | admin | ✗ | ✗ | ✗ | ✓ |
-| `POST /hooks`, `PATCH /hooks/{name}`, `DELETE /hooks/{name}` (code the control plane runs, C2-09) | admin | ✗ | ✗ | ✗ | ✓ |
+| `POST /hooks`, `PATCH /hooks/{name}`, `PUT /hooks/{name}/secret` (write-only), `DELETE /hooks/{name}` (code the control plane runs, C2-09) | admin | ✗ | ✗ | ✗ | ✓ |
 | `POST /notifications/channels`, `PATCH /notifications/channels/{name}`, `DELETE /notifications/channels/{name}`, `PUT …/secret`, `POST …/test`; a subscription to every plan and its removal (a channel decides where the installation's data goes, C2-19) | admin | ✗ | ✗ | ✗ | ✓ |
 
 Design intent: operators can run and *undo* (rollback, cancel) but cannot authorize the risky forward steps
