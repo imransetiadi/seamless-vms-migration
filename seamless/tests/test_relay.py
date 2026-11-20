@@ -112,6 +112,8 @@ class Replica:
     server: uvicorn.Server | None = None
     task: asyncio.Task[Any] | None = None
     _stop: asyncio.Event | None = None
+    #: a viewer's token: the whole health report is a viewer's (SDD §12, pentest 2026-11-19 P4.1)
+    viewer: dict[str, str] = field(default_factory=dict)
 
     @property
     def svc(self) -> Any:
@@ -133,13 +135,13 @@ class Replica:
 
     async def health(self) -> dict[str, Any]:
         async with self.client() as caller:
-            answer = await caller.get("/api/v1/health")
+            answer = await caller.get("/api/v1/health", headers=self.viewer)
         assert answer.status_code == 200, answer.text
         return dict(answer.json())
 
     async def ready(self) -> httpx.Response:
         async with self.client() as caller:
-            return await caller.get("/api/v1/ready")
+            return await caller.get("/api/v1/ready", headers=self.viewer)
 
     async def stop(self) -> None:
         """Stop the replica as SIGTERM does: its server ends its streams after a second, then its
@@ -198,6 +200,7 @@ class Cluster:
         sock = sock or bound_socket()
         settings = self.settings(name, port or int(sock.getsockname()[1]), **kw)
         replica = Replica(name, create_app(settings, sse_heartbeat_s=sse_heartbeat_s), sock)
+        replica.viewer = self.auth(Role.viewer)
         self.replicas.append(replica)
         if serve:
             config = uvicorn.Config(
@@ -520,7 +523,7 @@ async def test_a_follower_answers_503_no_leader_while_no_replica_leads(
 
     async with Silent() as silent, b.client() as caller:
         await refused(caller, "nobody took the lease")
-        body = (await caller.get("/api/v1/health")).json()
+        body = (await caller.get("/api/v1/health", headers=viewer)).json()
         assert body["leader"] == NOBODY
         assert body["orchestrator"] == NONE_RUNS
 
@@ -528,21 +531,21 @@ async def test_a_follower_answers_503_no_leader_while_no_replica_leads(
         assert campaign(phantom) == 1
         await refused(caller, "the leader does not answer")
         assert silent.connections == len(relayed), "it tried the leader each time"
-        body = (await caller.get("/api/v1/health")).json()
+        body = (await caller.get("/api/v1/health", headers=viewer)).json()
         assert (body["leader"]["holder"], body["leader"]["epoch"]) == ("seamless-a", 1)
         assert body["orchestrator"] == BEFORE_START, "it wrote none since it took the lease"
 
         assert phantom.release(1)
         await refused(caller, "the lease expired")
         assert silent.connections == len(relayed), "an expired lease's address is not tried"
-        body = (await caller.get("/api/v1/health")).json()
+        body = (await caller.get("/api/v1/health", headers=viewer)).json()
         assert body["leader"] == NOBODY and body["orchestrator"] == NONE_RUNS
 
         itself = Lease(any_store.engine, b.svc.leadership.holder, silent.address, 30.0)
         assert campaign(itself) == 2
         await refused(caller, "the lease names the follower itself")
         assert silent.connections == len(relayed), "never a relay to itself"
-        body = (await caller.get("/api/v1/health")).json()
+        body = (await caller.get("/api/v1/health", headers=viewer)).json()
         assert body["leader"]["holder"] == b.svc.leadership.holder
         assert body["leader"]["leading"] is False
 
@@ -622,7 +625,7 @@ async def test_a_follower_serves_its_health_ready_metrics_and_the_dashboard_itse
         b = await cluster("seamless-b", serve=False, dashboard_dir=dist)
         assert a.svc.leadership.leads() and not b.svc.leadership.leads()
         async with b.client(("192.0.2.41", 50410)) as caller:
-            health = await caller.get("/api/v1/health")
+            health = await caller.get("/api/v1/health", headers=viewer)
             assert health.status_code == 200
             assert health.json()["leader"]["holder"] == a.svc.leadership.holder
             ready = await caller.get("/api/v1/ready")

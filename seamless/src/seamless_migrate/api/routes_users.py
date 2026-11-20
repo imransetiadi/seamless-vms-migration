@@ -16,10 +16,10 @@ from ..security.auth import (
     generate_token,
     hash_token,
 )
-from .deps import ApiError, require_role, services
+from .deps import ApiError, AuthFirstRoute, require_role, services
 from .schemas import Me
 
-router = APIRouter(tags=["users"])
+router = APIRouter(tags=["users"], route_class=AuthFirstRoute)
 
 
 class UserCreate(BaseModel):

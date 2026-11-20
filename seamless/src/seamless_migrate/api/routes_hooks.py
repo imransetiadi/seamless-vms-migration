@@ -26,9 +26,9 @@ from ..security.auth import Principal
 from ..security.destinations import DestinationNotAllowed, check_stored
 from ..security.secret_store import SecretStoreError, secret_store
 from ..store import ConflictError
-from .deps import ApiError, require_role, services, validation_message
+from .deps import ApiError, AuthFirstRoute, require_role, services, validation_message
 
-router = APIRouter(tags=["hooks"])
+router = APIRouter(tags=["hooks"], route_class=AuthFirstRoute)
 log = logging.getLogger(__name__)
 
 #: PATCH /hooks/{name} (SDD §12); the name, the kind and the server-owned fields are immutable.

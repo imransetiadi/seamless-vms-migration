@@ -7,12 +7,13 @@ import hmac
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import Request
+from fastapi import Request, Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 
 from ..config import Settings
@@ -31,6 +32,8 @@ from ..security.auth import (
 from ..store import AsyncStore, Store, VersionedDocuments, unstorable
 
 log = logging.getLogger(__name__)
+#: where AuthFirstRoute keeps the principal its role check found, on the request's state
+_CHECKED = "seamless_checked_principal"
 
 #: at most this many auth.denied events per client per minute (protects the events table)
 #: Distinct client addresses tracked for audit throttling / lockout; the oldest are evicted.
@@ -284,6 +287,10 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
     """FastAPI dependency: the caller's principal, which must hold at least ``role``."""
 
     async def dependency(request: Request) -> Principal:
+        # AuthFirstRoute already ran this very dependency before the body was read
+        checked = getattr(request.state, _CHECKED, None)
+        if checked is not None and checked[0] is dependency:
+            return checked[1]
         svc = services(request)
         refusal = foreign_page(request) if svc.settings.auth_disabled else None
         if refusal is not None:
@@ -310,6 +317,30 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
 
     dependency.__name__ = f"require_{role}"
     return dependency
+
+
+class AuthFirstRoute(APIRoute):
+    """A route whose role is checked before FastAPI reads its body (SDD §12, §13.1; pentest
+    2026-11-19 P4.3): FastAPI parses a body before it solves the dependencies, so a request
+    without a token and with a body that is no JSON was answered 422 - a route told a stranger
+    it exists and what it takes. The route's own ``require_role`` dependency runs first, once:
+    its principal is kept for the dependency's second call."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        roles = [
+            dep.call
+            for dep in self.dependant.dependencies
+            if getattr(dep.call, "__name__", "").startswith("require_")
+        ]
+
+        async def auth_first(request: Request) -> Response:
+            for dependency in roles:
+                principal = await dependency(request)  # type: ignore[misc]
+                setattr(request.state, _CHECKED, (dependency, principal))
+            return await handler(request)
+
+        return auth_first
 
 
 async def _refuse_unstorable_body(request: Request) -> None:

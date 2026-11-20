@@ -32,6 +32,7 @@ from ..security.auth import Principal
 from ..store import NotFound
 from .deps import (
     ApiError,
+    AuthFirstRoute,
     _audit_denied,
     refuse_unknown_fields,
     require_role,
@@ -48,7 +49,7 @@ from .schemas import (
     WavesAutoRequest,
 )
 
-router = APIRouter(tags=["plans"])
+router = APIRouter(tags=["plans"], route_class=AuthFirstRoute)
 
 #: Plan fields that decide whether a cutover needs a human (SDD §12): approver-only.
 POLICY_FIELDS = frozenset(

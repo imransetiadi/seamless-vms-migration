@@ -6,8 +6,8 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, Path, Query, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from .. import __version__
@@ -20,7 +20,7 @@ from ..metrics import advisor_calls, render_metrics
 from ..security.auth import Principal
 from ..stats import Stats, compute_stats
 from ..store import NotFound
-from .deps import ApiError, metrics_access, require_role, services
+from .deps import ApiError, AuthFirstRoute, authenticate, metrics_access, require_role, services
 from .schemas import (
     AdvisorNoteEntry,
     AdvisorNoteList,
@@ -39,7 +39,7 @@ from .schemas import (
     SimilarIncidentsResponse,
 )
 
-router = APIRouter(tags=["misc"])
+router = APIRouter(tags=["misc"], route_class=AuthFirstRoute)
 log = logging.getLogger(__name__)
 
 #: a follower's report of the leader's orchestrator before the leader wrote it after its takeover:
@@ -63,20 +63,47 @@ async def demo_power(
     return await svc.orchestrator.demo_power(source_id, on=body.state == "on")
 
 
+async def _sees_the_report(request: Request) -> bool:
+    """Whether the caller reads the whole health report (SDD §12; pentest 2026-11-19 P4.1): a
+    viewer or above - or anyone in demo mode or with authentication off, where the API documents
+    itself to anyone too. A probe without a token, or with one that is none, reads the status
+    alone: the version, the leader's host name, its epoch and the loop's statistics name what an
+    attacker looks for first. No failure is counted or audited: a probe is no sign-in."""
+    svc = services(request)
+    if svc.settings.demo or svc.settings.auth_disabled:
+        return True
+    principal = await authenticate(request)
+    return principal is not None and principal.role.at_least(Role.viewer)
+
+
+def _answer(body: Health, full: bool, status_code: int = 200) -> Any:
+    if full:
+        return JSONResponse(body.model_dump(mode="json"), status_code=status_code)
+    return JSONResponse({"status": body.status}, status_code=status_code)
+
+
 @router.get("/health", response_model=Health)
-async def health(request: Request) -> Health:
-    """Liveness: always 200 while the process answers; the body says what is degraded."""
+async def health(request: Request) -> Any:
+    """Liveness: always 200 while the process answers; the body says what is degraded - its
+    ``status`` alone to a caller without a token (SDD §12)."""
+    return _answer(await _health(request), await _sees_the_report(request))
+
+
+@router.get("/health/detail", response_model=Health)
+async def health_detail(
+    request: Request, _: Principal = Depends(require_role(Role.viewer))
+) -> Health:
+    """The whole health report of the replica that answers (SDD §12): a viewer's."""
     return await _health(request)
 
 
 @router.get("/ready", response_model=Health)
-async def ready(request: Request, response: Response) -> Health:
+async def ready(request: Request) -> Any:
     """Readiness: the same body as ``/health`` with HTTP 503 while degraded, so Kubernetes
     stops routing to a replica whose database or orchestrator loop is unavailable."""
     body = await _health(request)
-    if body.status != "ok":
-        response.status_code = 503
-    return body
+    full = await _sees_the_report(request)
+    return _answer(body, full, 200 if body.status == "ok" else 503)
 
 
 async def _health(request: Request) -> Health:

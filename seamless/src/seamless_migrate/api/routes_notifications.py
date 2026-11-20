@@ -34,11 +34,18 @@ from ..security.auth import Principal
 from ..security.destinations import DestinationNotAllowed, check_stored
 from ..security.secret_store import SecretStoreError, secret_store
 from ..store import ConflictError, NotFound
-from .deps import ApiError, _audit_denied, require_role, services, validation_message
+from .deps import (
+    ApiError,
+    AuthFirstRoute,
+    _audit_denied,
+    require_role,
+    services,
+    validation_message,
+)
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(tags=["notifications"])
+router = APIRouter(tags=["notifications"], route_class=AuthFirstRoute)
 
 #: PATCH /notifications/channels/{name} (SDD §12): the name, the kind and the server-owned fields
 #: are immutable

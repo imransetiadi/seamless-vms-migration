@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import random
 import re
 from collections import Counter
@@ -50,6 +51,7 @@ from ..security.secrets import valid_secret_name
 from ..store import ConflictError, NotFound
 from .deps import (
     ApiError,
+    AuthFirstRoute,
     refuse_unknown_fields,
     require_role,
     services,
@@ -64,7 +66,7 @@ from .schemas import (
 )
 
 log = logging.getLogger(__name__)
-router = APIRouter(tags=["providers"])
+router = APIRouter(tags=["providers"], route_class=AuthFirstRoute)
 #: plans that can release their providers: a completed one, once none of its migrations holds its
 #: VM, and a cancelled one — a failed plan can be started again (SDD §8, §12)
 TERMINAL_PLAN_STATUSES = frozenset({PlanStatus.completed, PlanStatus.cancelled})
@@ -204,12 +206,33 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
         )
 
 
+def _check_ca_path(path: str, settings: Settings) -> None:
+    """A provider's CA bundle lies in one of ``SEAMLESS_CA_DIRS`` (SDD §12; pentest 2026-11-19
+    P4.4): any path was taken, and a check then answered differently for a file that exists and
+    one that does not - a probe of the control plane's filesystem. Judged by the path once its
+    symlinks and ``..`` are resolved; one refusal whatever is, or is not, at the path."""
+    real = os.path.realpath(path)
+    roots = [os.path.realpath(root) for root in settings.ca_dirs]
+    inside = os.path.isabs(path) and any(
+        real.startswith(root.rstrip(os.sep) + os.sep) for root in roots
+    )
+    if not inside:
+        raise ApiError(
+            422,
+            "validation_error",
+            "ca_cert_path: a CA bundle under one of the directories SEAMLESS_CA_DIRS names "
+            f"({', '.join(settings.ca_dirs)})",
+        )
+
+
 def _check_destinations(provider: Provider, fields: set[str], settings: Settings) -> None:
     """SDD §13.5 (pentest 2026-11-19 P3): an endpoint or a brought conversion host's address the
     control plane never connects to is refused as it is stored - a literal address or a name of
     the deployment's own DNS; a name's addresses are judged when the control plane connects -,
     and plain ``http://`` needs ``allow_plain_http``. Only the fields the request sets are
     checked, so a provider stored before stays editable. Not in demo mode: nothing is reached."""
+    if "ca_cert_path" in fields and provider.ca_cert_path is not None:
+        _check_ca_path(provider.ca_cert_path, settings)
     if settings.demo:
         return
     try:
@@ -248,7 +271,9 @@ async def create_provider(
     svc = services(request)
     await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
-    _check_destinations(body, {"endpoint", "conversion_host", "allow_plain_http"}, svc.settings)
+    _check_destinations(
+        body, {"endpoint", "conversion_host", "allow_plain_http", "ca_cert_path"}, svc.settings
+    )
     # the server-owned fields are ignored: the pin is the provider check's alone, the project
     # credentials their routes' (SDD §10, §12, §27.4)
     provider = body.model_copy(

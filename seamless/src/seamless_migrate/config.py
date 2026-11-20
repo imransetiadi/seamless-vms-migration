@@ -174,6 +174,15 @@ class Settings(BaseModel):
     egress_deny_cidrs: list[str] = Field(default_factory=list)
     #: when set, the only private networks a provider, a hook or a channel may be in (SDD §13.5)
     egress_allow_private_cidrs: list[str] = Field(default_factory=list)
+    #: the directories a provider's ca_cert_path may lie in (SDD §12, §15.1)
+    ca_dirs: list[str] = Field(
+        default_factory=lambda: [
+            "/etc/seamless/ca",
+            "/etc/seamless/clouds",
+            "/etc/pki",
+            "/etc/ssl/certs",
+        ]
+    )
     #: the bound of one provider check in seconds; 0 leaves it to the provider call's (SDD §10)
     provider_check_timeout_s: float = Field(default=30.0, ge=0)
     clouds_yaml: Path | None = None
@@ -373,6 +382,9 @@ class Settings(BaseModel):
         deny = get("EGRESS_DENY_CIDRS")
         if deny is not None:
             values["egress_deny_cidrs"] = _csv(deny)
+        ca_dirs = get("CA_DIRS")
+        if ca_dirs is not None:
+            values["ca_dirs"] = _csv(ca_dirs)
         allow = get("EGRESS_ALLOW_PRIVATE_CIDRS")
         if allow is not None:
             values["egress_allow_private_cidrs"] = _csv(allow)
