@@ -1180,6 +1180,7 @@ export const PERSISTED_EVENT_KINDS = [
   'notification.failed',
   'auth.denied',
   'user.created',
+  'user.deleted',
   'events.pruned',
   // the orchestrator's lease taken and released (SDD §4.3, §8, §25.3, plan task HA3)
   'leader.acquired',

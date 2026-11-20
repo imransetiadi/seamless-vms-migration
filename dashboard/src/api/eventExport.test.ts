@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { createTestClient, createTestServer } from '../test/utils';
 import { exportEventTrail, jsonLineParts } from './eventExport';
 
+/** What a role below admin reads: auth.* and user.* events are an admin's (SDD §12; pentest 2026-11-19 P5). */
+const shownBelowAdmin = (e: { kind: string }) => !e.kind.startsWith('auth.') && !e.kind.startsWith('user.');
+
 describe('exportEventTrail (SDD §16: the whole audit trail, like `seamless events export`)', () => {
   it('reads every persisted event page by page, in seq order', async () => {
     const server = createTestServer();
@@ -9,7 +12,7 @@ describe('exportEventTrail (SDD §16: the whole audit trail, like `seamless even
     const progress: number[] = [];
     const events = await exportEventTrail(api, { pageSize: 40, onProgress: (n) => progress.push(n) });
 
-    const persisted = server.events.filter((e) => e.seq > 0);
+    const persisted = server.events.filter((e) => e.seq > 0 && shownBelowAdmin(e));
     expect(persisted.length).toBeGreaterThan(100); // several pages of 40
     expect(events.map((e) => e.seq)).toEqual(persisted.map((e) => e.seq));
     expect(progress.at(-1)).toBe(persisted.length);
@@ -20,7 +23,7 @@ describe('exportEventTrail (SDD §16: the whole audit trail, like `seamless even
     const server = createTestServer();
     const api = createTestClient(server, 'viewer');
     const events = await exportEventTrail(api, { planId: 'plan-4f2a9c1e', pageSize: 25 });
-    const expected = server.events.filter((e) => e.seq > 0 && e.plan_id === 'plan-4f2a9c1e');
+    const expected = server.events.filter((e) => e.seq > 0 && e.plan_id === 'plan-4f2a9c1e' && shownBelowAdmin(e));
     expect(expected.length).toBeGreaterThan(25);
     expect(events.map((e) => e.seq)).toEqual(expected.map((e) => e.seq));
   });

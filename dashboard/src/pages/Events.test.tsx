@@ -24,6 +24,9 @@ function emitPhase(server: MockServer, message: string) {
   });
 }
 
+/** What a role below admin reads: auth.* and user.* events are an admin's (SDD §12; pentest 2026-11-19 P5). */
+const shownBelowAdmin = (e: { kind: string }) => !e.kind.startsWith('auth.') && !e.kind.startsWith('user.');
+
 describe('Events page', () => {
   it('keeps manually loaded older pages after leaving and going Back', async () => {
     function Journey() {
@@ -375,7 +378,8 @@ describe('Events page', () => {
       message: 'User mallory created',
       data: { name: 'mallory', role: 'admin' },
     });
-    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    // user.* events are an admin's (SDD §12; pentest 2026-11-19 P5)
+    renderWithApp(<Events />, { route: '/events', token: 'admin', server });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
     await within(list).findByText('User mallory created');
 
@@ -545,7 +549,7 @@ describe('Events page', () => {
 
       const exportButton = screen.getByRole('button', { name: 'Export the whole trail' });
       await user.click(exportButton);
-      const persisted = server.events.filter((e) => e.seq > 0);
+      const persisted = server.events.filter((e) => e.seq > 0 && shownBelowAdmin(e));
       // the result is said once, from a region already on the page; focus stays on the button
       const said = await screen.findByText(`Exported ${persisted.length} events.`);
       expect(regions).toContain(said.closest('[role="status"]'));
@@ -653,7 +657,7 @@ describe('Events page', () => {
     for (let i = 0; i < 900; i += 1) {
       server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `bulk check ${i}`, data: {} });
     }
-    const persisted = server.events.filter((e) => e.seq > 0);
+    const persisted = server.events.filter((e) => e.seq > 0 && shownBelowAdmin(e));
     expect(persisted.length).toBeGreaterThan(1000); // the loaded 500, a full page before them, and the rest
     const asked: string[] = [];
     renderWithApp(<Events />, {
@@ -700,7 +704,7 @@ describe('Events page', () => {
     for (let i = 0; i < 400; i += 1) {
       server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `bulk check ${i}`, data: {} });
     }
-    const before = server.events.filter((e) => e.seq > 0);
+    const before = server.events.filter((e) => e.seq > 0 && shownBelowAdmin(e));
     const { queryClient } = renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
     await waitFor(() => expect(within(list).getAllByRole('listitem')).toHaveLength(200));

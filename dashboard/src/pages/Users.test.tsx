@@ -139,3 +139,36 @@ it('rejects an empty required user name before calling the API', async () => {
   expect((screen.getByLabelText(/user name/i) as HTMLInputElement).validity.valueMissing).toBe(true);
   expect(requests.mock.calls.some(([method, path]) => method === 'POST' && path === '/users')).toBe(false);
 });
+
+describe('removing a dashboard user (SDD §12, §13.1)', () => {
+  it('removes a dashboard user after confirmation, and its token stops at once (SDD §12, §13.1)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    server.health.auth_disabled = false;
+    const created = await createTestClient(server, 'admin').post<{ token: string }>('/users', { name: 'ext.auditor', role: 'viewer' });
+    const view = renderWithApp(<Users />, { route: '/users', server, token: 'admin' });
+    const list = await screen.findByRole('list', { name: 'Dashboard users' });
+    const row = await within(list).findByRole('listitem', { name: 'ext.auditor' });
+    // the admin's own user cannot be removed from here
+    expect(within(list).getByRole('button', { name: 'Remove rina' })).toHaveAttribute('aria-disabled', 'true');
+    await user.click(within(row).getByRole('button', { name: 'Remove ext.auditor' }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent('Their token stops working at once');
+    await user.click(within(dialog).getByRole('button', { name: 'Remove user' }));
+    expect(await screen.findByText('User ext.auditor removed.')).toBeInTheDocument();
+    await waitFor(() => expect(within(list).queryByRole('listitem', { name: 'ext.auditor' })).not.toBeInTheDocument());
+    await expect(createTestClient(view.server, created.token).get('/me')).rejects.toMatchObject({ status: 401 });
+    expect(view.server.events.find((e) => e.kind === 'user.deleted')).toMatchObject({ kind: 'user.deleted', actor: 'rina', data: { name: 'ext.auditor', role: 'viewer' } });
+  });
+
+  it('shows why a user of the tokens file is not removed here', async () => {
+    const user = userEvent.setup();
+    renderUsers();
+    const list = await screen.findByRole('list', { name: 'Dashboard users' });
+    await user.click(within(await within(list).findByRole('listitem', { name: 'dimas' })).getByRole('button', { name: 'Remove dimas' }));
+    const dialog = await screen.findByRole('alertdialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Remove user' }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('dimas is a bootstrap token of the tokens file');
+    expect(within(list).getByRole('listitem', { name: 'dimas' })).toBeInTheDocument();
+  });
+});

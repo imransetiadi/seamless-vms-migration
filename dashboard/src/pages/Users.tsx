@@ -1,12 +1,13 @@
 import { ApiError } from '../api/client';
 import { UnsavedChangesGuard } from '../components/UnsavedChangesGuard';
-import { Copy, UserPlus } from 'lucide-react';
+import { Copy, Trash2, UserPlus } from 'lucide-react';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { useCreateUser, useHealth, useUsers } from '../api/hooks';
+import { useCreateUser, useDeleteUser, useHealth, useMe, useUsers } from '../api/hooks';
 import { useRole } from '../api/session';
 import { ROLES, type Role } from '../api/types';
 import { Checkbox } from '../components/Checkbox';
 import { Button } from '../components/Button';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField, TextAreaField, TextField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
@@ -28,6 +29,12 @@ export default function Users() {
   const health = useHealth();
   const users = useUsers(canManage);
   const create = useCreateUser();
+  const remove = useDeleteUser();
+  const me = useMe();
+  const [removing, setRemoving] = useState<{ name: string; role: Role } | null>(null);
+  const [removed, setRemoved] = useState('');
+  const removeReturnRef = useRef<HTMLElement | null>(null);
+  const listRef = useRef<HTMLUListElement>(null);
   const [name, setName] = useState('');
   const [role, setRole] = useState<Role>('viewer');
   const [copyStatus, setCopyStatus] = useState('');
@@ -120,18 +127,61 @@ export default function Users() {
             {users.isPending && <LoadingBlock label="Loading users" rows={3} />}
             {users.error && <ErrorBanner error={users.error} title="Users are unavailable" onRetry={() => void users.refetch()} />}
             {users.data && (users.data.length ? (
-              <ul className="divide-y divide-border">
-                {users.data.map((user, index) => (
-                  <li key={`${user.name}-${index}`} className="flex flex-wrap items-baseline justify-between gap-2 py-3">
-                    <span className="min-w-0 font-medium [overflow-wrap:anywhere]">{user.name}</span>
-                    <span className="text-sm text-muted-foreground">{ROLE_LABELS[user.role]}</span>
-                  </li>
-                ))}
+              <ul ref={listRef} tabIndex={-1} aria-label="Dashboard users" className="divide-y divide-border focus:outline-none">
+                {users.data.map((user, index) => {
+                  const own = me.data?.name?.toLowerCase() === user.name.toLowerCase();
+                  return (
+                    <li key={`${user.name}-${index}`} aria-label={user.name} className="flex flex-wrap items-center justify-between gap-2 py-3">
+                      <span className="min-w-0 font-medium [overflow-wrap:anywhere]">{user.name}</span>
+                      <span className="flex items-center gap-3">
+                        <span className="text-sm text-muted-foreground">{ROLE_LABELS[user.role]}</span>
+                        <Button
+                          icon={Trash2}
+                          variant="danger"
+                          aria-label={`Remove ${user.name}`}
+                          disabledReason={own ? 'You cannot remove the user you are signed in as.' : remove.isPending ? 'Wait for the current removal to finish.' : null}
+                          onClick={(event) => {
+                            removeReturnRef.current = event.currentTarget;
+                            setRemoved('');
+                            remove.reset();
+                            setRemoving(user);
+                          }}
+                        >
+                          Remove
+                        </Button>
+                      </span>
+                    </li>
+                  );
+                })}
               </ul>
             ) : <p className="text-sm text-muted-foreground">No dashboard users configured.</p>)}
+            <p role="status" className="text-sm text-status-success empty:hidden">{removed}</p>
           </Panel>
         </div>
       )}
+      <ConfirmDialog
+        open={removing !== null}
+        title={`Remove user ${removing?.name ?? ''}?`}
+        subject={removing ? `User ${removing.name} (${ROLE_LABELS[removing.role]})` : undefined}
+        description="Their token stops working at once and cannot be restored; add the user again to give new access. A user configured in the server's tokens file is removed there by the server administrator."
+        confirmLabel="Remove user"
+        tone="danger"
+        icon={Trash2}
+        pending={remove.isPending}
+        error={remove.error}
+        returnFocusRef={removeReturnRef}
+        onCancel={() => setRemoving(null)}
+        onConfirm={() => {
+          if (!removing) return;
+          remove.mutate(removing.name, {
+            onSuccess: () => {
+              removeReturnRef.current = listRef.current;
+              setRemoved(`User ${removing.name} removed.`);
+              setRemoving(null);
+            },
+          });
+        }}
+      />
     </>
   );
 }

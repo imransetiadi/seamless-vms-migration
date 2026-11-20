@@ -3262,6 +3262,21 @@ describe('mock hooks: the catalog an admin keeps (SDD §12, §23.3, plan task N1
     });
   });
 
+  it('lists auth.* and user.* events to an admin alone (SDD §12; pentest 2026-11-19 P5)', async () => {
+    const { server } = setup('admin');
+    const createClient = (srv: MockServer, token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(srv) });
+    const admin = createClient(server, 'admin');
+    await expect(createClient(server, 'viewer').post('/hooks', drain)).rejects.toMatchObject({ status: 403 }); // auth.denied
+    await admin.post('/hooks', drain); // hook.created
+    const kinds = async (role: string) => (await createClient(server, role).get<Array<{ kind: string }>>('/events')).map((e) => e.kind);
+    expect(await kinds('admin')).toEqual(expect.arrayContaining(['auth.denied', 'hook.created']));
+    for (const role of ['viewer', 'operator', 'approver']) {
+      const seen = await kinds(role);
+      expect(seen).toContain('hook.created');
+      expect(seen.filter((kind) => kind.startsWith('auth.') || kind.startsWith('user.'))).toEqual([]);
+    }
+  });
+
   it('lets every role read the catalog and an admin alone write it', async () => {
     for (const role of ['viewer', 'operator', 'approver'] as const) {
       const { client } = setup(role);

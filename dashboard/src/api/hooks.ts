@@ -163,6 +163,17 @@ export function useCreateUser() {
   });
 }
 
+/** DELETE /users/{name} (admin, SDD §12, §13.1): the user's token stops at once. */
+export function useDeleteUser() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => api.delete(`/users/${encodeURIComponent(name)}`),
+    retry: false,
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.users, ['events', 'tail']]),
+  });
+}
+
 /** Demo mode's time compression from `GET /health` (SDD §7.4): running downtime clocks show model time (§16, ADV-16). */
 export function useDemoSpeed(): number | null {
   const health = useHealth();
