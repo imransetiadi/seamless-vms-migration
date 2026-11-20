@@ -93,6 +93,7 @@ PERSISTED_KINDS = frozenset(
         "notification.failed",
         "auth.denied",
         "user.created",
+        "user.deleted",
         "events.pruned",
         # the orchestrator's lease taken and released, each in its own transaction (SDD §4.3, §8,
         # §11, §25.3)
@@ -102,6 +103,10 @@ PERSISTED_KINDS = frozenset(
     }
 )
 EPHEMERAL_KINDS = frozenset({"migration.progress", "migration.log", "heartbeat"})
+#: what an admin alone reads (SDD §12, §13.1; pentest 2026-11-19 P5): a refused request names its
+#: path, its method, the role it needed and the caller's address, and a user's creation names who
+#: was given which role - a map of the installation for a viewer handed to another party
+ADMIN_ONLY_KINDS = frozenset(k for k in PERSISTED_KINDS if k.startswith(("auth.", "user.")))
 
 _LAGGED = object()
 

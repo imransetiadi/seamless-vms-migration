@@ -16,6 +16,7 @@ from ..security.auth import (
     generate_token,
     hash_token,
 )
+from ..store import NotFound
 from .deps import ApiError, AuthFirstRoute, require_role, services
 from .schemas import Me
 
@@ -52,6 +53,36 @@ async def list_users(
     response.headers["Cache-Control"] = "no-store"
     entries = [*svc.tokens.entries, *await svc.db.list("user", DashboardUser)]
     return [Me(name=entry.name, role=entry.role) for entry in entries]
+
+
+@router.delete("/users/{name}", status_code=204)
+async def delete_user(
+    name: str,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.admin)),
+) -> Response:
+    """Remove a dashboard user (SDD §12, §13.1): its token stops at once - the users' digests are
+    read again on the next authentication - and an event stream it holds ends at its next check.
+    A bootstrap token is revoked in the tokens file, never here; an admin does not remove the
+    user it signs in as, so the last way in is never cut from the dashboard."""
+    svc = services(request)
+    folded = name.strip().casefold()
+    if any(entry.name.strip().casefold() == folded for entry in svc.tokens.entries):
+        raise ApiError(
+            409,
+            "conflict",
+            f"{name} is a bootstrap token of the tokens file: remove its entry there and restart",
+        )
+    if folded == principal.name.strip().casefold():
+        raise ApiError(409, "conflict", "you cannot remove the user you are signed in as")
+    try:
+        async with svc.bus.emit_lock:
+            event = await asyncio.to_thread(svc.store.delete_user, folded, principal.name)
+            svc.bus.publish(event, persist=True)
+    except NotFound:
+        raise ApiError(404, "not_found", f"user {name!r} not found") from None
+    svc.forget_users()
+    return Response(status_code=204)
 
 
 @router.post("/users", response_model=UserCreated, status_code=201)

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import json
 import logging
 import math
 import threading
@@ -509,6 +510,30 @@ class Store:
             raise ConflictError("a user with this name already exists") from None
         return Event(seq=seq, **row)
 
+    def delete_user(self, user_id: str, actor: str) -> Event:
+        """Delete a dashboard user and record ``user.deleted`` together (SDD §12, §13.1): its
+        token stops at once, and the audit names who removed whom with which role - never the
+        token's digest. A user already gone is ``NotFound``, and records nothing."""
+        if _unsendable(user_id):
+            raise NotFound("user", user_id)
+        key = (documents.c.kind == "user") & (documents.c.id == user_id)
+        with self._write(f"delete_user {user_id}") as conn:
+            row = conn.execute(sa.select(documents.c.data).where(key)).first()
+            if row is None:
+                raise NotFound("user", user_id)
+            data = row.data if isinstance(row.data, dict) else json.loads(row.data)
+            event = Event(
+                kind="user.deleted",
+                actor=actor,
+                message=f"User {data.get('name', user_id)} deleted",
+                data={"name": data.get("name", user_id), "role": str(data.get("role"))},
+            )
+            conn.execute(documents.delete().where(key))
+            event_row = _event_row(event)
+            result = conn.execute(events.insert().values(**event_row))
+            seq = int(result.inserted_primary_key[0])
+        return Event(seq=seq, **event_row)
+
     def put(self, kind: str, model: BaseModel, expected_version: int | None = None) -> int:
         """Insert or update ``model``; return the new version.
 
@@ -857,6 +882,7 @@ class Store:
         kinds: Iterable[str] | None = None,
         tail: bool = False,
         before_seq: int | None = None,
+        exclude_kinds: Iterable[str] | None = None,
     ) -> list[Event]:
         """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
         first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
@@ -882,6 +908,9 @@ class Store:
             query = query.where(events.c.migration_id == migration_id)
         if kinds is not None:
             query = query.where(events.c.kind.in_(list(kinds)))
+        if exclude_kinds:
+            # in the query, so a page holds ``limit`` events its reader may see (SDD §12)
+            query = query.where(events.c.kind.not_in(sorted(exclude_kinds)))
         order = events.c.seq.desc() if tail else events.c.seq
         query = query.order_by(order).limit(max(0, int(limit)))
         with self.engine.connect() as conn:

@@ -351,6 +351,7 @@ ROUTES = [
     ("GET", "/api/v1/me", Role.viewer, None),
     ("GET", "/api/v1/users", Role.admin, None),
     ("POST", "/api/v1/users", Role.admin, {"name": "matrix-user"}),
+    ("DELETE", "/api/v1/users/nope-1", Role.admin, None),
     ("GET", "/api/v1/providers", Role.viewer, None),
     ("POST", "/api/v1/providers", Role.admin, {**SOURCE, "id": "matrix-src"}),
     ("GET", "/api/v1/providers/src-osp", Role.viewer, None),
@@ -1342,7 +1343,7 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
         assert "/api/openapi.json" not in spec["paths"], "docs routes stay out of the schema"
     store.dispose()
 
-    # outside demo mode the docs need a viewer token (Security.md R-04, QASuite S-07)
+    # outside demo mode the docs need an admin's token (Security.md R-04, QASuite S-07; pentest P5)
     prod, tokens = api_settings(tmp_path / "prod", demo=False)
     store2 = Store(f"sqlite:///{tmp_path / 'prod.db'}")
     store2.create_schema()
@@ -1350,8 +1351,10 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
         assert client.get("/api/docs").status_code == 401
         assert client.get("/api/openapi.json").status_code == 401
         viewer = {"Authorization": f"Bearer {tokens[Role.viewer]}"}
-        assert client.get("/api/openapi.json", headers=viewer).status_code == 200
-        assert client.get("/api/docs", headers=viewer).status_code == 200
+        assert client.get("/api/openapi.json", headers=viewer).status_code == 403
+        admin = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+        assert client.get("/api/openapi.json", headers=admin).status_code == 200
+        assert client.get("/api/docs", headers=admin).status_code == 200
         assert client.get("/docs").status_code == 404 and client.get("/redoc").status_code == 404
     store2.dispose()
 

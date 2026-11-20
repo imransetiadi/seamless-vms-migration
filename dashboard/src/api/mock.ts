@@ -2092,6 +2092,20 @@ export class MockServer {
       }
     }
 
+    if (root === 'users' && id && method === 'DELETE') {
+      // DELETE /users/{name} (SDD §12, §13.1): a bootstrap persona is the tokens file's, and an admin keeps its own user
+      const me = this.require(token, 'admin', path);
+      const folded = id.toLowerCase();
+      if (ROLES.some((role) => PERSONAS[role].toLowerCase() === folded))
+        throw new HttpError(409, 'conflict', `${id} is a bootstrap token of the tokens file: remove its entry there and restart`);
+      if (me.name.toLowerCase() === folded) throw new HttpError(409, 'conflict', 'you cannot remove the user you are signed in as');
+      const entry = [...this.users.entries()].find(([, user]) => user.name.toLowerCase() === folded);
+      if (!entry) throw new HttpError(404, 'not_found', `user ${pyRepr(id)} not found`);
+      this.users.delete(entry[0]);
+      this.emit({ kind: 'user.deleted', actor: me.name, message: `User ${entry[1].name} deleted`, plan_id: null, migration_id: null, data: { name: entry[1].name, role: entry[1].role } });
+      return { status: 204 };
+    }
+
     if (root === 'hooks') return this.hooksRoute(method, id, input, token, path, sub);
     if (root === 'notifications') return this.notificationsRoute(method, id, sub, subsub, input, query, token, path);
 
@@ -2255,7 +2269,8 @@ export class MockServer {
     }
 
     if (root === 'events' && method === 'GET' && !id) {
-      this.require(token, 'viewer', path);
+      // auth.* and user.* events are an admin's alone (SDD §12; pentest 2026-11-19 P5)
+      const adminOnly = this.require(token, 'viewer', path).role !== 'admin';
       const since = Number(query.get('since') ?? 0) || 0;
       // before: only events below that seq, so tail + before is the page before the oldest shown (SDD §12)
       const before = query.has('before') ? Number(query.get('before')) : Infinity;
@@ -2271,7 +2286,8 @@ export class MockServer {
           e.seq < before &&
           (!planId || e.plan_id === planId) &&
           (!migrationId || e.migration_id === migrationId) &&
-          (!audit || (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind)),
+          (!audit || (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind)) &&
+          !(adminOnly && (e.kind.startsWith('auth.') || e.kind.startsWith('user.'))),
       );
       // tail: the newest `limit` matching events instead of the first, still ascending (SDD §12)
       return ok(query.get('tail') === 'true' ? matching.slice(-limit) : matching.slice(0, limit));
@@ -3896,8 +3912,10 @@ export class MockServer {
   /** `GET /events/stream` as a real `text/event-stream` body. */
   openStream(query: URLSearchParams, token: string | null, signal: AbortSignal | null | undefined, heartbeatMs: number): Response {
     this.request = { method: 'GET', path: '/events/stream' };
+    // auth.* and user.* events are sent to an admin alone, as GET /events lists them (SDD §12; pentest 2026-11-19 P5)
+    let shown = (_event: Event) => true;
     try {
-      this.require(token, 'viewer', '/events/stream');
+      if (this.require(token, 'viewer', '/events/stream').role !== 'admin') shown = (event) => !event.kind.startsWith('auth.') && !event.kind.startsWith('user.');
     } catch (error) {
       if (!(error instanceof HttpError)) throw error;
       return new Response(JSON.stringify({ error: { code: error.code, message: error.message } }), {
@@ -3921,9 +3939,9 @@ export class MockServer {
         const sinceParam = query.get('since');
         if (sinceParam !== null) {
           const since = Number(sinceParam) || 0;
-          for (const event of this.events) if (event.seq > since) send(sseFrame(event));
+          for (const event of this.events) if (event.seq > since && shown(event)) send(sseFrame(event));
         }
-        const unsubscribe = this.subscribe((event) => send(sseFrame(event)));
+        const unsubscribe = this.subscribe((event) => { if (shown(event)) send(sseFrame(event)); });
         const heartbeat = setInterval(() => send(': heartbeat\n\n'), heartbeatMs);
         cleanup = () => {
           if (closed) return;

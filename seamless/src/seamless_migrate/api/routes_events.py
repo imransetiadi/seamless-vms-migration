@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from ..domain.enums import Role
 from ..domain.models import Event
-from ..events import AUDIT_KINDS, Subscription
+from ..events import ADMIN_ONLY_KINDS, AUDIT_KINDS, Subscription
 from ..security.auth import Principal
 from ..store import MAX_SEQ
 from .deps import AuthFirstRoute, authenticate, require_role, services
@@ -39,6 +39,7 @@ async def sse_frames(
     heartbeat_s: float,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     still_allowed: Callable[[], Awaitable[bool]] | None = None,
+    hidden: frozenset[str] = frozenset(),
 ) -> AsyncIterator[str]:
     """The stream's frames. ``still_allowed`` runs at each heartbeat, and before an event once a
     heartbeat interval has passed since it last ran: a principal no longer accepted - a database
@@ -63,9 +64,17 @@ async def sse_frames(
                 checked = time.monotonic()
                 if not await still_allowed():
                     return
+            if event.kind in hidden:
+                continue  # an admin's alone (SDD §12): never sent, as GET /events never lists it
             yield format_sse(event)
     finally:
         await subscription.aclose()
+
+
+def _hidden_from(principal: Principal) -> frozenset[str]:
+    """The event kinds ``principal`` never reads (SDD §12; pentest 2026-11-19 P5): ``auth.*``
+    and ``user.*`` are an admin's."""
+    return frozenset() if principal.role.at_least(Role.admin) else ADMIN_ONLY_KINDS
 
 
 @router.get("/events", response_model=list[Event])
@@ -78,7 +87,7 @@ async def list_events(
     limit: int = Query(default=500, ge=1, le=1000),
     tail: bool = False,
     audit: bool = False,
-    _: Principal = Depends(require_role(Role.viewer)),
+    principal: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Event]:
     # tail: the newest ``limit`` matching events instead of the first (SDD §12), still ascending;
     # before: only events below that seq, so tail + before is the page before the oldest shown;
@@ -91,6 +100,7 @@ async def list_events(
         limit=limit,
         tail=tail,
         kinds=AUDIT_KINDS if audit else None,
+        exclude_kinds=_hidden_from(principal),
     )
 
 
@@ -98,7 +108,7 @@ async def list_events(
 async def stream_events(
     request: Request,
     since: int | None = Query(default=None, ge=0, le=MAX_SEQ),
-    _: Principal = Depends(require_role(Role.viewer)),
+    principal: Principal = Depends(require_role(Role.viewer)),
 ) -> StreamingResponse:
     svc = services(request)
     start = since if since is not None else await svc.db.max_seq()
@@ -108,7 +118,13 @@ async def stream_events(
         return await authenticate(request) is not None
 
     return StreamingResponse(
-        sse_frames(subscription, svc.sse_heartbeat_s, request.is_disconnected, still_allowed),
+        sse_frames(
+            subscription,
+            svc.sse_heartbeat_s,
+            request.is_disconnected,
+            still_allowed,
+            _hidden_from(principal),
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

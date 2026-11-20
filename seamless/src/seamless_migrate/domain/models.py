@@ -347,11 +347,32 @@ class Provider(_Model):
         return found if isinstance(found, str) and found else None
 
 
+#: what a request never sets on a provider (SDD §4.2, §12): POST ignores them, PATCH refuses them
+PROVIDER_SERVER_OWNED = (
+    "capabilities",
+    "status",
+    "status_message",
+    "last_checked_at",
+    "credentials_updated_at",
+    "conversion_key_updated_at",
+    "conversion_host_pin",
+    "project_credentials",
+)
+
+
+def _drop_server_owned(schema: dict[str, Any]) -> None:
+    """``ProviderCreate``'s schema names what a request sets (SDD §12; pentest 2026-11-19 P5):
+    the server-owned fields - a project credential's secret name among them - are the stored
+    model's, and the API's document no longer offers them as input."""
+    for name in PROVIDER_SERVER_OWNED:
+        schema.get("properties", {}).pop(name, None)
+
+
 class ProviderCreate(Provider):
     """The ``POST /providers`` body (SDD §12): a field ``Provider`` does not have is refused
     (422), never dropped; stored providers keep loading with later fields (``_Model``, §11)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_drop_server_owned)
 
     @field_validator("name")
     @classmethod

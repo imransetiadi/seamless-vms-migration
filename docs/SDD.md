@@ -656,7 +656,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `conversion_host.key_pinned` (§7.2, §10, §26.5), `conversion_host.key_refused` (§7.2, §26.5), `hook.created`,
 `hook.updated`, `hook.deleted` (§23.3), `channel.created`, `channel.updated`, `channel.deleted`, `subscription.created`,
-`subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `events.pruned` (§15), `leader.acquired`, `leader.released` (§8, §11, §25.3), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`subscription.deleted` (§24.3, §24.4, §24.7), `notification.sent`, `notification.failed` (§8.7, §24.7), `auth.denied`, `user.created`, `user.deleted`, `events.pruned` (§15), `leader.acquired`, `leader.released` (§8, §11, §25.3), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value; a project credential's write (§12, §27.4, plan task TC2) carries its `project_id` and the secret's
@@ -4481,7 +4481,8 @@ expected_version)` each, and their events in one transaction: all are written or
 the document that moved; a strategy change and an advisor decision, §8, §14.6; `put_with_event` is its one
 document's case),
 `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
-one transaction; a `ConflictError` for a name that exists in any case), `delete_with_events(kind, id,
+one transaction; a `ConflictError` for a name that exists in any case), `delete_user(user_id, actor) -> Event`
+(§13.1: the `user` document gone and its `user.deleted` event in one transaction; `NotFound` for one already gone), `delete_with_events(kind, id,
 expected_version, events) -> [Event]` (a versioned delete and its events in one transaction, a `ConflictError` or
 `NotFound` as `delete`'s: an advisor policy's deletion and its `policy.deleted`, §14.5, review RV51-11),
 `prune_events(before, actor) -> (count, Event)` (`events prune`, §15: the events before the cutoff deleted and
@@ -4637,6 +4638,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
+| DELETE | `/users/{name}` | admin | — | `204`; the user's token stops at once (§13.1); 404 for an unknown name; 409 for a bootstrap token of the tokens file (revoked there) and for the user the admin signs in as. Event `user.deleted` (actor, name, role), an admin's alone |
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` - its projects' pins with it - ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses Outside demo mode, 422 too when `endpoint` or `conversion_host.address` is a destination the control plane never connects to (§13.5, "destination not allowed"), or `endpoint` is plain `http://` without `allow_plain_http: true` (pentest 2026-11-19 P3). `ca_cert_path` lies under one of `SEAMLESS_CA_DIRS` (§15.1) once its symlinks and `..` are resolved, else 422 - one refusal whatever is at the path (pentest P4.4). |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
@@ -4687,8 +4689,8 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; `storage_handover` is refused (400, §9.2's reason) while the migration holds the destination volumes an earlier attempt created, judged at the request - a Retry does not re-assess the estimates the last validation stored (review RV40-01); 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
-| GET | `/events` | viewer | query `since` (seq), `before` (seq: only events below it — with `tail`, the newest `limit` of them, the page before the oldest one shown), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
-| GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
+| GET | `/events` | viewer | query `since` (seq), `before` (seq: only events below it — with `tail`, the newest `limit` of them, the page before the oldest one shown), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event The `auth.*` and `user.*` events are an admin's alone (pentest 2026-11-19 P5): a role below admin never reads them here or from the stream - a refused request names its path, method, needed role and caller's address, and `user.created` who was given which role -, and its pages still hold `limit` events it may see. |
+| GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) `auth.*` and `user.*` events are sent to an admin alone, as `GET /events` lists them. |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?,"deployment":"on_prem"\|"remote","endpoint_host":str?,"console_sent":bool},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` (§13.4) |
 | GET | `/advisor/data-sent` | viewer | — | `{"items": [{"decision_type": DecisionType, "tool": str, "fields": [{"key": str, "label": str}], "sent": bool, "note": str?}]}` — generated from the serializers' field specs (§13.4, ADV-06) |
@@ -4719,7 +4721,10 @@ the width of `events.seq` - PostgreSQL's `integer` -: a larger value is a 422, n
 review ST-01).
 
 Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
-and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
+and need the admin role otherwise - the document maps every route and field (pentest 2026-11-19 P5); in it
+`ProviderCreate` names what a request sets, without the server-owned fields (`capabilities`, `status`,
+`status_message`, `last_checked_at`, `credentials_updated_at`, `conversion_key_updated_at`, `conversion_host_pin`,
+`project_credentials`), which `POST /providers` still ignores and `PATCH` refuses; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
 disabled (Security.md R-04). Every response carries the security headers of Security.md R-05.
 
 **The followers** (§25.6, plan task HA4). A server replica that does not lead (§8) answers `/api/v1/health`,
@@ -4841,7 +4846,12 @@ tokens and database users. The default role is `viewer`. The response returns a 
 token once with `Cache-Control: no-store`; later listings expose only name and role. A `user`
 document stores the SHA-256 digest in the existing database, with its lowercase name as ID.
 Creation and `user.created` (actor, name, role; never token or digest) commit together, and duplicate
-creates cannot replace an existing token. Authentication keeps the database users' digests in
+creates cannot replace an existing token. An admin removes a database user with `DELETE /users/{name}` (the name
+matched ignoring case): the document and `user.deleted` (actor, name, role) commit together, and the process that
+answered reads the digests again at once, so the token is refused from its next request on that replica (another
+replica within the 5 seconds below); its event stream ends at the next check. A bootstrap token of the tokens file is
+revoked there, never by the route (409), and an admin cannot remove the user it signs in as (409), so the dashboard
+never cuts the last way in (the retest of 2026-11-20 found no way to revoke a user). Authentication keeps the database users' digests in
 memory per process and reads them again when the `user` kind's change stamp moved (one aggregate
 query, §11) or at the latest after 5 seconds — a deletion and a re-creation at the same version
 leave the stamp unchanged — so access survives restarts, a change is visible across processes
