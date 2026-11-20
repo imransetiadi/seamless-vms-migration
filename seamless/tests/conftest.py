@@ -142,3 +142,12 @@ def land_first() -> Iterator[Callable[[Store, str, str, Callable[[], object]], l
     yield land
     for engine, listener in listening:
         sa.event.remove(engine, "before_cursor_execute", listener)
+
+
+@pytest.fixture(autouse=True)
+def _no_name_is_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The destination guard (SDD §13.5) resolves no name on the network in a test: every name
+    answers one public address (TEST-NET-3); a test of the guard gives its own resolver."""
+    from seamless_migrate.security import destinations
+
+    monkeypatch.setattr(destinations, "system_resolver", lambda host: ["203.0.113.10"])

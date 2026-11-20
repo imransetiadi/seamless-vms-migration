@@ -29,7 +29,7 @@ ACTION
                      ReadWriteMany seamless-data (SDD §25.7); docker and podman run one
   capacity           scale the one control plane up or down: --max-migrations N, --max-cutovers N,
                      and on a cluster --cpu C, --memory M (its limits); then a restart
-  status             what runs, and the API's health - on a cluster with --url, the leading pod
+  status             what runs, and the API's health - on a cluster with --url and --token-file, the leading pod
   logs               follow the control plane's log - on a cluster with two replicas one pod's,
                      not necessarily the leader's: status names the leading pod
   resume PLAN_ID...  start again the plans a --drain paused (needs --token-file)
@@ -40,7 +40,7 @@ OPTIONS
   --drain FILE       before down, stop, restart, scale 0 or capacity: pause every running plan and wait
                      until no migration is in cutover, verifying or rolling_back; FILE holds an
                      operator's token and may be read by its owner alone (chmod 600)
-  --token-file FILE  the operator's token for resume (chmod 600)
+  --token-file FILE  the operator's token for resume, a viewer's for status's leading pod (chmod 600)
   --url URL          the API's base URL: on docker/podman http://127.0.0.1:$SEAMLESS_HOST_PORT (8080) by
                      default; on a cluster the Route's or Ingress's URL, needed by --drain and resume
   --wait-timeout S   how long a --drain waits for the cutovers in flight (default 1800)
@@ -887,13 +887,30 @@ cluster() {
     status)
       kube get deployment/seamless statefulset/seamless-postgres
       kube get pods -l 'app.kubernetes.io/name in (seamless,seamless-postgres)'
-      if [ -n "$API" ] && [ "$DRY" = 1 ]; then
+      # the whole report - the leader with it - is a viewer's (SDD §12, pentest 2026-11-19 P4.1): /health/detail
+      # with --token-file; without one /health answers its status alone
+      if [ -n "$API" ] && [ -n "$TOKEN_FILE" ]; then
+        open_token "$TOKEN_FILE"
+        if [ "$DRY" = 1 ]; then
+          run curl -fsS --max-time 10 -H "$HEADER" "$API/api/v1/health/detail"
+          say "# then the leading pod, named by the health's leader"
+        else
+          health=$(curl -fsS --max-time 10 -H "$HEADER" "$API/api/v1/health/detail") ||
+            die "the API does not answer at $API, or the token of --token-file is no viewer's"
+          say "$health"
+          leading_pod "$health"
+        fi
+      elif [ -n "$API" ] && [ "$DRY" = 1 ]; then
         run curl -fsS --max-time 10 "$API/api/v1/health"
-        say "# then the leading pod, named by the health's leader"
+        say "# the leading pod is named with --token-file FILE (a viewer's token)"
       elif [ -n "$API" ]; then
         health=$(curl -fsS --max-time 10 "$API/api/v1/health") || die "the API does not answer at $API"
         say "$health"
-        leading_pod "$health"
+        case $health in
+          # a whole report: demo mode, authentication off, or an API from before 0.5.0
+          *'"version"'*) leading_pod "$health" ;;
+          *) say "the leading pod is named with --token-file FILE (a viewer's token)" ;;
+        esac
       fi
       ;;
     logs) kube logs deployment/seamless -f --tail=200 ;;

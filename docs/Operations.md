@@ -1394,6 +1394,80 @@ it.
 
 ---
 
+### 7.6 The caller's address behind a reverse proxy (pentest 2026-11-19, P2)
+
+Behind an ingress controller every request reaches the control plane from the controller's pod. Unless the control
+plane is told to trust that hop, the audit trail (`auth.denied`'s `client`) and the authentication lockout
+(`SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`, per address) see one address for every caller: forensics name the proxy, and the
+lockout either never counts anyone or locks everyone out together. Two settings, both the deployment's:
+
+1. **The control plane trusts the proxy's hop.** Set `FORWARDED_ALLOW_IPS` on the `seamless` container to the
+   addresses the ingress controller's pods connect from - a CIDR, comma-separated for several, **never `*`**: uvicorn
+   (started with `proxy_headers`) then takes the caller's address from `X-Forwarded-For`, and only from those peers.
+   Any other peer's header is ignored. `deploy/openshift/deployment.yaml` carries the variable commented; the HA
+   component sets it to the pod network (§4.7). A server started without it on a non-loopback address logs a warning
+   at start.
+
+   | Ingress | `FORWARDED_ALLOW_IPS` |
+   |---|---|
+   | Traefik on k3s (the bundled one) | the pod network, `10.42.0.0/16` by default - or the Traefik pods' addresses |
+   | ingress-nginx | the controller pods' network |
+   | OpenShift router | the router pods' addresses (host network: the nodes') |
+
+2. **The proxy itself sees the caller.** Behind a cloud load balancer the proxy must be given the real address, or
+   it forwards the load balancer's. One of:
+   * the proxy's Service with `externalTrafficPolicy: Local` (the source address is kept; no extra hop);
+   * PROXY protocol on the load balancer (an AWS NLB target group attribute) and on the proxy - Traefik:
+     `--entryPoints.websecure.proxyProtocol.trustedIPs=<the load balancer's CIDR>`;
+   * a load balancer that writes `X-Forwarded-For` (an ALB), trusted on the proxy - Traefik:
+     `--entryPoints.websecure.forwardedHeaders.trustedIPs=<the load balancer's CIDR>`.
+
+   On k3s the bundled Traefik is configured with a `HelmChartConfig` (`kube-system/traefik`): `service.spec.
+   externalTrafficPolicy: Local`, or the `additionalArguments` above.
+
+Check it: send one request with a wrong token from a known address, then read the newest `auth.denied` event as an
+admin (`GET /api/v1/events?kind=auth.denied&limit=1`): its `client` is that address, not the proxy's.
+
+The lockout: `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` failed bearer authentications (default 60) from one address within
+a minute answer that address's further failures with 429 for the rest of the minute; a valid bootstrap-file token
+always passes. Tokens are `smg_` and 32 random bytes (256 bits).
+
+### 7.7 The destination guard: where the control plane connects (pentest 2026-11-19, P3)
+
+The control plane connects only where SDD §13.5 allows. A provider's endpoint, the endpoints its Keystone catalog
+names, a brought conversion host's address, a webhook hook's and a webhook channel's URL are refused when they are a
+loopback or link-local address (the metadata service), a name of the cluster's DNS, or inside
+`SEAMLESS_EGRESS_DENY_CIDRS`.
+
+* **Set `SEAMLESS_EGRESS_DENY_CIDRS` to the cluster's pod and service networks.** The overlays set the defaults beside
+  the NetworkPolicies' ranges (`deploy/openshift/configmap.yaml`: `10.128.0.0/14,172.30.0.0/16`; `deploy/kubernetes`:
+  `10.244.0.0/16,10.96.0.0/12`). k3s: `10.42.0.0/16,10.43.0.0/16`. On Compose it is empty.
+* **Optional: `SEAMLESS_EGRESS_ALLOW_PRIVATE_CIDRS`**, the networks your clouds, conversion hosts and receivers are
+  in. Unset, every private network is allowed (an on-premises OpenStack lives there); set, a private address outside
+  it is refused.
+* A refusal reads "destination not allowed: {host} …" - in the 422 of a save, in a provider's `status_message`, as a
+  hook's failure, as a channel's `destination_not_allowed`. A cloud inside a denied range - one that runs in the same
+  cluster - needs its range taken out of `SEAMLESS_EGRESS_DENY_CIDRS`, and an egress rule (the NetworkPolicy stays the
+  second layer).
+* A provider check ends within `SEAMLESS_PROVIDER_CHECK_TIMEOUT_S` (30 s). A large cloud whose check needs longer:
+  raise it; `0` leaves the bound to the provider call's.
+* Plain `http://` for a **new or changed** endpoint needs `allow_plain_http: true` (the provider dialog's "Allow plain
+  HTTP for this endpoint"). A provider stored before keeps working.
+
+### 7.8 After upgrading to the build with the pentest fixes of 2026-11-19
+
+* **Rotate every webhook hook's bearer token** (`PUT /hooks/{name}/secret`, or the Hooks page's Bearer token): before,
+  the name of a hook's secret - or a token typed in its place - was answered to every role. At its first start the
+  control plane copies each hook's token to the secret `hook-{name}` and drops the old name; a hook whose old name
+  held no token logs "named a secret that holds no token" and needs its token set. The secret store must be writable
+  (`SEAMLESS_SECRET_STORE`, §13.3 of the SDD); until it is, the hook keeps reading the secret it named.
+* Set `FORWARDED_ALLOW_IPS` (§7.6) and `SEAMLESS_EGRESS_DENY_CIDRS` (§7.7).
+* `GET /api/v1/health` and `/ready` answer `{"status": …}` alone without a token; probes that read only the status
+  code need no change. The full report is `GET /api/v1/health/detail` (viewer), which `seamless-ctl.sh status` reads
+  with `--token-file`.
+* Not in the code: restrict SSH (port 22) on the hosts to the administrators' addresses or a VPN, or use a session
+  manager; run a stable release, not a release candidate.
+
 ## 8. Runbooks: what a migration leaves to the operator
 
 A migration moves a VM: its server, disks and ports and, as its plan asks, its floating IPs with their addresses, its

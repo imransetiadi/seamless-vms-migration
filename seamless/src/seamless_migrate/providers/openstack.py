@@ -33,6 +33,7 @@ from ..planning.preflight import (
     StackPlace,
     StackRead,
 )
+from ..security.destinations import DestinationNotAllowed, check_destination
 from ..security.secrets import (
     SecretNotFound,
     openstack_cloud_entry,
@@ -151,7 +152,29 @@ def connect(provider: Provider, settings: Settings, project_id: str | None = Non
         kwargs["cacert"] = provider.ca_cert_path
     # a black-holed endpoint must not pin a worker thread forever (SDD §7)
     kwargs["api_timeout"] = PROVIDER_API_TIMEOUT_S
+    # the control plane connects only where it may (SDD §13.5): the provider's endpoint and the
+    # auth URL its credential is posted to, judged by the addresses they resolve to
+    auth = kwargs.get("auth")
+    auth_url = auth.get("auth_url") if isinstance(auth, dict) else None
+    for field, url in (("endpoint", provider.endpoint), ("auth_url", auth_url)):
+        if url:
+            try:
+                check_destination(str(url), settings, field=field)
+            except DestinationNotAllowed as exc:
+                raise ProviderError(f"{provider.id}: {exc}") from None
     return openstack.connect(**kwargs)
+
+
+def _refuse_catalog(provider: Provider, conn: Any, settings: Settings) -> None:
+    """The endpoints Keystone's catalog names are destinations too (SDD §13.5): a catalog an
+    admin's provider answers could send the next calls anywhere inside the deployment."""
+    for name, proxy in _SERVICES:
+        url = _try(lambda p=proxy: _catalog_url(getattr(conn, p)), None)
+        if isinstance(url, str) and url:
+            try:
+                check_destination(url, settings, field=f"the catalog's {name} endpoint")
+            except DestinationNotAllowed as exc:
+                raise ProviderError(f"{provider.id}: {exc}") from None
 
 
 def _name_pattern(name: str) -> str:
@@ -874,6 +897,7 @@ class OpenStackProvider:
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
+        _refuse_catalog(self.provider, conn, self.settings)
         admin = _try(lambda: list(conn.compute.hypervisors()), None) is not None
         # keystoneauth hands a parsed tuple: reported as "2.96" (review RV18-01)
         microversion = _try(

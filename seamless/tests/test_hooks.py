@@ -27,9 +27,7 @@ DESTINATION = make_provider(
     id="dst-rhoso", name="RHOSO 18.0", kind=ProviderKind.rhoso, role=ProviderRole.destination
 )
 PLAYBOOK = Hook(name="drain-lb", kind="playbook", playbook="/opt/hooks/drain-lb.yml", timeout_s=30)
-WEBHOOK = Hook(
-    name="dns-swap", kind="webhook", url="https://hooks.example.org/dns", secret="dns-hook-token"
-)
+WEBHOOK = Hook(name="dns-swap", kind="webhook", url="https://hooks.example.org/dns")
 
 #: a fake ansible-playbook: records what it was given, prints its lines, sleeps, exits - told how
 #: by ANSIBLE_HOOK_FAKE_* variables, the ANSIBLE_* the hook's environment lets through
@@ -56,8 +54,8 @@ def env(tmp_path, monkeypatch):
     fake.write_text(FAKE.format(python=sys.executable))
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     secrets = tmp_path / "secrets"
-    (secrets / "dns-hook-token").mkdir(parents=True)
-    (secrets / "dns-hook-token" / "token").write_text("t0ken-for-the-hook")
+    (secrets / "hook-dns-swap").mkdir(parents=True)
+    (secrets / "hook-dns-swap" / "token").write_text("t0ken-for-the-hook")
     record = tmp_path / "record.json"
     monkeypatch.setenv("ANSIBLE_HOOK_FAKE_RECORD", str(record))
     # what the control plane holds and no hook may get (SDD §7.2)
@@ -212,7 +210,7 @@ async def test_a_webhook_hook_posts_the_context_with_its_bearer_secret(env, tmp_
     assert (result.outcome, result.detail) == ("failed", "HTTP 500")
     assert not any("body never logged" in line for line in logged)
     requests.clear()
-    (settings.secrets_dir / "dns-hook-token" / "token").unlink()
+    (settings.secrets_dir / "hook-dns-swap" / "token").unlink()
     result, _ = await run(settings, WEBHOOK, context, tmp_path, answering(204))
     assert (result.outcome, result.detail) == ("failed", "its secret holds no token")
     assert requests == []
@@ -343,3 +341,50 @@ async def test_a_rerun_hook_gets_the_same_idempotency_key(env, tmp_path):
     retried = migration().model_copy(update={"attempts": 3})
     again = context_document(retried, plan(), "post_create", SOURCE, DESTINATION)
     assert again["idempotency_key"] == "mig-0123456789.3.post_create"
+
+
+async def test_a_hook_of_an_earlier_version_moves_its_token_to_its_own_secret(env, tmp_path):
+    """SDD §13.3: before 0.5.0 a hook named its secret and every role read that name. A start
+    copies the token to hook-{name} and drops the name; a name that holds no token - a token typed
+    in its place - is dropped alike; a hook reads the secret it named until the start moved it."""
+    from seamless_migrate.hooks import adopt_hook_secrets
+    from seamless_migrate.store import AsyncStore, Store
+
+    settings, _ = env
+    (settings.secrets_dir / "legacy-name").mkdir()
+    (settings.secrets_dir / "legacy-name" / "token").write_text("t0ken-of-old")
+    store = Store(f"sqlite:///{tmp_path / 'hooks.db'}")
+    store.create_schema()
+    db = AsyncStore(store)
+    old = Hook(
+        name="old", kind="webhook", url="https://hooks.example.org/old", secret="legacy-name"
+    )
+    typed = Hook(
+        name="typed", kind="webhook", url="https://hooks.example.org/t", secret="smg_typed-token"
+    )
+    for hook in (old, typed, WEBHOOK, PLAYBOOK):
+        await db.put("hook", hook)
+    # until a start moved it, the hook reads the secret it named
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(204)
+
+    result, _ = await run(settings, old, document(), tmp_path, httpx.MockTransport(handler))
+    assert result.outcome == "succeeded"
+    assert requests[-1].headers["authorization"] == "Bearer t0ken-of-old"
+    assert await adopt_hook_secrets(db, settings) == 2
+    moved = await db.get("hook", "old", Hook)
+    assert moved.secret is None and moved.secret_updated_at is not None
+    assert (settings.secrets_dir / "hook-old" / "token").read_text() == "t0ken-of-old"
+    result, _ = await run(settings, moved, document(), tmp_path, httpx.MockTransport(handler))
+    assert requests[-1].headers["authorization"] == "Bearer t0ken-of-old"
+    dropped = await db.get("hook", "typed", Hook)
+    assert dropped.secret is None and dropped.secret_updated_at is None
+    assert not (settings.secrets_dir / "hook-typed").exists()
+    assert "smg_typed-token" not in json.dumps(
+        [h.model_dump(mode="json") for h in await db.list("hook", Hook)]
+    )
+    assert await adopt_hook_secrets(db, settings) == 0  # nothing left to move
+    store.dispose()

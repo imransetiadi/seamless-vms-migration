@@ -10,7 +10,7 @@ from pydantic import TypeAdapter
 from ..domain.enums import Phase, Role
 from ..domain.models import Migration, MigrationSummary
 from ..security.auth import Principal
-from .deps import require_role, services
+from .deps import AuthFirstRoute, require_role, services
 from .schemas import (
     ApproveRequest,
     CancelRequest,
@@ -22,7 +22,7 @@ from .schemas import (
     StrategyRequest,
 )
 
-router = APIRouter(tags=["migrations"])
+router = APIRouter(tags=["migrations"], route_class=AuthFirstRoute)
 
 #: the list as JSON in one pass: the store has validated each migration already, and a response
 #: model would dump, validate and serialize all of them again (44 ms against 21 ms per 1,000)

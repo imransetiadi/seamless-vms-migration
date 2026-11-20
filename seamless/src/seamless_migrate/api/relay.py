@@ -41,7 +41,14 @@ log = logging.getLogger(__name__)
 #: the API a follower relays (SDD §12)
 API_PREFIX = "/api/v1"
 #: what a follower answers itself under it: its own health, readiness and metrics (SDD §12)
-LOCAL_PATHS = frozenset({f"{API_PREFIX}/health", f"{API_PREFIX}/ready", f"{API_PREFIX}/metrics"})
+LOCAL_PATHS = frozenset(
+    {
+        f"{API_PREFIX}/health",
+        f"{API_PREFIX}/health/detail",
+        f"{API_PREFIX}/ready",
+        f"{API_PREFIX}/metrics",
+    }
+)
 #: the event stream: relayed without a bound (SDD §12)
 STREAM_PATH = f"{API_PREFIX}/events/stream"
 #: the relay's marker (SDD §12): a replica that does not lead never relays a marked request again

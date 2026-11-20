@@ -749,7 +749,7 @@ describe('Plans page', () => {
     const server = createTestServer();
     const at = '2026-10-08T12:00:00Z';
     for (const name of ['drain-lb', 'warm-cache', 'smoke'])
-      server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, secret: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
+      server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, url_host: null, secret_set: false, secret_updated_at: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
     const web = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!.find((vm) => vm.name === 'web-01')!;
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
     const dialog = await newPlan(user, 'Cut over the portal', 'rhosp17-dc1');

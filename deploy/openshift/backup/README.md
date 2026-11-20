@@ -60,7 +60,7 @@ Order: **Secrets → database → data PVC**, with the control plane stopped.
    `completed` but not `finalized` needs its warm state for a rollback; a plan that is `finalized`
    or `draft` does not).
 6. Start the control plane: `oc -n seamless-migrate scale deploy/seamless --replicas=1`, then check
-   `GET /api/v1/health` reports `db: ok` and the dashboard lists the plans you expect. Migrations
+   `GET /api/v1/health/detail` (a viewer's token) reports `db: ok` and the dashboard lists the plans you expect. Migrations
    that were in flight at backup time come back as the orchestrator re-validates them (SDD §8).
 
 ## Restore drill

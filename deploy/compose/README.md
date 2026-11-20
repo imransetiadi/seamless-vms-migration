@@ -64,8 +64,9 @@ from your workstation first (`ssh -L 8080:127.0.0.1:8080 you@server`). Or call t
 ```bash
 read -rs TOKEN && export TOKEN                           # paste the token compose-init.sh printed; nothing echoes
 hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
-curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
-curl -fsS http://127.0.0.1:8080/api/v1/ready             # same body; HTTP 503 while the DB or the orchestrator loop is down
+curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok"} - the status alone without a token (SDD 12)
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/health/detail   # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
+curl -fsS http://127.0.0.1:8080/api/v1/ready             # as /health; HTTP 503 while the DB or the orchestrator loop is down
 curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/me
 curl -N   -H @"$hdr" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
 rm -rf "${hdr%/auth}"                                    # when you are done

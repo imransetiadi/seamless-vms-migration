@@ -19,6 +19,7 @@ from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
+from ..security.destinations import DestinationNotAllowed, check_destination
 from ..security.secrets import SecretNotFound, resolve
 from .base import ProviderError, VMNotFound, missing_dependency
 from .openstack import PROVIDER_API_TIMEOUT_S, PROVIDER_CALL_TIMEOUT_S
@@ -305,6 +306,10 @@ class VMwareProvider:
         except SecretNotFound as exc:
             raise ProviderError(f"{self.provider.id}: {exc}") from None
         host, port = parse_endpoint(self.provider.endpoint)
+        try:  # the control plane connects only where it may (SDD §13.5)
+            check_destination(host, self.settings, field="endpoint")
+        except DestinationNotAllowed as exc:
+            raise ProviderError(f"{self.provider.id}: {exc}") from None
         connector = self._connector or default_connector
         return connector(
             host=host,

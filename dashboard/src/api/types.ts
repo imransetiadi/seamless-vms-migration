@@ -167,6 +167,8 @@ export interface Provider {
   credentials_secret: string | null;
   region: string | null;
   verify_tls: boolean;
+  /** Plain http:// is refused for an endpoint unless its admin opts in (SDD §13.5): a lab. */
+  allow_plain_http: boolean;
   ca_cert_path: string | null;
   conversion_host: ConversionHostConfig | null;
   capabilities: Record<string, unknown>;
@@ -224,12 +226,12 @@ export interface ProjectCheck {
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
-export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
+export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'allow_plain_http' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
   Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks' | 'ceph'>>;
 
 /** `PATCH /providers/{id}`: the editable fields (SDD §12). */
 export type ProviderPatch = Partial<
-  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks' | 'ceph'>
+  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'allow_plain_http' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks' | 'ceph'>
 >;
 
 /** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
@@ -553,16 +555,20 @@ export interface Hook {
   kind: 'playbook' | 'webhook';
   description: string | null;
   playbook: string | null;
+  /** A webhook's URL: in full for an admin, null for any other role, which reads `url_host` (SDD §12). */
   url: string | null;
-  secret: string | null;
+  url_host: string | null;
+  /** Whether the API holds a bearer token for the webhook: the token itself is write-only (SDD §12, §13.3). */
+  secret_set: boolean;
+  secret_updated_at: Timestamp | null;
   timeout_s: number;
   revert: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
 
-/** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable. */
-export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'secret' | 'timeout_s' | 'revert'>>;
+/** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable; `secret` is the bearer token, write-only. */
+export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'timeout_s' | 'revert'>> & { secret?: string };
 
 /** What a notification subscription chooses (SDD §4.1, §24.5). */
 export type NotifyTopic = 'approval' | 'downtime' | 'problem' | 'outcome' | 'progress';
@@ -1345,6 +1351,7 @@ export interface LeaderHealth {
   since: string | null;
 }
 
+/** `GET /health` (SDD §12). Without a token - the sign-in page - the API answers `status` alone outside demo mode: read the other fields as possibly absent there. */
 export interface Health {
   /** Judges the replica that answered: the leader by its tick loop, a follower by its campaign (SDD §12). */
   status: 'ok' | 'degraded';

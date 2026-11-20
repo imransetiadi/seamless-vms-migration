@@ -395,6 +395,7 @@ ROUTES = [
     ("DELETE", "/api/v1/providers/nope-1", Role.admin, None),
     ("POST", "/api/v1/providers/src-osp/check", Role.operator, None),
     ("GET", "/api/v1/providers/src-osp/inventory", Role.viewer, None),
+    ("GET", "/api/v1/health/detail", Role.viewer, None),
     # the hook catalog (SDD §12, plan task N3)
     ("GET", "/api/v1/hooks", Role.viewer, None),
     (
@@ -406,6 +407,7 @@ ROUTES = [
     ("GET", "/api/v1/hooks/nope-1", Role.viewer, None),
     ("PATCH", "/api/v1/hooks/nope-1", Role.admin, {"timeout_s": 60}),
     ("DELETE", "/api/v1/hooks/nope-1", Role.admin, None),
+    ("PUT", "/api/v1/hooks/nope-1/secret", Role.admin, {"token": "matrix-token"}),
     ("GET", "/api/v1/notifications/channels", Role.viewer, None),
     (
         "POST",
@@ -1429,9 +1431,13 @@ def test_chunked_request_body_over_1_mib_is_refused_with_413(api):
         for _ in range(17):  # 17 x 64 KiB = 1,114,112 bytes
             yield b"x" * 65536
 
-    res = api.client.post(_APPROVE, headers={"Content-Type": "application/json"}, content=chunks())
+    headers = {"Content-Type": "application/json", **api.h(Role.approver)}
+    res = api.client.post(_APPROVE, headers=headers, content=chunks())
     assert res.status_code == 413, res.text
     assert res.json()["error"]["code"] == "payload_too_large"
+    # without a token nothing of the body is read: the 401 comes first (SDD §12, pentest P4.3)
+    res = api.client.post(_APPROVE, headers={"Content-Type": "application/json"}, content=chunks())
+    assert res.status_code == 401, res.text
 
 
 async def test_body_limit_counts_streamed_chunks():

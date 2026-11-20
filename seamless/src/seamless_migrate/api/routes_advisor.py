@@ -21,6 +21,7 @@ from ..security.auth import Principal
 from ..store import ConflictError, NotFound
 from .deps import (
     ApiError,
+    AuthFirstRoute,
     Services,
     refuse_unknown_fields,
     require_permission,
@@ -29,7 +30,7 @@ from .deps import (
 )
 from .schemas import EmptyRequest, OverrideRequest, PolicyList
 
-router = APIRouter(tags=["advisor"])
+router = APIRouter(tags=["advisor"], route_class=AuthFirstRoute)
 
 
 async def _check_scope(svc: Services, spec: AdvisorPolicySpec) -> None:

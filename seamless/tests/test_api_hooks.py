@@ -9,6 +9,9 @@ from seamless_migrate.domain.models import Plan
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings
 
+#: a webhook hook's bearer token: write-only (SDD §12, §13.3)
+TOKEN = "canary-" * 5 + "hook"
+
 PLAYBOOK = {
     "name": "drain-lb",
     "kind": "playbook",
@@ -19,7 +22,7 @@ WEBHOOK = {
     "name": "dns-swap",
     "kind": "webhook",
     "url": "https://hooks.example.org/dns",
-    "secret": "dns-hook-token",
+    "secret": TOKEN,
 }
 PLAN = {
     "name": "Network",
@@ -31,7 +34,7 @@ PLAN = {
 
 @pytest.fixture
 def api(tmp_path):
-    settings, tokens = api_settings(tmp_path)
+    settings, tokens = api_settings(tmp_path, secrets_dir=tmp_path / "secrets")
     store = Store(f"sqlite:///{tmp_path / 'api.db'}")
     store.create_schema()
     with TestClient(create_app(settings, store)) as client:
@@ -72,14 +75,17 @@ def test_only_an_admin_registers_a_hook(api):
         assert api.post("/api/v1/hooks", role=role, json=WEBHOOK).status_code == 403
     assert api.get("/api/v1/hooks").json() == []
     created = register(api, WEBHOOK)
-    assert {k: created[k] for k in ("name", "kind", "url", "secret", "timeout_s", "revert")} == {
+    assert {
+        k: created[k] for k in ("name", "kind", "url", "secret_set", "timeout_s", "revert")
+    } == {
         "name": "dns-swap",
         "kind": "webhook",
         "url": "https://hooks.example.org/dns",
-        "secret": "dns-hook-token",
+        "secret_set": True,
         "timeout_s": 300,
         "revert": None,
     }
+    assert "secret" not in created
     assert created["playbook"] is None and created["description"] is None
     assert created["created_at"] and created["updated_at"]
     register(api, PLAYBOOK)
@@ -112,15 +118,13 @@ def test_only_an_admin_registers_a_hook(api):
         ),
         ("hook.deleted", {"name": "drain-lb", "kind": "playbook"}, "admin-user"),
     ]
-    assert not any(
-        "hooks.example.org" in e.message or "dns-hook-token" in e.message for e in events
-    )
+    assert not any("hooks.example.org" in e.message or TOKEN in e.message for e in events)
 
 
 def test_a_webhook_hook_needs_https(api):
     """SDD §4.2, §12, §23.9: a webhook's URL is https:// without user information, and its bearer
-    secret a name §13.3 reads that is no provider's credential - the webhook would send it to its
-    URL; a playbook hook names an absolute .yml or .yaml path; each kind takes its own fields alone,
+    secret a token an Authorization header carries, which no refusal repeats; a playbook hook names
+    an absolute .yml or .yaml path; each kind takes its own fields alone,
     a timeout of 1-1800 s, and a revert naming another hook of the catalog. A refused edit stores
     nothing."""
     cases = [
@@ -128,11 +132,12 @@ def test_a_webhook_hook_needs_https(api):
         ({**WEBHOOK, "url": "https://user:pw@hooks.example.org/dns"}, "user information"),
         ({**WEBHOOK, "url": "https://"}, "https"),
         ({k: v for k, v in WEBHOOK.items() if k != "url"}, "url"),
-        ({k: v for k, v in WEBHOOK.items() if k != "secret"}, "secret"),
         ({**WEBHOOK, "playbook": "/opt/x.yml"}, "playbook"),
-        ({**WEBHOOK, "secret": "../token"}, "secret"),
-        ({**WEBHOOK, "secret": "provider-dst-rhoso"}, "provider"),
-        ({**WEBHOOK, "secret": "Provider_src.osp"}, "provider"),
+        ({**WEBHOOK, "secret": "a token"}, "secret"),
+        ({**WEBHOOK, "secret": "tok\nen"}, "secret"),
+        ({**WEBHOOK, "secret": ""}, "secret"),
+        ({**WEBHOOK, "secret": 7}, "secret"),
+        ({**WEBHOOK, "secret": "x" * 4097}, "secret"),
         ({**PLAYBOOK, "playbook": "hooks/drain.yml"}, "absolute"),
         ({**PLAYBOOK, "playbook": "/opt/hooks/drain.sh"}, ".yml"),
         ({k: v for k, v in PLAYBOOK.items() if k != "playbook"}, "playbook"),
@@ -150,19 +155,18 @@ def test_a_webhook_hook_needs_https(api):
         assert refused.status_code == 422, (body, refused.text)
         assert why in message(refused), (body, message(refused))
     assert api.get("/api/v1/hooks").json() == []
-    # a secret a provider names as its credential is no webhook's
-    assert (
-        patch(api, "/providers/dst-rhoso", {"credentials_secret": "rhoso-creds"}).status_code == 200
-    )
-    refused = api.post("/api/v1/hooks", json={**WEBHOOK, "secret": "rhoso-creds"})
-    assert refused.status_code == 422 and "provider" in message(refused)
+    # a refusal never repeats the token, and writes none
+    refused = api.post("/api/v1/hooks", json={**WEBHOOK, "secret": "bad token"})
+    assert "bad token" not in refused.text
+    assert not (api.settings.secrets_dir / "hook-dns-swap").exists()
     register(api, WEBHOOK)
     register(api, {**PLAYBOOK, "revert": "dns-swap", "playbook": "/opt/hooks/drain.YAML"})
     refused = patch(api, "/hooks/dns-swap", {"url": "http://hooks.example.org/dns"})
     assert refused.status_code == 422 and "https" in message(refused)
-    refused = patch(api, "/hooks/dns-swap", {"secret": "rhoso-creds"})
-    assert refused.status_code == 422 and "provider" in message(refused)
-    assert api.get("/api/v1/hooks/dns-swap").json()["url"] == "https://hooks.example.org/dns"
+    refused = patch(api, "/hooks/drain-lb", {"secret": TOKEN})
+    assert refused.status_code == 422 and "takes none" in message(refused)
+    kept = api.get("/api/v1/hooks/dns-swap", role=Role.admin).json()
+    assert kept["url"] == "https://hooks.example.org/dns"
     assert patch(api, "/hooks/drain-lb", {"revert": "nope"}).status_code == 422
     assert patch(api, "/hooks/drain-lb", {"revert": None}).json()["revert"] is None
 
@@ -252,3 +256,114 @@ def test_a_hook_in_use_cannot_be_deleted(api):
     assert delete(api, "/hooks/drain-lb").status_code == 204
     assert delete(api, "/hooks/drain-lb").status_code == 404
     assert api.get("/api/v1/hooks").json() == []
+
+
+def stored_token(api, name):
+    return (api.settings.secrets_dir / f"hook-{name}" / "token").read_text()
+
+
+def test_a_hooks_secret_is_write_only_and_named_after_it(api):
+    """SDD §12, §13.3 (pentest 2026-11-19, P1): a webhook hook's bearer token is write-only. POST
+    and PATCH take it as `secret`, PUT /hooks/{name}/secret as {"token"} - an admin alone -; it
+    reaches the secret store under hook-{name} and no route, event or refusal returns it: the
+    answers say `secret_set` and `secret_updated_at` instead. Deleting the hook deletes it."""
+    created = register(api, WEBHOOK)
+    assert created["secret_set"] is True and created["secret_updated_at"]
+    assert stored_token(api, "dns-swap") == TOKEN
+    bare = register(api, {k: v for k, v in WEBHOOK.items() if k != "secret"} | {"name": "bare"})
+    assert bare["secret_set"] is False and bare["secret_updated_at"] is None
+    rotated = "rotated-" + TOKEN
+    for role in (Role.viewer, Role.operator, Role.approver):
+        refused = api.client.put(
+            "/api/v1/hooks/bare/secret", headers=api.h(role), json={"token": rotated}
+        )
+        assert refused.status_code == 403
+    put = lambda name, body: api.client.put(  # noqa: E731
+        f"/api/v1/hooks/{name}/secret", headers=api.h(Role.admin), json=body
+    )
+    assert put("nope", {"token": rotated}).status_code == 404
+    for body in ({}, {"secret": rotated}, {"token": rotated, "x": 1}, {"token": "a b"}):
+        refused = put("bare", body)
+        assert refused.status_code == 422 and rotated not in refused.text, body
+    answer = put("bare", {"token": rotated})
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["secret_set"] is True and answer.json()["secret_updated_at"]
+    assert stored_token(api, "bare") == rotated
+    # PATCH rotates it too, and the other fields stay
+    newer = "newer-" + TOKEN
+    patched = patch(api, "/hooks/dns-swap", {"secret": newer, "timeout_s": 30})
+    assert patched.status_code == 200 and patched.json()["timeout_s"] == 30
+    assert stored_token(api, "dns-swap") == newer
+    assert patched.json()["secret_updated_at"] >= created["secret_updated_at"]
+    # no answer of any role holds a token, nor does an event
+    answers = "".join(
+        api.get(path, role=role).text
+        for role in (Role.viewer, Role.operator, Role.approver, Role.admin)
+        for path in ("/api/v1/hooks", "/api/v1/hooks/dns-swap", "/api/v1/hooks/bare")
+    )
+    answers += answer.text + patched.text + created.__repr__()
+    events = api.client.get("/api/v1/events?limit=1000", headers=api.h(Role.admin)).text
+    for token in (TOKEN, rotated, newer):
+        assert token not in answers and token not in events
+    assert '"secret":' not in answers
+    kinds = [(e.kind, e.data.get("fields")) for e in hook_events(api)]
+    assert ("hook.updated", ["secret"]) in kinds
+    assert ("hook.updated", ["secret", "timeout_s"]) in kinds
+    # the secret goes with its hook
+    assert delete(api, "/hooks/bare").status_code == 204
+    assert not (api.settings.secrets_dir / "hook-bare").exists()
+    # a registration refused as a duplicate replaces no hook's secret
+    assert api.post("/api/v1/hooks", json={**WEBHOOK, "secret": "other"}).status_code == 409
+    assert stored_token(api, "dns-swap") == newer
+
+
+def test_a_hooks_url_is_shown_in_full_to_an_admin_alone(api):
+    """SDD §12 (pentest 2026-11-19, P1): a webhook's URL may hold a token in its path, so a role
+    below admin reads it as null beside its host, as a notification channel's (§24.3)."""
+    register(api, {**WEBHOOK, "url": "https://hooks.example.org/in/T0P-S3CRET-PATH"})
+    register(api, PLAYBOOK)
+    for role in (Role.viewer, Role.operator, Role.approver):
+        for answer in (
+            api.get("/api/v1/hooks/dns-swap", role=role),
+            api.get("/api/v1/hooks", role=role),
+        ):
+            assert "T0P-S3CRET-PATH" not in answer.text
+        hook = api.get("/api/v1/hooks/dns-swap", role=role).json()
+        assert (hook["url"], hook["url_host"]) == (None, "hooks.example.org")
+    hook = api.get("/api/v1/hooks/dns-swap", role=Role.admin).json()
+    assert hook["url"] == "https://hooks.example.org/in/T0P-S3CRET-PATH"
+    assert hook["url_host"] == "hooks.example.org"
+    playbook = api.get("/api/v1/hooks/drain-lb").json()
+    assert (playbook["url"], playbook["url_host"], playbook["secret_set"]) == (None, None, False)
+
+
+def test_a_hook_secret_name_is_refused_for_a_provider_and_a_dns_target(api):
+    """SDD §13.3 (pentest 2026-11-19, P1): hook-* names are the hooks' secrets - a provider's
+    credential or a DNS target's TSIG key never is one, compared as the readers fold a name: a
+    check would send a hook's bearer token to the provider's endpoint."""
+    register(api, WEBHOOK)
+    for name in ("hook-dns-swap", "Hook_dns.swap"):
+        refused = patch(api, "/providers/dst-rhoso", {"credentials_secret": name})
+        assert refused.status_code == 422 and "hook-*" in message(refused), name
+        refused = patch(
+            api,
+            "/providers/src-osp",
+            {"conversion_host": {**SOURCE["conversion_host"], "ssh_key_secret": name}},
+        )
+        assert refused.status_code == 422 and "hook-*" in message(refused), name
+    plan = {
+        **PLAN,
+        "network_cutover": {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "rfc2136",
+                    "zone": "example.org.",
+                    "record": "app.example.org.",
+                    "server": "192.0.2.53",
+                    "tsig_secret": "hook-dns-swap",
+                }
+            }
+        },
+    }
+    refused = api.post("/api/v1/plans", role=Role.operator, json=plan)
+    assert refused.status_code == 422 and "hook-*" in message(refused), refused.text

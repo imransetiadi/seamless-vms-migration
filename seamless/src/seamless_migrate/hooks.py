@@ -5,6 +5,7 @@ run bounded by its timeout, and the ``migration.action`` that records it."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import time
@@ -18,11 +19,23 @@ import httpx
 
 from .ai.redaction import redact, redact_cut
 from .config import Settings
-from .domain.models import Event, Hook, HookPoint, Migration, Plan, Provider
+from .domain.models import (
+    Event,
+    Hook,
+    HookPoint,
+    Migration,
+    Plan,
+    Provider,
+    hook_secret_name,
+    utcnow,
+)
 from .events import new_event
 from .executors.ansible import ansible_env, ansible_yaml, stop_process_group
 from .executors.base import ProcessGroups
+from .security.destinations import NOT_ALLOWED, DestinationNotAllowed, check_destination_async
+from .security.secret_store import SecretStoreError, secret_store
 from .security.secrets import SecretNotFound, read_secret
+from .store import ConflictError, NotFound
 
 #: how many of a playbook's last lines a failure's detail is looked for in
 _TAIL_LINES = 400
@@ -200,7 +213,7 @@ class HookRunner:
         """An HTTPS POST of the document with the bearer token of the hook's secret and the
         idempotency key; no redirect followed, any 2xx a success (SDD §7.2, §13.3)."""
         try:
-            values = await asyncio.to_thread(read_secret, str(hook.secret), self.settings)
+            values = await asyncio.to_thread(read_secret, hook.secret_name, self.settings)
         except SecretNotFound:
             values = {}
         token = values.get("token")
@@ -210,6 +223,13 @@ class HookRunner:
             "Authorization": f"Bearer {token}",
             "Idempotency-Key": str(context["idempotency_key"]),
         }
+        if self.transport is None:
+            # the token goes only where the control plane may connect (SDD §13.5); a test's
+            # transport stands in for the network, which it never reaches
+            try:
+                await check_destination_async(str(hook.url), self.settings, field="url")
+            except DestinationNotAllowed:
+                raise _Failed(NOT_ALLOWED) from None
         try:
             async with httpx.AsyncClient(
                 transport=self.transport, follow_redirects=False, timeout=hook.timeout_s
@@ -250,3 +270,55 @@ async def _read_output(
         lines.append(line)
         if log is not None and line.strip():
             await log(redact(line))
+
+
+log = logging.getLogger(__name__)
+
+
+async def adopt_hook_secrets(db: Any, settings: Settings) -> int:
+    """Move the bearer token of each hook an earlier version stored into ``hook-{name}`` and drop
+    the name it was read from (SDD §13.3): a hook named its secret before 0.5.0, and every role
+    read that name - or a token typed in its place. A secret that holds no token is dropped with
+    its name; one the store cannot read or take now keeps its name for the next start, and the
+    hook reads it there meanwhile. Returns how many hooks changed; no line names a secret."""
+    changed = 0
+    for hook in await db.list("hook", Hook):
+        if hook.secret is None:
+            continue
+        moved = False
+        try:
+            values = await asyncio.to_thread(read_secret, hook.secret, settings)
+            token = values.get("token")
+            if token and hook.secret != hook_secret_name(hook.name):
+                store = secret_store(settings)
+                await asyncio.to_thread(
+                    store.write,
+                    hook_secret_name(hook.name),
+                    {"token": token},
+                    {"seamless.io/hook": hook.name},
+                )
+            moved = bool(token)
+        except (SecretNotFound, SecretStoreError) as exc:
+            log.warning(
+                "hook %s keeps the secret an earlier version named: %s",
+                hook.name,
+                type(exc).__name__,
+            )
+            continue
+
+        try:
+            fresh, version = await db.get_versioned("hook", hook.name, Hook)
+            update: dict[str, Any] = {"secret": None}
+            if moved and fresh.secret_updated_at is None:
+                update["secret_updated_at"] = utcnow()
+            await db.put("hook", fresh.model_copy(update=update), expected_version=version)
+        except (ConflictError, NotFound):
+            continue  # an admin changed or deleted it meanwhile: the next start looks again
+        changed += 1
+        if not moved:
+            log.warning(
+                "hook %s named a secret that holds no token: set one with PUT /hooks/%s/secret",
+                hook.name,
+                hook.name,
+            )
+    return changed

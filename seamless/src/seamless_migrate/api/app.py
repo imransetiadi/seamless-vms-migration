@@ -157,12 +157,19 @@ _CSP_DOCS = (
 )
 
 
+#: one year, the host's subdomains with it (Security.md R-05)
+HSTS = "max-age=31536000; includeSubDomains"
+
+
 def _apply_security_headers(headers: Any, path: str) -> None:
     headers.setdefault("X-Content-Type-Options", "nosniff")
     headers.setdefault("X-Frame-Options", "DENY")
     headers.setdefault("Referrer-Policy", "same-origin")
     headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     headers.setdefault("Content-Security-Policy", _CSP_APP)
+    # a browser that reached the dashboard over HTTPS never asks for it in the clear again
+    # (pentest 2026-11-19 P4.2); a browser ignores the header on a plain-HTTP answer (RFC 6797)
+    headers.setdefault("Strict-Transport-Security", HSTS)
 
 
 #: SDD §12: the largest request body. A 5,000-VM plan with an override per VM is about 0.5 MB.
@@ -187,6 +194,33 @@ class GZipExceptEventStream:
             await self.app(scope, receive, send)
             return
         await self.gzip(scope, receive, send)
+
+
+class HeadAsGetMiddleware:
+    """HEAD is answered as GET without its body (RFC 9110 §9.3.2; pentest 2026-11-19 P4.6):
+    FastAPI's routes take no HEAD, so one was a 405 whose Content-Length named a body that never
+    came. The same route, role check and headers answer it; the event stream, which never
+    ends, keeps its 405."""
+
+    def __init__(self, app: Callable[..., Awaitable[None]], stream_path: str) -> None:
+        self.app = app
+        self.stream_path = stream_path
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "HEAD"
+            or scope.get("path") == self.stream_path
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        async def without_body(message: Any) -> None:
+            if message["type"] == "http.response.body":
+                message = {**message, "body": b""}
+            await send(message)
+
+        await self.app({**scope, "method": "GET"}, receive, without_body)
 
 
 class BodyLimitMiddleware:
@@ -461,6 +495,7 @@ def create_app(
     # added before the security headers middleware, which therefore wraps it: a 413 carries the
     # R-05 headers too
     app.add_middleware(BodyLimitMiddleware)
+    app.add_middleware(HeadAsGetMiddleware, stream_path=f"{API_PREFIX}/events/stream")
     if settings.cors_origins:
         # inside the security headers too: the CORS layer answers preflights itself (audit AP-09)
         app.add_middleware(

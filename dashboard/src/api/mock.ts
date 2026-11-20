@@ -939,7 +939,7 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
 }
 
 /** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
-export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'allow_plain_http', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks', 'ceph']);
 
 /** A Ceph cluster's fsid and a monitor address, as the API's model reads them (SDD §4.2, §28.4). */
 const CEPH_FSID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -1062,7 +1062,9 @@ function checkDeclarations(input: Record<string, unknown> | Provider) {
 /** A hook's name, as the API's HOOK_NAME (SDD §4.2, §23.3). */
 const HOOK_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/;
 /** The fields a Hook has, in the model's order: what pydantic reports its errors by (SDD §4.2). */
-const HOOK_FIELDS = ['name', 'kind', 'description', 'playbook', 'url', 'secret', 'timeout_s', 'revert', 'created_at', 'updated_at'];
+const HOOK_FIELDS = ['name', 'kind', 'description', 'playbook', 'url', 'secret', 'timeout_s', 'revert', 'created_at', 'updated_at', 'secret_updated_at'];
+/** A webhook hook's bearer token (SDD §12): 1-4096 visible ASCII characters. */
+const HOOK_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 /** PATCH /hooks/{name}'s fields (SDD §12): the name, the kind and the server-owned ones are immutable. */
 const HOOK_EDITABLE = ['description', 'playbook', 'url', 'secret', 'timeout_s', 'revert'];
 
@@ -1077,7 +1079,7 @@ function hookProblem(body: Record<string, unknown>): string | null {
   else if (!HOOK_NAME.test(body.name)) fields.push(`name: String should match pattern '${HOOK_NAME.source}'`);
   if (body.kind === undefined) fields.push('kind: Field required');
   else if (body.kind !== 'playbook' && body.kind !== 'webhook') fields.push("kind: Input should be 'playbook' or 'webhook'");
-  for (const key of ['description', 'playbook', 'url', 'secret']) if (!text(key)) fields.push(`${key}: Input should be a valid string`);
+  for (const key of ['description', 'playbook', 'url']) if (!text(key)) fields.push(`${key}: Input should be a valid string`);
   const timeout = body.timeout_s;
   if (timeout !== undefined) {
     if (typeof timeout !== 'number' || !Number.isInteger(timeout)) fields.push('timeout_s: Input should be a valid integer');
@@ -1088,8 +1090,8 @@ function hookProblem(body: Record<string, unknown>): string | null {
   if (fields.length) return fields.slice(0, 5).join('; ');
   // the model's own rules, in its order (SDD §4.2)
   const kind = body.kind as Hook['kind'];
-  const own = kind === 'playbook' ? ['playbook'] : ['url', 'secret'];
-  const other = kind === 'playbook' ? ['url', 'secret'] : ['playbook'];
+  const own = kind === 'playbook' ? ['playbook'] : ['url'];
+  const other = kind === 'playbook' ? ['url'] : ['playbook'];
   const missing = own.find((key) => body[key] === undefined || body[key] === null);
   if (missing) return `Value error, ${missing}: a ${kind} hook needs it`;
   const extraneous = other.find((key) => body[key] !== undefined && body[key] !== null);
@@ -1110,9 +1112,6 @@ function hookProblem(body: Record<string, unknown>): string | null {
     if (!parsed || parsed.protocol !== 'https:' || !parsed.hostname) return 'Value error, url: an https:// URL with a host';
     if (parsed.username || parsed.password || /^https:\/\/[^/?#]*@/i.test(url)) return "Value error, url: no user information - put the credential in the hook's secret";
   }
-  const secret = body.secret as string | null | undefined;
-  if (typeof secret === 'string' && (!SECRET_NAME.test(secret) || secret === '.' || secret === '..'))
-    return "Value error, secret: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit";
   if (body.revert === body.name && body.revert) return 'Value error, revert: a hook cannot revert itself';
   return null;
 }
@@ -2093,7 +2092,7 @@ export class MockServer {
       }
     }
 
-    if (root === 'hooks') return this.hooksRoute(method, id, input, token, path);
+    if (root === 'hooks') return this.hooksRoute(method, id, input, token, path, sub);
     if (root === 'notifications') return this.notificationsRoute(method, id, sub, subsub, input, query, token, path);
 
     if (root === 'providers') {
@@ -2562,6 +2561,7 @@ export class MockServer {
       credentials_secret: null,
       region: null,
       verify_tls: true,
+      allow_plain_http: false,
       ca_cert_path: null,
       conversion_host: null,
       distribution: null,
@@ -2911,27 +2911,45 @@ export class MockServer {
         if (!this.hooks.has(name)) throw new HttpError(422, 'validation_error', `network_cutover.hooks.${point}: no hook ${pyRepr(name)} in the catalog`);
   }
 
-  /** Like the API's _check_hook (SDD §12): a revert of the catalog, and a secret no provider's credential. */
-  private refuseHookSecretAndRevert(hook: Hook): void {
+  /** Like the API's _check_hook (SDD §12): a revert of the catalog. */
+  private refuseHookRevert(hook: Hook): void {
     if (hook.revert !== null && !this.hooks.has(hook.revert)) throw new HttpError(422, 'validation_error', `revert: no hook ${pyRepr(hook.revert)} in the catalog`);
-    if (hook.secret === null) return;
-    if (hook.secret.toLowerCase().replace(/[^a-z0-9]/g, '-').startsWith('provider-'))
-      throw new HttpError(422, 'validation_error', 'secret: provider-* names belong to the secrets Seamless stores for each provider; a webhook would send it to its URL');
-    const owner = this.providers.find((p) => p.credentials_secret === hook.secret || p.conversion_host?.ssh_key_secret === hook.secret);
-    if (owner) throw new HttpError(422, 'validation_error', `secret: provider ${owner.id} names it as its credential; a webhook would send it to its URL`);
   }
 
-  /** GET, POST, PATCH and DELETE /hooks (SDD §12, §23.3, plan task N12a): the API's rules, refusals and events. */
-  private hooksRoute(method: string, name: string | undefined, input: Record<string, unknown>, token: string | null, path: string): MockResponse {
+  /** A hook's bearer token as a request gives it (SDD §12, §13.3): write-only, and no refusal repeats it. */
+  private hookToken(value: unknown, kind: Hook['kind']): string {
+    if (kind !== 'webhook') throw new HttpError(422, 'validation_error', `secret: a ${kind} hook takes none`);
+    if (typeof value !== 'string' || !HOOK_TOKEN.test(value)) throw new HttpError(422, 'validation_error', 'secret: the bearer token, 1-4096 visible ASCII characters without a space');
+    return value;
+  }
+
+  /** The hook as a role reads it (SDD §12): its URL in full for an admin, else its host alone. */
+  private hookView(hook: Hook, full: boolean): Hook {
+    let host: string | null = null;
+    try {
+      host = hook.url ? new URL(hook.url).hostname : null;
+    } catch {
+      host = null;
+    }
+    return { ...hook, url: full ? hook.url : null, url_host: host };
+  }
+
+  /** GET, POST, PATCH and DELETE /hooks and PUT /hooks/{name}/secret (SDD §12, §23.3, plan task N12a): the API's rules, refusals and events. The mock holds no token: it records that one was set. */
+  private hooksRoute(method: string, name: string | undefined, input: Record<string, unknown>, token: string | null, path: string, sub?: string): MockResponse {
     const writes = method !== 'GET';
     const me = this.require(token, writes ? 'admin' : 'viewer', path);
+    const full = me.role === 'admin';
+    const view = (hook: Hook) => this.hookView(hook, full);
     const event = (kind: string, hook: Hook, data: Record<string, unknown> = {}) =>
       this.emit({ kind, plan_id: null, migration_id: null, actor: me.name, message: `hook ${hook.name} ${kind.split('.')[1]}`, data: { name: hook.name, kind: hook.kind, ...data } });
     if (!name) {
-      if (method === 'GET') return ok([...this.hooks.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
+      if (method === 'GET') return ok([...this.hooks.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).map(view));
       if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
-      const problem = hookProblem(input);
+      const { secret: given, created_at: _c, updated_at: _u, secret_updated_at: _s, ...fields } = input;
+      const problem = hookProblem(fields);
       if (problem) throw new HttpError(422, 'validation_error', problem);
+      const set = given !== undefined && given !== null;
+      if (set) this.hookToken(given, input.kind as Hook['kind']);
       const now = new Date(this.now()).toISOString();
       const hook: Hook = {
         name: input.name as string,
@@ -2939,36 +2957,55 @@ export class MockServer {
         description: (input.description as string | null | undefined) ?? null,
         playbook: (input.playbook as string | null | undefined) ?? null,
         url: (input.url as string | null | undefined) ?? null,
-        secret: (input.secret as string | null | undefined) ?? null,
+        url_host: null,
+        secret_set: set,
+        secret_updated_at: set ? now : null,
         timeout_s: (input.timeout_s as number | undefined) ?? 300,
         revert: (input.revert as string | null | undefined) ?? null,
         created_at: now,
         updated_at: now,
       };
-      this.refuseHookSecretAndRevert(hook);
+      this.refuseHookRevert(hook);
       if (this.hooks.has(hook.name)) throw new HttpError(409, 'conflict', `hook ${pyRepr(hook.name)} already exists`);
       this.hooks.set(hook.name, hook);
       event('hook.created', hook);
-      return ok(hook, 201);
+      return ok(view(hook), 201);
+    }
+    if (sub === 'secret') {
+      if (method !== 'PUT') throw new HttpError(method === 'GET' ? 404 : 405, method === 'GET' ? 'not_found' : 'method_not_allowed', method === 'GET' ? 'Not Found' : 'Method Not Allowed');
+      const hook = this.hooks.get(name);
+      if (!hook) throw notFound('hook', name);
+      if (Object.keys(input).length !== 1 || !('token' in input)) throw new HttpError(422, 'validation_error', 'a hook\'s secret is {"token"} alone');
+      this.hookToken(input.token, hook.kind);
+      const now = new Date(this.now()).toISOString();
+      const updated = { ...hook, secret_set: true, secret_updated_at: now, updated_at: now };
+      this.hooks.set(name, updated);
+      event('hook.updated', updated, { fields: ['secret'] });
+      return ok(view(updated));
     }
     if (method === 'GET') {
       const hook = this.hooks.get(name);
       if (!hook) throw notFound('hook', name);
-      return ok(hook);
+      return ok(view(hook));
     }
     if (method === 'PATCH') {
       const unknown = Object.keys(input).filter((key) => !HOOK_EDITABLE.includes(key)).sort();
       if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
       const hook = this.hooks.get(name);
       if (!hook) throw notFound('hook', name);
-      const merged = { ...hook, ...input } as Record<string, unknown>;
+      const { secret: given, ...fields } = input;
+      const set = 'secret' in input;
+      if (set) this.hookToken(given, hook.kind);
+      const { url_host: _h, secret_set: _set, secret_updated_at: _at, ...stored } = hook;
+      const merged = { ...stored, ...fields } as Record<string, unknown>;
       const problem = hookProblem(merged);
       if (problem) throw new HttpError(422, 'validation_error', problem);
-      const updated = { ...(merged as unknown as Hook), updated_at: new Date(this.now()).toISOString() };
-      this.refuseHookSecretAndRevert(updated);
+      const now = new Date(this.now()).toISOString();
+      const updated: Hook = { ...hook, ...(fields as Partial<Hook>), updated_at: now, ...(set ? { secret_set: true, secret_updated_at: now } : {}) };
+      this.refuseHookRevert(updated);
       this.hooks.set(name, updated);
       event('hook.updated', updated, { fields: Object.keys(input).sort() });
-      return ok(updated);
+      return ok(view(updated));
     }
     if (method === 'DELETE') {
       const hook = this.hooks.get(name);

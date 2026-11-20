@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Coroutine, Iterator, Sequence
+from collections.abc import Coroutine, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -161,6 +161,26 @@ def _load_yaml(path: str) -> Any:
 
 
 # -- commands ---------------------------------------------------------------------------------
+def untrusted_proxy_warning(settings: Settings, environ: Mapping[str, str]) -> str | None:
+    """What a server reachable from other machines logs at start when no proxy is trusted
+    (Security.md §12, pentest 2026-11-19 P2): behind an ingress every caller is then audited and
+    locked out as the proxy's address. None on a loopback bind or once FORWARDED_ALLOW_IPS names
+    the proxies; "*" trusts every peer's X-Forwarded-For and is warned about too."""
+    trusted = environ.get("FORWARDED_ALLOW_IPS", "").strip()
+    if "*" in [entry.strip() for entry in trusted.split(",")]:
+        return (
+            "FORWARDED_ALLOW_IPS is '*': any peer can claim any client address in "
+            "X-Forwarded-For; name the proxies' addresses instead (docs/Operations.md §7.6)"
+        )
+    if trusted or is_loopback(settings.host) or settings.auth_disabled:
+        return None
+    return (
+        "FORWARDED_ALLOW_IPS is not set: behind a reverse proxy the audit trail and the "
+        "authentication lockout see the proxy's address for every caller; set it to the "
+        "proxies' addresses, never '*' (docs/Operations.md §7.6)"
+    )
+
+
 def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: no cover - I/O
     import uvicorn
 
@@ -240,6 +260,9 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
     configure_logging(settings)
     if settings.auth_disabled:
         log.warning("authentication is DISABLED (loopback only)")
+    untrusted = untrusted_proxy_warning(settings, os.environ)
+    if untrusted is not None:
+        log.warning(untrusted)
     with _server_lock(settings):
         run_server(build_app(settings), settings, args.reload)
     return 0
@@ -333,11 +356,11 @@ def _resolve_providers(store: Any, spec: PlanCreate) -> None:
                 raise CliError(refusal)
     # SDD §15: the hooks it names, as POST and PATCH /plans check them (§12, plan task N3)
     from .domain.models import Hook
-    from .plan_checks import notify_tsig_secret, unknown_hook
+    from .plan_checks import reserved_tsig_secret, unknown_hook
 
     why = unknown_hook(spec, {h.name for h in store.list("hook", Hook)})
     if why is None:
-        why = notify_tsig_secret(spec)  # SDD §13.3: never a notification channel's secret
+        why = reserved_tsig_secret(spec)  # SDD §13.3: never a channel's or a hook's secret
     if why is not None:
         raise CliError(why)
 

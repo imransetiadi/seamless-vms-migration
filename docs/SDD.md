@@ -197,7 +197,8 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # differs between Python 3.11 and newer (RV22-06)
            kind: ProviderKind,
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
-           region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
+           region: str|null, verify_tls: bool = true, allow_plain_http: bool = false,   # §13.5: plain http:// needs it
+           ca_cert_path: str|null,
            conversion_host: ConversionHostConfig|null,
            distribution: Distribution|null,            # must match kind (see above); null = by kind
            release: str|null (regex ^20[0-9]{2}\.[12]$), # the community series its operator declares, e.g.
@@ -427,8 +428,10 @@ Hook { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which
        kind: "playbook"|"webhook", description: str|null = null,
        playbook: str|null = null,   # playbook: the playbook's absolute path, a .yml or .yaml file (required); else none
        url: str|null = null,        # webhook: an https:// URL without user information (required); else none
-       secret: str|null = null,     # webhook: the secret (§13.3) whose key `token` is its bearer token (required); else
-                                    # none; never a provider-* name nor a secret a provider names (§13.3)
+       secret: str|null = null,     # server-owned, never answered: the name of the secret a hook stored before 0.5.0
+                                    # read its token from, until a start moved the token to hook-{name} (§13.3). In a
+                                    # request, `secret` is the webhook's bearer token itself: write-only (§12)
+       secret_updated_at: datetime|null = null,   # server-owned: when the API last wrote the bearer token (§12)
        timeout_s: int = 300,        # 1-1800 (§23.3)
        revert: str|null = null,     # the hook a rollback runs to undo this one: another hook of the catalog
        created_at: datetime, updated_at: datetime }   # server-owned
@@ -659,7 +662,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 never a value; a project credential's write (§12, §27.4, plan task TC2) carries its `project_id` and the secret's
 name too, and its deletion the provider id, `project_id`, the secret's name and `deleted` true, without key names.
 `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
-`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
+`name` and `kind`, and `hook.updated` the fields it set (`fields`; `secret` when the bearer token was written) - never a URL or a token; `hook.deleted` names the secret the store could not remove (`secret_left`). `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback started
 the source again); `migration.phase` to `failed` carries `source_stopped`, whether the downtime clock was open at the
 failure (§24.5, plan task NT4). The `channel.*` events
 carry the channel's `name` and `kind`; `channel.updated` the fields it set (`fields`), `secret` among them when the secret
@@ -3430,7 +3433,7 @@ route waits for it.
   after `whsec_`. Each try takes a new timestamp and a new signature with the same `webhook-id`, so a receiver that
   refuses an old timestamp still takes a retry, and one that keeps the ids it saw drops the copy (§24.6). A 2xx is
   `sent`; 408, 429 and 5xx, a timeout, a connection or TLS error are `retry`, with the answer's `Retry-After`; 410 and
-  any other 4xx are `failed` with the status as the reason; a 3xx is `failed` with the reason `redirect`; a missing
+  any other 4xx are `failed` with the status as the reason; a 3xx is `failed` with the reason `redirect`; a URL whose host resolves to a destination §13.5 refuses is `failed` with the reason `destination_not_allowed`, and nothing is sent; a missing
   or malformed `signing_key` is `failed` with the reason `no_secret`, and nothing is sent. The key never leaves the
   control plane: only the signature travels, and no request, event, log line or reason carries it (§13.3).
 * **Retries, pacing, expiry** (§24.6): 5 tries with 10, 20, 40 and 80 s before the second to the fifth, each ±20 %,
@@ -4591,6 +4594,10 @@ a follower's answer while no replica leads or the leader does not answer, below)
 including error responses written by the server-error handler and the answers to CORS preflights (with
 `SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
 `bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
+`Strict-Transport-Security: max-age=31536000; includeSubDomains` is among them (pentest 2026-11-19 P4.2). A route's
+token and role are checked **before its body is read**: a request without a token is a 401 whatever its body - one
+that is no JSON too -, and one whose role is too low a 403 (pentest P4.3). `HEAD` is answered as `GET` without its
+body - the same status, role check and headers - on every route but the event stream, which keeps its 405 (P4.6).
 A request body with a field the route does not take is refused with 422 (`validation_error`, naming
 the field) — at any depth, a nested object's field too (`conversion_host.ssh_allowed_cdir`, `verification.tcp_port`,
 a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and
@@ -4624,29 +4631,31 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool},"leader":{"leading":bool,"holder":str\|null,"epoch":int\|null,"since":datetime\|null}}` — `status` and `db` judge the replica that answers (plan task HA4): `degraded` when the database is unreachable or, on the replica that leads (§8), the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed, and on a follower when its campaign is dead (no try of the lease for max(5 × the retry period, 30 s), §8, §11); probes use it; `orchestrator`: the leader's, whichever replica answers (below); `leader` (§25.6): `leading`, whether this replica leads, and the lease's `holder`, `epoch` and `acquired_at` (`since`) while the lease is valid as this replica reads the row (§11), each null while no replica leads or the row cannot be read - a leader that cannot read it names its own holder and epoch, `since` null -; a server whose store holds no lease (a test's) leads alone: `leading` true, the rest null; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
-| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness): it judges the replica that answers, so both replicas are ready while one leads (§25.6) |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool},"leader":{"leading":bool,"holder":str\|null,"epoch":int\|null,"since":datetime\|null}}` — `status` and `db` judge the replica that answers (plan task HA4): `degraded` when the database is unreachable or, on the replica that leads (§8), the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed, and on a follower when its campaign is dead (no try of the lease for max(5 × the retry period, 30 s), §8, §11); probes use it; `orchestrator`: the leader's, whichever replica answers (below); `leader` (§25.6): `leading`, whether this replica leads, and the lease's `holder`, `epoch` and `acquired_at` (`since`) while the lease is valid as this replica reads the row (§11), each null while no replica leads or the row cannot be read - a leader that cannot read it names its own holder and epoch, `since` null -; a server whose store holds no lease (a test's) leads alone: `leading` true, the rest null; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show **Without a token** - or with one that is none - the answer is `{"status"}` alone outside demo mode and with authentication on: the version, `auth_disabled`, the leader's host name, its epoch and the loop's statistics are a viewer's (pentest 2026-11-19 P4.1); a probe is no sign-in, so nothing is audited or counted. A viewer or above reads the whole body here too; demo mode and a server with authentication off answer it to anyone. |
+| GET | `/health/detail` | viewer | — | the whole body of `/health`, whatever the mode; a follower answers its own, as it answers `/health` (§25.6) |
+| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness): it judges the replica that answers, so both replicas are ready while one leads (§25.6) Its body follows `/health`'s rule: `{"status"}` alone without a token. |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role,"host_key_checking":bool}` — `host_key_checking`: SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (§15.1, §26.8), which the dashboard's provider page warns of while it is off (§16); signed-in only, never on the public `/health`: off, it tells that no hop of the data path checks a conversion host's key (plan task ST7) |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` - its projects' pins with it - ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields, `conversion_host_pin` and `project_credentials` - its projects' pins with it - ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses Outside demo mode, 422 too when `endpoint` or `conversion_host.address` is a destination the control plane never connects to (§13.5, "destination not allowed"), or `endpoint` is plain `http://` without `allow_plain_http: true` (pentest 2026-11-19 P3). `ca_cert_path` lies under one of `SEAMLESS_CA_DIRS` (§15.1) once its symlinks and `..` are resolved, else 422 - one refusal whatever is at the path (pentest P4.4). |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pins - its own and its project credentials' -, each of which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `allow_plain_http`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` and `project_credentials` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pins - its own and its project credentials' -, each of which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` The destinations the request sets (`endpoint` with `allow_plain_http`, `conversion_host.address`) are judged as `POST /providers` judges them (§13.5). |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | PUT | `/providers/{id}/ceph-key` | admin | write-only `{"key": str}`: the Ceph user's key as `ceph auth get-key` prints it, base64 (§28.4) | `Provider` (`ceph.key_updated_at` set; `status` and the check report reset as by PATCH); 422 while the provider has no `ceph` (set it first), or when `key` is no base64 key; the secret `provider-{id}.ceph`, key `key` (§13.3); event `provider.credentials_updated` with the secret's and the key's names |
 | PUT | `/providers/{id}/projects/{project_id}/credentials` | admin | write-only `{"application_credential_id": str, "application_credential_secret": str}`, neither blank: a Keystone application credential of the project `project_id` (§27.4, owner decision 3); no other field - a password, an `auth_url`, an `interface` - (422): it signs in where the provider's own credential does (§13.3) | `Provider` (`project_credentials[project_id]` set to the secret's name and `updated_at`, its `conversion_host_pin` kept: a credential written again reaches the same project's host, whose pin belongs to its server (§26.4); that project's entry of the check report - `projects`, §27.7 - dropped, the rest of the report and `status` kept; no value returned); 422 for a `project_id` that is not 1-64 letters, digits, `-` or `_`, and on a vmware provider; 409 when another project's entry holds the secret's name, nothing written (§13.3); the secret `provider-{id}.project-<h>`, keys `application_credential_id` and `application_credential_secret` (§13.3); event `provider.credentials_updated` with `project_id` and the secret's and the keys' names. It writes and records the secret under the lock of `DELETE /providers/{id}`, so a write and a deletion of a provider's project credentials never interleave |
 | DELETE | `/providers/{id}/projects/{project_id}/credentials` | admin | — | `204` (404 when the provider holds no credential for the project, 422 for a `project_id` `PUT` refuses; 409 while a plan needs the project, judged as `DELETE /providers/{id}` judges a provider: a plan that names it on the provider's side - its `source_project` on its source provider, its `destination_project` on its destination (§4.2, §27.4) - and is neither `completed` nor `cancelled`, or is and still needs its providers as that row says, each named); deletes the secret, then the entry - its project's conversion host pin with it, so a later credential for the project starts without one (§26.4) - and that project's entry of the check report, under the lock of `DELETE /providers/{id}`, which `POST /plans` and `PATCH /plans/{id}` take, so no plan is saved naming the project between the check and the deletion; 503 `unavailable` when the store cannot delete the secret, the entry kept, so the deletion can be sent again and no secret the store may still hold goes unrecorded. Event `provider.credentials_updated` with `project_id`, the secret's name and `deleted` true |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets, its project credentials' among them (§27.4) - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
-| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin checked against its project's host, looked up by its name alone: a pin of another server, or a host no server of the project bears the name of ("conversion host not found: ..."), reported in that project's entry of `projects`, no console of a project's host read, §10) |
-| GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
-| POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
-| GET | `/hooks/{name}` | viewer | — | `Hook` |
-| PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); the merged hook is checked as `POST /hooks` checks one | `Hook`; event `hook.updated` with the fields set |
-| DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. Event `hook.deleted` |
+| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`; a project credential's pin checked against its project's host, looked up by its name alone: a pin of another server, or a host no server of the project bears the name of ("conversion host not found: ..."), reported in that project's entry of `projects`, no console of a project's host read, §10) The check connects only where §13.5 allows - the endpoint, the auth URL, the endpoints the Keystone catalog names and a brought conversion host's address, each judged by the addresses it resolves to; a refused one is `status: error` with "destination not allowed" at once - and ends within `SEAMLESS_PROVIDER_CHECK_TIMEOUT_S` (30 s; `status: error`, "the check did not finish within 30 s"), so neither the kind nor the timing of an answer tells what listens inside the deployment (pentest 2026-11-19 P3). |
+| GET | `/hooks` | viewer | — | `HookView[]` by name (§23.3). `HookView` = `Hook` without `secret`, plus `secret_set: bool` (the API wrote a bearer token, or a hook of an earlier version still names its secret) and `url_host`; a role below admin reads `url` as null - a webhook's URL may hold a token in its path - and its host in `url_host`. No route returns a token or a secret's name (pentest 2026-11-19, P1) |
+| POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at`, `secret_updated_at` ignored; a field `Hook` does not have: 422); `secret`, optional for a webhook, is its bearer token - 1-4096 visible ASCII characters -, written to the secret store under `hook-{name}` (§13.3) and never stored in the document nor answered | `201 HookView`; 409 when the name exists (no token is written); 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, `secret` is no such token or the hook is a playbook - the refusal never repeats the value -, or `revert` names the hook itself or no hook of the catalog; 503 `unavailable` when the secret store cannot take the token (nothing is registered). Event `hook.created` 422 also when a webhook's URL is a destination §13.5 refuses as it is stored. |
+| GET | `/hooks/{name}` | viewer | — | `HookView` |
+| PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); `secret` is a new bearer token, as `POST /hooks` takes one; the merged hook is checked as `POST /hooks` checks one | `HookView`; event `hook.updated` with the fields set |
+| PUT | `/hooks/{name}/secret` | admin | `{"token"}` alone: the webhook's bearer token, as `POST /hooks` takes `secret` | `HookView` (write-only: no route returns the token); 404 for an unknown hook; 422 for another body, a value that is no token or a playbook hook; 503 `unavailable` when the secret store cannot take it. Event `hook.updated` with `fields: ["secret"]` |
+| DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. The secret the store holds for the hook (`hook-{name}`) is deleted with it. Event `hook.deleted` |
 | GET | `/notifications/channels` | viewer | — | `NotificationChannelView[]` by name (§24.3): each channel with `recipient_count`, `url_host` and its `cursor` (null before it handled an event). Recipients are personal data and a webhook's URL may hold a token (§24.8), so a role below admin reads `recipients` as `[]` and `url` as null |
-| POST | `/notifications/channels` | admin | `NotificationChannel` (the server-owned fields ignored; a field it does not have: 422) | `201 NotificationChannelView`; 409 when the name exists; 422 when the kind's fields are missing or another kind's are set, a recipient is no addr-spec or there are more than 50, or a webhook's URL is not `https://` or holds user information (§4.2); with plan task NT6, 422 for an email channel while the relay is unset. Event `channel.created` |
+| POST | `/notifications/channels` | admin | `NotificationChannel` (the server-owned fields ignored; a field it does not have: 422) | `201 NotificationChannelView`; 409 when the name exists; 422 when the kind's fields are missing or another kind's are set, a recipient is no addr-spec or there are more than 50, or a webhook's URL is not `https://` or holds user information (§4.2); with plan task NT6, 422 for an email channel while the relay is unset. Event `channel.created` 422 also when a webhook's URL is a destination §13.5 refuses as it is stored. |
 | GET | `/notifications/channels/{name}` | viewer | — | `NotificationChannelView`, as the list shows it to the role |
 | PATCH | `/notifications/channels/{name}` | admin | any of `description`, `recipients`, `url`, `redact_names`, `enabled` (`name`, `kind` and the server-owned fields are immutable: 422); the merged channel is checked as `POST` checks one | `NotificationChannelView`; event `channel.updated` with the fields set |
 | DELETE | `/notifications/channels/{name}` | admin | — | `204`; 409 while a subscription names the channel, each named with its plan or "every plan". It deletes the channel's cursor and the secret `notify-{name}` the store manages (`secret_left` in the event when the store could not). Event `channel.deleted` |
@@ -4887,9 +4896,16 @@ holds the new value, the provider does not record it yet, and the operator sends
 deleted meanwhile answers 404, and the secret just written is removed again. A connection to a provider is built
 again once its document (its state fields aside) or the mounted `clouds.yaml` changed — the provider registry's and
 the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
-credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret holds its bearer token as the
-key `token`, read each time the hook runs, and an RFC 2136 DNS target's TSIG key is a secret alike (§7.2, §23.3,
-§23.5); a hook's or a target's secret is never a provider's (§12). An RFC 2136 target's TSIG secret holds the key as
+credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret is `hook-{name}` - the admin
+never chooses the name -: it holds the bearer token as the key `token`, read each time the hook runs, and is written
+through `POST`/`PATCH /hooks` (`secret`) or `PUT /hooks/{name}/secret`, write-only, or created outside the control plane
+under that name (pentest 2026-11-19, P1: before 0.5.0 the hook named its secret, every role read the name, and a token
+typed in its place was answered to every role). At each start of the orchestrator a hook that still names a secret
+has its token copied to `hook-{name}` and the name dropped from its document; a name whose secret holds no token is
+dropped alike, and one the store cannot read or take then is kept for the next start, the hook reading it there
+meanwhile. Names that fold to one starting with `hook-` belong to the hooks: a `credentials_secret`, a
+`conversion_host.ssh_key_secret` or a DNS target's `tsig_secret` that folds to one is refused (422). An RFC 2136 DNS
+target's TSIG key is a secret alike (§7.2, §23.3, §23.5); a target's secret is never a provider's (§12). An RFC 2136 target's TSIG secret holds the key as
 `name`, `secret` (base64) and, optionally, `algorithm` (`hmac-sha256` by default) (§8.4). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory, each key written
@@ -4919,7 +4935,7 @@ Windows) opens `provider-x` for `Provider-x`, and the variables upper-case the n
 into `_` - lower-cased, with every character other than a letter or digit taken as `-`: a name that folds to one
 starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). Names that fold to one
 starting with `notify-` belong to the notification channels (`notify-{name}`, §24.3), which the store writes through
-`PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`, a hook's `secret`
+`PUT /notifications/channels/{name}/secret`: a `credentials_secret`, a `conversion_host.ssh_key_secret`
 or a DNS target's `tsig_secret` that folds to one is refused (422), so writing a channel's secret never replaces theirs,
 and a channel never reads theirs. `SEAMLESS_SMTP_SECRET` names the secret whose `username` and `password` the email sender
 authenticates to the relay with (§15.1, §24.3); it is read each time a message is sent. A webhook channel's `signing_key`
@@ -5056,6 +5072,38 @@ badge, default unset). The console excerpt leaves the installation only when the
 `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` is true (default false): otherwise `review_verification` sends neither
 `jev_screen` nor `jev_verify` the excerpt, verifies the check results alone and its note says the console stayed
 local (rules-only screening: the verification's own console patterns, §7.5).
+
+### 13.5 Destinations the control plane connects to
+
+An admin names the places the control plane connects to: a provider's `endpoint` (and the auth URL of its
+credential), the endpoints its Keystone catalog then names, a brought conversion host's `address`, a webhook hook's
+`url` and a webhook channel's. Connected to from inside the deployment, they would let the kind and the timing of an
+answer tell which internal addresses and ports listen (pentest 2026-11-19, P3, P4.5). One guard
+(`security/destinations.py`) judges every one of them **by the addresses its host resolves to**:
+
+* Never a loopback, link-local, unspecified, multicast or reserved address - the node's metadata service
+  (`169.254.169.254`) among them - in any spelling: an IPv4-mapped, 6to4, Teredo or NAT64 IPv6 address is judged by the
+  IPv4 address it carries, a decimal or hexadecimal IPv4 address as the resolver reads it, a name by every address it
+  resolves to (a single refused one refuses it). A name that does not resolve is refused: nothing would be reached.
+* Never an address inside `SEAMLESS_EGRESS_DENY_CIDRS` (§15.1): the deployment's own networks - a cluster's pod and
+  service networks, which the overlays set beside the NetworkPolicies' ranges (§17).
+* Never `localhost` or a name of the cluster's own DNS (`*.svc`, `*.cluster.local`).
+* A private address (RFC 1918, RFC 6598, an IPv6 unique local one) is allowed - an on-premises cloud lives there -
+  unless `SEAMLESS_EGRESS_ALLOW_PRIVATE_CIDRS` is set: then only inside one of its networks. A public address never
+  needs it.
+
+Where it is applied: as a route stores a URL or an address (422; a literal address or a refused name alone - nothing is
+resolved, so a receiver whose name does not resolve yet can be registered); as a connection to a provider is built
+and as its check reads the catalog (`ProviderError`, the provider's `status: error`); before a webhook hook's or a
+webhook channel's request (the hook's run `failed` with "destination not allowed"; the message `failed` with
+`destination_not_allowed`) - no bearer token and no signed document leaves. A refusal says "destination not allowed"
+and names the host and the reason, never a path, a query or a credential. A Slack channel's URL is Slack's own host
+(§24.3). Demo mode reaches nothing and judges nothing. Plain `http://` is refused for a provider's endpoint as it is
+stored unless its admin sets `allow_plain_http: true` (a lab); a provider stored before keeps working, and its check
+keeps reporting `capabilities.plain_http` (§10).
+
+The guard judges the addresses a name resolves to at that moment and the connection resolves it again: a record that
+changes in between is the NetworkPolicies' to stop (Security.md §8), which stay the second layer.
 
 ---
 
@@ -5444,6 +5492,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_DEMO`, `SEAMLESS_DEMO_SPEED`, `SEAMLESS_DEMO_SEED`, `SEAMLESS_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
 | `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (a valid bootstrap-file token always passes — a shared ingress or NAT address never locks it out; a database user's token is looked up only while its address is not locked out, §13.1; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
+| `SEAMLESS_EGRESS_DENY_CIDRS`, `SEAMLESS_EGRESS_ALLOW_PRIVATE_CIDRS` | empty, empty | the destination guard (§13.5), comma-separated networks in CIDR form: the deployment's own networks - a cluster's pod and service networks -, never connected to; and, when set, the only private networks a provider, a hook or a channel may be in (unset: every private network is allowed) |
+| `SEAMLESS_CA_DIRS` | `/etc/seamless/ca,/etc/seamless/clouds,/etc/pki,/etc/ssl/certs` | comma-separated directories a provider's `ca_cert_path` may lie in (§12): any other path is refused as the provider is stored, so no check probes the control plane's files |
+| `SEAMLESS_PROVIDER_CHECK_TIMEOUT_S` | `30` | the bound of one provider check (§12, §13.5); `0` leaves it to the provider call's bound (§10) |
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
@@ -6156,18 +6207,20 @@ is no origin a browser sends (review RV31-03).
   `/hooks` (Hooks, plan task N12a, §23.3 — "Playbooks and webhooks a plan runs at the points of its network cut-over.
   A hook runs code with the control plane's reach, so only an admin registers one.", with the Technology Preview badge
   — on `GET /hooks` for every role and its writes for an admin alone, §12. The catalog, in name order: each hook's
-  name, kind (Playbook, Webhook), description, what it runs - the playbook's path, or the webhook's URL and the name
-  of its secret, never a value the API does not hold -, timeout and the hook that reverts it; "No hooks registered."
+  name, kind (Playbook, Webhook), description, what it runs - the playbook's path, or the webhook's URL (an admin;
+  any other role reads "Receiver {host}") and whether a bearer token is set, never the token -, timeout and the hook
+  that reverts it; "No hooks registered."
   when there are none, unavailable with Retry when the catalog cannot be loaded. For an admin, Register hook: Name
   (the API's rule, its hint: 2-63 lowercase letters, digits and hyphens, starting with a letter or a digit), Kind
   (Playbook by default), Description, the kind's own fields - Playbook path (an absolute path to a .yml or .yaml
-  file), or URL (https://, with no user information) and Secret (the name of the secret §13.3 reads, its key `token`
-  the bearer token) -, Timeout (seconds; 300 by default, 1-1800) and Revert (another hook of the catalog, or none);
+  file), or URL (https://, with no user information) and Bearer token (a password field, write-only: sent as
+  `secret`, never shown again; on Edit it is empty, and left empty it keeps the token set) -, Timeout (seconds; 300 by default, 1-1800) and Revert (another hook of the catalog, or none);
   a refused registration keeps what was typed and shows the API's reason. A hook's Edit opens that form with its
   values, its name and kind read only (§12: immutable), saved with `PATCH /hooks/{name}`; its Delete asks to confirm
   in a `ConfirmDialog` naming the hook, and a refused one shows the API's reason - the plans that name it, the hooks it
   reverts. Any other role reads the catalog and is told that registering hooks requires the admin role. The offline
-  mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` with §12's rules and refusals
+  mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` and `PUT /hooks/{name}/secret`
+  with §12's rules and refusals
   in the API's words, an admin's writes alone, and a plan naming catalog hooks alone - and holds none at first),
   `/notifications` (Notifications, the Activity group's page beside Events, plan task NT9, §24.9 — "Where the
   installation's events go: email, Slack and webhook channels, and the plans each one follows. A channel decides where
@@ -7540,7 +7593,8 @@ Not in 0.4.0:
   * A `playbook` hook is an Ansible playbook the AnsibleExecutor runs with the migration's context as extra vars. It
     gets the executor's rules (§7.2, §13.4): secret files with mode 0600, `!unsafe` values, and output through
     `redact()`.
-  * A `webhook` hook is an HTTPS POST of the context document, with a bearer secret from the secret store (§13.3), and
+  * A `webhook` hook is an HTTPS POST of the context document, with the bearer token of its secret `hook-{name}`
+    (§13.3; write-only through the API), and
     any 2xx answer counts as success.
 * **Who defines them.** An admin registers hooks in a catalog by name, and a plan references them by name per point. A
   hook is code that runs with the control plane's reach (owner decision 2).
@@ -8234,7 +8288,9 @@ The owner took each default as written on 2026-10-23 (D19):
    * Pasting a Slack URL is how an admin sets one up.
    * The fixed name keeps a channel from reading or replacing another's secret.
 
-   The alternative is the hook catalog's way: only a secret made outside the control plane, named by the admin.
+   The alternative was the hook catalog's way until 0.5.0: only a secret made outside the control plane, named by the
+   admin. The hooks follow the channels since the pentest of 2026-11-19 (P1, §13.3): every role read the name, and an
+   admin who typed the token in its place showed it to every role.
 6. **Who subscribes:** an admin keeps the catalog; an operator subscribes a channel to a plan at any time; an admin
    subscribes one to every plan. There are no personal subscriptions in 0.5.0 (§24.4).
 7. **What is sent, and when:** `approval`, `downtime` and `problem` by default, with `outcome` and `progress` opt-in;

@@ -138,7 +138,13 @@ from .executors.base import (
     TransientStepError,
     outlive_cancel,
 )
-from .hooks import HookRun, HookRunner, context_document, hook_action_event
+from .hooks import (
+    HookRun,
+    HookRunner,
+    adopt_hook_secrets,
+    context_document,
+    hook_action_event,
+)
 from .invariants import check_invariants
 from .lb_helper import (
     LbHelperError,
@@ -186,6 +192,7 @@ from .planning.probes import suggest_probes
 from .planning.selector import HELD_VOLUMES_REASON, eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError, VMNotFound
+from .security.destinations import DestinationNotAllowed, check_destination_async
 from .security.host_keys import console_keys, fingerprint
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
 from .verification import VerificationResult, Verifier, review_reason
@@ -1258,6 +1265,29 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # providers
+    async def _bounded_check(self, provider: Provider, impl: Any) -> Mapping[str, Any]:
+        """The provider's own check within ``SEAMLESS_PROVIDER_CHECK_TIMEOUT_S`` (SDD §10, §13.5,
+        pentest 2026-11-19 P3): an endpoint that swallows the packets must not hold the request -
+        how long a check hangs told which internal addresses listen. Outside demo mode a brought
+        conversion host's address is judged first, as the provider's endpoint is as it connects."""
+        host = provider.conversion_host
+        if not self.settings.demo and host is not None and host.address:
+            try:
+                await check_destination_async(
+                    host.address, self.settings, field="conversion_host.address"
+                )
+            except DestinationNotAllowed as exc:
+                raise ProviderError(f"{provider.id}: {exc}") from None
+        bound = self.settings.provider_check_timeout_s
+        if bound <= 0:
+            return await impl.check()
+        try:
+            return await asyncio.wait_for(impl.check(), bound)
+        except TimeoutError:
+            raise ProviderError(
+                f"{provider.id}: the check did not finish within {bound:g} s"
+            ) from None
+
     async def check_provider(
         self, provider_id: str, actor: str = "system", *, projects: Collection[str] | None = None
     ) -> Provider:
@@ -1275,7 +1305,7 @@ class Orchestrator:
             pinned: Event | None = None
             update: dict[str, Any]
             try:
-                caps = await impl.check()
+                caps = await self._bounded_check(provider, impl)
                 update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
             except ProviderError as exc:
                 update = {"status": "error", "status_message": redact(str(exc))[:500]}
@@ -3819,6 +3849,11 @@ class Orchestrator:
         self._forget()
         self._stopping = False
         self._wake = asyncio.Event()
+        # SDD §13.3: a hook of an earlier version named its secret; its token moves to hook-{name}
+        try:
+            await adopt_hook_secrets(self.db, self.settings)
+        except Exception:  # noqa: BLE001 - a start never fails on it: the next start tries again
+            log.warning("the hooks' secrets could not be moved to the secret store", exc_info=True)
         migrations = await self.db.list("migration", Migration)
         for m in migrations:
             if m.phase in fsm.RESUMABLE_PHASES:
