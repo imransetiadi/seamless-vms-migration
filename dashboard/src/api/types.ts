@@ -1351,6 +1351,7 @@ export interface LeaderHealth {
   since: string | null;
 }
 
+/** `GET /health` (SDD §12). Without a token - the sign-in page - the API answers `status` alone outside demo mode: read the other fields as possibly absent there. */
 export interface Health {
   /** Judges the replica that answered: the leader by its tick loop, a follower by its campaign (SDD §12). */
   status: 'ok' | 'degraded';

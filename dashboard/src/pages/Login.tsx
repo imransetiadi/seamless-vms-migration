@@ -146,7 +146,8 @@ export default function Login() {
             {health.data ? (
               <p className="flex items-center gap-1.5">
                 <CircleCheck aria-hidden className="size-3.5 text-status-success" />
-                Control plane {health.data.version} reachable{health.data.demo ? ' · demo mode' : ''}
+                {/* without a token the API answers its status alone (SDD §12): the version is a signed-in viewer's */}
+                Control plane {health.data.version ? `${health.data.version} ` : ''}reachable{health.data.demo ? ' · demo mode' : ''}
               </p>
             ) : health.error ? (
               <p className="flex items-center gap-1.5 text-status-danger">

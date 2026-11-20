@@ -1202,6 +1202,7 @@ describe('mock API', () => {
     const refused = (message: string) => ({ status: 422, body: { error: { code: 'validation_error', message } } });
     // the API's PROVIDER_EDITABLE_FIELDS, field for field
     expect([...PROVIDER_EDITABLE].sort()).toEqual([
+      'allow_plain_http',
       'announces_tenant_networks',
       'ca_cert_path',
       'ceph',
