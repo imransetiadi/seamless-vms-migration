@@ -2870,6 +2870,9 @@ async def test_a_vcenter_that_accepts_and_never_answers_frees_the_worker_thread(
     pytest.importorskip("pyVim.connect")
     from seamless_migrate.providers import vmware as vmw
 
+    # the stand-in listens on loopback, which the destination guard refuses (SDD §13.5): it is
+    # the worker thread this test is about
+    monkeypatch.setattr("seamless_migrate.providers.vmware.check_destination", lambda *a, **kw: [])
     server = socket.create_server(("127.0.0.1", 0))
     server.settimeout(0.1)
     held: list = []
