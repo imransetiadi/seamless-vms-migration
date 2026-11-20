@@ -1,6 +1,8 @@
 """The API's hardening after the pentest of 2026-11-19 (P4): what a caller without a token learns,
 the headers every answer carries, and where a provider's CA bundle may lie."""
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -153,3 +155,131 @@ def test_a_ca_bundle_lies_in_a_ca_directory(tmp_path):
         )
         assert patched.status_code == 422
     store.dispose()
+
+
+def test_auth_and_user_events_are_an_admins_alone(api):
+    """SDD §12, §13.1 (pentest 2026-11-19 P5): auth.denied names a refused request's path, method,
+    needed role and caller's address, and user.created who was given which role: an admin reads
+    them, no other role does - from GET /events, whose pages still hold `limit` events its reader
+    may see, as from the stream."""
+    assert api.client.get("/api/v1/me").status_code == 401  # auth.denied
+    created = api.post("/api/v1/users", json={"name": "ext-auditor", "role": "viewer"})
+    assert created.status_code == 201  # user.created
+    hook = {"name": "h1", "kind": "playbook", "playbook": "/opt/hooks/h1.yml"}
+    assert api.post("/api/v1/hooks", json=hook).status_code == 201  # hook.created
+    seen = {
+        role: [e["kind"] for e in api.get("/api/v1/events", role=role).json()]
+        for role in (Role.viewer, Role.operator, Role.approver, Role.admin)
+    }
+    assert {"auth.denied", "user.created", "hook.created"} <= set(seen[Role.admin])
+    for role in (Role.viewer, Role.operator, Role.approver):
+        assert "hook.created" in seen[role]
+        assert not [k for k in seen[role] if k.startswith(("auth.", "user."))], role
+    # a page is filled with what the reader may see: the newest one is the hook's, not hidden
+    newest = api.get("/api/v1/events?tail=true&limit=1", role=Role.viewer).json()
+    assert [e["kind"] for e in newest] == ["hook.created"]
+
+
+async def test_the_event_stream_sends_auth_and_user_events_to_an_admin_alone():
+    from seamless_migrate.api.routes_events import sse_frames
+    from seamless_migrate.events import ADMIN_ONLY_KINDS, EventBus, new_event
+
+    assert {"auth.denied", "user.created"} <= ADMIN_ONLY_KINDS
+    assert all(kind.startswith(("auth.", "user.")) for kind in ADMIN_ONLY_KINDS)
+
+    async def frames(hidden):
+        bus = EventBus(None)
+        stream = sse_frames(bus.subscribe(), 0.05, hidden=hidden)
+        first = asyncio.ensure_future(stream.__anext__())
+        await asyncio.sleep(0.01)
+        for seq, kind in enumerate(("auth.denied", "user.created", "plan.created"), start=1):
+            event = new_event(kind, kind)
+            event.seq = seq
+            bus.publish(event, persist=True)
+        got = [await first]
+        while not got[-1].startswith(": heartbeat"):
+            got.append(await stream.__anext__())
+        await stream.aclose()
+        return [line.split("event: ")[1].split("\n")[0] for line in got if "event: " in line]
+
+    assert await frames(frozenset()) == ["auth.denied", "user.created", "plan.created"]
+    assert await frames(ADMIN_ONLY_KINDS) == ["plan.created"]
+
+
+def test_the_api_document_is_an_admins_outside_demo_mode(api):
+    """SDD §12, Security.md R-04 (pentest P5): /api/openapi.json and /api/docs map every route and
+    field of the installation; outside demo mode they are an admin's."""
+    for path in ("/api/openapi.json", "/api/docs"):
+        assert api.client.get(path).status_code == 401
+        for role in (Role.viewer, Role.operator, Role.approver):
+            assert api.get(path, role=role).status_code == 403, (path, role)
+        assert api.get(path, role=Role.admin).status_code == 200
+
+
+def test_the_provider_input_schema_offers_no_server_owned_field(api):
+    """SDD §12 (pentest P5): ProviderCreate in the API's document names what a request sets - no
+    status, check report, pin or project credential, which POST ignores and PATCH refuses."""
+    from seamless_migrate.domain.models import PROVIDER_SERVER_OWNED
+
+    spec = api.get("/api/openapi.json", role=Role.admin).json()
+    offered = set(spec["components"]["schemas"]["ProviderCreate"]["properties"])
+    assert offered & set(PROVIDER_SERVER_OWNED) == set()
+    assert {
+        "id",
+        "name",
+        "kind",
+        "role",
+        "endpoint",
+        "conversion_host",
+        "allow_plain_http",
+    } <= offered
+    stored = set(spec["components"]["schemas"]["Provider"]["properties"])
+    assert set(PROVIDER_SERVER_OWNED) <= stored  # the answers still carry them
+    # the behaviour is unchanged: POST ignores a server-owned field, never stores it
+    body = {**SOURCE, "status": "ok", "capabilities": {"admin": True}}
+    created = api.post("/api/v1/providers", json=body)
+    assert created.status_code == 201, created.text
+    assert (created.json()["status"], created.json()["capabilities"]) == ("unknown", {})
+
+
+def test_an_admin_removes_a_dashboard_user_and_its_token_stops_at_once(api):
+    """SDD §12, §13.1 (the retest of 2026-11-20 found no way to revoke one): DELETE /users/{name}
+    is an admin's; the user's token is refused on its next request, user.deleted names who
+    removed whom with which role - never a token or a digest - and an admin's alone reads it. A
+    bootstrap token of the tokens file and the admin's own user are refused (409), an unknown
+    name is a 404, and the name is matched as POST /users compares it, ignoring case."""
+    created = api.post("/api/v1/users", json={"name": "Ext-Auditor", "role": "viewer"})
+    assert created.status_code == 201
+    token = created.json()["token"]
+    as_user = {"Authorization": f"Bearer {token}"}
+    assert api.client.get("/api/v1/me", headers=as_user).status_code == 200
+    for role in (Role.viewer, Role.operator, Role.approver):
+        refused = api.client.delete("/api/v1/users/Ext-Auditor", headers=api.h(role))
+        assert refused.status_code == 403, role
+    assert api.client.get("/api/v1/me", headers=as_user).status_code == 200
+    removed = api.client.delete("/api/v1/users/ext-auditor", headers=api.h(Role.admin))
+    assert removed.status_code == 204, removed.text
+    assert api.client.get("/api/v1/me", headers=as_user).status_code == 401
+    names = [u["name"] for u in api.get("/api/v1/users", role=Role.admin).json()]
+    assert "Ext-Auditor" not in names
+    gone = api.client.delete("/api/v1/users/ext-auditor", headers=api.h(Role.admin))
+    assert gone.status_code == 404
+    # a bootstrap token is the tokens file's to revoke
+    bootstrap = api.client.delete("/api/v1/users/viewer-user", headers=api.h(Role.admin))
+    assert bootstrap.status_code == 409 and "tokens file" in bootstrap.text
+    events = api.get("/api/v1/events?limit=1000", role=Role.admin).json()
+    [deleted] = [e for e in events if e["kind"] == "user.deleted"]
+    assert deleted["data"] == {"name": "Ext-Auditor", "role": "viewer"}
+    assert deleted["actor"] == "admin-user"
+    assert token not in str(events)
+    seen = [e["kind"] for e in api.get("/api/v1/events?limit=1000", role=Role.viewer).json()]
+    assert "user.deleted" not in seen
+
+
+def test_an_admin_cannot_remove_the_user_it_signs_in_as(api):
+    """SDD §12: the last way in is never cut from the dashboard."""
+    created = api.post("/api/v1/users", json={"name": "second-admin", "role": "admin"})
+    own = {"Authorization": f"Bearer {created.json()['token']}"}
+    refused = api.client.delete("/api/v1/users/Second-Admin", headers=own)
+    assert refused.status_code == 409 and "signed in as" in refused.text
+    assert api.client.get("/api/v1/me", headers=own).status_code == 200

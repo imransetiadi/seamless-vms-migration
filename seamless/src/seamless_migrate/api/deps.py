@@ -101,6 +101,11 @@ class Services:
             self._users_read_at = time.monotonic()
             return users
 
+    def forget_users(self) -> None:
+        """Read the users' digests again at the next authentication (SDD §13.1): a removed user's
+        token stops at once, whatever the change stamp says."""
+        self._users_stamp = None
+
     def _users_current(self, stamp: tuple[int, int]) -> bool:
         return (
             stamp == self._users_stamp
