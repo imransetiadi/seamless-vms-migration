@@ -715,6 +715,41 @@ LEADS = {
 NOBODY = {"leading": False, "holder": None, "epoch": None, "since": None}
 
 
+def test_cluster_status_reads_the_leader_with_a_viewers_token(tmp_path):
+    """SDD §12, §17.2 (pentest 2026-11-19 P4.1): without a token /health answers its status alone,
+    and status says how to name the leading pod; with --token-file it asks /health/detail with the
+    token's header - from a private file, never on the command line - and names it."""
+    minimal = json.dumps({"status": "ok"})
+    rules = [{"cmd": "curl", "has": ["/api/v1/health"], "answers": [{"stdout": minimal}]}]
+    proc, calls, _ = _run(tmp_path, "kubernetes", "status", "--url", CLUSTER_URL, rules=rules)
+    assert proc.returncode == 0, proc.stderr
+    assert _args(calls, "curl") == [f"-fsS --max-time 10 {CLUSTER_URL}/api/v1/health"]
+    assert "the leading pod is named with --token-file FILE (a viewer's token)" in proc.stdout
+    detail = json.dumps(
+        {
+            "status": "ok",
+            "version": "0.5.0",
+            "leader": {"leading": True, "holder": "seamless-7d9f-abcde-0a1b2c3d", "epoch": 4},
+        }
+    )
+    rules = [{"cmd": "curl", "has": ["/api/v1/health/detail"], "answers": [{"stdout": detail}]}]
+    proc, calls, _ = _run(
+        tmp_path,
+        "kubernetes",
+        "status",
+        "--url",
+        CLUSTER_URL,
+        "--token-file",
+        "@TOKEN_FILE",
+        rules=rules,
+    )
+    assert proc.returncode == 0, proc.stderr
+    curl = _args(calls, "curl")[-1]
+    assert curl.endswith(f"{CLUSTER_URL}/api/v1/health/detail") and "-H @" in curl
+    assert "Bearer" not in curl
+    assert "leading pod: seamless-7d9f-abcde" in proc.stdout
+
+
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
 @pytest.mark.parametrize(
     ("leader", "says"),
