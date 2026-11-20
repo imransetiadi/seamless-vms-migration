@@ -288,7 +288,8 @@ def _install_security_headers(app: FastAPI) -> None:
 
 
 def _install_api_docs(app: FastAPI, settings: Settings) -> None:
-    """``/api/openapi.json`` and ``/api/docs``: public in demo mode, viewer role otherwise."""
+    """``/api/openapi.json`` and ``/api/docs``: public in demo mode, an admin's otherwise - the
+    document maps every route and field of the installation (pentest 2026-11-19 P5)."""
     from fastapi.openapi.docs import get_swagger_ui_html
 
     from ..domain.enums import Role
@@ -296,7 +297,7 @@ def _install_api_docs(app: FastAPI, settings: Settings) -> None:
 
     async def docs_access(request: Request) -> None:
         if not settings.demo:
-            await require_role(Role.viewer)(request)
+            await require_role(Role.admin)(request)
 
     @app.get("/api/openapi.json", include_in_schema=False)
     async def openapi_json(request: Request) -> Any:

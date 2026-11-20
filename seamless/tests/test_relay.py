@@ -635,8 +635,10 @@ async def test_a_follower_serves_its_health_ready_metrics_and_the_dashboard_itse
             assert (await caller.get("/")).text.startswith("<!doctype html>")
             assert (await caller.get("/plans/plan-1")).text.startswith("<!doctype html>")
             assert "dashboard" in (await caller.get("/assets/app.js")).text
-            assert (await caller.get("/api/openapi.json", headers=viewer)).json()["info"]["title"]
-            assert (await caller.get("/api/docs", headers=viewer)).status_code == 200
+            # the API documents are an admin's outside demo mode (SDD §12; pentest 2026-11-19 P5)
+            admin = cluster.auth(Role.admin)
+            assert (await caller.get("/api/openapi.json", headers=admin)).json()["info"]["title"]
+            assert (await caller.get("/api/docs", headers=admin)).status_code == 200
             assert (await caller.get("/api/v10/plans", headers=viewer)).status_code == 404
             assert silent.connections == 0, "nothing of that was relayed"
             unauthenticated = await caller.get("/api/v1/metrics")
