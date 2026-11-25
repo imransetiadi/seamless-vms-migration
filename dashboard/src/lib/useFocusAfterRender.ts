@@ -7,8 +7,10 @@ type Target = () => HTMLElement | null | undefined;
  * dialog swaps in place and never drops to the page).
  *
  * A bare `requestAnimationFrame(() => ref.current?.focus())` races React: on a busy machine the frame can
- * run before the commit, find no element and leave the focus on `<body>`. The target is looked up after
- * every commit until it exists, with one frame as the fallback for an update that draws nothing new.
+ * run before the commit, find no element and leave the focus on `<body>`. Here a frame that finds nothing
+ * keeps the request, and every later commit schedules another frame until the element exists. The focus
+ * always moves in a frame, never inside the commit, so a closing confirm dialog's own focus return (which
+ * runs during the commit) cannot take it back afterwards.
  */
 export function useFocusAfterRender(): (target: Target) => void {
   const pending = useRef<Target | null>(null);
@@ -20,7 +22,9 @@ export function useFocusAfterRender(): (target: Target) => void {
     element.focus();
   }, []);
 
-  useLayoutEffect(attempt);
+  useLayoutEffect(() => {
+    if (pending.current) requestAnimationFrame(attempt);
+  });
 
   return useCallback(
     (target: Target) => {

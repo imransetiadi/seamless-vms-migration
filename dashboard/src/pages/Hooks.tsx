@@ -16,6 +16,7 @@ import { HOOK_KIND_LABELS } from '../lib/cutover';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useDraftGuard } from '../lib/useDraftGuard';
 import { useHashLanding } from '../lib/useHashLanding';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 
 interface HookForm {
   name: string;
@@ -70,6 +71,7 @@ export default function Hooks() {
   const [editing, setEditing] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<Hook | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const catalogRef = useRef<HTMLHeadingElement>(null);
   const deleteReturnRef = useRef<HTMLElement | null>(null);
   const write = editing ? update : create;
@@ -84,7 +86,7 @@ export default function Hooks() {
     setEditing(null);
     create.reset();
     update.reset();
-    if (focus) requestAnimationFrame(() => nameRef.current?.focus());
+    if (focus) focusAfterRender(() => nameRef.current);
   }
 
   function submit(event: FormEvent) {
@@ -223,7 +225,7 @@ export default function Hooks() {
                             const values = formOf(hook);
                             setForm(values);
                             setInitial(values);
-                            requestAnimationFrame(() => nameRef.current?.focus());
+                            focusAfterRender(() => nameRef.current);
                           })}
                         >
                           Edit

@@ -18,6 +18,7 @@ import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 import { Button } from './Button';
 import { Checkbox } from './Checkbox';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -372,6 +373,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const [errors, setErrors] = useState<Errors>({});
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   // read with the plan's source project's credential, so a tenant's VMs are those offered (SDD §16, §27.4)
   const inventory = useInventory(form.sourceId || undefined, form.sourceProject || null);
   // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing - read only while
@@ -666,7 +668,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const { errors: found, body } = validate();
     setErrors(found);
     if (!body) {
-      requestAnimationFrame(() => summaryRef.current?.focus());
+      focusAfterRender(() => summaryRef.current);
       return;
     }
     if (plan) {

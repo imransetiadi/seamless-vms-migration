@@ -28,6 +28,7 @@ import { CHANNEL_KIND_LABELS, generateSigningKey } from '../lib/notifications';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useDraftGuard } from '../lib/useDraftGuard';
 import { useHashLanding } from '../lib/useHashLanding';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 
 type Kind = NotificationChannelView['kind'];
 
@@ -264,6 +265,7 @@ export default function Notifications() {
   /** The channel whose Enable, Disable or Send test runs, so the other channels' buttons stay as they are. */
   const [busy, setBusy] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const catalogRef = useRef<HTMLHeadingElement>(null);
   const deleteReturnRef = useRef<HTMLElement | null>(null);
   const write = editing ? update : create;
@@ -278,7 +280,7 @@ export default function Notifications() {
     setEditing(null);
     create.reset();
     update.reset();
-    if (focus) requestAnimationFrame(() => nameRef.current?.focus());
+    if (focus) focusAfterRender(() => nameRef.current);
   }
 
   function submit(event: FormEvent) {
@@ -437,7 +439,7 @@ export default function Notifications() {
                               const values = formOf(channel);
                               setForm(values);
                               setInitial(values);
-                              requestAnimationFrame(() => nameRef.current?.focus());
+                              focusAfterRender(() => nameRef.current);
                             })}
                           >
                             Edit

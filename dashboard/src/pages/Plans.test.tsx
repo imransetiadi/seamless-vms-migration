@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Route, Routes } from 'react-router-dom';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
@@ -314,6 +314,24 @@ describe('Plans page', () => {
     await screen.findByRole('dialog', { name: /new migration plan/i });
     await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
     expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
+  });
+
+  it('moves the focus to the error summary even when a frame runs before it is drawn (SDD §16)', async () => {
+    const frame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    try {
+      const user = userEvent.setup({ delay: null });
+      renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+      await user.click(await screen.findByRole('button', { name: /new plan/i }));
+      const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+      await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+      const summary = await within(dialog).findByRole('alert');
+      await waitFor(() => expect(summary).toHaveFocus());
+    } finally {
+      frame.mockRestore();
+    }
   });
 
   it('summarises validation errors and moves focus to the summary', async () => {

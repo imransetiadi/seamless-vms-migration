@@ -8,6 +8,7 @@ import { formatDateTime, formatRelative } from '../lib/format';
 import { EXPIRY_WARNING_MS, ownProjectWords, projectCheckOf, projectCredentialRows, projectWords, type ProjectCredentialRow } from '../lib/projectCredentials';
 import { useNow } from '../lib/useNow';
 import { deleteRefusal, plansThatNeedProject, providerLabel } from '../lib/providerUse';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ErrorBanner } from './ErrorBanner';
@@ -126,6 +127,7 @@ function AddProjectCredentialDialog({ provider, open, onClose, onAnnounce }: { p
   const projectRef = useRef<HTMLInputElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
   const outcomeRef = useRef<HTMLHeadingElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const [projectId, setProjectId] = useState('');
   const [appId, setAppId] = useState('');
   const [appSecret, setAppSecret] = useState('');
@@ -157,7 +159,7 @@ function AddProjectCredentialDialog({ provider, open, onClose, onAnnounce }: { p
     } catch (error) {
       setOutcome({ projectId: pid, provider: null, checkError: error });
     }
-    requestAnimationFrame(() => outcomeRef.current?.focus());
+    focusAfterRender(() => outcomeRef.current);
   };
 
   const submit = async (event: FormEvent) => {
@@ -170,7 +172,7 @@ function AddProjectCredentialDialog({ provider, open, onClose, onAnnounce }: { p
     setErrors(found);
     setFailure(null);
     if (Object.keys(found).length) {
-      requestAnimationFrame(() => summaryRef.current?.focus());
+      focusAfterRender(() => summaryRef.current);
       return;
     }
     const secret = appSecret;

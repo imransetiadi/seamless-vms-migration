@@ -48,6 +48,23 @@ describe('dashboard user access', () => {
     expect(login.queryClient.getQueryData(queryKeys.me)).toEqual({ ...identity, host_key_checking: true });
   });
 
+  it('returns the focus to the name after Done even when a frame runs before the form is drawn again (SDD §16)', async () => {
+    // a busy machine can run the next frame before React commits: the focus must follow the commit
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    const user = userEvent.setup({ delay: null });
+    renderUsers();
+    await screen.findByText('rina');
+    await user.type(screen.getByLabelText(/user name/i), 'busy.operator');
+    await user.click(screen.getByRole('button', { name: 'Add user' }));
+    await screen.findByLabelText('New user API token');
+    await user.click(screen.getByLabelText('I have saved this token securely'));
+    await user.click(screen.getByRole('button', { name: 'Done' }));
+    await waitFor(() => expect(screen.getByLabelText(/user name/i)).toHaveFocus());
+  });
+
   it('keeps token selectable when clipboard access fails', async () => {
     const user = userEvent.setup();
     renderUsers();

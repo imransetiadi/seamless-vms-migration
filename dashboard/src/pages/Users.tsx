@@ -15,6 +15,7 @@ import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { ROLE_LABELS } from '../lib/roles';
 import { usePageTitle } from '../lib/usePageTitle';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 
 const ROLE_HELP: Record<Role, string> = {
   viewer: 'View dashboard data without changing it.',
@@ -41,6 +42,7 @@ export default function Users() {
   const [acknowledged, setAcknowledged] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const tokenId = 'new-user-token';
   const created = create.data;
   const unsavedToken = Boolean(created) && !acknowledged;
@@ -68,7 +70,7 @@ export default function Users() {
       onError: (error) => {
         if (error instanceof ApiError && (error.status === 409 || error.status === 422)) {
           setNameError(error.message);
-          requestAnimationFrame(() => nameRef.current?.focus());
+          focusAfterRender(() => nameRef.current);
         }
       },
     });
@@ -109,7 +111,7 @@ export default function Users() {
                     setName('');
                     setRole('viewer');
                     setCopyStatus('');
-                    requestAnimationFrame(() => nameRef.current?.focus());
+                    focusAfterRender(() => nameRef.current);
                   }}>Done</Button>
                 </div>
                 <p role="status" className="text-sm">{copyStatus}</p>
