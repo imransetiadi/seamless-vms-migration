@@ -82,8 +82,8 @@ jobs:
       - name: Install ansible-core and the test tools
         run: |
           python -m pip install --upgrade pip
-          # openstacksdk: prelude_common checks its version at the start of every playbook
-          python -m pip install "ansible-core>=2.16,<2.19" ansible-lint pytest pytest-mock pyyaml "openstacksdk>=4.5,!=4.23.0"
+          # Use the collection runtime requirements, including the reviewed openstacksdk range.
+          python -m pip install "ansible-core>=2.16,<2.19" ansible-lint pytest pytest-mock -r requirements.txt
       - name: Lay the repository out as ansible_collections/os_migrate/os_migrate
         run: |
           mkdir -p "$RUNNER_TEMP/colltree/ansible_collections/os_migrate"
