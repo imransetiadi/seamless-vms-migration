@@ -11,7 +11,7 @@ import {
   Tooltip,
   XAxis,
   YAxis,
-  type TooltipProps,
+  type TooltipContentProps,
 } from 'recharts';
 import { STRATEGIES, type Strategy } from '../api/types';
 import { formatDuration } from '../lib/format';
@@ -62,7 +62,7 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
       ? `Average downtime for ${data.length} strategies.`
       : `${overCount === 0 ? 'Every strategy is within' : `${overCount} of ${data.length} strategies exceed`} the ${sloLabel} of ${formatDuration(sloS)}.`;
 
-  const renderTooltip = ({ active, payload }: TooltipProps<number, string>) => {
+  const renderTooltip = ({ active, payload }: TooltipContentProps) => {
     const row = payload?.[0]?.payload as (typeof data)[number] | undefined;
     if (!active || !row) return null;
     return (

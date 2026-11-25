@@ -10,7 +10,7 @@ import {
   Tooltip,
   XAxis,
   YAxis,
-  type TooltipProps,
+  type TooltipContentProps,
 } from 'recharts';
 import { SYNC_PASSES_LATEST, type ConvergedBy, type ForceCutover, type Strategy, type SyncPass } from '../api/types';
 import { passExtentsText, tracksExtents } from '../lib/extents';
@@ -195,7 +195,7 @@ export function SyncPassChart({
   const hasFinal = data.some((d) => d.final);
   const hasDelta = data.some((d) => !d.final);
 
-  const renderTooltip = ({ active, payload }: TooltipProps<number, string>) => {
+  const renderTooltip = ({ active, payload }: TooltipContentProps) => {
     const row = payload?.[0]?.payload as (typeof data)[number] | undefined;
     if (!active || !row) return null;
     return (
