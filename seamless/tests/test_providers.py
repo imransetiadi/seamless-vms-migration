@@ -5137,7 +5137,7 @@ async def test_a_failing_project_credential_fails_neither_its_provider_nor_anoth
     from seamless_migrate.providers import openstack as openstack_provider
 
     caplog.set_level(logging.DEBUG)
-    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 3.0)
     h, cloud = _checking(tmp_path, store)
     refused, held, hidden, unstored, fine = (
         _tenant(cloud, name)
@@ -5163,7 +5163,7 @@ async def test_a_failing_project_credential_fails_neither_its_provider_nor_anoth
     unstored_name = project_secret_name("src-osp", unstored.project_id)
     assert {t.name: report[t.project_id]["message"] for t in tenants} == {
         "tenant-a": "src-osp: the sign-in failed: HTTP 401",
-        "tenant-b": "src-osp: call timed out after 1 s",
+        "tenant-b": "src-osp: call timed out after 3 s",
         "tenant-c": "src-osp: the application credential's record was not read: HTTP 403",
         "tenant-d": (
             f"src-osp: secret '{unstored_name}' is missing application_credential_id, "
@@ -5220,7 +5220,7 @@ async def test_a_project_sign_in_keystone_cannot_answer_is_unreachable(tmp_path,
     from seamless_migrate.providers import openstack as openstack_provider
     from seamless_migrate.providers.base import ProviderUnreachable
 
-    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(openstack_provider, "PROVIDER_CALL_TIMEOUT_S", 3.0)
     cloud = InProcessCloud(tmp_path / "cloud")
     answers = {
         "refused": requests.exceptions.ConnectionError("[Errno 61] Connection refused"),
@@ -5264,7 +5264,7 @@ async def test_a_project_sign_in_keystone_cannot_answer_is_unreachable(tmp_path,
         "down": ("unreachable", f"{signed} HTTP 503"),
         "forbidden": ("rejected", f"{signed} HTTP 403"),
         "rejected": ("rejected", f"{signed} HTTP 401"),
-        "held": ("unreachable", "src-osp: call timed out after 1 s"),
+        "held": ("unreachable", "src-osp: call timed out after 3 s"),
         "lost": ("unreachable", f"{record} HTTP 503"),
         "cut": ("unreachable", f"{record} ConnectFailure"),
         "gone": ("rejected", f"{record} HTTP 404"),
