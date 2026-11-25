@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { DestinationInventory, GpuCapacity } from '../api/types';
 import { TECH_PREVIEW_DETAIL } from '../components/TechPreviewBadge';
 import { formatDateTime } from '../lib/format';
@@ -661,6 +661,34 @@ describe('Providers page', () => {
     await user.click(within(failed).getByRole('button', { name: /^edit again$/i }));
     const form = await screen.findByRole('dialog', { name: /edit kolla lab f/i });
     await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
+  });
+
+  it('keeps the focus in the dialog when a frame comes before the result is drawn, as on a busy machine (SDD §16)', async () => {
+    // a slow render lets the next frame run before the commit: the focus must follow the commit, not the frame
+    const frame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    try {
+      const user = userEvent.setup({ delay: null });
+      renderPage();
+      const dialog = await openAdd(user);
+      await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab G');
+      await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://unreachable.example.com:5000/v3');
+      await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+      await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+      await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+      await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+
+      const failed = await screen.findByRole('dialog', { name: /kolla lab g was saved, but the connection test did not pass/i });
+      await waitFor(() => expect(within(failed).getByRole('heading', { level: 2 })).toHaveFocus());
+      await user.click(within(failed).getByRole('button', { name: /^edit again$/i }));
+      const form = await screen.findByRole('dialog', { name: /edit kolla lab g/i });
+      await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
+    } finally {
+      frame.mockRestore();
+    }
   });
 
   it('does not offer Delete while plans still need the provider, and says which (SDD §12, §16)', async () => {
