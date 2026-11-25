@@ -2,7 +2,7 @@
 
 A tag (``@v4``) can be moved, or force-pushed by whoever compromises the action's repository, to
 make CI run other code with the workflow's token; a full commit SHA cannot. The version stays in a
-comment (``# v4.4.0``) so a reader and Dependabot's ``github-actions`` updates know the release.
+comment (``# v4.4.0``) so a reader, and whoever bumps the pin, knows the release.
 """
 
 import re
