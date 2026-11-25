@@ -46,6 +46,10 @@ updates:
       interval: weekly
       day: monday
     groups:
+      # Every github/codeql-action step must run the same release: a lone major bump of
+      # init or analyze fails the workflow ("Not all workflow steps ... use the same version").
+      codeql:
+        patterns: ["github/codeql-action/*"]
       actions:
         patterns: ["*"]
         update-types: [minor, patch]
