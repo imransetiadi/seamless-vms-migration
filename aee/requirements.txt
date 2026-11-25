@@ -7,6 +7,6 @@
 # openstack.version, which had kept the fork's pin for 2.5.0.
 # 4.23.0 ships without openstack/config/defaults.json; 4.25.0 negotiates Nova flavor
 # microversion 2.102, above the reviewed cap (SDD §21.7).
-openstacksdk>=4.22.0,!=4.23.0,<4.25.0
+openstacksdk!=4.23.0,>=4.24.0,<4.25.0
 PyYAML==6.0.3
 jmespath>=1.1.0
