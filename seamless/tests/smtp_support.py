@@ -103,7 +103,7 @@ class Relay:
             context.load_cert_chain(str(certificate[0]), str(certificate[1]))
         kwargs: dict = {}
         if mode == "starttls":
-            kwargs["server_kwargs"] = {"tls_context": context, "require_starttls": True}
+            kwargs.update(tls_context=context, require_starttls=True)
         elif mode == "implicit":
             kwargs["ssl_context"] = context
         if auth is not None:

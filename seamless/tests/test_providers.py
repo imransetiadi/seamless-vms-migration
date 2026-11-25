@@ -2552,6 +2552,7 @@ async def test_openstack_destination_takes_a_failed_port_read_for_no_answer(read
     Neutron; a read that fails (a 503, a timeout) is no answer - a provider error, which the
     rollback retries - while a port gone since the listing is no server holding the address."""
     import openstack.exceptions
+    import requests
 
     floating = [NS(floating_ip_address="198.51.100.40", port_id="conv-port")]
 
@@ -2565,7 +2566,11 @@ async def test_openstack_destination_takes_a_failed_port_read_for_no_answer(read
         def get_port(self, port_id):
             if read == "gone":
                 raise openstack.exceptions.NotFoundException(f"No Port found for {port_id}")
-            raise openstack.exceptions.HttpException(message="Service Unavailable", http_status=503)
+            unavailable = requests.Response()
+            unavailable.status_code = 503
+            raise openstack.exceptions.HttpException(
+                message="Service Unavailable", response=unavailable
+            )
 
     dst = make_provider(
         id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"

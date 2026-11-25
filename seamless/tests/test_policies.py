@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.ai.policies import GLOBAL_DEFAULT, resolve_policy
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import DecisionStatus, DecisionType, ReasonCode, Role
+from seamless_migrate.domain.enums import DecisionStatus, DecisionType, ReasonCode, Role, Strategy
 from seamless_migrate.domain.models import (
     AdvisorActor,
     AdvisorModelInfo,
@@ -420,7 +420,7 @@ def test_no_decision_while_the_plan_sets_the_option_the_advisor_recommends(api, 
     sets: an approve of the option it pins is refused, as an override to it."""
     mid, rid = _held_for_a_decision(api)
     plan = api.store.get("plan", "plan-1", Plan)
-    plan.strategy_overrides[f"src-{mid}"] = "warm"  # what the advisor recommends
+    plan.strategy_overrides[f"src-{mid}"] = Strategy.warm  # what the advisor recommends
     api.store.put("plan", plan)
     body = {} if action == "approve" else {"option": "warm", "reason": "Rehearsed the warm path"}
     res = api.post(f"/api/v1/advisor/recommendations/{rid}/{action}", json=body)
