@@ -116,7 +116,8 @@ describe('SyncPassChart', () => {
     const legend = screen.getByRole('list', { name: 'Legend' });
     expect(within(legend).getAllByRole('listitem').map((li) => li.textContent)).toEqual(['Final sync, source stopped']);
     // the threshold line is one rule of three: it is labelled as the threshold, not as convergence
-    expect(container.querySelector('.recharts-reference-line')).toHaveTextContent('Threshold 1 GiB');
+    expect(container.querySelector('.recharts-reference-line line')).toBeInTheDocument();
+    expect(screen.getByText('Threshold 1 GiB').closest('svg')).toBeInTheDocument();
     expect(container).not.toHaveTextContent(/converged below/i);
   });
 
