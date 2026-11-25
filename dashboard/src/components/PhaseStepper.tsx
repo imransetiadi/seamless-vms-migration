@@ -39,76 +39,76 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
   };
 
   return (
-    <div className={cn('flex flex-col gap-3 md:flex-row md:items-start', className)}>
-      {/* on a phone two columns read top-down, steps 1..n/2 then the rest (half the height of one); from md one row.
-          --rows only sets the phone's row count: the desktop classes never read it */}
-      <ol
-        aria-label="Migration lifecycle"
-        style={{ '--rows': `repeat(${Math.ceil(path.length / 2)}, auto)` } as CSSProperties}
-        className="grid flex-1 gap-1 max-md:grid-flow-col max-md:grid-cols-2 max-md:grid-rows-(--rows) max-md:gap-x-4 md:auto-cols-fr md:grid-flow-col md:gap-0"
-      >
-        {path.map((phase, index) => {
-          const meta = phaseMeta(phase);
-          const state = stateOf(index);
-          const Icon = state === 'done' ? Check : meta.icon;
-          const toneClasses = TONE_CLASSES[state === 'interrupted' && offPathMeta ? offPathMeta.tone : meta.tone];
-          return (
-            <li
-              key={phase}
-              aria-current={state === 'current' ? 'step' : undefined}
-              className="relative flex min-w-0 flex-wrap items-center gap-2 md:flex-col md:gap-1 md:px-1 md:text-center"
-            >
-              {index > 0 && (
+    <div className={cn('@container/lifecycle', className)}>
+      <div className="flex flex-col gap-3 @min-[40rem]/lifecycle:flex-row @min-[40rem]/lifecycle:items-start">
+        {/* Two columns read top-down when labels have room. The smallest container reads as one column. */}
+        <ol
+          aria-label="Migration lifecycle"
+          style={{ '--rows': `repeat(${Math.ceil(path.length / 2)}, auto)` } as CSSProperties}
+          className="lifecycle-track grid flex-1 gap-1"
+        >
+          {path.map((phase, index) => {
+            const meta = phaseMeta(phase);
+            const state = stateOf(index);
+            const Icon = state === 'done' ? Check : meta.icon;
+            const toneClasses = TONE_CLASSES[state === 'interrupted' && offPathMeta ? offPathMeta.tone : meta.tone];
+            return (
+              <li
+                key={phase}
+                aria-current={state === 'current' ? 'step' : undefined}
+                className="relative flex min-w-0 flex-wrap items-center gap-2 @min-[40rem]/lifecycle:flex-col @min-[40rem]/lifecycle:gap-1 @min-[40rem]/lifecycle:px-1 @min-[40rem]/lifecycle:text-center"
+              >
+                {index > 0 && (
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'absolute top-[calc(1rem-1px)] right-[calc(50%+1rem)] left-[calc(-50%+1rem)] hidden h-0.5 @min-[40rem]/lifecycle:block',
+                      index <= reached ? 'bg-status-success/70' : 'bg-border',
+                    )}
+                  />
+                )}
                 <span
                   aria-hidden
                   className={cn(
-                    'absolute hidden h-0.5 md:block',
-                    'left-[calc(-50%+16px)] right-[calc(50%+16px)] top-[15px]',
-                    index <= reached ? 'bg-status-success/70' : 'bg-border',
+                    'relative z-1 flex size-8 shrink-0 items-center justify-center rounded-full border bg-card transition-colors duration-200',
+                    state === 'done' && 'border-status-success/70 text-status-success',
+                    state === 'current' && cn('border-2', toneClasses.border, toneClasses.text),
+                    state === 'interrupted' && cn('border-2 border-dashed', toneClasses.border, toneClasses.text),
+                    state === 'upcoming' && 'border-border text-muted-foreground',
                   )}
-                />
-              )}
-              <span
-                aria-hidden
-                className={cn(
-                  'relative z-1 flex size-8 shrink-0 items-center justify-center rounded-full border bg-card transition-colors duration-200',
-                  state === 'done' && 'border-status-success/70 text-status-success',
-                  state === 'current' && cn('border-2', toneClasses.border, toneClasses.text),
-                  state === 'interrupted' && cn('border-2 border-dashed', toneClasses.border, toneClasses.text),
-                  state === 'upcoming' && 'border-border text-muted-foreground',
-                )}
-              >
-                <Icon className="size-4" />
-              </span>
-              <span
-                className={cn(
-                  'min-w-0 max-w-full wrap-anywhere text-xs leading-tight',
-                  state === 'current' || state === 'interrupted' ? 'font-semibold text-foreground' : 'text-muted-foreground',
-                  state === 'done' && 'text-foreground',
-                )}
-              >
-                {meta.label}
-                <span className="sr-only">, {SR_STATE[state]}</span>
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-      {offPathMeta && (
-        <p
-          aria-current="step"
-          className={cn(
-            'flex items-center gap-2 self-start rounded-md border px-3 py-2 text-sm font-semibold md:ml-2',
-            TONE_CLASSES[offPathMeta.tone].badge,
-          )}
-        >
-          <offPathMeta.icon aria-hidden className="size-4 shrink-0" />
-          <span>
-            Now: {offPathMeta.label}
-            <span className="sr-only"> — {offPathMeta.description}</span>
-          </span>
-        </p>
-      )}
+                >
+                  <Icon className="size-4" />
+                </span>
+                <span
+                  className={cn(
+                    'min-w-0 max-w-full wrap-anywhere text-xs leading-tight',
+                    state === 'current' || state === 'interrupted' ? 'font-semibold text-foreground' : 'text-muted-foreground',
+                    state === 'done' && 'text-foreground',
+                  )}
+                >
+                  {meta.label}
+                  <span className="sr-only">, {SR_STATE[state]}</span>
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        {offPathMeta && (
+          <p
+            aria-current="step"
+            className={cn(
+              'flex items-center gap-2 self-start rounded-md border px-3 py-2 text-sm font-semibold',
+              TONE_CLASSES[offPathMeta.tone].badge,
+            )}
+          >
+            <offPathMeta.icon aria-hidden className="size-4 shrink-0" />
+            <span>
+              Now: {offPathMeta.label}
+              <span className="sr-only"> — {offPathMeta.description}</span>
+            </span>
+          </p>
+        )}
+      </div>
     </div>
   );
 }

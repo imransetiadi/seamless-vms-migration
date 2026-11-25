@@ -28,8 +28,15 @@ const RecommendationDetail = lazy(() => routeChunk('RecommendationDetail', () =>
 const Login = lazy(() => routeChunk('Login', () => import('./pages/Login')));
 const NotFound = lazy(() => routeChunk('NotFound', () => import('./pages/NotFound')));
 
-export class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
-  override state = { failed: false };
+type PageBoundaryProps = { children: ReactNode; pathname?: string };
+type PageBoundaryState = { failed: boolean; pathname?: string };
+
+export class PageErrorBoundary extends Component<PageBoundaryProps, PageBoundaryState> {
+  override state: PageBoundaryState = { failed: false, pathname: this.props.pathname };
+
+  static getDerivedStateFromProps({ pathname }: PageBoundaryProps, state: PageBoundaryState): Partial<PageBoundaryState> | null {
+    return pathname === state.pathname ? null : { failed: false, pathname };
+  }
 
   static getDerivedStateFromError(): { failed: boolean } {
     return { failed: true };
@@ -54,16 +61,16 @@ export class PageErrorBoundary extends Component<{ children: ReactNode }, { fail
   }
 }
 
-function Page({ children }: { children: ReactNode }) {
+function Page({ children, keepMounted }: { children: ReactNode; keepMounted?: boolean }) {
   const { pathname } = useLocation();
   return (
-    <PageErrorBoundary key={pathname}>
+    <PageErrorBoundary key={keepMounted ? undefined : pathname} pathname={pathname}>
       <Suspense fallback={<LoadingBlock label="Loading page…" rows={4} />}>{children}</Suspense>
     </PageErrorBoundary>
   );
 }
 
-const ROUTES: Array<{ path?: string; index?: true; element: ReactNode }> = [
+const ROUTES: Array<{ path?: string; index?: true; element: ReactNode; keepMounted?: boolean }> = [
   { index: true, element: <Overview /> },
   { path: 'plans', element: <Plans /> },
   { path: 'plans/:planId', element: <PlanDetail /> },
@@ -71,8 +78,8 @@ const ROUTES: Array<{ path?: string; index?: true; element: ReactNode }> = [
   { path: 'migrations/:migrationId', element: <MigrationDetail /> },
   { path: 'providers', element: <Providers /> },
   { path: 'users', element: <Users /> },
-  { path: 'inventory', element: <Inventory /> },
-  { path: 'inventory/:providerId', element: <Inventory /> },
+  // The provider picker switches data in place and needs to keep its DOM focus (SDD §16).
+  { path: 'inventory/:providerId?', element: <Inventory />, keepMounted: true },
   { path: 'events', element: <Events /> },
   { path: 'notifications', element: <Notifications /> },
   { path: 'advisor', element: <Advisor /> },
@@ -104,7 +111,7 @@ export function AppRoutes() {
           route.index ? (
             <Route key="index" index element={<Page>{route.element}</Page>} />
           ) : (
-            <Route key={route.path} path={route.path} element={<Page>{route.element}</Page>} />
+            <Route key={route.path} path={route.path} element={<Page keepMounted={route.keepMounted}>{route.element}</Page>} />
           ),
         )}
       </Route>

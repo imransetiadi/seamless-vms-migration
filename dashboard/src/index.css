@@ -232,23 +232,43 @@
     @apply bg-background font-sans text-foreground antialiased;
     -webkit-text-size-adjust: 100%;
     /* Keep keyboard focus clear of the sticky mobile header (WCAG 2.2 focus-not-obscured). */
-    scroll-padding-top: 4.5rem;
+    scroll-padding-top: calc(var(--mobile-header-height, 0px) + 1rem);
   }
 
-  @media (min-width: 1024px) {
-    html {
-      scroll-padding-top: 1rem;
-    }
+  .mobile-header {
+    position: sticky;
+    top: 0;
+  }
+
+  .section-nav {
+    position: sticky;
+    top: var(--mobile-header-height, 0px);
   }
 
   /* Keep keyboard focus below both the mobile header and the section navigation. */
   html:has(.section-nav) {
-    scroll-padding-top: 8rem;
+    scroll-padding-top: calc(var(--mobile-header-height, 0px) + var(--section-nav-height, 0px) + 1rem);
   }
 
   @media (min-width: 768px) {
+    .section-nav {
+      top: 0.5rem;
+    }
+
     html:has(.section-nav) {
-      scroll-padding-top: 5rem;
+      scroll-padding-top: calc(var(--section-nav-height, 0px) + 1.5rem);
+    }
+  }
+
+  @media (max-height: 480px) {
+    .mobile-header,
+    .section-nav {
+      position: static;
+    }
+
+    html,
+    html:has(.section-nav) {
+      scroll-padding-top: 1rem;
     }
   }
 
@@ -302,6 +322,23 @@
 }
 
 @layer components {
+  @container lifecycle (14rem <= width < 40rem) {
+    .lifecycle-track {
+      grid-auto-flow: column;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: var(--rows);
+      column-gap: 1rem;
+    }
+  }
+
+  @container lifecycle (width >= 40rem) {
+    .lifecycle-track {
+      grid-auto-columns: minmax(0, 1fr);
+      grid-auto-flow: column;
+      gap: 0;
+    }
+  }
+
   @keyframes drawer-in {
     from {
       transform: translateX(-100%);

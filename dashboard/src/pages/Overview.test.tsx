@@ -54,7 +54,7 @@ describe('Overview page (mock data)', () => {
     const server = createTestServer();
     renderWithApp(<Overview />, { server });
     const metric = await screen.findByRole('group', { name: 'Failed' });
-    await user.click(await within(metric).findByRole('button', { name: /^View failed migrations/ }));
+    await user.click(await within(metric).findByRole('button', { name: /^Failed \d/ }));
     const dialog = within(screen.getByRole('dialog', { name: 'Find migration' }));
     const failures = server.migrations.filter((m) => m.phase === 'failed');
     expect(dialog.getAllByRole('link').map((link) => link.getAttribute('href')).sort())
@@ -67,7 +67,7 @@ describe('Overview page (mock data)', () => {
   it('returns to Find migration if a live update removes the metric that opened the finder', async () => {
     const user = userEvent.setup({ delay: null });
     const { queryClient } = renderWithApp(<Overview />);
-    const failed = await screen.findByRole('button', { name: /^View failed migrations/ });
+    const failed = await screen.findByRole('button', { name: /^Failed \d/ });
     const find = screen.getByRole('button', { name: 'Find migration' });
     await user.click(failed);
     await screen.findByRole('dialog', { name: 'Find migration' });

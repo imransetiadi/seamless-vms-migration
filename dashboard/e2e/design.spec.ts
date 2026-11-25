@@ -159,7 +159,7 @@ test('a failure count opens the matching VMs and Escape returns to the metric', 
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await page.getByRole('link', { name: 'View metrics' }).click();
   await expect(page.getByRole('heading', { name: 'Performance', exact: true })).toBeFocused();
-  const failed = page.getByRole('button', { name: /^View failed migrations/ });
+  const failed = page.getByRole('button', { name: /^Failed \d/ });
   await failed.click();
   const dialog = page.getByRole('dialog', { name: 'Find migration' });
   await expect(dialog.getByRole('link', { name: /legacy-rhel6-app.*Failed/i })).toBeVisible();

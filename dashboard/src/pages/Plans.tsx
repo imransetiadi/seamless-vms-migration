@@ -168,7 +168,7 @@ export default function Plans() {
       </div>
 
       {/* a live region already on the page: what the filters show is read out, none too (SDD §16) */}
-      <p role="status" className="mb-2 text-xs text-muted-foreground empty:hidden">
+      <p role="status" className="mb-2 text-xs text-muted-foreground empty:sr-only">
         {plans.data && plans.data.length > 0 ? `Showing ${formatNumber(rows.length)} of ${formatNumber(plans.data.length)} plans` : ''}
       </p>
       {plans.isPending && <LoadingBlock label="Loading plans…" rows={5} />}
@@ -215,7 +215,7 @@ export default function Plans() {
                 return (
                   <tr key={p.id}>
                     <th scope="row" className="sm:min-w-48">
-                      <Link to={`/plans/${p.id}`} className="font-medium underline-offset-4 hover:underline">
+                      <Link to={`/plans/${p.id}`} id={`plan-result-${p.id}`} data-return-focus className="inline-flex min-h-6 items-center rounded-sm font-medium underline-offset-4 hover:underline">
                         {p.name}
                       </Link>
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>

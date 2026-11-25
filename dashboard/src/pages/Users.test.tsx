@@ -157,6 +157,7 @@ describe('removing a dashboard user (SDD §12, §13.1)', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Remove user' }));
     expect(await screen.findByText('User ext.auditor removed.')).toBeInTheDocument();
     await waitFor(() => expect(within(list).queryByRole('listitem', { name: 'ext.auditor' })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: 'Dashboard users' })).toHaveFocus();
     await expect(createTestClient(view.server, created.token).get('/me')).rejects.toMatchObject({ status: 401 });
     expect(view.server.events.find((e) => e.kind === 'user.deleted')).toMatchObject({ kind: 'user.deleted', actor: 'rina', data: { name: 'ext.auditor', role: 'viewer' } });
   });

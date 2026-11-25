@@ -160,8 +160,8 @@ export function PlanNotificationsPanel({ planId }: { planId: string }) {
   const rows = own.data && all.data ? [...own.data, ...all.data.filter((sub) => sub.plan_id === null)] : null;
   const loadError = own.error ?? all.error;
   return (
-    <Panel title="Notifications" description="The channels that follow this plan, for their topics. Adding or removing one leaves the plan as it is.">
-      <p role="status" className="mb-2 flex items-start gap-2 text-sm text-status-success empty:hidden">
+    <Panel id="plan-notifications" title="Notifications" description="The channels that follow this plan, for their topics.">
+      <p role="status" className="mb-2 flex items-start gap-2 text-sm text-status-success empty:sr-only">
         {announcement && <><CircleCheck aria-hidden className="mt-0.5 size-4 shrink-0" />{announcement}</>}
       </p>
       {(own.isPending || all.isPending) && <LoadingBlock label="Loading subscriptions…" rows={2} />}

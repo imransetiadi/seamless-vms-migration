@@ -69,6 +69,7 @@ const PLAN_SECTIONS = [
   ['plan-waves', 'Waves'],
   ['plan-migrations', 'Migrations'],
   ['plan-findings', 'Findings'],
+  ['plan-notifications', 'Notifications'],
 ] as const;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
@@ -229,7 +230,7 @@ function SettingsSummary({
               .map(([k, v]) => `${k}=${formatOverride(k, v)}`)
               .join(' · ')}
           </span>
-          <span className="block text-xs text-muted-foreground">Replace the planning defaults for this plan (SDD §9.1)</span>
+          <span className="block text-xs text-muted-foreground">Override the planning defaults for this plan</span>
         </Setting>
       )}
       <Setting label="Storage handover">
@@ -528,7 +529,7 @@ export default function PlanDetail() {
       <SectionNav label="Plan sections" sections={PLAN_SECTIONS} />
 
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
-      <section id="plan-metrics" tabIndex={-1} aria-label="Plan metrics" className="mb-4 grid scroll-mt-20 grid-cols-2 gap-3 outline-offset-2 focus:outline-2 focus:outline-ring md:grid-cols-4 2xl:grid-cols-7">
+      <section id="plan-metrics" tabIndex={-1} aria-label="Plan metrics" className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,max(40%,8rem)),1fr))] gap-3 outline-offset-2 focus:outline-2 focus:outline-ring md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
         <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
         {/* Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19) */}
@@ -600,7 +601,7 @@ export default function PlanDetail() {
           )}
         </Panel>
 
-        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-offset-2 focus:outline-2 focus:outline-ring">
+        <section id="plan-findings" tabIndex={-1} className="outline-offset-2 focus:outline-2 focus:outline-ring">
           <Panel
             title="Findings"
             description={

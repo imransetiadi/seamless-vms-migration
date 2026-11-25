@@ -343,7 +343,7 @@ export default function Advisor() {
         </div>
       </div>
       {/* what each decision type sends, below the feed it explains (SDD §13.4, §16) */}
-      <div id="advisor-data" tabIndex={-1} className="mt-4 scroll-mt-20">
+      <div id="advisor-data" tabIndex={-1} className="mt-4">
         <DataSentPanel />
       </div>
     </>
