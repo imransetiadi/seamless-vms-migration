@@ -40,7 +40,7 @@ services:
   # ---------------------------------------------------------------------------------------------
   postgres:
     <<: *service-defaults
-    # pinned by digest (Security.md §12); Dependabot (docker, deploy/compose) proposes updates
+    # pinned by digest (Security.md §12); bump the digest by hand in a reviewed PR
     image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_DB: seamless
