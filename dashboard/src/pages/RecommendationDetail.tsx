@@ -188,7 +188,7 @@ function InputTab({ rec }: { rec: AdvisorRecommendation }) {
           </>
         )}
       </p>
-      <p className="text-xs text-muted-foreground">Redacted before it was stored: passwords, tokens and keys are removed (SDD §13.4).</p>
+      <p className="text-xs text-muted-foreground">Passwords, tokens and keys were removed before this snapshot was saved.</p>
       <pre role="region" aria-label="Input snapshot JSON" tabIndex={0} className="max-h-[28rem] overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words text-foreground">
         <code>{JSON.stringify(s.payload, null, 2)}</code>
       </pre>

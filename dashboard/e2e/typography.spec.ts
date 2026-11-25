@@ -82,6 +82,19 @@ test('200% text keeps dashboard actions and status labels inside the viewport', 
   }
 });
 
+test('event rows fit a short landscape viewport with enlarged text', async ({ page }) => {
+  await page.setViewportSize({ width: 740, height: 360 });
+  await signIn(page);
+  await page.goto('/events');
+  const heading = page.getByRole('heading', { name: 'Events', exact: true });
+  const row = page.getByRole('list', { name: 'Events, newest first' }).getByRole('listitem').first();
+  await expect(row).toBeVisible();
+  await page.addStyleTag({ content: 'html { font-size: 200%; }' });
+  await expect(heading).toHaveCSS('font-size', '40px');
+  await expect.poll(() => row.evaluate((item) => getComputedStyle(item).gridTemplateColumns.split(' ').length)).toBe(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+});
+
 // the label/value lists that gave their labels an auto column: at 320px with 200% text the label took its whole
 // width and left the value a few pixels (the design pass's measurements: 11, 51 and 55 px), as the Ceph summary did
 for (const place of [

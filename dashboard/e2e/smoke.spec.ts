@@ -256,6 +256,25 @@ for (const width of [320, 375]) {
   });
 }
 
+test('overview controls include their visible names and plan links have compact touch targets', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page);
+  const metrics = page.getByRole('region', { name: 'Key metrics' });
+  await expect(metrics.getByRole('button').first()).toBeVisible();
+  await page.addScriptTag({ content: AXE });
+  const failures = await metrics.evaluate(async (region) => {
+    const axe = (window as unknown as { axe: { run: (context: Element, options: object) => Promise<{ violations: Array<{ nodes: Array<{ target: string[] }> }> }> } }).axe;
+    const result = await axe.run(region, { runOnly: { type: 'rule', values: ['label-content-name-mismatch'] } });
+    return result.violations.flatMap((v) => v.nodes.map((n) => n.target.join(' ')));
+  });
+  expect(failures).toEqual([]);
+
+  await page.goto('/plans');
+  const plan = page.getByRole('link', { name: 'VMware exit — ERP', exact: true });
+  await expect(plan).toBeVisible();
+  expect((await plan.boundingBox())!.height).toBeGreaterThanOrEqual(24);
+});
+
 test('the error summaries of the plan, policy and provider dialogs keep their links 24 px or spaced (WCAG 2.5.8)', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await signIn(page, 'admin');

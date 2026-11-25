@@ -39,7 +39,6 @@ import { useHashLanding } from '../lib/useHashLanding';
 import { attentionItems, type AttentionItem } from '../lib/attention';
 import { cn } from '../lib/cn';
 import { buttonClassName } from '../lib/buttonStyles';
-import { phaseMeta } from '../lib/phase';
 import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
@@ -375,9 +374,7 @@ export default function Overview() {
   const phaseMetric = (phase: Phase, count: number) => {
     const value = formatNumber(count);
     if (!count || !migrationsQuery.data || stats.isPlaceholderData) return { value };
-    const action = phase === 'completed' ? 'View migrations awaiting finalize' : `View ${phaseMeta(phase).label.toLowerCase()} migrations`;
     return { value, inspect: {
-      label: `${action} (${value})`,
       id: `overview-metric-${phase}`,
       onClick: () => setFinderPhase(phase),
     } };
@@ -494,7 +491,7 @@ export default function Overview() {
         )}
       </div>
 
-      <h2 id="performance" tabIndex={-1} className="mt-6 mb-3 scroll-mt-20 rounded-sm text-lg font-semibold">Performance</h2>
+      <h2 id="performance" tabIndex={-1} className="mt-6 mb-3 rounded-sm text-lg font-semibold">Performance</h2>
       {!s ? (
         statsUnknown ? (
           <MetricStrip
