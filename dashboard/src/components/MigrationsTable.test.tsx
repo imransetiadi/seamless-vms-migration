@@ -112,6 +112,20 @@ describe('MigrationsTable', () => {
     expect(screen.getByRole('status')).toHaveTextContent(`Showing 3 of ${migrations.length} migrations`);
   });
 
+  it('keeps the selected phase visible after a live update moves the last matching VM', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { rerender } = renderTable();
+    await user.selectOptions(screen.getByLabelText('Phase'), 'blocked');
+    expect(rowNames()).toEqual(['gpu-render-01']);
+
+    const updated = migrations.map((migration): Migration => migration.phase === 'blocked' ? { ...migration, phase: 'ready' } : migration);
+    rerender(<MemoryRouter><MigrationsTable migrations={updated} plan={plan} /></MemoryRouter>);
+    expect(screen.getByLabelText('Phase')).toHaveValue('blocked');
+    expect(screen.getByText('No migrations match these filters')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(rows()).toHaveLength(updated.length);
+  });
+
   it('summarises findings by severity in words, not colour', () => {
     renderTable();
     expect(rowFor('gpu-render-01')).toHaveTextContent('1 blocker');

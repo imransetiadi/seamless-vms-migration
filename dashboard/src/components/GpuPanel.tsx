@@ -72,7 +72,7 @@ export function GpuPanel({ migration: m, plan, source, destination }: { migratio
   ];
   const wait = m.gpu_wait;
   return (
-    <Panel title="GPU" description="Its GPUs, the GPU flavor its plan maps them to, and what the validation and the verification found (SDD §22)" actions={<TechPreviewBadge />}>
+    <Panel title="GPU" description="GPU devices, destination flavor mappings, and validation and verification results." actions={<TechPreviewBadge />}>
       <div className="flex flex-col gap-3">
         {wait && (
           // the source keeps running while the cutover waits (SDD §5.4 rule 5, §22.7): announced from the page's region

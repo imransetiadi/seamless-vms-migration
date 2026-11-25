@@ -13,6 +13,7 @@ import {
 } from '../api/types';
 import { DECISION_TYPE_LABELS } from '../lib/advisor';
 import { providerLabel } from '../lib/providerUse';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 import { Button } from './Button';
 import { Checkbox } from './Checkbox';
 import { ErrorBanner } from './ErrorBanner';
@@ -134,6 +135,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
   const plans = usePlans();
   const nameRef = useRef<HTMLInputElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const [form, setForm] = useState<FormState>(() => formOf(policy, defaultThreshold));
   const [errors, setErrors] = useState<Errors>({});
 
@@ -177,7 +179,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
     const { errors: found, spec } = validate(form);
     setErrors(found);
     if (!spec) {
-      requestAnimationFrame(() => summaryRef.current?.focus());
+      focusAfterRender(() => summaryRef.current);
       return;
     }
     save.mutate(

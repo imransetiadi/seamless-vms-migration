@@ -118,6 +118,38 @@ test('one-time token requires acknowledgement and warns before navigation', asyn
   await expect(page.getByText('browser-audit-user', { exact: true })).toBeVisible();
 });
 
+test('an unsaved user draft survives navigation, and Enter retains focus during creation', async ({ page, server }) => {
+  expect(server.health.auth_disabled).toBe(false);
+  await page.goto('/users');
+  const name = page.getByLabel('User name');
+  const role = page.getByLabel('Role', { exact: true });
+  await name.fill('draft.operator');
+  await role.selectOption('operator');
+  const overview = page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Overview', exact: true });
+  await overview.click();
+  const discard = page.getByRole('alertdialog', { name: 'Discard unsaved changes?' });
+  await expect(discard).toBeVisible();
+  await discard.getByRole('button', { name: 'Keep editing' }).click();
+  await expect(name).toHaveValue('draft.operator');
+  await expect(role).toHaveValue('operator');
+
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => { finish = resolve; });
+  await page.route('**/api/v1/users', async (route) => {
+    if (route.request().method() === 'POST') await pending;
+    await route.fallback();
+  });
+  try {
+    await name.press('Enter');
+    const submit = page.getByRole('button', { name: 'Add user', exact: true });
+    await expect(submit).toHaveAttribute('aria-busy', 'true');
+    await expect(submit).toBeFocused();
+  } finally {
+    finish();
+  }
+  await expect(page.getByLabel('New user API token')).toBeFocused();
+});
+
 test('older recommendation audit events remain reachable beyond the newest thousand', async ({ page, server }) => {
   const rec = server.recommendations.find((item) => item.id === 'rec-d4e6f8a09001')!;
   const expected = server.events.filter((event) => event.data.target_id === rec.id);
@@ -143,11 +175,14 @@ test('investigation filters, sort and Pause survive navigation and Back', async 
   await migrations.fill('analytics-node-1');
   await page.getByRole('columnheader', { name: /^VM/ }).getByRole('button').click();
   const migrationSort = await page.getByRole('columnheader', { name: /^VM/ }).getAttribute('aria-sort');
-  await page.getByRole('table', { name: /^Migrations in/ }).getByRole('link', { name: 'analytics-node-1', exact: true }).click();
+  const migration = page.getByRole('table', { name: /^Migrations in/ }).getByRole('link', { name: 'analytics-node-1', exact: true });
+  await migration.click();
   await expect(page.getByRole('heading', { name: 'analytics-node-1', exact: true })).toBeVisible();
   await page.goBack();
   await expect(migrations).toHaveValue('analytics-node-1');
   await expect(page.getByRole('columnheader', { name: /^VM/ })).toHaveAttribute('aria-sort', migrationSort!);
+  await expect(migration).toBeFocused();
+  await expect(migration).toBeInViewport();
   for (const [path, label, value] of [
     ['/inventory/rhosp17-dc1', 'Search VMs', 'web-01'],
     ['/events', 'Search events', 'web-01'],

@@ -15,6 +15,7 @@ import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { ROLE_LABELS } from '../lib/roles';
 import { usePageTitle } from '../lib/usePageTitle';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 
 const ROLE_HELP: Record<Role, string> = {
   viewer: 'View dashboard data without changing it.',
@@ -34,15 +35,18 @@ export default function Users() {
   const [removing, setRemoving] = useState<{ name: string; role: Role } | null>(null);
   const [removed, setRemoved] = useState('');
   const removeReturnRef = useRef<HTMLElement | null>(null);
-  const listRef = useRef<HTMLUListElement>(null);
+  const listHeadingRef = useRef<HTMLHeadingElement>(null);
   const [name, setName] = useState('');
   const [role, setRole] = useState<Role>('viewer');
   const [copyStatus, setCopyStatus] = useState('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const tokenId = 'new-user-token';
   const created = create.data;
+  const unsavedToken = Boolean(created) && !acknowledged;
+  const dirtyDraft = !created && (name !== '' || role !== 'viewer');
   const disabledReason = !canManage
     ? 'Adding users requires the admin role.'
     : health.data?.auth_disabled === false
@@ -55,9 +59,10 @@ export default function Users() {
     if (created) document.getElementById(tokenId)?.focus();
   }, [created]);
 
-  function submit(event: FormEvent) {
+  function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (disabledReason || create.isPending || created) return;
+    event.currentTarget.querySelector<HTMLButtonElement>('button[type="submit"]')?.focus({ preventScroll: true });
     setCopyStatus('');
     setNameError(null);
     setAcknowledged(false);
@@ -65,7 +70,7 @@ export default function Users() {
       onError: (error) => {
         if (error instanceof ApiError && (error.status === 409 || error.status === 422)) {
           setNameError(error.message);
-          requestAnimationFrame(() => nameRef.current?.focus());
+          focusAfterRender(() => nameRef.current);
         }
       },
     });
@@ -74,11 +79,11 @@ export default function Users() {
   return (
     <>
       <UnsavedChangesGuard
-        dirty={create.isPending || (Boolean(created) && !acknowledged)}
+        dirty={create.isPending || dirtyDraft || unsavedToken}
         pending={create.isPending}
-        title="Leave without saving this token?"
-        description="This token cannot be shown again. Save it before leaving. If lost, ask your server administrator to provision a new credential under a different name with seamless token create."
-        confirmLabel="Leave and lose token"
+        title={unsavedToken ? 'Leave without saving this token?' : undefined}
+        description={unsavedToken ? 'This token cannot be shown again. To replace a lost token, remove this user and add them again.' : undefined}
+        confirmLabel={unsavedToken ? 'Leave and lose token' : undefined}
       />
       <PageHeader title="Users" description="Give each person their own dashboard access and role. Their name identifies their actions in Events." />
       {!canManage ? (
@@ -106,7 +111,7 @@ export default function Users() {
                     setName('');
                     setRole('viewer');
                     setCopyStatus('');
-                    requestAnimationFrame(() => nameRef.current?.focus());
+                    focusAfterRender(() => nameRef.current);
                   }}>Done</Button>
                 </div>
                 <p role="status" className="text-sm">{copyStatus}</p>
@@ -123,11 +128,11 @@ export default function Users() {
               </form>
             )}
           </Panel>
-          <Panel title="Dashboard users" description="Includes users configured by the server administrator.">
+          <Panel title="Dashboard users" headingRef={listHeadingRef} description="Includes users configured by the server administrator.">
             {users.isPending && <LoadingBlock label="Loading users" rows={3} />}
             {users.error && <ErrorBanner error={users.error} title="Users are unavailable" onRetry={() => void users.refetch()} />}
             {users.data && (users.data.length ? (
-              <ul ref={listRef} tabIndex={-1} aria-label="Dashboard users" className="divide-y divide-border focus:outline-none">
+              <ul aria-label="Dashboard users" className="divide-y divide-border">
                 {users.data.map((user, index) => {
                   const own = me.data?.name?.toLowerCase() === user.name.toLowerCase();
                   return (
@@ -155,7 +160,7 @@ export default function Users() {
                 })}
               </ul>
             ) : <p className="text-sm text-muted-foreground">No dashboard users configured.</p>)}
-            <p role="status" className="text-sm text-status-success empty:hidden">{removed}</p>
+            <p role="status" className="text-sm text-status-success empty:sr-only">{removed}</p>
           </Panel>
         </div>
       )}
@@ -163,7 +168,7 @@ export default function Users() {
         open={removing !== null}
         title={`Remove user ${removing?.name ?? ''}?`}
         subject={removing ? `User ${removing.name} (${ROLE_LABELS[removing.role]})` : undefined}
-        description="Their token stops working at once and cannot be restored; add the user again to give new access. A user configured in the server's tokens file is removed there by the server administrator."
+        description="Their token stops working at once. To give them access again, add the user and share the new token. Accounts managed in the server’s tokens file must be removed there."
         confirmLabel="Remove user"
         tone="danger"
         icon={Trash2}
@@ -175,7 +180,7 @@ export default function Users() {
           if (!removing) return;
           remove.mutate(removing.name, {
             onSuccess: () => {
-              removeReturnRef.current = listRef.current;
+              removeReturnRef.current = listHeadingRef.current;
               setRemoved(`User ${removing.name} removed.`);
               setRemoving(null);
             },

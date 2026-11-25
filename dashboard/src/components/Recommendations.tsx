@@ -92,7 +92,7 @@ function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorReco
         <time dateTime={rec.created_at} title={formatDateTime(rec.created_at)} className="text-muted-foreground">
           {formatRelative(rec.created_at)}
         </time>
-        <Link ref={detailsRef} to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
+        <Link ref={detailsRef} to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} id={`recommendation-result-${rec.id}`} data-return-focus className="ml-auto underline underline-offset-4">
           Details <span className="sr-only">for {rec.subject.name}</span>
         </Link>
       </div>

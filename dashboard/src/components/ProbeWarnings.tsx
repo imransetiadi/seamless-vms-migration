@@ -54,7 +54,7 @@ export function ProbeWarnings({ plan, migrations, edit, onSaved, focusAfterRef }
   };
   const count = missing.length;
   return (
-    <Panel title="Application probes" description="Verification checks only the boot of a VM without one (SDD §7.5)">
+    <Panel title="Application probes" description="Without an application probe, verification only checks that the VM boots.">
       <div className="flex flex-col gap-3">
         <p className="flex items-start gap-2 text-sm text-foreground">
           <ShieldQuestion aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />

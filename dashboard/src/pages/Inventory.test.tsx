@@ -33,10 +33,15 @@ describe('Inventory', () => {
     expect(within(screen.getByRole('row', { name: /app-billing-01/ })).getByRole('checkbox')).toBeChecked();
   });
   it('shows one recovery message for a missing provider', async () => {
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Inventory />, { route: '/inventory/not-found', path: '/inventory/:providerId' });
     expect(await screen.findByText('Provider not-found does not exist')).toBeInTheDocument();
     expect(screen.queryByText(/^Cannot read the inventory/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    const provider = screen.getByLabelText('Provider');
+    expect(provider).toHaveValue('not-found');
+    await user.selectOptions(provider, 'rhosp17-dc1');
+    expect(await screen.findByRole('table', { name: /^VMs on RHOSP/ })).toBeInTheDocument();
   });
   it('keeps a failed inventory said, with Retry busy and focused, while it is read again (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });

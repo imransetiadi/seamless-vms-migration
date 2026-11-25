@@ -83,7 +83,12 @@ names need `min-w-0` and `wrap-anywhere`. `card` provides intrinsic shrinkage an
 - `ScrollRegion` labels tables without focusable content and permits keyboard scrolling.
 - `ErrorBanner` supports retry for transient failure. A missing entity needs navigation recovery.
 - `EmptyState` distinguishes no data from filters with no matches. List views preserve filters and
-  sort when returning from details. Dialog-only selectors keep their state local.
+  sort when returning from details. Browser Back can restore focus to the result that opened a detail.
+  Inventory keeps focus in its provider picker and scopes VM filters and selection to the inventory
+  credential. Dialog-only selectors keep their state local.
+- The mobile header and `SectionNav` use their rendered heights to keep focus and fragment targets
+  visible when labels wrap or text is enlarged. Both scroll with the page on short viewports. The
+  migration lifecycle reduces its column count as its available space narrows.
 
 ## Cards and page headers
 

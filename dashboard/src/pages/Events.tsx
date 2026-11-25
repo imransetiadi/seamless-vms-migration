@@ -112,7 +112,7 @@ function byNewest(a: Item, b: Item): number {
 const EventRow = memo(function EventRow({ event, planName }: { event: Event; planName: string | undefined }) {
   const meta = kindMeta(event.kind);
   return (
-    <li className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
+    <li className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 @min-[36rem]/events:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] @min-[36rem]/events:gap-3">
       <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
         {formatTime(event.ts)}
         <span className="block text-xs">{formatDateTime(event.ts).slice(0, 10)}</span>
@@ -126,12 +126,12 @@ const EventRow = memo(function EventRow({ event, planName }: { event: Event; pla
         <p className="flex flex-wrap gap-2 text-xs text-muted-foreground">
           <span>by {event.actor}</span>
           {event.plan_id && (
-            <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
+            <Link to={`/plans/${event.plan_id}`} id={event.seq > 0 ? `event-plan-${event.seq}` : undefined} data-return-focus className="underline underline-offset-4">
               {planName ?? event.plan_id}
             </Link>
           )}
           {event.migration_id && (
-            <Link to={`/migrations/${event.migration_id}`} className="font-mono underline underline-offset-4">
+            <Link to={`/migrations/${event.migration_id}`} id={event.seq > 0 ? `event-migration-${event.seq}` : undefined} data-return-focus className="font-mono underline underline-offset-4">
               {event.migration_id}
             </Link>
           )}
@@ -272,8 +272,15 @@ export default function Events() {
   // button as Show older events, so the focus stays on it
   const moreRef = useRef<HTMLButtonElement>(null);
   const restoreAfterLoad = useRef(false);
-  const [loadingOlder, setLoadingOlder] = useState(false);
-  const [olderError, setOlderError] = useState<unknown>(null);
+  const olderRun = useRef<AbortController | null>(null);
+  const [olderLoad, setOlderLoad] = useState<{ planId: string; pending: boolean; error: unknown }>({ planId, pending: false, error: null });
+  if (olderLoad.planId !== planId) setOlderLoad({ planId, pending: false, error: null });
+  const { pending: loadingOlder, error: olderError } = olderLoad;
+  useLayoutEffect(() => () => {
+    olderRun.current?.abort();
+    olderRun.current = null;
+    restoreAfterLoad.current = false;
+  }, [planId]);
   const canLoadOlder = Boolean(history.data) && (older.planId === planId ? older.more : (history.data?.length ?? 0) >= HISTORY);
   const showMore = filtered.length > limit || canLoadOlder;
   useLayoutEffect(() => {
@@ -283,12 +290,15 @@ export default function Events() {
     if (!showMore && document.activeElement === document.body) (listRef.current ?? searchRef.current)?.focus();
   }, [loadingOlder, showMore]);
   const loadOlder = async () => {
+    if (olderRun.current) return;
     const oldest = [...olderItems, ...historyItems].reduce((min, { event }) => (event.seq > 0 ? Math.min(min, event.seq) : min), Infinity);
     if (!Number.isFinite(oldest)) return;
-    setLoadingOlder(true);
-    setOlderError(null);
+    const run = new AbortController();
+    olderRun.current = run;
+    setOlderLoad({ planId, pending: true, error: null });
     try {
-      const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
+      const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY, run.signal);
+      if (run.signal.aborted) return;
       restoreAfterLoad.current = document.activeElement === moreRef.current;
       const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
       // the history it was read below stays loaded too: when the newest history is read again, its window moves up
@@ -296,10 +306,11 @@ export default function Events() {
       setOlder((prev) => ({ planId, items: [...pageItems, ...(prev.planId === planId ? prev.items : []), ...historyItems], more: page.length >= HISTORY }));
       setLimit((n) => n + PAGE);
       setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
+      setOlderLoad({ planId, pending: false, error: null });
     } catch (error) {
-      setOlderError(error);
+      if (!run.signal.aborted) setOlderLoad({ planId, pending: false, error });
     } finally {
-      setLoadingOlder(false);
+      if (olderRun.current === run) olderRun.current = null;
     }
   };
   const [exported, setExported] = useState<number | null>(null);
@@ -483,7 +494,7 @@ export default function Events() {
             Showing {formatNumber(Math.min(filtered.length, limit))} of {formatNumber(filtered.length)} {filtersActive ? 'matching' : 'loaded'} events
             {canLoadOlder && ' · Older events available'}
           </p>
-          <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
+          <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card @container/events divide-y divide-border outline-hidden">
             {filtered.slice(0, limit).map(({ key, event }) => (
               <EventRow key={key} event={event} planName={event.plan_id ? planNames.get(event.plan_id) : undefined} />
             ))}

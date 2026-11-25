@@ -25,7 +25,7 @@ export function Panel({ title, description, actions, children, className, bodyCl
       id={id}
       tabIndex={id ? -1 : undefined}
       aria-labelledby={headingId}
-      className={cn('card flex min-w-0 flex-col', id && 'scroll-mt-20 outline-offset-2 focus:outline-2 focus:outline-ring', className)}
+      className={cn('card flex min-w-0 flex-col', id && 'outline-offset-2 focus:outline-2 focus:outline-ring', className)}
     >
       <div className="flex flex-wrap items-start justify-between gap-3 rounded-t-xl border-b border-border bg-muted/20 px-4 py-3">
         <div className="min-w-0">

@@ -48,6 +48,23 @@ describe('dashboard user access', () => {
     expect(login.queryClient.getQueryData(queryKeys.me)).toEqual({ ...identity, host_key_checking: true });
   });
 
+  it('returns the focus to the name after Done even when a frame runs before the form is drawn again (SDD §16)', async () => {
+    // a busy machine can run the next frame before React commits: the focus must follow the commit
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    const user = userEvent.setup({ delay: null });
+    renderUsers();
+    await screen.findByText('rina');
+    await user.type(screen.getByLabelText(/user name/i), 'busy.operator');
+    await user.click(screen.getByRole('button', { name: 'Add user' }));
+    await screen.findByLabelText('New user API token');
+    await user.click(screen.getByLabelText('I have saved this token securely'));
+    await user.click(screen.getByRole('button', { name: 'Done' }));
+    await waitFor(() => expect(screen.getByLabelText(/user name/i)).toHaveFocus());
+  });
+
   it('keeps token selectable when clipboard access fails', async () => {
     const user = userEvent.setup();
     renderUsers();
@@ -157,6 +174,7 @@ describe('removing a dashboard user (SDD §12, §13.1)', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Remove user' }));
     expect(await screen.findByText('User ext.auditor removed.')).toBeInTheDocument();
     await waitFor(() => expect(within(list).queryByRole('listitem', { name: 'ext.auditor' })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: 'Dashboard users' })).toHaveFocus();
     await expect(createTestClient(view.server, created.token).get('/me')).rejects.toMatchObject({ status: 401 });
     expect(view.server.events.find((e) => e.kind === 'user.deleted')).toMatchObject({ kind: 'user.deleted', actor: 'rina', data: { name: 'ext.auditor', role: 'viewer' } });
   });

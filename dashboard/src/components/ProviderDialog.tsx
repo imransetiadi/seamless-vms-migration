@@ -12,6 +12,7 @@ import { inventoryGpuFlavors, sameVgpuProfiles, vgpuProfileErrors, vgpuProfileMa
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
 import { isBlank, providerLabel } from '../lib/providerUse';
 import { providerStatusMeta } from '../lib/status';
+import { useFocusAfterRender } from '../lib/useFocusAfterRender';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
@@ -524,6 +525,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const summaryRef = useRef<HTMLDivElement>(null);
   // the dialog swaps its content in place: the focus follows to the new step (SDD §16)
   const outcomeRef = useRef<HTMLHeadingElement>(null);
+  const focusAfterRender = useFocusAfterRender();
   const [form, setForm] = useState<FormState>(() => initialState(provider));
   const [baseline, setBaseline] = useState(() => JSON.stringify(initialState(provider)));
   const [errors, setErrors] = useState<Errors>({});
@@ -723,7 +725,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setFailure(null);
     if (Object.keys(found).length) {
       if (['hostName', 'hostAddress', 'hostKeys', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
-      requestAnimationFrame(() => summaryRef.current?.focus());
+      focusAfterRender(() => summaryRef.current);
       return;
     }
     setBusy(true);
@@ -783,7 +785,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         saved = keep(await check.mutateAsync(saved.id));
         setBaseline(JSON.stringify(form));
         setOutcome({ provider: saved, checked: true });
-        requestAnimationFrame(() => outcomeRef.current?.focus());
+        focusAfterRender(() => outcomeRef.current);
       } else {
         onSaved?.(saved, `${providerLabel(saved)} ${provider ? 'saved' : 'added'}.`);
         onClose();
@@ -845,7 +847,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 variant="secondary"
                 onClick={() => {
                   setOutcome(null);
-                  requestAnimationFrame(() => nameRef.current?.focus());
+                  focusAfterRender(() => nameRef.current);
                 }}
               >
                 Edit again
@@ -904,7 +906,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                           return;
                         }
                         setHostOpen(true);
-                        requestAnimationFrame(() => document.getElementById(id(key))?.focus());
+                        focusAfterRender(() => document.getElementById(id(key)));
                       }}
                     >
                       {message}

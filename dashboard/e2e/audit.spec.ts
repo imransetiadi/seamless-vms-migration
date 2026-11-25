@@ -190,6 +190,76 @@ test('compact navigation keeps identity, role and demo context visible', async (
   }
 });
 
+test('switching inventory provider keeps the same focused picker', async ({ page }) => {
+  await signIn(page, '/inventory/rhosp17-dc1');
+  const provider = page.getByRole('combobox', { name: 'Provider', exact: true });
+  await expect(page.getByRole('table', { name: /^VMs on RHOSP/ })).toBeVisible();
+  await provider.focus();
+  await provider.selectOption('vcenter-hq');
+  await expect(page.getByRole('table', { name: /^VMs on vCenter/ })).toBeVisible();
+  await expect(provider).toBeFocused();
+});
+
+test('switching inventory credentials starts a new VM selection and filter scope', async ({ page }) => {
+  await signIn(page, '/inventory/rhosp17-dc1');
+  const search = page.getByLabel('Search VMs');
+  const credential = page.getByRole('combobox', { name: 'Project credential', exact: true });
+  await search.fill('web-01');
+  await page.getByRole('checkbox', { name: 'Select web-01', exact: true }).check();
+  await page.getByRole('checkbox', { name: 'Selected only', exact: true }).check();
+  await credential.focus();
+  await credential.selectOption('5f0c3a9e2b7d41c8a6e9d2f1b3c4a5e6');
+  await expect(search).toHaveValue('');
+  await expect(page.getByRole('checkbox', { name: 'Select web-01', exact: true })).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Create plan', exact: true })).toHaveAttribute('aria-disabled', 'true');
+  await expect(credential).toBeFocused();
+});
+
+test('changing from mobile to desktop closes the navigation drawer', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, '/plans');
+  await page.getByRole('button', { name: 'Open navigation' }).click();
+  await expect(page.getByRole('dialog', { name: 'Navigation' })).toBeVisible();
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await expect(page.getByRole('dialog', { name: 'Navigation' })).toBeHidden();
+  await expect(page.getByRole('link', { name: 'Plans', exact: true }).first()).toBeFocused();
+  await expect(page.locator('#root')).not.toHaveAttribute('inert');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole('button', { name: 'Open navigation' })).toHaveAttribute('aria-expanded', 'false');
+});
+
+test('the mobile header leaves section links and their targets clear at 200% text', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await signIn(page, '/migrations/mig-5d7e2b4a12');
+  const header = page.getByRole('banner');
+  const sections = page.getByRole('navigation', { name: 'Migration sections' });
+  for (const size of ['100%', '200%']) {
+    await page.evaluate(async (fontSize) => {
+      document.documentElement.style.fontSize = fontSize;
+      await document.fonts.ready;
+      const nav = document.querySelector('.section-nav')!;
+      window.scrollTo(0, scrollY + nav.getBoundingClientRect().top + 150);
+    }, size);
+    await expect.poll(async () => (await header.boundingBox())!.height).toBeLessThanOrEqual(size === '100%' ? 72 : 200);
+    await expect.poll(async () => {
+      const box = (await header.boundingBox())!;
+      return (await sections.boundingBox())!.y - box.y - box.height;
+    }).toBeGreaterThanOrEqual(-1);
+    await expect.poll(() => sections.evaluate((nav) => parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) - nav.getBoundingClientRect().bottom)).toBeGreaterThanOrEqual(0);
+    await sections.getByRole('link', { name: 'Progress', exact: true }).press('Enter');
+    const progress = page.getByRole('region', { name: 'Lifecycle', exact: true });
+    await expect(progress).toBeFocused();
+    const nav = (await sections.boundingBox())!;
+    expect((await progress.boundingBox())!.y).toBeGreaterThanOrEqual(nav.y + nav.height - 1);
+    const columns = await progress.getByRole('list', { name: 'Migration lifecycle' }).evaluate((list) => getComputedStyle(list).gridTemplateColumns.split(' ').length);
+    expect(columns).toBe(size === '100%' ? 2 : 1);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);
+  }
+  await page.setViewportSize({ width: 740, height: 360 });
+  await expect(header).toHaveCSS('position', 'static');
+  await expect(sections).toHaveCSS('position', 'static');
+});
+
 for (const width of [320, 1440]) {
   test(`activity filters recover empty results without losing focus at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
