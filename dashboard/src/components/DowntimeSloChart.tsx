@@ -129,7 +129,7 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
                 axisLine={false}
                 tickLine={false}
               />
-              <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
+              <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35, stroke: 'none' }} isAnimationActive={false} />
               {sloS !== null && (
                 <ReferenceLine
                   x={sloS}

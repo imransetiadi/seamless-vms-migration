@@ -247,7 +247,7 @@ export function SyncPassChart({
                   tickLine={false}
                   width={96}
                 />
-                <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35 }} isAnimationActive={false} />
+                <Tooltip content={renderTooltip} cursor={{ fill: colors.grid, fillOpacity: 0.35, stroke: 'none' }} isAnimationActive={false} />
                 {showThreshold && (
                   <ReferenceLine
                     y={thresholdBytes}
