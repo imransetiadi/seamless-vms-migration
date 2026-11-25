@@ -40,7 +40,7 @@ export default defineConfig({
     sourcemap: false,
     rolldownOptions: {
       output: {
-        // Framework code in `vendor` (needed at start); Recharts and its d3/lodash dependencies in `charts`, loaded
+        // Framework code in `vendor` (needed at start); Recharts 3 and its dependencies (Redux Toolkit, d3) in `charts`, loaded
         // only with the pages that draw charts. A group also takes the dependencies of what it captures, so
         // `vendor` goes first (higher priority) and keeps React: otherwise `charts` took React in through Recharts
         // and the entry preloaded every chart library. `scripts/check-bundle.mjs` (run by `npm run build`) fails
@@ -54,7 +54,7 @@ export default defineConfig({
             },
             {
               name: 'charts',
-              test: /node_modules[\\/](recharts|recharts-scale|react-smooth|react-is|react-transition-group|dom-helpers|victory-vendor|d3-[^\\/]+|internmap|lodash|decimal\.js-light|eventemitter3|clsx|tiny-invariant|fast-equals)[\\/]/,
+              test: /node_modules[\\/](recharts|@reduxjs[\\/]toolkit|react-redux|redux|redux-thunk|immer|reselect|es-toolkit|use-sync-external-store|react-is|victory-vendor|d3-[^\\/]+|internmap|decimal\.js-light|eventemitter3|clsx|tiny-invariant)[\\/]/,
               priority: 1,
             },
           ],

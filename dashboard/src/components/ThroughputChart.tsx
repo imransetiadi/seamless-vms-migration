@@ -1,6 +1,6 @@
 import { Activity } from 'lucide-react';
 import { useMemo } from 'react';
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, type TooltipProps } from 'recharts';
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, type TooltipContentProps } from 'recharts';
 import type { ThroughputPoint } from '../api/types';
 import { formatBytes, formatRate, formatTime } from '../lib/format';
 import { niceByteTicks } from '../lib/ticks';
@@ -32,7 +32,7 @@ export function ThroughputChart({ series }: { series: ThroughputPoint[] }) {
   const yTicks = niceByteTicks(peak);
   const yTick = (v: number) => (v === 0 ? '0' : `${formatBytes(v).replace('.0 ', ' ')}/s`);
 
-  const renderTooltip = ({ active, payload, label }: TooltipProps<number, string>) => {
+  const renderTooltip = ({ active, payload, label }: TooltipContentProps) => {
     if (!active || !payload?.length) return null;
     return (
       <ChartTooltipBody
