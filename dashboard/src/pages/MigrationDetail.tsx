@@ -873,7 +873,7 @@ export default function MigrationDetail() {
           <DemoSourcePower key={m.id} migration={m} role={role} />
         </Panel>
 
-        <section id="progress" tabIndex={-1} aria-label="Lifecycle" className="card scroll-mt-20 p-4 outline-hidden focus:outline-2 focus:outline-ring">
+        <section id="progress" tabIndex={-1} aria-label="Lifecycle" className="card p-4 outline-hidden focus:outline-2 focus:outline-ring">
           <PhaseStepper migration={m} />
         </section>
 
@@ -919,10 +919,10 @@ export default function MigrationDetail() {
           </Panel>
         )}
 
-        <Panel id="network" title="Network" description="Where each NIC goes on the destination: the plan's mapping, or this VM's override (SDD §9.3)">
+        <Panel id="network" title="Network" description="Destination network for each interface. VM overrides take precedence over plan mappings.">
           <NetworkPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>
-        <Panel id="verification" title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
+        <Panel id="verification" title="Verification" description="Post-cutover checks and their latest results.">
           <VerificationPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>
         <p role="status" className="sr-only">
@@ -930,7 +930,7 @@ export default function MigrationDetail() {
         </p>
 
         <div className="grid gap-4 xl:grid-cols-2">
-          <Panel id="findings" title="Findings" description="Pre-flight checks (SDD §9.3)">
+          <Panel id="findings" title="Findings" description="Results of the pre-flight checks.">
             <FindingsList
               findings={m.findings}
               emptyText={
@@ -947,18 +947,18 @@ export default function MigrationDetail() {
           </Panel>
         </div>
 
-        <Panel id="estimates" title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
+        <Panel id="estimates" title="Estimates" description="Compare the strategies considered for this VM.">
           <EstimatesPanel m={m} role={role} />
         </Panel>
 
         {/* the short panels stack beside the long timeline instead of leaving half rows empty */}
         <div className="grid items-start gap-4 xl:grid-cols-2">
           <div className="flex min-w-0 flex-col gap-4">
-            <Panel title="Estimate inputs" description="What the downtime estimate rests on; delta passes calibrate it (SDD §9.1)">
+            <Panel title="Estimate inputs" description="The inputs and sync passes used to estimate downtime.">
               <CalibrationPanel migration={m} plan={p} />
             </Panel>
             {hasResolvedMappings(m) && (
-              <Panel title="Resolved mappings" description="Matched automatically by pre-flight; add a plan mapping to override (SDD §9.3)">
+              <Panel title="Resolved mappings" description="Pre-flight matched these automatically. Add a plan mapping to override a match.">
                 <ResolvedMappings migration={m} />
               </Panel>
             )}

@@ -108,7 +108,7 @@ export default function Hooks() {
         meta={<TechPreviewBadge feature="network" />}
       />
       {canManage && (
-        <p role="status" className="mb-3 flex items-start gap-2 text-sm text-status-success empty:hidden">
+        <p role="status" className="mb-3 flex items-start gap-2 text-sm text-status-success empty:sr-only">
           {announcement && <><CircleCheck aria-hidden className="mt-0.5 size-4 shrink-0" />{announcement}</>}
         </p>
       )}

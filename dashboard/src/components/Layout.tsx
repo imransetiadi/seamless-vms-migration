@@ -19,8 +19,8 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { useEffect, useId, useRef, useState } from 'react';
-import { Link, Outlet, useLocation } from 'react-router-dom';
+import { useEffect, useId, useRef, useState, type MouseEvent } from 'react';
+import { Link, Outlet, useLocation, useNavigationType } from 'react-router-dom';
 import { useHealth, useMe, useStats } from '../api/hooks';
 import { useLiveSnapshot, type LiveStatus } from '../api/live';
 import { useSignOut } from '../api/session';
@@ -28,6 +28,7 @@ import type { Health } from '../api/types';
 import { cn } from '../lib/cn';
 import { hashTarget, keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
+import { useScrollOffset } from '../lib/useScrollOffset';
 import { BrandMark } from './BrandMark';
 import { BRAND_DESTINATIONS } from '../lib/platforms';
 import { LiveIndicator } from './LiveIndicator';
@@ -131,14 +132,18 @@ function useNavMode(): [NavMode, () => void] {
   return [mode, toggle];
 }
 
-function Brand({ compact = false }: { compact?: boolean }) {
+function Brand({ compact = false, mobile = false }: { compact?: boolean; mobile?: boolean }) {
   return (
-    <Link to="/" className={cn('flex min-h-11 min-w-0 items-center gap-3 rounded-lg', compact && 'justify-center')}>
-      <BrandMark className="size-8 shrink-0 drop-shadow-sm" />
+    <Link to="/" className={cn(
+      'flex min-w-0 items-center rounded-lg',
+      mobile ? 'min-h-[44px] grow basis-[min(7.5rem,calc(100%_-_44px_-_0.5rem))] gap-2' : 'min-h-11 gap-3',
+      compact && 'justify-center',
+    )}>
+      <BrandMark className="size-[32px] shrink-0 drop-shadow-sm" />
       <span className={cn('flex min-w-0 flex-col wrap-anywhere leading-tight', compact && 'sr-only')}>
         {/* a space of its own between the lines: only CSS sets them apart, and the link's name must not rely on it */}
         <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>{' '}
-        <span className="text-xs text-muted-foreground">to {BRAND_DESTINATIONS}</span>
+        <span className={cn('text-xs text-muted-foreground', mobile && 'sr-only')}>to {BRAND_DESTINATIONS}</span>
       </span>
     </Link>
   );
@@ -445,16 +450,39 @@ function SessionFooter() {
  * below 768 px a drawer from the left behind the header's menu button — and the main region.
  */
 export function Layout() {
-  const { pathname, hash, state } = useLocation();
+  const { key, pathname, hash, state } = useLocation();
+  const navigationType = useNavigationType();
   const [menuOpen, setMenuOpen] = useState(false);
   const [mode, toggleMode] = useNavMode();
   const mainRef = useRef<HTMLElement>(null);
   // where the focus goes when the drawer closes: its button, or the page when the choice was the page already shown
   const drawerReturnRef = useRef<HTMLElement | null>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileHeaderRef = useScrollOffset<HTMLElement>('--mobile-header-height');
+  const columnNavRef = useRef<HTMLElement>(null);
   const drawerTitleId = useId();
   const columnNavId = useId();
   const lastPath = useRef(pathname);
+  const visitedResults = useRef(new Map<string, string>());
+  const visit = `${key}:${pathname}`;
+  const rememberResult = (event: MouseEvent<HTMLElement>) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>('a[data-return-focus]') : null;
+    if (!link?.id || link.pathname === pathname || (link.target && link.target !== '_self')) return;
+    visitedResults.current.set(visit, link.id);
+    if (visitedResults.current.size > 100) visitedResults.current.delete(visitedResults.current.keys().next().value!);
+  };
+  useEffect(() => {
+    if (!menuOpen) return;
+    const desktop = window.matchMedia('(min-width: 768px)');
+    const closeOnDesktop = () => {
+      if (!desktop.matches) return;
+      drawerReturnRef.current = columnNavRef.current?.querySelector<HTMLElement>('[aria-current="page"]') ?? mainRef.current;
+      setMenuOpen(false);
+    };
+    desktop.addEventListener('change', closeOnDesktop);
+    return () => desktop.removeEventListener('change', closeOnDesktop);
+  }, [menuOpen]);
   const closeMenu = () => {
     drawerReturnRef.current = menuButtonRef.current;
     setMenuOpen(false);
@@ -486,12 +514,37 @@ export function Layout() {
     lastPath.current = pathname;
     // a control that switches the view in place (the inventory's Provider select) keeps the focus: moving it on
     // each choice would be a change of context on input (WCAG 3.2.2, SDD §16)
-    if (keepsFocus(state) || mainRef.current?.closest('[inert]')) return;
+    const main = mainRef.current;
+    if (!main || keepsFocus(state) || main.closest('[inert]')) return;
+    const resultId = navigationType === 'POP' && !drawerWasOpen ? visitedResults.current.get(visit) : undefined;
+    const restoreResult = () => {
+      const result = resultId ? document.getElementById(resultId) : null;
+      if (!result || !main.contains(result) || result.closest('[inert]')) return false;
+      result.focus({ preventScroll: true });
+      result.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+      return true;
+    };
+    if (restoreResult()) return;
     const target = hashTarget(hash);
     if (target && document.activeElement === target) return;
-    if (!drawerWasOpen) mainRef.current?.focus({ preventScroll: true });
+    if (!drawerWasOpen) main.focus({ preventScroll: true });
     window.scrollTo(0, 0);
-  }, [pathname, hash, state, drawerWasOpen]);
+    if (!resultId) return;
+    // The result may return with a delayed query. Cancel as soon as the user starts another interaction.
+    const listeners = new AbortController();
+    const stop = () => {
+      observer.disconnect();
+      listeners.abort();
+    };
+    const observer = new MutationObserver(() => {
+      if (document.activeElement !== main || restoreResult()) stop();
+    });
+    observer.observe(main, { childList: true, subtree: true });
+    for (const type of ['keydown', 'pointerdown', 'wheel']) {
+      document.addEventListener(type, stop, { capture: true, signal: listeners.signal });
+    }
+    return stop;
+  }, [pathname, hash, state, drawerWasOpen, visit, navigationType]);
 
   const full = mode === 'full';
   return (
@@ -510,7 +563,7 @@ export function Layout() {
         )}
       >
         <Brand compact={!full} />
-        <nav id={columnNavId} aria-label="Primary" className="shrink-0">
+        <nav ref={columnNavRef} id={columnNavId} aria-label="Primary" className="shrink-0">
           <NavGroups pathname={pathname} mode={mode} compact />
         </nav>
         {/* at the column's foot while there is room, after the items once there is none */}
@@ -532,7 +585,7 @@ export function Layout() {
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-nav flex flex-wrap items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
+        <header ref={mobileHeaderRef} className="mobile-header z-nav flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
           <button
             type="button"
             ref={menuButtonRef}
@@ -540,12 +593,12 @@ export function Layout() {
             aria-haspopup="dialog"
             aria-expanded={menuOpen}
             aria-label="Open navigation"
-            className="inline-flex min-h-11 min-w-11 cursor-pointer items-center justify-center rounded-md text-foreground transition-colors duration-200 hover:bg-muted"
+            className="inline-flex min-h-[44px] min-w-[44px] shrink-0 cursor-pointer items-center justify-center rounded-md text-foreground transition-colors duration-200 hover:bg-muted"
           >
             <Menu aria-hidden className="size-5" />
           </button>
-          <Brand />
-          <div className="ml-auto flex items-center gap-1">
+          <Brand mobile />
+          <div className="ml-auto flex shrink-0 items-center gap-1 [&>button]:min-h-[44px] [&>button]:min-w-[44px] [&>button]:px-0">
             <LiveIndicator compact />
             <ThemeToggle />
           </div>
@@ -584,6 +637,7 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
+          onClickCapture={rememberResult}
           className="mx-auto w-full max-w-[1400px] flex-1 wrap-anywhere px-4 pb-4 pt-2 outline-hidden md:px-6 md:py-6"
         >
           <HealthNotice />

@@ -50,7 +50,7 @@ const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }
   return (
     <tr>
       <th scope="row" className="whitespace-nowrap font-mono">
-        <Link to={`/migrations/${m.id}`} className="underline-offset-4 hover:underline">
+        <Link to={`/migrations/${m.id}`} id={`migration-result-${m.id}`} data-return-focus className="underline-offset-4 hover:underline">
           {m.vm.name}
         </Link>
       </th>
@@ -117,10 +117,11 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations', empt
   const waves = useMemo(() => [...(plan?.waves ?? [])].sort((a, b) => a.order - b.order), [plan]);
   const waveName = useMemo(() => new Map(waves.map((w) => [w.id, w.name])), [waves]);
   const waveOrder = useMemo(() => new Map(waves.map((w) => [w.id, w.order])), [waves]);
-  const phasesPresent = useMemo(() => PHASE_ORDER.filter((p) => migrations.some((m) => m.phase === p)), [migrations]);
-  const strategiesPresent = useMemo(
-    () => (Object.keys(STRATEGY_LABELS) as Strategy[]).filter((s) => migrations.some((m) => m.strategy === s)),
-    [migrations],
+  // Live updates can remove the last match while a filter is still active. Keep its option selected.
+  const phaseOptions = useMemo(() => PHASE_ORDER.filter((p) => p === phase || migrations.some((m) => m.phase === p)), [migrations, phase]);
+  const strategyOptions = useMemo(
+    () => (Object.keys(STRATEGY_LABELS) as Strategy[]).filter((s) => s === strategy || migrations.some((m) => m.strategy === s)),
+    [migrations, strategy],
   );
 
   const filtered = useMemo(() => {
@@ -193,22 +194,26 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations', empt
           className="md:w-44"
           value={phase}
           onChange={(e) => setPhase(e.target.value as Phase | 'all')}
-          options={[{ value: 'all', label: 'All' }, ...phasesPresent.map((p) => ({ value: p, label: phaseMeta(p).label }))]}
+          options={[{ value: 'all', label: 'All' }, ...phaseOptions.map((p) => ({ value: p, label: phaseMeta(p).label }))]}
         />
         <SelectField
           label="Strategy"
           className="md:w-44"
           value={strategy}
           onChange={(e) => setStrategy(e.target.value as Strategy | 'all')}
-          options={[{ value: 'all', label: 'All' }, ...strategiesPresent.map((s) => ({ value: s, label: STRATEGY_LABELS[s] }))]}
+          options={[{ value: 'all', label: 'All' }, ...strategyOptions.map((s) => ({ value: s, label: STRATEGY_LABELS[s] }))]}
         />
-        {waves.length > 0 && (
+        {(waves.length > 0 || wave !== 'all') && (
           <SelectField
             label="Wave"
             className="md:w-52"
             value={wave}
             onChange={(e) => setWave(e.target.value)}
-            options={[{ value: 'all', label: 'All' }, ...waves.map((w) => ({ value: w.id, label: `${w.order}. ${w.name}` }))]}
+            options={[
+              { value: 'all', label: 'All' },
+              ...waves.map((w) => ({ value: w.id, label: `${w.order}. ${w.name}` })),
+              ...(wave !== 'all' && !waveName.has(wave) ? [{ value: wave, label: `${wave} (no longer in plan)` }] : []),
+            ]}
           />
         )}
         {filtersActive && sorted.length > 0 && (

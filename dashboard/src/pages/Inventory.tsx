@@ -1,7 +1,7 @@
 import { useListState } from '../lib/useListState';
 import { ClipboardPlus, HardDrive, Info, Server, TriangleAlert } from 'lucide-react';
 import { useMemo } from 'react';
-import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useInventory, useMigrationSummaries, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, type DestinationInventory, type GpuCapacity, type GpuFlavor, type Provider } from '../api/types';
@@ -16,6 +16,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { VmTable } from '../components/VmTable';
+import { buttonClassName } from '../lib/buttonStyles';
 import { formatBytes, formatDateTime, formatNumber } from '../lib/format';
 import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuLabel, poolFreeText, poolLabel } from '../lib/gpu';
 import { holdersOf } from '../lib/holds';
@@ -341,12 +342,13 @@ export default function Inventory() {
   const inventory = useInventory(providerId, project);
   const role = useRole();
   const listState = useListState('inventory-selection');
-  const [selected, setSelected] = listState.field<{ providerId: string; ids: Set<string> }>('selection', { providerId: '', ids: new Set() });
+  const scope = JSON.stringify([providerId, project]);
+  const [selected, setSelected] = listState.field<{ scope: string; ids: Set<string> }>('selection', { scope: '', ids: new Set() });
   const provider = providers.data?.find((p) => p.id === providerId);
   // planning starts from a source; viewers see the action unavailable, with the reason (SDD §16)
   const isSource = provider?.role === 'source';
   const canPlan = hasRole(role, 'operator') && isSource;
-  const selection = new Set(selected.providerId === providerId ? [...selected.ids].filter(id => !Array.isArray(inventory.data) || inventory.data.some(vm => vm.source_id === id)) : []);
+  const selection = new Set(selected.scope === scope ? [...selected.ids].filter(id => !Array.isArray(inventory.data) || inventory.data.some(vm => vm.source_id === id)) : []);
   // which plans hold each VM of a source (SDD §5.4, §16): unknown, never free, while the plans or migrations fail
   const plans = usePlans();
   const migrations = useMigrationSummaries();
@@ -366,7 +368,8 @@ export default function Inventory() {
         {providers.error ? (
           <ErrorBanner error={providers.error} title="Providers are unavailable" onRetry={() => void providers.refetch()} />
         ) : (
-          <EmptyState icon={Server} title="No providers registered" description="Register a source provider to discover its VMs." />
+          <EmptyState icon={Server} title="No providers registered" description="Register a source provider to discover its VMs."
+            action={<Link to="/providers" className={buttonClassName('secondary', 'lg')}>View providers</Link>} />
         )}
       </>
     );
@@ -391,7 +394,10 @@ export default function Inventory() {
               value={providerId}
               // switches the inventory in place: focus stays here and the address is replaced, a project dropped (WCAG 3.2.2, SDD §16)
               onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
-              options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerOption(p) }))}
+              options={[
+                ...(!provider ? [{ value: providerId, label: providers.data ? `Unavailable provider (${providerId})` : providerId, disabled: true }] : []),
+                ...(providers.data ?? []).map((p) => ({ value: p.id, label: providerOption(p) })),
+              ]}
             />
             {provider && provider.kind !== 'vmware' && (Object.keys(provider.project_credentials ?? {}).length > 0 || project) && (
               <SelectField
@@ -400,9 +406,10 @@ export default function Inventory() {
                 className="w-full sm:w-80"
                 value={project ?? ''}
                 // in place, as the Provider select: the address keeps the project (SDD §16)
-                onChange={(e) =>
-                  navigate(`/inventory/${provider.id}${e.target.value ? `?project=${encodeURIComponent(e.target.value)}` : ''}`, { replace: true, state: KEEP_FOCUS })
-                }
+                onChange={(e) => {
+                  setSelected({ scope: '', ids: new Set() });
+                  void navigate(`/inventory/${provider.id}${e.target.value ? `?project=${encodeURIComponent(e.target.value)}` : ''}`, { replace: true, state: KEEP_FOCUS });
+                }}
                 options={[
                   ...projectChoices(provider),
                   // a project an old address names that the provider holds no credential for: read as the API answers it
@@ -417,7 +424,9 @@ export default function Inventory() {
       {/* the inventory shows with its provider: while that is loading or failed, say so (SDD §16) */}
       {providers.error && <ErrorBanner error={providers.error} title="Providers are unavailable" onRetry={() => void providers.refetch()} />}
       {providers.data && !provider && (
-        <EmptyState icon={Server} title={`Provider ${providerId} does not exist`} description="Pick another provider above." />
+        <EmptyState icon={Server} title={`Provider ${providerId} does not exist`}
+          description={providers.data.length ? 'Choose another provider to read its inventory.' : 'Register a provider to discover its resources.'}
+          action={!providers.data.length ? <Link to="/providers" className={buttonClassName('secondary', 'lg')}>View providers</Link> : undefined} />
       )}
       {(providers.isPending || (inventory.isPending && provider)) && <LoadingBlock label="Reading inventory…" rows={6} />}
       {inventory.error && (!providers.data || provider) && (
@@ -446,15 +455,15 @@ export default function Inventory() {
               </div>
             )}
             <VmTable
-              persistenceKey={`inventory:${providerId}:${wanted ?? ''}`}
+              persistenceKey={`inventory:${scope}:${wanted ?? ''}`}
               // a link to one VM by its source id (`?vm=`, SDD §16) opens the table searching for its name
-              key={`${providerId}:${wanted ?? ''}`}
+              key={`${scope}:${wanted ?? ''}`}
               initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}
               caption={`VMs on ${providerLabel(provider)}`}
               selected={canPlan ? selection : undefined}
-              onSelectedChange={canPlan ? (ids) => setSelected({ providerId: provider.id, ids }) : undefined}
+              onSelectedChange={canPlan ? (ids) => setSelected({ scope, ids }) : undefined}
               holders={holders}
             />
           </div>

@@ -28,6 +28,36 @@ function emitPhase(server: MockServer, message: string) {
 const shownBelowAdmin = (e: { kind: string }) => !e.kind.startsWith('auth.') && !e.kind.startsWith('user.');
 
 describe('Events page', () => {
+  it('ignores an older history failure after switching to another plan', async () => {
+    const server = createTestServer();
+    const planId = 'plan-4f2a9c1e';
+    for (let index = 0; index < 501; index++) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'test', message: 'history record', data: {} });
+    }
+    let finish!: () => void;
+    const held = new Promise<void>((resolve) => { finish = resolve; });
+    let answered!: () => void;
+    const response = new Promise<void>((resolve) => { answered = resolve; });
+    renderWithApp(<Events />, {
+      route: '/events', server,
+      wrapFetch: (mock) => async (input, init) => {
+        if (!new URL(String(input), 'http://localhost').searchParams.has('before')) return mock(input, init);
+        await held;
+        answered();
+        return new Response(JSON.stringify({ detail: 'Previous scope unavailable' }), { status: 503 });
+      },
+    });
+    const user = userEvent.setup({ delay: null });
+    const search = await screen.findByLabelText('Search events');
+    await user.type(search, 'nothing-matches');
+    await user.click(await screen.findByRole('button', { name: 'Load older events' }));
+    const plan = screen.getByLabelText('Plan');
+    await user.selectOptions(plan, planId);
+    await act(async () => { finish(); await response; });
+    expect(plan).toHaveValue(planId);
+    expect(screen.queryByText('Older events could not be loaded')).not.toBeInTheDocument();
+  });
+
   it('keeps manually loaded older pages after leaving and going Back', async () => {
     function Journey() {
       const location = useLocation(); const navigate = useNavigate();
