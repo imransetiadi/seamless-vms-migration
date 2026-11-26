@@ -33,7 +33,7 @@ def test_table_matches_sdd():
     assert {k: set(v) for k, v in fsm.TRANSITIONS.items()} == ALLOWED
 
 
-@pytest.mark.parametrize("src,dst", [(s, d) for s, ds in ALLOWED.items() for d in ds])
+@pytest.mark.parametrize("src,dst", [(s, d) for s, ds in ALLOWED.items() for d in sorted(ds)])
 def test_every_allowed_transition_succeeds(src, dst):
     m = make_migration(phase=src)
     before = m.updated_at

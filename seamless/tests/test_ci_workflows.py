@@ -72,3 +72,16 @@ def test_collection_unit_tests_run_in_parallel_with_the_pinned_xdist():
     assert re.search(r"pytest -n auto\b.* tests/unit", unit)
     # every test still runs: the step still fails on a skipped one
     assert "unexpected skipped tests" in unit
+
+
+def test_control_plane_tests_run_in_parallel_with_the_coverage_gate():
+    """The control-plane suite took ~700 s serially, the CI critical path once the collection and
+    browser jobs were parallel; each xdist worker gets its own PostgreSQL database
+    (tests/pg_support.py), and the coverage gate (NFR-11) covers every worker's lines."""
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = {s.get("name", ""): s.get("run", "") for s in ci["jobs"]["control-plane"]["steps"]}
+    run = next(run for name, run in steps.items() if name.startswith("Unit and integration tests"))
+    assert re.search(r"pytest -n auto\b.*--cov-fail-under=85", run)
+    pyproject = (ROOT / "seamless" / "pyproject.toml").read_text()
+    dev = pyproject.split("\ndev = [", 1)[1].split("]", 1)[0]
+    assert "pytest-xdist" in dev

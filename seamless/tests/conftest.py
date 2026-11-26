@@ -13,8 +13,13 @@ import sqlalchemy as sa
 
 from seamless_migrate.store import Store
 from tests.leftover_tasks import cancel_leftovers
+from tests.pg_support import ensure_database, worker_database_url
 
 PG_URL = os.environ.get("SEAMLESS_TEST_PG_URL")
+if PG_URL and os.environ.get("PYTEST_XDIST_WORKER"):
+    # every test module reads PG_URL from here: each xdist worker gets a database of its own
+    PG_URL = worker_database_url(PG_URL, os.environ["PYTEST_XDIST_WORKER"])
+    ensure_database(PG_URL)
 
 STORE_BACKENDS = [
     "sqlite",
