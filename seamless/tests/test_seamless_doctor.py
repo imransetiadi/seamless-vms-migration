@@ -5,6 +5,7 @@ prints a secret, fails for what ``make seamless-check`` or the stack targets nee
 the optional."""
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,6 +15,12 @@ import pytest
 from seamless_migrate.config import find_repo_root
 
 ROOT = find_repo_root()
+#: the ruff line the pre-commit hook pins (the venv must match it): read, never restated, so a
+#: bump of the hook does not break these tests
+RUFF_PIN = re.search(
+    r"ruff-pre-commit\s+rev: v(\S+)", (ROOT / ".pre-commit-config.yaml").read_text()
+).group(1)
+RUFF_OFF_PIN = RUFF_PIN.rsplit(".", 1)[0] + "." + str(int(RUFF_PIN.rsplit(".", 1)[1]) + 1)
 SCRIPT = ROOT / "scripts" / "seamless-doctor.sh"
 
 #: the system tools the doctor may use besides the ones it checks (stubbed below)
@@ -83,7 +90,7 @@ def _run(
     codes=None,
     missing=(),
     venv=("3.13", 0),
-    ruff="ruff 0.17.2",
+    ruff=f"ruff {RUFF_PIN}",
     hook=True,
     chromium=True,
     node_modules=True,
@@ -173,7 +180,7 @@ def test_the_doctor_passes_on_a_machine_with_every_pinned_tool(tmp_path):
     assert "may differ" not in proc.stdout
     for text in (
         "Python 3.13",
-        "ruff 0.17.2",
+        f"ruff {RUFF_PIN}",
         "node 22.23.3",
         "npm 10.9.9",
         "gitleaks 8.30.1",
@@ -190,7 +197,7 @@ def test_the_doctor_passes_on_a_machine_with_every_pinned_tool(tmp_path):
 @pytest.mark.parametrize(
     "rel, old, new, named",
     [
-        (".pre-commit-config.yaml", "rev: v0.17.2", "rev: v0.17.3", "0.17.3"),
+        (".pre-commit-config.yaml", f"rev: v{RUFF_PIN}", f"rev: v{RUFF_OFF_PIN}", RUFF_OFF_PIN),
         (
             "seamless/pyproject.toml",
             'requires-python = ">=3.11"',
