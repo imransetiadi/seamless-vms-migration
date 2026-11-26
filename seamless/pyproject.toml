@@ -64,6 +64,12 @@ testpaths = ["tests"]
 # a test still running after 5 minutes prints every thread's traceback: a hang names itself (CI's py3.11
 # job once hung at 55 % of the suite until its 30-minute timeout, with no test named)
 faulthandler_timeout = 300
+# openstacksdk 4.25 warns from inside itself on calls we make correctly (~430 lines that buried the
+# ResourceWarnings that matter); the module field scopes the filter to warnings openstack.* issues, so one
+# that points at our own call site still shows (tests/test_warning_filters.py). The SDK's RemovedInSDK*Warning
+# classes subclass PendingDeprecationWarning: naming that builtin keeps a venv without the openstack extra
+# (`make seamless-test`'s) able to load this config.
+filterwarnings = ["ignore::PendingDeprecationWarning:openstack\\."]
 markers = [
   "live: talks to real external services (Jev, agentmemory, Slack, an SMTP relay, a webhook receiver); skipped unless enabled",
   "lab: runs against the reference lab clouds (QASuite §7); skipped unless SEAMLESS_LAB_* is set",
