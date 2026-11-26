@@ -15,6 +15,11 @@ except ImportError:
     HAS_OPENSTACK = False
     OPENSTACK_SDK_FLAVOR = None
 
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
+    const,
+    osm_resource,
+)
+
 LOG = logging.getLogger("os-migrate")
 
 #: Compute API 2.102 removed rxtx_factor from the flavor create body (sending it is a 400) and
@@ -31,11 +36,6 @@ def _flavor_microversion_drops_rxtx_factor(conn):
     if not negotiated:
         return False
     return discover.normalize_version_number(negotiated) >= RXTX_FACTOR_REMOVED_IN
-
-from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
-    const,
-    osm_resource,
-)
 
 
 class Flavor(osm_resource.Resource):
