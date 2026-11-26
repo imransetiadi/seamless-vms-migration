@@ -37,6 +37,10 @@ REFUSED = [
     "https://[fe80::1]/",
     "https://224.0.0.1/",
     "https://[64:ff9b::7f00:1]/",  # NAT64 of 127.0.0.1
+    "https://[2002:7f00:1::1]/",  # 6to4 of 127.0.0.1
+    "https://[2002:a9fe:a9fe::1]/",  # 6to4 of 169.254.169.254
+    "https://[2001:0:4136:e378:8000:63bf:80ff:fffe]/",  # Teredo of 127.0.0.1 (client bits inverted)
+    "https://[2001:0:4136:e378:8000:63bf:5601:5601]/",  # Teredo of 169.254.169.254
 ]
 
 
@@ -221,3 +225,37 @@ async def test_a_hook_is_never_sent_to_an_internal_address(tmp_path, monkeypatch
     )
     assert (result.outcome, result.reason) == ("failed", "destination_not_allowed")
     assert sent == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[2002:cb00:7107::1]/",  # 6to4 of 203.0.113.7
+        "https://[2001:0:4136:e378:8000:63bf:34ff:8ef8]/",  # Teredo of 203.0.113.7
+    ],
+)
+def test_an_ipv6_address_carrying_a_public_ipv4_one_passes(url):
+    """SDD §13.5: a 6to4 or Teredo address is judged by the IPv4 address it carries - refused
+    for a loopback or the metadata service (REFUSED), passed for a public one: the prefix alone
+    refuses nothing."""
+    check_stored(url, settings())
+    assert check_destination(url, settings(), resolver=lambda host: [host]) == [
+        url.split("[", 1)[1].split("]", 1)[0]
+    ]
+
+
+async def test_a_name_that_does_not_resolve_in_time_is_refused(monkeypatch):
+    """SDD §13.5: the async check bounds the resolution; a resolver that outlasts
+    RESOLVE_TIMEOUT_S refuses the destination, naming the host and the bound, never hanging the
+    route that asked."""
+    import time
+
+    monkeypatch.setattr(destinations, "RESOLVE_TIMEOUT_S", 0.05)
+    with pytest.raises(DestinationNotAllowed) as refused:
+        await destinations.check_destination_async(
+            "https://slow.example.org/x",
+            settings(),
+            resolver=lambda host: time.sleep(0.5) or ["203.0.113.7"],
+        )
+    assert "slow.example.org did not resolve in 0.05 s" in str(refused.value)
+    assert "/x" not in str(refused.value)

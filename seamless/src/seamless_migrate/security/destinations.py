@@ -64,14 +64,6 @@ def _networks(values: Iterable[str]) -> list[IPNetwork]:
     return [ipaddress.ip_network(v.strip(), strict=False) for v in values if v.strip()]
 
 
-def parse_networks(values: Iterable[str], setting: str) -> list[IPNetwork]:
-    """``values`` as networks, else a ValueError naming ``setting`` (the configuration's check)."""
-    try:
-        return _networks(values)
-    except ValueError as exc:
-        raise ValueError(f"{setting}: {exc}") from None
-
-
 def _embedded(address: IPAddress) -> IPAddress:
     """The IPv4 address an IPv6 address carries (mapped, 6to4, Teredo, NAT64), else itself."""
     if isinstance(address, ipaddress.IPv6Address):
