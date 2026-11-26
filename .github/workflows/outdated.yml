@@ -1,0 +1,72 @@
+# Weekly report of the direct dependencies that have newer releases (scripts/outdated-report.py).
+# It replaces Dependabot's visibility without its pull requests: it only reads, writes the job
+# summary, and never fails the run. Bumps are made by hand in a reviewed pull request
+# (Security.md §12); a release outside a declared range (a reviewed cap, SDD §21.7) is marked.
+name: outdated
+
+on:
+  schedule:
+    - cron: "23 3 * * 1" # Mondays (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: outdated dependencies (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # the job installs the newest packages and their build code runs here: keep no token
+          # in .git/config (only the release lookup gets one, through its own environment)
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: The report's one dependency (packaging) for the runner's Python
+        run: python -m pip install -q packaging
+      - name: Python packages behind (outdated)
+        continue-on-error: true
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q packaging -e 'seamless[openstack,vmware,jev,dns,dev,collection]' -r requirements.txt
+          "$RUNNER_TEMP/venv/bin/pip" list --outdated --format=json > "$RUNNER_TEMP/pip.json"
+      - name: npm packages behind (outdated)
+        continue-on-error: true
+        working-directory: dashboard
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm outdated --json > "$RUNNER_TEMP/npm.json" || true # exits 1 when anything is behind
+      - name: Latest release of each pinned action (outdated)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "{"
+            sep=""
+            for repo in $(python scripts/outdated-report.py --list-actions); do
+              # the newest stable release named like a version (v4.40.0): some repositories also
+              # release other artifacts (github/codeql-action's codeql-bundle-v2.27.6)
+              tag=$(gh api "repos/$repo/releases?per_page=30" \
+                --jq '[.[] | select(.prerelease | not) | .tag_name | select(test("^v[0-9]"))][0] // empty' \
+                2>/dev/null || true)
+              [ -n "$tag" ] && printf '%s"%s": "%s"\n' "$sep" "$repo" "$tag" && sep=","
+            done
+            echo "}"
+          } > "$RUNNER_TEMP/actions.json"
+      - name: Write the report to the job summary (outdated)
+        continue-on-error: true
+        run: |
+          args=()
+          for kind in pip npm; do
+            [ -s "$RUNNER_TEMP/$kind.json" ] && args+=("--$kind" "$RUNNER_TEMP/$kind.json")
+          done
+          [ -s "$RUNNER_TEMP/actions.json" ] && args+=(--actions-latest "$RUNNER_TEMP/actions.json")
+          python scripts/outdated-report.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
