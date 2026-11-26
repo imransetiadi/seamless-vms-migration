@@ -47,8 +47,9 @@ A tag is cut only when every gate below holds, or a waiver recorded in the relea
 
 **Every release candidate and every final release**
 
-- [ ] CI is green on the release commit of `main`. The `ci` workflow runs nine jobs: `control-plane`,
-      `collection`, `dashboard`, `dashboard-e2e`, `security`, `manifests` and `deploy-scripts` on every run, and
+- [ ] CI is green on the release commit of `main`. The `ci` workflow runs eleven jobs: `control-plane`,
+      `rhel-control-plane`, `collection`, `dashboard`, `dashboard-e2e` (Chromium and the demo-server journeys),
+      `dashboard-e2e-webkit`, `security`, `manifests` and `deploy-scripts` on every run, and
       `image` - with trivy (no fixable HIGH or CRITICAL) and a CycloneDX SBOM - and `compose-linux` - the Compose
       smoke on a Linux engine - on `main`, nightly and when dispatched, not on pull requests.
 - [ ] `make seamless-check` is green on a clean checkout of that commit.
