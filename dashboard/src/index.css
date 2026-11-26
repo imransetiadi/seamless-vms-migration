@@ -322,6 +322,13 @@
 }
 
 @layer components {
+  /* The track's gaps live here, not in a gap-* class on it: a utility wins over this layer, so the
+     container queries below could not change it (a quarter rem in one column, 1rem between two
+     columns, none on the row whose connectors meet). */
+  .lifecycle-track {
+    gap: 0.25rem;
+  }
+
   @container lifecycle (14rem <= width < 40rem) {
     .lifecycle-track {
       grid-auto-flow: column;
