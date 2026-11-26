@@ -1,6 +1,7 @@
 import os
 import re
 import secrets
+from collections.abc import Iterator
 
 import pytest
 import yaml
@@ -25,9 +26,23 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
+#: the stores store_for opened in the running test, disposed when it ends
+_OPENED: list[Store] = []
+
+
+@pytest.fixture(autouse=True)
+def _dispose_opened_stores() -> Iterator[None]:
+    """A store's engine keeps its pooled SQLite connections open until it is disposed; left to the
+    garbage collector they are closed late, with a ResourceWarning in some later test."""
+    yield
+    while _OPENED:
+        _OPENED.pop().dispose()
+
+
 def store_for(tmp_path) -> Store:
     store = Store(f"sqlite:///{tmp_path / 'cli.db'}")
     store.create_schema()
+    _OPENED.append(store)
     return store
 
 

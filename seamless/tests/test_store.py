@@ -3,6 +3,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import UTC, datetime
 
 import pytest
@@ -38,7 +39,8 @@ from tests.factories import make_migration, make_plan, make_provider, make_vm
 def sqlite_reads_nan_json() -> bool:
     """Whether this SQLite reads NaN and Infinity in a JSON document: 3.34.1, RHEL 9's, answers
     "malformed JSON" where 3.45 and later read them as null and inf (CI's RHEL 9 job)."""
-    with sqlite3.connect(":memory:") as connection:
+    # a connection's own `with` ends its transaction, not the connection: closing() closes it
+    with closing(sqlite3.connect(":memory:")) as connection:
         try:
             connection.execute("select json_extract(?, '$.a')", ('{"a": NaN}',))
         except sqlite3.OperationalError:
