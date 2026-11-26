@@ -45,6 +45,6 @@ export function useListState(key?: string) {
 
 /** Validate history sort values before using them to index rows. */
 export function validListSort(keys: readonly string[]) {
-  return (value: unknown): boolean => value === null || typeof value === 'object' && value !== null &&
+  return (value: unknown): boolean => value === null || typeof value === 'object' &&
     'key' in value && keys.includes(String(value.key)) && 'direction' in value && (value.direction === 'ascending' || value.direction === 'descending');
 }

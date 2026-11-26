@@ -15,7 +15,7 @@ from ..config import Settings
 from ..domain.models import NotificationChannel
 from .email import render_email
 from .messages import Message, slack_payload
-from .notifier import SendResult
+from .result import SendResult
 from .webhook import webhook_body
 
 
