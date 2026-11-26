@@ -384,7 +384,7 @@ class VMwareProvider:
         finally:
             view.Destroy()
 
-    def _context(self, content: Any, vim: Any) -> tuple[dict[str, str], dict[Any, str]]:
+    def _context(self, content: Any, vim: Any) -> tuple[dict[int, str], dict[str, str]]:
         """Custom-field names and DVS portgroup names used while mapping VMs."""
         fields = {
             f.key: f.name
