@@ -45,6 +45,10 @@ SERIES: tuple[Series, ...] = (
 #: the newest microversions whose behaviour Seamless's calls were checked against (SDD §21.7)
 REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}
 
+#: an SDK resource reviewed further than its service: compute 2.102 for flavors, whose create sends
+#: no rxtx_factor from 2.102 on (SDD §21.7; the collection's flavor module)
+REVIEWED_RESOURCE_MICROVERSIONS = {"Flavor": "2.102"}
+
 #: the tiers of the window, the most favourable first
 TIERS = ("tier1", "tier2", "tier3")
 

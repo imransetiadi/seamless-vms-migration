@@ -12,6 +12,7 @@ from seamless_migrate.config import find_repo_root
 from seamless_migrate.planning.platforms import (
     READ_ON,
     REVIEWED_MICROVERSIONS,
+    REVIEWED_RESOURCE_MICROVERSIONS,
     SERIES,
     ReleaseRange,
     SupportTier,
@@ -323,9 +324,10 @@ def test_the_sdd_support_table_matches_the_code_series_table():
     ):
         block.update({first: maximum, second: maximum})
     assert block == {s.name: s.block_storage_max for s in SERIES}
-    assert f"`REVIEWED_MICROVERSIONS = {json.dumps(REVIEWED_MICROVERSIONS)}`" in _sdd_section(
-        "### 10.1 Destination release series"
-    )
+    section = _sdd_section("### 10.1 Destination release series")
+    assert f"`REVIEWED_MICROVERSIONS = {json.dumps(REVIEWED_MICROVERSIONS)}`" in section
+    reviewed_alone = json.dumps(REVIEWED_RESOURCE_MICROVERSIONS)
+    assert f"`REVIEWED_RESOURCE_MICROVERSIONS = {reviewed_alone}`" in section
 
 
 @pytest.mark.parametrize("path", sorted(VERSIONS.glob("*.json")), ids=lambda p: p.stem)
@@ -407,8 +409,9 @@ SDK_RESOURCES = (
 def test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window(series):
     """SDD §21.7: openstacksdk asks a cloud for the lower of a resource's cap and the cloud's
     maximum - its own negotiation, run here against each series' maxima. Compute 2.101 (a volume
-    attach answers 202), 2.102 (flavors lose two fields) and 2.103 (/os-volumes_boot is gone) must
-    never reach Seamless's calls: a raised openstacksdk pin whose caps pass REVIEWED_MICROVERSIONS
+    attach answers 202) and 2.103 (/os-volumes_boot is gone) must never reach Seamless's calls;
+    2.102 (flavors lose two fields) reaches the flavor calls alone, reviewed for them
+    (REVIEWED_RESOURCE_MICROVERSIONS). A raised openstacksdk pin whose caps pass what was reviewed
     fails here until those versions are reviewed."""
     pytest.importorskip("openstack")
     import importlib
@@ -430,7 +433,8 @@ def test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window(serie
         version = utils.maximum_supported_microversion(adapter, cap)
         asked[name] = version
         assert version is not None, (name, cap, maximum)
-        assert _version(version) <= _version(REVIEWED_MICROVERSIONS[service]), (name, cap, version)
+        reviewed = REVIEWED_RESOURCE_MICROVERSIONS.get(name, REVIEWED_MICROVERSIONS[service])
+        assert _version(version) <= _version(reviewed), (name, cap, version)
         assert _version(version) <= _version(maximum), (name, cap, version)
     assert asked.get("Server"), asked
 
