@@ -4412,6 +4412,8 @@ A pure module (no I/O) holding the series table of §21.1 and the detection and 
   Seamless's calls were checked against (§21.7). openstacksdk asks a cloud for the lower of a resource's cap and the
   cloud's maximum; `test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window` fails when the installed
   openstacksdk would ask any series of the window for more than these (raising the pin re-checks them).
+* `REVIEWED_RESOURCE_MICROVERSIONS = {"Flavor": "2.102"}`: an SDK resource reviewed further than its service, which
+  the same test holds it to instead: the flavor calls at compute 2.102 (§21.7).
 
 ---
 
@@ -6994,9 +6996,14 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 ### 21.7 API changes the design absorbs (today)
 
 * openstacksdk sends at most its own per-resource microversion, negotiated down to each cloud's maximum
-  (openstacksdk 4.21: servers 2.100, flavors 2.61, volume attachments 2.89, block storage 3.71). Compute 2.101 (a volume
-  attach answers 202), 2.102 (flavors lose `rxtx_factor` and `OS-FLV-DISABLED:disabled`) and 2.103 (`/os-volumes_boot`
-  is gone) never reach Seamless's calls, and an older cloud gets its own maximum.
+  (openstacksdk 4.25: servers 2.100, flavors 2.102, volume attachments 2.89, block storage 3.71). Compute 2.101 (a
+  volume attach answers 202) and 2.103 (`/os-volumes_boot` is gone) never reach Seamless's calls, and an older cloud
+  gets its own maximum.
+* Compute 2.102 reaches the flavor calls alone, reviewed for them: it removes `rxtx_factor` and
+  `OS-FLV-DISABLED:disabled` from every flavor response, and a flavor create that sends `rxtx_factor` is refused (400).
+  From 2.102 on the collection creates a flavor without `rxtx_factor` and logs a warning when the dropped value is not
+  the default 1.0 (the owner's decision of 2026-11-26); a flavor read back without it is no difference, so a re-run
+  changes nothing. Below 2.102 the value is migrated as before.
 * The collection pins openstacksdk (the root `requirements.txt`, `aee/`), and raising that pin re-checks those caps
   against the window; the control plane's image and CI install the newest openstacksdk `seamless/pyproject.toml`
   allows (`>=4.5`), so every CI run re-checks them: the contract suite (QASuite S-DST, since T1) runs openstacksdk's own
