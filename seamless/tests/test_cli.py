@@ -764,9 +764,20 @@ def test_estimate_table(env, capsys):
     )
 
 
+def _served(into: list):
+    """A run_server that records the settings it was given instead of serving. The app it gets
+    opened its own store, which the lifespan never run here would close: dispose it."""
+
+    def run(app, settings, reload):
+        into.append(settings)
+        app.state.services.store.dispose()
+
+    return run
+
+
 def test_serve_refuses_auth_disabled_on_public_bind(env, capsys, monkeypatch):
     calls = []
-    monkeypatch.setattr(cli, "run_server", lambda app, settings, reload: calls.append(settings))
+    monkeypatch.setattr(cli, "run_server", _served(calls))
     monkeypatch.setenv("SEAMLESS_AUTH_DISABLED", "true")
     assert cli.main(["serve", "--host", "0.0.0.0", "--port", "9999"]) == 2
     assert "loopback" in capsys.readouterr().err and calls == []
@@ -792,13 +803,14 @@ def test_a_second_server_on_one_sqlite_database_exits_with_an_error(env, capsys,
     def first_server(app, settings, reload):
         assert lock.is_file(), "the running server holds its lock file"
         second.append(cli.main(["serve", "--port", "8081"]))
+        app.state.services.store.dispose()
 
     monkeypatch.setattr(cli, "run_server", first_server)
     assert cli.main(["serve"]) == 0
     assert second == [1]
     assert "error: another server runs against this database" in capsys.readouterr().err
     served = []
-    monkeypatch.setattr(cli, "run_server", lambda app, settings, reload: served.append(settings))
+    monkeypatch.setattr(cli, "run_server", _served(served))
     assert cli.main(["serve", "--port", "8082"]) == 0
     assert [s.port for s in served] == [8082]
 
