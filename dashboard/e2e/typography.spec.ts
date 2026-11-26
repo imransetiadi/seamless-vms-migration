@@ -40,8 +40,11 @@ test('chart labels follow 200% root text size and stay keyboard-scrollable', asy
     await expect(chart.locator('.recharts-text').first()).toBeVisible();
     await page.addStyleTag({ content: 'html { font-size: 200%; }' });
     await expect.poll(() => chart.locator('.recharts-text').first().evaluate((el) => parseFloat(getComputedStyle(el).fontSize))).toBe(24);
-    const sizes = await page.locator('.recharts-surface text').evaluateAll((elements) => elements.map((el) => parseFloat(getComputedStyle(el).fontSize)));
-    expect(sizes.every((size) => size === 24)).toBe(true);
+    // every label, not just the first: the charts re-render their ticks one after another, and a
+    // single read right after the first one changed raced them on a slow runner (CI, WebKit)
+    await expect
+      .poll(() => page.locator('.recharts-surface text').evaluateAll((elements) => elements.every((el) => parseFloat(getComputedStyle(el).fontSize) === 24)))
+      .toBe(true);
     await chart.focus();
     await page.keyboard.press('ArrowRight');
     await expect.poll(() => chart.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
