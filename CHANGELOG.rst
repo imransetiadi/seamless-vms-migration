@@ -751,3 +751,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   a conversion host it deploys in a plan's project. A host that holds a
   floating IP keeps it, and ``os_migrate_conversion_floating_ip_address`` is
   attached as before.
+- Flavors at compute microversion 2.102 (Seamless Migrate SDD 10.1, 21.7):
+  Nova 2.102 removes ``rxtx_factor`` from flavor responses and refuses it in a
+  create request (400), and openstacksdk 4.25 negotiates 2.102. The ``flavor``
+  module now leaves ``rxtx_factor`` out of the create request when the
+  negotiated compute microversion is 2.102 or later, and warns when the
+  exported flavor carried a value other than the default ``1.0``, which the
+  destination cannot keep; an update no longer compares ``rxtx_factor`` when
+  the destination does not report it. Below 2.102 the module behaves as
+  before.
