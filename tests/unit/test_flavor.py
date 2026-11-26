@@ -4,6 +4,7 @@ __metaclass__ = type
 
 import openstack
 import unittest
+from unittest import mock
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import const, flavor
 
@@ -97,3 +98,65 @@ class TestFlavor(unittest.TestCase):
         # disallowed params when creating a flavor
         self.assertNotIn("id", sdk_params)
         self.assertNotIn("is_disabled", sdk_params)
+
+
+def _conn(server_max, existing=None):
+    """A connection whose compute endpoint offers microversions up to `server_max`."""
+    conn = mock.Mock()
+    conn.compute.get_endpoint_data.return_value = mock.Mock(
+        min_microversion="2.1", max_microversion=server_max
+    )
+    conn.compute.find_flavor.return_value = existing
+    conn.compute.create_flavor.return_value = sdk_flavor()
+    return conn
+
+
+def _with_rxtx(value):
+    """A flavor as the export writes it from a source cloud (below 2.102)."""
+    source = sdk_flavor()
+    source.rxtx_factor = value
+    return flavor.Flavor.from_data(flavor.Flavor.from_sdk(None, source).data)
+
+
+class TestFlavorRxtxFactorFrom2102(unittest.TestCase):
+    """Nova 2.102 removed rxtx_factor from the flavor create body (400 if sent) and from
+    responses (SDD 21.7). openstacksdk 4.25 negotiates flavors up to 2.102."""
+
+    def setUp(self):
+        patcher = mock.patch.object(flavor.OPENSTACK_SDK_FLAVOR, "_max_microversion", "2.102")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_creates_without_rxtx_factor_at_2_102_and_warns_on_a_dropped_value(self):
+        conn = _conn("2.103")
+        with self.assertLogs("os-migrate", level="WARNING") as logged:
+            self.assertTrue(_with_rxtx(1.5).create_or_update(conn))
+        sdk_params = conn.compute.create_flavor.call_args.kwargs
+        self.assertNotIn("rxtx_factor", sdk_params)
+        self.assertEqual(sdk_params["name"], "test-flavor")
+        self.assertIn("rxtx_factor 1.5", "\n".join(logged.output))
+
+    def test_drops_the_default_rxtx_factor_quietly(self):
+        conn = _conn("2.103")
+        with mock.patch.object(flavor.LOG, "warning") as warning:
+            _with_rxtx(1.0).create_or_update(conn)
+        self.assertNotIn("rxtx_factor", conn.compute.create_flavor.call_args.kwargs)
+        warning.assert_not_called()
+
+    def test_keeps_rxtx_factor_below_2_102(self):
+        conn = _conn("2.101")
+        _with_rxtx(1.5).create_or_update(conn)
+        self.assertEqual(conn.compute.create_flavor.call_args.kwargs["rxtx_factor"], 1.5)
+
+    def test_keeps_rxtx_factor_with_an_sdk_that_stops_below_2_102(self):
+        conn = _conn("2.103")
+        with mock.patch.object(flavor.OPENSTACK_SDK_FLAVOR, "_max_microversion", "2.61"):
+            _with_rxtx(1.5).create_or_update(conn)
+        self.assertEqual(conn.compute.create_flavor.call_args.kwargs["rxtx_factor"], 1.5)
+
+    def test_a_flavor_read_back_without_rxtx_factor_needs_no_update(self):
+        existing = sdk_flavor()
+        existing.rxtx_factor = None  # not returned at 2.102 or later
+        conn = _conn("2.103", existing=existing)
+        self.assertFalse(_with_rxtx(1.0).create_or_update(conn))
+        conn.compute.create_flavor.assert_not_called()
