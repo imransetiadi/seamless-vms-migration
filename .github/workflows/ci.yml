@@ -63,7 +63,8 @@ jobs:
       - name: Unit and integration tests with the coverage gate (NFR-11)
         env:
           SEAMLESS_TEST_PG_URL: postgresql+psycopg://seamless:ci-only@127.0.0.1:5432/seamless_test
-        run: pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
+        # -n auto: one PostgreSQL database per xdist worker (tests/pg_support.py); serially ~700 s
+        run: pytest -n auto -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
       - name: DEMO-07 on a throwaway demo server (QASuite §6.6, §14.7)
         # about 15 s: a hang fails this step, not the job's whole time budget
         timeout-minutes: 5
