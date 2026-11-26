@@ -1,5 +1,5 @@
 import { History, ShieldAlert, ShieldCheck } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { fetchEventTail, useApi, useEventTail, useMigration, useRecommendation, useRecommendations, useSnapshot } from '../api/hooks';
 import { ApiError } from '../api/client';
@@ -94,6 +94,15 @@ function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
   const [error, setError] = useState<unknown>(null);
   const button = useRef<HTMLButtonElement>(null);
   const region = useRef<HTMLDivElement>(null);
+  const restoreFocus = useRef(false);
+  // The last page removes the button: the loaded history takes the focus, never the page (SDD §16). Decided after
+  // the commit that applies the page - a frame scheduled before it could still find the button and leave the focus
+  // on <body>.
+  useEffect(() => {
+    if (!restoreFocus.current) return;
+    restoreFocus.current = false;
+    if (!button.current && (document.activeElement === document.body || document.activeElement === null)) region.current?.focus();
+  }, [older]);
   const merged = new Map<number, Event>();
   for (const e of [...(older?.events ?? []), ...(events.data ?? [])]) merged.set(e.seq, e);
   const loaded = [...merged.values()].sort((a, b) => a.seq - b.seq);
@@ -103,11 +112,8 @@ function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
     setLoading(true); setError(null);
     try {
       const page = await fetchEventTail(api, { ...scope, audit: true, before: loaded[0]!.seq }, 1000);
-      const restore = document.activeElement === button.current;
+      restoreFocus.current = document.activeElement === button.current;
       setOlder({ events: [...page, ...loaded], more: page.length >= 1000 });
-      requestAnimationFrame(() => {
-        if (restore && !button.current && document.activeElement === document.body) region.current?.focus();
-      });
     } catch (e) { setError(e); }
     finally { setLoading(false); }
   };
