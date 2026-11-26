@@ -9,7 +9,9 @@ found behind:
   --pip FILE             ``pip list --outdated --format=json``
   --npm FILE             ``npm outdated --json`` (run in dashboard/)
   --actions-latest FILE  {"owner/repo": "vX.Y.Z"}, each action's latest release
+  --images-latest FILE   {"name:tag": "sha256:..."}, each digest-pinned image tag's current digest
   --list-actions         print the pinned actions' owner/repo, one per line, and exit
+  --list-images          print the digest-pinned images' name:tag, one per line, and exit
 
 A Python release the declared range refuses (a reviewed cap, such as openstacksdk's, SDD §21.7) is
 marked "outside": it needs a deliberate, reviewed bump, not a routine one. Bumps are made by hand
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import tomllib
@@ -31,6 +34,11 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 NOTHING = "Nothing behind."
+#: an image pinned by digest with its tag: [registry[:port]/]path:tag@sha256:...
+IMAGE = re.compile(r"((?:[\w.-]+(?::\d+)?/)?[\w./-]+:[\w.-]+)@(sha256:[0-9a-f]{64})")
+#: where the repository pins container images by digest (Security.md §12)
+IMAGE_FILE = re.compile(r"(Containerfile|Dockerfile)[^/]*$|^deploy/.+\.ya?ml$")
+SKIP_DIRS = {".git", "node_modules", ".venv", ".worktrees", "dist", "dist-mock"}
 USES = re.compile(r"uses:\s*([\w.-]+/[\w.-]+)(?:/[^@\s]*)?@[0-9a-f]{40}\s*#\s*(v?[\w.-]+)")
 
 
@@ -151,16 +159,55 @@ def actions_section(root: Path, latest: dict[str, str]) -> list[str]:
     return [*head, "| Action | Pinned | Latest release |", "|---|---|---|", *rows, ""]
 
 
+def pinned_images(root: Path) -> dict[str, dict[str, list[str]]]:
+    """Each digest-pinned image's name:tag, its pinned digests and the files that pin each."""
+    pins: dict[str, dict[str, list[str]]] = {}
+    files = []
+    for directory, subdirectories, names in os.walk(root):
+        subdirectories[:] = sorted(d for d in subdirectories if d not in SKIP_DIRS)  # not entered
+        for name in sorted(names):
+            path = Path(directory, name)
+            if IMAGE_FILE.search(path.relative_to(root).as_posix()):
+                files.append(path)
+    for path in files:
+        relative = path.relative_to(root)
+        for image, digest in IMAGE.findall(path.read_text(errors="replace")):
+            where = pins.setdefault(image, {}).setdefault(digest, [])
+            if str(relative) not in where:
+                where.append(str(relative))
+    return pins
+
+
+def images_section(root: Path, latest: dict[str, str]) -> list[str]:
+    rows = [
+        f"| {image} | {pinned[:19]} | {latest[image][:19]} | {', '.join(files)} |"
+        for image, digests in sorted(pinned_images(root).items())
+        if latest.get(image, "").startswith("sha256:")
+        for pinned, files in sorted(digests.items())
+        if latest[image] != pinned
+    ]
+    head = ["## Container images (pinned by digest)", ""]
+    if not rows:
+        return [*head, NOTHING, ""]
+    table = ["| Image | Pinned | Tag's current digest | Pinned in |", "|---|---|---|---|"]
+    return [*head, *table, *rows, ""]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--pip", type=Path)
     parser.add_argument("--npm", type=Path)
     parser.add_argument("--actions-latest", type=Path)
+    parser.add_argument("--images-latest", type=Path)
     parser.add_argument("--list-actions", action="store_true")
+    parser.add_argument("--list-images", action="store_true")
     args = parser.parse_args(argv)
     if args.list_actions:
         print("\n".join(sorted(pinned_actions(args.root))))
+        return 0
+    if args.list_images:
+        print("\n".join(sorted(pinned_images(args.root))))
         return 0
     out = ["# Outdated dependencies", ""]
     if args.pip:
@@ -169,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
         out += npm_section(json.loads(args.npm.read_text() or "{}"))
     if args.actions_latest:
         out += actions_section(args.root, json.loads(args.actions_latest.read_text() or "{}"))
+    if args.images_latest:
+        out += images_section(args.root, json.loads(args.images_latest.read_text() or "{}"))
     print("\n".join(out))
     return 0
 

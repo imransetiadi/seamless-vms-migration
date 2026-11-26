@@ -250,3 +250,113 @@ def test_the_workflow_s_own_steps_build_valid_json_and_a_summary_when_a_step_fai
     assert "# Outdated dependencies" in report
     assert re.search(r"^\| github/codeql-action \| v[\d.]+ \| v999\.0\.0 \|$", report, re.M), report
     assert "## Python" not in report and "## Dashboard" not in report  # those steps left nothing
+
+
+PG_PIN = "sha256:" + "1" * 64
+UBI_PIN = "sha256:" + "2" * 64
+
+
+def _images(root: Path) -> Path:
+    """Digest-pinned images where the repository pins them: compose and the Containerfile."""
+    (root / "deploy" / "compose").mkdir(parents=True)
+    (root / "deploy" / "compose" / "compose.yaml").write_text(
+        f"services:\n  db:\n    image: postgres:16-alpine@{PG_PIN}\n"
+        "  web:\n    image: seamless-migrate:dev\n"  # built here: no digest, not listed
+    )
+    (root / "seamless" / "Containerfile").write_text(
+        f"ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest@{UBI_PIN}\n"
+        "FROM ${BASE_IMAGE}\n"
+    )
+    return root
+
+
+def test_the_report_lists_each_digest_pinned_image_once(tmp_path):
+    root = _images(_tree(tmp_path / "repo"))
+    listed = _run(root, "--list-images")
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.split() == [
+        "postgres:16-alpine",
+        "registry.access.redhat.com/ubi9/python-311:latest",
+    ]
+
+
+def test_the_report_names_a_pinned_image_whose_tag_has_moved(tmp_path):
+    """The tag's current digest differs from the pin: a newer image (rebuilt for fixes) waits."""
+    root = _images(_tree(tmp_path / "repo"))
+    moved = "sha256:" + "3" * 64
+    latest = _json(
+        tmp_path,
+        "images.json",
+        {"postgres:16-alpine": moved, "registry.access.redhat.com/ubi9/python-311:latest": UBI_PIN},
+    )
+    done = _run(root, "--images-latest", latest)
+    assert done.returncode == 0, done.stderr
+    assert "## Container images (pinned by digest)" in done.stdout
+    assert (
+        "| postgres:16-alpine | sha256:111111111111 | sha256:333333333333 "
+        "| deploy/compose/compose.yaml |" in done.stdout
+    )
+    assert "ubi9" not in done.stdout.split("## Container images")[1]  # still current
+
+
+def test_the_report_leaves_out_an_image_whose_digest_could_not_be_read(tmp_path):
+    root = _images(_tree(tmp_path / "repo"))
+    latest = _json(tmp_path, "images.json", {"postgres:16-alpine": "", "other:1": "sha256:x"})
+    done = _run(root, "--images-latest", latest)
+    assert done.returncode == 0, done.stderr
+    assert "Nothing behind." in done.stdout.split("## Container images")[1]
+
+
+def test_the_workflow_s_image_step_reads_each_tag_s_digest_without_pulling(tmp_path):
+    """The step asks the registry for each pinned tag's current digest (buildx imagetools, no
+    pull), writes valid JSON even when one lookup fails, and the summary names the moved tag."""
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    docker = stubs / "docker"
+    docker.write_text(
+        '#!/bin/sh\n[ "$1 $2 $3" = "buildx imagetools inspect" ] || exit 2\ncase "$4" in\n'
+        '  postgres:*) echo \'{"mediaType":"application/vnd.oci.image.index.v1+json",'
+        '"digest":"sha256:' + "9" * 64 + "\"}' ;;\n"
+        "  *) echo 'registry unreachable' >&2; exit 1 ;;\nesac\n"
+    )
+    docker.chmod(0o755)
+    (stubs / "python").symlink_to(sys.executable)
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    summary = tmp_path / "summary.md"
+    env = {
+        "PATH": f"{stubs}:/usr/bin:/bin",
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "HOME": str(tmp_path),
+    }
+    for name in ("Current digest of each pinned image", "Write the report to the job summary"):
+        done = subprocess.run(
+            ["bash", "-e", "-c", _step(name)], cwd=ROOT, env=env, capture_output=True, text=True
+        )
+        assert done.returncode == 0, (name, done.stderr)
+    assert json.loads((runner_temp / "images.json").read_text()) == {
+        "postgres:16-alpine": "sha256:" + "9" * 64
+    }
+    report = summary.read_text()
+    assert re.search(
+        r"^\| postgres:16-alpine \| sha256:\w{12} \| sha256:999999999999 \| deploy/compose/",
+        report,
+        re.M,
+    ), report
+
+
+def test_the_image_list_keeps_a_registry_port_and_skips_vendored_trees(tmp_path):
+    """A registry with a port keeps its whole name; a Dockerfile inside node_modules (a
+    package's own) is not one of the repository's pins."""
+    root = _images(_tree(tmp_path / "repo"))
+    (root / "deploy" / "compose" / "local.yaml").write_text(
+        f"services:\n  cache:\n    image: registry.example.test:5000/team/cache:2.1@{PG_PIN}\n"
+    )
+    vendored = root / "dashboard" / "node_modules" / "some-package"
+    vendored.mkdir(parents=True)
+    (vendored / "Dockerfile").write_text(f"FROM alpine:3.20@{UBI_PIN}\n")
+    listed = _run(root, "--list-images")
+    assert listed.returncode == 0, listed.stderr
+    assert "registry.example.test:5000/team/cache:2.1" in listed.stdout.split()
+    assert "alpine:3.20" not in listed.stdout
