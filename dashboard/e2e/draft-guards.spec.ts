@@ -1,12 +1,17 @@
 import { expect, test } from '@playwright/test';
 
-test('changed provider, policy and plan drafts survive Back and rejected reload', async ({ page }) => {
-  await page.goto('/login');
-  await page.getByLabel('API token', { exact: true }).fill('admin');
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
-  for (const [path, heading, button] of [['/providers', 'Providers', 'Add provider'], ['/advisor/policies', 'Advisor policies', 'New policy'], ['/plans', 'Plans', 'New plan']]) {
-    await page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Overview', exact: true }).click();
+// One test per page: the three ran in one test that took up to 29.7 s of its 30 s on WebKit and
+// timed out under load (PR #254); apart, each gets its own budget and they run in parallel.
+for (const [path, heading, button] of [
+  ['/providers', 'Providers', 'Add provider'],
+  ['/advisor/policies', 'Advisor policies', 'New policy'],
+  ['/plans', 'Plans', 'New plan'],
+] as const) {
+  test(`a changed ${heading} draft survives Back and rejected reload`, async ({ page }) => {
+    await page.goto('/login');
+    await page.getByLabel('API token', { exact: true }).fill('admin');
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
     await page.getByRole('navigation', { name: 'Primary' }).locator(`a[href="${path}"]`).click();
     await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
     await page.getByRole('button', { name: button, exact: true }).click();
@@ -28,5 +33,5 @@ test('changed provider, policy and plan drafts survive Back and rejected reload'
     await page.goBack();
     await warning.getByRole('button', { name: 'Discard changes' }).click();
     await expect(page).not.toHaveURL(new RegExp(`${path}$`));
-  }
-});
+  });
+}
