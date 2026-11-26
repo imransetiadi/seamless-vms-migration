@@ -45,7 +45,7 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
         <ol
           aria-label="Migration lifecycle"
           style={{ '--rows': `repeat(${Math.ceil(path.length / 2)}, auto)` } as CSSProperties}
-          className="lifecycle-track grid flex-1 gap-1"
+          className="lifecycle-track grid flex-1"
         >
           {path.map((phase, index) => {
             const meta = phaseMeta(phase);

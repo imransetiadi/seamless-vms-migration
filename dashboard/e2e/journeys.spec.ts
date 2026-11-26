@@ -312,10 +312,15 @@ test('on a phone the lifecycle reads down two columns, half the height of one (S
   expect(boxes[half + 1].y).toBeGreaterThan(boxes[half].y);
   // half the rows of the single column it replaces
   expect(Math.max(...boxes.map((b) => b.bottom)) - boxes[0].y).toBeLessThan(half * 40);
-  // the desktop row is unchanged: every step on one line
+  // the two columns stand 1rem apart, the steps of a column a quarter rem
+  const list = page.getByRole('list', { name: 'Migration lifecycle' });
+  const gaps = () => list.evaluate((el) => [getComputedStyle(el).columnGap, getComputedStyle(el).rowGap]);
+  expect(await gaps()).toEqual(['16px', '4px']);
+  // the desktop row is unchanged: every step on one line, the connectors meeting without a gap
   await page.setViewportSize({ width: 1280, height: 900 });
   const row = await steps.evaluateAll((items) => items.map((el) => Math.round(el.getBoundingClientRect().y)));
   expect(new Set(row).size).toBe(1);
+  expect(await gaps()).toEqual(['0px', '0px']);
 });
 
 
