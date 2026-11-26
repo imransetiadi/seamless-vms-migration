@@ -10,5 +10,5 @@
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["e2e", "playwright.config.ts", "playwright.api.config.ts", "src/playwrightConfig.test.ts"]
+  "include": ["e2e", "playwright.config.ts", "playwright.api.config.ts"]
 }

@@ -18,6 +18,5 @@
     "types": ["vite/client"],
     "noEmit": true
   },
-  "include": ["src"],
-  "exclude": ["src/playwrightConfig.test.ts"]
+  "include": ["src"]
 }
