@@ -85,3 +85,34 @@ def test_control_plane_tests_run_in_parallel_with_the_coverage_gate():
     pyproject = (ROOT / "seamless" / "pyproject.toml").read_text()
     dev = pyproject.split("\ndev = [", 1)[1].split("]", 1)[0]
     assert "pytest-xdist" in dev
+
+
+def _playwright_runs() -> list[str]:
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    return [
+        step.get("run", "")
+        for job in ci["jobs"].values()
+        for step in job.get("steps", [])
+        if "test:e2e" in step.get("run", "") or "playwright test" in step.get("run", "")
+    ]
+
+
+def test_every_playwright_project_runs_in_ci_on_a_runner_of_its_own():
+    """The browser smoke ran Chromium and WebKit in one job, the CI critical path; more workers on
+    one runner made WebKit time out (#256). Each browser now runs on a runner of its own, both
+    Playwright configs per browser, so no project is ever dropped."""
+    runs = _playwright_runs()
+    for config, command in (
+        ("playwright.config.ts", "test:e2e"),
+        ("playwright.api.config.ts", "--config playwright.api.config.ts"),
+    ):
+        projects = re.findall(r"name: '(\w+)'", (ROOT / "dashboard" / config).read_text())
+        assert sorted(projects) == ["chromium", "webkit"], config
+        for project in projects:
+            matching = [
+                run
+                for run in runs
+                if command in run
+                and (config != "playwright.config.ts" or "playwright.api" not in run)
+            ]
+            assert any(f"--project={project}" in run for run in matching), (config, project)
