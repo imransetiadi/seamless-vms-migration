@@ -226,7 +226,7 @@ async def delete_channel(
         try:
             await svc.db.delete("notification_cursor", name)
         except NotFound:
-            pass
+            pass  # a channel that never sent has no cursor to delete
     # the secret the store manages for the channel goes with it (SDD §13.3, §24.3), as a
     # provider's; the deletion is audited whatever the store answers, naming what it left
     left: dict[str, Any] = {}

@@ -16,7 +16,7 @@ from ..config import Settings
 from ..domain.models import NotificationChannel
 from ..security.secrets import SecretNotFound, read_secret
 from .messages import Message, email_message
-from .notifier import SendResult
+from .result import SendResult
 
 log = logging.getLogger(__name__)
 

@@ -21,7 +21,7 @@ from ..config import Settings
 from ..domain.models import NotificationChannel, utcnow
 from ..security.destinations import DestinationNotAllowed, check_destination_async
 from .messages import Message, webhook_document
-from .notifier import SendResult
+from .result import SendResult
 
 #: an HTTP request has this long (SDD §24.6)
 HTTP_TIMEOUT_S = 15.0

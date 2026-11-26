@@ -16,7 +16,7 @@ import httpx
 from ..config import Settings
 from ..domain.models import NotificationChannel
 from .messages import Message, slack_payload
-from .notifier import SendResult
+from .result import SendResult
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,6 @@ class SlackSender:
             return SendResult("retry", "429", retry_after_s=_retry_after(answer))
         if status in _RETRIED_4XX or status >= 500:
             return SendResult("retry", str(status))
-        reason = _final_reason(answer) if 400 <= status < 500 else str(status)
+        reason = _final_reason(answer) if status >= 400 else str(status)
         log.warning("channel %s: Slack answered %s, final", channel.name, reason)
         return SendResult("failed", reason)

@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from ..config import Settings
 from ..domain.enums import NotifyTopic, NotifyTrigger
@@ -29,23 +29,14 @@ from ..events import EventBus, emit
 from ..security.secrets import SecretNotFound, read_secret
 from ..store import ConflictError, NotFound, Store
 from .messages import Message, build_message, triggers_for
+from .result import SendResult
+
+__all__ = ["NEVER_NOTIFIED", "Notifier", "SendResult", "Sender", "Timing", "senders_for"]
 
 log = logging.getLogger(__name__)
 
 #: the kinds the notifier itself writes or the catalog writes: never notified (SDD §24.7)
 NEVER_NOTIFIED = ("notification.", "channel.", "subscription.")
-
-
-@dataclass(frozen=True)
-class SendResult:
-    """What a sender answers (SDD §8.7): final at once, or to be tried again."""
-
-    outcome: Literal["sent", "failed", "retry"]
-    reason: str | None = None
-    #: a Retry-After the answer carried, in seconds
-    retry_after_s: float | None = None
-    #: an email's refused recipients
-    refused: int = 0
 
 
 class Sender(Protocol):
@@ -152,7 +143,7 @@ class Notifier:
             try:
                 await asyncio.wait_for(self._wake.wait(), self.timing.tick_s)
             except TimeoutError:
-                pass
+                pass  # no wake-up within the tick: the next tick runs all the same
 
     async def _keep_channel_tasks(self) -> None:
         channels = await asyncio.to_thread(
@@ -185,7 +176,7 @@ class Notifier:
             try:
                 await asyncio.wait_for(self._wake.wait(), self.timing.tick_s)
             except TimeoutError:
-                pass
+                pass  # no wake-up within the tick: the next tick runs all the same
 
     # -------------------------------------------------------------------- one channel
 
@@ -264,7 +255,7 @@ class Notifier:
                 written = True
                 await self._sleep(self.timing.pace_s)  # one message a second per channel
         if expired.count:
-            version = await self._record_expired(channel, cursor, version, expired)
+            await self._record_expired(channel, cursor, version, expired)
             written = True
         if written:
             return asyncio.get_running_loop().time()
@@ -517,7 +508,7 @@ def senders_for(settings: Settings) -> dict[str, Sender]:
     sender (NT7) and the webhook sender (NT8) - in demo mode a recording sender for every kind
     instead, which renders the message and sends nothing (§7.4, plan task NT10)."""
     if settings.demo:
-        from .recording import RecordingSender  # the senders import SendResult from here
+        from .recording import RecordingSender  # loaded only for the demo (§7.4)
 
         return {
             "email": RecordingSender("email", settings),
