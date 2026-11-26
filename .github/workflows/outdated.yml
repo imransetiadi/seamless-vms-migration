@@ -61,6 +61,21 @@ jobs:
             done
             echo "}"
           } > "$RUNNER_TEMP/actions.json"
+      - name: Current digest of each pinned image (outdated)
+        continue-on-error: true
+        run: |
+          # the registry's answer for each digest-pinned tag (no pull): a tag that moved off its
+          # pin was rebuilt, usually for fixes (Security.md §12)
+          {
+            echo "{"
+            sep=""
+            for ref in $(python scripts/outdated-report.py --list-images); do
+              digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' 2>/dev/null \
+                | python -c 'import json, sys; print(json.load(sys.stdin)["digest"])' 2>/dev/null || true)
+              [ -n "$digest" ] && printf '%s"%s": "%s"\n' "$sep" "$ref" "$digest" && sep=","
+            done
+            echo "}"
+          } > "$RUNNER_TEMP/images.json"
       - name: Write the report to the job summary (outdated)
         continue-on-error: true
         run: |
@@ -69,4 +84,5 @@ jobs:
             [ -s "$RUNNER_TEMP/$kind.json" ] && args+=("--$kind" "$RUNNER_TEMP/$kind.json")
           done
           [ -s "$RUNNER_TEMP/actions.json" ] && args+=(--actions-latest "$RUNNER_TEMP/actions.json")
+          [ -s "$RUNNER_TEMP/images.json" ] && args+=(--images-latest "$RUNNER_TEMP/images.json")
           python scripts/outdated-report.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
