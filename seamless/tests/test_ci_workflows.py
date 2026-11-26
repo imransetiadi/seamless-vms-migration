@@ -7,6 +7,8 @@ comment (``# v4.4.0``) so a reader, and whoever bumps the pin, knows the release
 
 import re
 
+import yaml
+
 from seamless_migrate.config import find_repo_root
 
 ROOT = find_repo_root()
@@ -30,3 +32,19 @@ def test_every_action_is_pinned_to_a_commit_sha_with_its_version():
     assert uses, "no 'uses:' found in .github/workflows"
     assert [f"{f}:{n} {ref}" for f, n, ref, _ in uses if not PINNED.fullmatch(ref)] == []
     assert [f"{f}:{n} {ref}" for f, n, ref, rest in uses if not VERSION_COMMENT.search(rest)] == []
+
+
+def test_every_checkout_leaves_no_token_in_the_repository():
+    """actions/checkout keeps the job token in .git/config by default; the jobs then install
+    packages whose build code runs in the workspace and could read it. No job uses git with
+    credentials after checking out (the repository is public; gitleaks-action takes its token
+    from env), so every checkout sets persist-credentials: false."""
+    persisting = []
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        for name, job in yaml.safe_load(workflow.read_text())["jobs"].items():
+            for step in job.get("steps", []):
+                if not step.get("uses", "").startswith("actions/checkout@"):
+                    continue
+                if (step.get("with") or {}).get("persist-credentials") is not False:
+                    persisting.append(f"{workflow.name}: {name}")
+    assert persisting == []
