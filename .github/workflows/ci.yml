@@ -87,7 +87,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # the collection runtime requirements, including the reviewed openstacksdk range (SDD §21.7)
-          python -m pip install "ansible-core>=2.16,<2.19" ansible-lint pytest pytest-mock -r requirements.txt
+          # pytest-xdist: the pin upstream's requirements-tests.txt carries (seamless/tests/test_ci_workflows.py)
+          python -m pip install "ansible-core>=2.16,<2.19" ansible-lint pytest pytest-mock pytest-xdist==3.8.0 \
+            -r requirements.txt
       - name: Lay the repository out as ansible_collections/os_migrate/os_migrate
         run: |
           mkdir -p "$RUNNER_TEMP/colltree/ansible_collections/os_migrate"
@@ -98,8 +100,9 @@ jobs:
         working-directory: ${{ runner.temp }}/colltree/ansible_collections/os_migrate/os_migrate
         run: |
           python plugins/module_utils/blocksync.py --help > /dev/null
-          # every file, not a list: SEC-01/03/05 regression tests live outside the warm path
-          pytest -q -rs tests/unit > "$RUNNER_TEMP/unit.txt" 2>&1 || { cat "$RUNNER_TEMP/unit.txt"; exit 1; }
+          # every file, not a list: SEC-01/03/05 regression tests live outside the warm path; -n auto spreads
+          # them over the runner's CPUs (serially they took ~19 of this job's 20 minutes)
+          pytest -n auto -q -rs tests/unit > "$RUNNER_TEMP/unit.txt" 2>&1 || { cat "$RUNNER_TEMP/unit.txt"; exit 1; }
           tail -n 15 "$RUNNER_TEMP/unit.txt"
           if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/unit.txt"; then echo "unexpected skipped tests"; exit 1; fi
       - name: ansible-test sanity on the collection, as upstream runs it, from a copied tree (QASuite §14.2)
