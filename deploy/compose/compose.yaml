@@ -41,7 +41,7 @@ services:
   postgres:
     <<: *service-defaults
     # pinned by digest (Security.md §12); bump the digest by hand in a reviewed PR
-    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     environment:
       POSTGRES_DB: seamless
       POSTGRES_USER: seamless
@@ -75,7 +75,7 @@ services:
   jev:
     <<: *service-defaults
     profiles: ["ai"]
-    image: node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
+    image: node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
     init: true
     user: node
     cap_drop:
