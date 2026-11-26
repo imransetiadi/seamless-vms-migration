@@ -48,3 +48,27 @@ def test_every_checkout_leaves_no_token_in_the_repository():
                 if (step.get("with") or {}).get("persist-credentials") is not False:
                     persisting.append(f"{workflow.name}: {name}")
     assert persisting == []
+
+
+def _collection_steps() -> dict[str, str]:
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    return {step.get("name", ""): step.get("run", "") for step in ci["jobs"]["collection"]["steps"]}
+
+
+def test_collection_unit_tests_run_in_parallel_with_the_pinned_xdist():
+    """tests/unit ran serially for ~19 of the collection job's 20 minutes, the CI critical path;
+    pytest-xdist spreads it over the runner's CPUs. The job installs the pin upstream's
+    requirements-tests.txt already carries, so the two never drift."""
+    steps = _collection_steps()
+    pin = re.search(
+        r"^pytest-xdist==\S+$",
+        (ROOT / "requirements-tests.txt").read_text(),
+        re.M,
+    )
+    assert pin, "requirements-tests.txt no longer pins pytest-xdist"
+    install = next(run for name, run in steps.items() if name.startswith("Install ansible-core"))
+    assert pin.group(0) in install
+    unit = next(run for name, run in steps.items() if name.startswith("Collection unit tests"))
+    assert re.search(r"pytest -n auto\b.* tests/unit", unit)
+    # every test still runs: the step still fails on a skipped one
+    assert "unexpected skipped tests" in unit
