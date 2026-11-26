@@ -149,6 +149,9 @@ def test_the_outdated_workflow_runs_weekly_only_reads_and_never_fails_the_run():
     assert "pull-request" not in WORKFLOW.read_text().replace("pull_request", "")
     report_steps = [s for s in job["steps"] if "outdated" in s.get("run", "")]
     assert report_steps and all(s.get("continue-on-error") for s in report_steps)
+    # it installs the newest packages, whose build code runs in the job: leave no token in .git
+    [checkout] = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+    assert checkout.get("with", {}).get("persist-credentials") is False
 
 
 def test_the_report_ignores_a_latest_release_that_is_not_the_actions_version(tmp_path):
