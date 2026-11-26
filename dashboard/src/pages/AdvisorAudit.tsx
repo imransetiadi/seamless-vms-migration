@@ -1,6 +1,6 @@
 import { useListState } from '../lib/useListState';
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
-import { useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchEventTail, useApi, useEventTail, usePlans, usePolicies, useProviders } from '../api/hooks';
 import type { Event } from '../api/types';
@@ -61,6 +61,15 @@ export default function AdvisorAudit() {
   const [announcement, setAnnouncement] = useState('');
   const moreRef = useRef<HTMLButtonElement>(null);
   const tableRef = useRef<HTMLDivElement>(null);
+  const restoreFocus = useRef(false);
+  // The start of the trail removes the button: the table takes the focus, or Search when filters hide it, never the
+  // page (SDD §16). Decided after the commit that applies the page - a frame scheduled before it could still find
+  // the button and leave the focus on <body>.
+  useEffect(() => {
+    if (!restoreFocus.current) return;
+    restoreFocus.current = false;
+    if (!moreRef.current && (document.activeElement === document.body || document.activeElement === null)) (tableRef.current ?? searchRef.current)?.focus();
+  }, [older]);
   const events = useMemo(() => {
     const bySeq = new Map<number, Event>();
     for (const e of [...(older?.events ?? []), ...(audit.data ?? [])]) bySeq.set(e.seq, e);
@@ -74,13 +83,9 @@ export default function AdvisorAudit() {
     setOlderError(null);
     try {
       const page = await fetchEventTail(api, { audit: true, before: oldest }, AUDIT_KEEP);
-      const restoreFocus = document.activeElement === moreRef.current;
+      restoreFocus.current = document.activeElement === moreRef.current;
       setOlder((prev) => ({ events: [...page, ...(prev?.events ?? []), ...(audit.data ?? [])], more: page.length >= AUDIT_KEEP }));
       setAnnouncement(page.length ? `Loaded ${page.length} older audit events.` : 'This is the start of the audit trail.');
-      // the start of the trail removes the button: the table takes the focus, never the page (SDD §16)
-      requestAnimationFrame(() => {
-        if (restoreFocus && !moreRef.current && document.activeElement === document.body) (tableRef.current ?? searchRef.current)?.focus();
-      });
     } catch (error) {
       setOlderError(error);
     } finally {

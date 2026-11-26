@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { strategyRecommendation } from '../api/mockData';
 import { formatBytes } from '../lib/format';
@@ -31,6 +31,26 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
     expect(screen.getAllByText('Recommendation created')).toHaveLength(1);
     await waitFor(() => expect(screen.getByRole('region', { name: 'Loaded recommendation audit history' })).toHaveFocus());
   });
+  it('focuses the loaded history even when a frame runs before the commit (SDD §16)', async () => {
+    // a busy machine: the frame runs at once, before React commits the loaded page
+    const frame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    onTestFinished(() => frame.mockRestore());
+    const server = createTestServer();
+    for (let i = 0; i < 1001; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: 'mig-d4e6f8a090', actor: 'test', message: 'newer scope event', data: {} });
+    renderRec('rec-d4e6f8a09001', server);
+    await screen.findByText(/^Recommended: Warm migration/);
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole('tab', { name: 'Audit' }));
+    expect(await screen.findByText('No audit events for this recommendation in the loaded window.')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    expect(await screen.findByRole('table')).toHaveTextContent('Recommendation created');
+    expect(screen.getAllByText('Recommendation created')).toHaveLength(1);
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Loaded recommendation audit history' })).toHaveFocus());
+    });
+
   it('keeps the audit window when loading older events fails and retries', async () => {
     const server = createTestServer();
     for (let i = 0; i < 1001; i++) server.emit({ kind: 'policy.updated', plan_id: null, migration_id: 'mig-d4e6f8a090', actor: 'test', message: 'newer', data: {} });

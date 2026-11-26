@@ -1,7 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { AUDIT_EVENT_KINDS } from '../api/types';
 import { createTestServer, renderWithApp } from '../test/utils';
 import AdvisorAudit from './AdvisorAudit';
@@ -213,6 +213,27 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     await waitFor(() => expect(search).toHaveFocus());
   });
 
+  it('returns focus to Search even when a frame runs before the commit (SDD §16)', async () => {
+    // a busy machine: the frame runs at once, before React commits the last page
+    const frame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(performance.now());
+      return 0;
+    });
+    onTestFinished(() => frame.mockRestore());
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 1000; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: {} });
+    }
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', server });
+    await auditTable();
+    const search = screen.getByLabelText('Search');
+    await user.type(search, 'no-matching-event');
+    await user.click(screen.getByRole('button', { name: 'Load older audit events' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument());
+    await waitFor(() => expect(search).toHaveFocus());
+    });
+
   it('keeps focus on Search when an older page finishes after the user moved there', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
@@ -342,4 +363,3 @@ describe('a policy change names a provider stored blank by its id (SDD §1 namin
     );
   });
 });
-
