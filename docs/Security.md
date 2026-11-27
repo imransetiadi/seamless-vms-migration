@@ -1223,6 +1223,21 @@ the six internal endpoint spellings refused with 422 in under 10 ms, hook and ch
 refused as a CA path, `auth.denied` naming the caller's public address, the status alone from `/health`, HSTS, 401
 before a broken body, HEAD answered - all passed.
 
+Retest against the live deployment on 0.5.0-rc.3, 2026-11-27 (an admin's token, a temporary viewer and operator and a
+temporary webhook hook, all removed afterwards, nothing named `retest-*` left): 34 of 34 checks passed. P1 - the
+hook's token in no create answer, in no role's `/hooks` answers, nor in the newest 1000 events; `url` null with
+`url_host` alone below admin. P2 - `auth.denied` names the caller's public address, not the ingress pod. P3 - eight
+provider endpoints refused with 422 "destination not allowed": the metadata address, a loopback, the cluster's DNS name,
+an IPv4-mapped, a decimal, a hexadecimal and a 6to4 spelling, and the service network. P4.1 `/health` and `/ready` the
+status alone without a token, P4.2 HSTS, P4.3 401 before a broken body, P4.4 one refusal for a CA path outside
+`SEAMLESS_CA_DIRS` whether it exists or not, P4.5 hook and channel URLs to internal addresses refused, P4.6 HEAD
+answered. P5 - `/api/openapi.json` and `/api/docs` 401 without a token, 403 for a viewer, 200 for an admin;
+`ProviderCreate` offers no server-owned field; a viewer's `/events` carry no `auth.*` or `user.*` event.
+`DELETE /users/{name}` answered 204 and the user's token was a 401 at once. Not run: P4.7's lockout (it would lock the
+tester's own address out of the live service for a minute; `tests/test_client_address.py` covers it). This retest was
+run by the project's own agent with the owner's approval: it is not the independent retest that 0.5.0 final still
+needs (RELEASING.md §3).
+
 Already covered, named "not tested" by the report: the four-eyes approval (`require_distinct_approver`:
 `test_the_cutover_requester_cannot_approve_it_over_the_api`, `test_the_gate_counts_approvals_by_anyone_but_the_cutover_requester`,
 `test_an_approval_the_requester_gave_before_requesting_does_not_count`, `test_the_requester_of_a_decision_neither_approves_nor_overrides_it`).
