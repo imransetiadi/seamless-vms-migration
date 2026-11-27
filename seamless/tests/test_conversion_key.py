@@ -8,6 +8,7 @@ refuses. Every key is synthetic (tests/key_support.py).
 
 from __future__ import annotations
 
+import base64
 import stat
 from pathlib import Path
 
@@ -258,3 +259,34 @@ async def test_a_key_generated_meanwhile_is_never_written_over(settings, monkeyp
     assert await resolve(settings, held) == {"src": old, "dst": old}
 
     assert blob(installation_key(settings)) == public_key(3).split()[1]
+
+
+def test_a_keys_identity_is_its_type_and_blob_never_its_comment():
+    """SDD §7.2: two lines of the same key with different comments are one key, and its
+    fingerprint is what ``ssh-keygen -l`` prints."""
+    one, two = public_key(7, "conv@a"), public_key(7, "someone else")
+    assert conversion_key.key_id(one) == conversion_key.key_id(two) is not None
+    assert conversion_key.key_id(one)[0] == "ssh-ed25519"
+    assert conversion_key.fingerprint(one) == fingerprint(7)
+
+
+_ED25519_BLOB = public_key(7).split()[1]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "ssh-ed25519",  # no blob
+        "ssh-ed25519 not*base64!",  # not base64
+        f"ssh-rsa {_ED25519_BLOB}",  # the line's type is not the one the blob names
+        "ssh-ed25519 " + base64.b64encode(b"\x00\x00\x00\x40ssh-ed25519").decode(),  # truncated
+    ],
+)
+def test_text_that_holds_no_key_has_no_identity(text):
+    """SDD §7.2: what is no public key - nothing, a type alone, a blob that is not base64, one
+    whose own type disagrees with the line's, one shorter than the type it announces - has no
+    identity, so it never matches a pinned key, and its fingerprint says it is no key."""
+    assert conversion_key.key_id(text) is None
+    assert conversion_key.fingerprint(text) == "a text that is no public key"
