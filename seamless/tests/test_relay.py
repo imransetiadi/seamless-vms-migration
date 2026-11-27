@@ -845,7 +845,9 @@ async def test_a_leader_whose_health_finds_its_lease_taken_is_deposed(any_store,
     here a deadline set past the lease, so nothing else deposes it - deposes it at once."""
     a_h = build_replica(tmp_path / "a", any_store.url, [])
     b_h = build_replica(tmp_path / "b", any_store.url, [])
-    a = lead(a_h, "seamless-a", lease_s=1.0, renew_deadline_s=30.0)
+    # a lease of 3 s, renewed every 0.1 s: both replicas start well inside it on a loaded runner
+    # (one of 1 s lapsed during the starts under CI's xdist workers: b took over before the stall)
+    a = lead(a_h, "seamless-a", lease_s=3.0, renew_deadline_s=30.0)
     b = lead(b_h, "seamless-b")
     try:
         await a.start()
