@@ -1925,3 +1925,39 @@ def test_project_credentials_are_server_owned(api):
     assert rewritten.status_code == 200 and rewritten.json()["project_credentials"] == recorded
     checked = api.post("/api/v1/providers/src-osp/check", Role.operator)
     assert checked.status_code == 200 and checked.json()["project_credentials"] == recorded
+
+
+@pytest.mark.parametrize(
+    "call, status, message",
+    [
+        ("read", 500, "reading secret failed: HTTP 500"),
+        ("write", 409, "writing secret failed: HTTP 409"),
+        ("delete", 500, "deleting secret failed: HTTP 500"),
+        ("read", None, "Kubernetes API unreachable: ConnectError"),
+        ("write", None, "Kubernetes API unreachable: ConnectError"),
+    ],
+)
+def test_a_kubernetes_store_failure_names_what_failed_never_the_values(call, status, message):
+    """SDD §13.3: an API server that answers an unexpected status or cannot be reached fails the
+    call with SecretStoreError naming the operation and the status - never the secret's values
+    nor the ServiceAccount token, which the error text could otherwise carry into an event."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if status is None:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(status)
+
+    store = KubernetesSecretStore(
+        "ns",
+        base_url="https://api.test",
+        token="sa-token-xyz",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SecretStoreError) as failed:
+        if call == "write":
+            store.write("provider-x", {"username": "u", "password": "s3cr3t-value"}, {})
+        else:
+            getattr(store, call)("provider-x")
+    text = str(failed.value)
+    assert message in text
+    assert "s3cr3t-value" not in text and "sa-token-xyz" not in text
