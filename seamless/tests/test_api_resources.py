@@ -1667,7 +1667,10 @@ def test_migration_actions_transitions(api):
     assert res.json()["attempts"] == 1 and res.json()["error"] is None
 
     completed = migs["completed"].id
+    # undoing a cutover needs what the cutover needed (SDD §12): an approver
     res = api.post(f"{base}/{completed}/rollback", Role.operator, json={"reason": "app broken"})
+    assert res.status_code == 403
+    res = api.post(f"{base}/{completed}/rollback", Role.approver, json={"reason": "app broken"})
     assert res.status_code == 200 and res.json()["phase"] == "rolling_back"
     wait_for(lambda: api.get(f"{base}/{completed}").json()["phase"] == "rolled_back")
     res = api.post(f"{base}/{completed}/rollback", Role.operator, json={"reason": "again"})
@@ -2276,9 +2279,10 @@ async def test_a_rollback_whose_provider_no_longer_exists_answers_409(tmp_path):
     store.delete("provider", "dst-rhoso")
     app = create_app(settings, orchestrator=h.orch)
     operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    approver = {"Authorization": f"Bearer {tokens[Role.approver]}"}  # a completed migration's
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         refused = await c.post(
-            f"/api/v1/migrations/{m.id}/rollback", headers=operator, json={"reason": "app broken"}
+            f"/api/v1/migrations/{m.id}/rollback", headers=approver, json={"reason": "app broken"}
         )
         assert refused.status_code == 409, refused.text
         assert refused.json()["error"]["message"] == (
@@ -2721,3 +2725,53 @@ def test_extent_tracking_changes_at_any_time_and_keeps_the_status(api, status):
     off = patch({"extent_tracking": False})
     assert off.status_code == 200 and off.json()["status"] == status, off.text
     assert api.store.get("plan", plan_id, Plan).extent_tracking is False
+
+
+async def test_a_completed_migrations_rollback_needs_an_approver(tmp_path):
+    """SDD §12 (pentest 2026-11-28): a cutover needs an approver, and so does undoing one - the
+    rollback of a completed migration deletes the destination server -; an operator's is refused
+    (403, audited) and the migration stays completed. Before its cutover an operator rolls back."""
+    store = Store(f"sqlite:///{tmp_path / 'rollback.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    vms = [make_vm(source_id="vm-1", name="web-01"), make_vm(source_id="vm-2", name="web-02")]
+    h = build_harness(tmp_path, store, vms, settings=settings)
+    plan = make_plan(vm_ids=["vm-1", "vm-2"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    done, running = await h.migrations(plan.id)
+    done.phase = Phase.completed
+    done.downtime_started_at = utcnow()
+    done.downtime_ended_at = utcnow()
+    store.put("migration", done)
+    running.phase = Phase.failed
+    store.put("migration", running)
+    app = create_app(settings, orchestrator=h.orch)
+    operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    approver = {"Authorization": f"Bearer {tokens[Role.approver]}"}
+    body = {"reason": "app broken"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        refused = await c.post(
+            f"/api/v1/migrations/{done.id}/rollback", headers=operator, json=body
+        )
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error"]["message"] == (
+            "rolling back a completed migration requires the approver role"
+        )
+        migration = (await c.get(f"/api/v1/migrations/{done.id}", headers=operator)).json()
+        assert migration["phase"] == "completed"
+        denied = [e for e in store.events(since_seq=0, limit=500) if e.kind == "auth.denied"]
+        assert denied and denied[-1].data["required_role"] == "approver"
+        allowed = await c.post(
+            f"/api/v1/migrations/{running.id}/rollback", headers=operator, json=body
+        )
+        assert allowed.status_code == 200, allowed.text
+        allowed = await c.post(
+            f"/api/v1/migrations/{done.id}/rollback", headers=approver, json=body
+        )
+        assert allowed.status_code == 200, allowed.text
+        missing = await c.post("/api/v1/migrations/nope/rollback", headers=operator, json=body)
+        assert missing.status_code == 404
+    await h.orch.stop()
+    store.dispose()

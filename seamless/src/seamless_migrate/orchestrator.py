@@ -2618,7 +2618,12 @@ class Orchestrator:
         self._launch(mid)
         return m
 
-    async def rollback(self, mid: str, actor: str, reason: str) -> Migration:
+    async def rollback(
+        self, mid: str, actor: str, reason: str, *, undo_completed: bool = True
+    ) -> Migration:
+        """Roll ``mid`` back. ``undo_completed`` is whether the caller may undo a cutover (SDD
+        §12): the API passes an operator's as False, and a migration that completed between the
+        route's own check and this lock is then left as it is."""
         reason = reason.strip()
         if not reason:
             raise Unprocessable("reason is required.")  # as the dashboard says (SDD §12)
@@ -2626,6 +2631,8 @@ class Orchestrator:
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.rolling_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be rolled back")
+            if m.phase == P.completed and not undo_completed:
+                raise NotAllowed("the migration completed: its rollback needs an approver")
             if m.phase == P.completed and m.checkpoint == "finalizing":
                 # SDD §8.1: the rollback would delete the destination server and find no source
                 raise NotAllowed("the finalize began deleting the source VM: finalize it again")
