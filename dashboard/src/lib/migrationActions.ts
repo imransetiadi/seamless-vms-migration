@@ -116,7 +116,14 @@ export function approveDialog(m: Migration, plan: Plan | null | undefined, now: 
   };
 }
 
-function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number, user: string | undefined): Availability {
+function phaseRule(
+  m: Migration,
+  key: MigrationActionKey,
+  plan: Plan | null | undefined,
+  now: number,
+  user: string | undefined,
+  role: Role | undefined,
+): Availability {
   const ok: Availability = { enabled: true, reason: null };
   const no = (reason: string): Availability => ({ enabled: false, reason });
   switch (key) {
@@ -148,6 +155,9 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
       return m.phase === 'awaiting_cutover' ? ok : no('A delta sync can be requested only while awaiting cutover.');
     case 'rollback':
       if (m.phase === 'finalized') return no('A finalized migration cannot be rolled back.');
+      // SDD §12 (pentest 2026-11-28): undoing a cutover needs what the cutover needed - the rollback of a completed
+      // migration deletes the destination server -; before that, an operator's
+      if (m.phase === 'completed' && !hasRole(role, 'approver')) return no('Rolling back a completed migration requires the approver role.');
       // SDD §8.1: the source may be gone; a rollback would delete the destination server and find no source
       if (m.phase === 'completed' && m.checkpoint === 'finalizing') return no('The finalize began deleting the source VM: finalize it again.');
       return canTransition(m.phase, 'rolling_back')
@@ -193,7 +203,7 @@ export function migrationActions(
   const result = {} as Record<MigrationActionKey, Availability>;
   for (const key of MIGRATION_ACTION_ORDER) {
     const min = ACTION_MIN_ROLE[key];
-    result[key] = hasRole(role, min) ? phaseRule(m, key, plan, now, user) : { enabled: false, reason: `Requires the ${min} role.` };
+    result[key] = hasRole(role, min) ? phaseRule(m, key, plan, now, user, role) : { enabled: false, reason: `Requires the ${min} role.` };
   }
   return result;
 }

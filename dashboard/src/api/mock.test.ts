@@ -1855,7 +1855,8 @@ describe('mock API', () => {
   });
 
   it('refuses a rollback whose provider no longer exists, like the API: nothing changes (SDD §5.1)', async () => {
-    const { server, client } = setup('operator');
+    // a completed migration's rollback is an approver's (SDD §12)
+    const { server, client } = setup('approver');
     const done = byPhase(server, 'completed');
     const plan = server.plans.find((p) => p.id === done.plan_id)!;
     server.providers.splice(server.providers.findIndex((p) => p.id === plan.destination_provider_id), 1);
@@ -2904,12 +2905,26 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
   });
 
+  it('keeps the rollback of a completed migration to an approver, like the API: 403 and auth.denied (SDD §12, pentest 2026-11-28)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const web01 = byName(server, 'web-01');
+    expect(web01.phase).toBe('completed');
+    await expect(as(server, 'operator').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' })).rejects.toMatchObject({
+      status: 403,
+      message: 'rolling back a completed migration requires the approver role',
+    });
+    expect(web01.phase).toBe('completed');
+    expect(server.events.filter((e) => e.kind === 'auth.denied').at(-1)).toMatchObject({ data: { required_role: 'approver' } });
+    await as(server, 'approver').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' });
+    expect(web01.phase).toBe('rolling_back');
+  });
+
   it('refuses to roll back a completed migration whose finalize began deleting the source, like the API (SDD §8.1)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const web01 = byName(server, 'web-01');
     expect(web01.phase).toBe('completed');
     web01.checkpoint = 'finalizing';
-    await expect(as(server, 'operator').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' })).rejects.toMatchObject({
+    await expect(as(server, 'approver').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' })).rejects.toMatchObject({
       status: 409,
       message: 'the finalize began deleting the source VM: finalize it again',
     });
@@ -3015,7 +3030,8 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     await as(server, 'operator').post(`/demo/vms/${cache.vm.source_id}/power`, { state: 'on' });
     server.tick();
     expect(cache.source_running_at).not.toBeNull();
-    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    // a completed migration's rollback is an approver's (SDD §12)
+    await as(server, 'approver').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
     expect(cache.source_running_at).toBeNull();
     // the power the demo set goes with it: completed again (a retry cut it over), the source the cutover
     // stopped is not flagged by the old setting
@@ -3032,7 +3048,8 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect([cache.phase, endedAt !== null]).toEqual(['completed', true]);
     const ended = () => server.events.filter((e) => e.migration_id === cache.id && e.kind === 'migration.downtime_ended').length;
     const before = ended();
-    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    // a completed migration's rollback is an approver's (SDD §12)
+    await as(server, 'approver').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
     for (let i = 0; i < 40 && cache.phase !== 'rolled_back'; i++) server.tick();
     expect(cache.phase).toBe('rolled_back');
     expect([cache.actual_downtime_s, cache.downtime_ended_at, ended()]).toEqual([actual, endedAt, before]);
