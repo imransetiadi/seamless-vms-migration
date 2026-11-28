@@ -1178,3 +1178,63 @@ async def test_the_reachability_wait_counts_in_the_downtime(tmp_path, store):
     assert check["ok"] is True
     assert m.actual_downtime_s >= 60  # the two waits, inside the outage
     assert m.downtime_ended_at - m.downtime_started_at >= timedelta(seconds=60)
+
+
+async def test_success_patterns_match_as_before_off_the_event_loop():
+    """SDD §7.5 (pentest 2026-11-28): the console's success patterns are matched in a process of
+    their own; the first pattern found is the answer, an invalid one is a plain substring."""
+    from seamless_migrate.console_patterns import match_bounded
+
+    found = await match_bounded(["login: ", "(unclosed"], "x (unclosed y")
+    assert found.pattern == "(unclosed" and not found.timed_out
+    found = await match_bounded(
+        [r"Reached target .*Multi-User"], "Reached target Multi-User System"
+    )
+    assert found.pattern == r"Reached target .*Multi-User"
+    found = await match_bounded(["(unclosed"], "nothing")
+    assert found.pattern is None and not found.timed_out
+    found = await match_bounded([], "web-01 login: ")
+    assert found.pattern is None and not found.timed_out
+
+
+async def test_a_success_pattern_that_never_ends_stops_at_its_deadline_and_the_loop_runs_on():
+    """SDD §7.5 (pentest 2026-11-28): an operator's pattern with catastrophic backtracking -
+    ``(a+)+$`` - held the event loop, the API and the orchestrator with it, for as long as it
+    ran. It is stopped at its deadline, and the loop keeps its other tasks running meanwhile."""
+    import time
+
+    from seamless_migrate.console_patterns import match_bounded
+
+    ticks = 0
+
+    async def tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    started = time.monotonic()
+    try:
+        found = await match_bounded([r"(a+)+$"], "a" * 64 + "!", timeout_s=0.5)
+    finally:
+        ticker.cancel()
+    assert found.timed_out and found.pattern is None
+    assert time.monotonic() - started < 5
+    assert ticks >= 10, ticks
+
+
+async def test_a_verification_whose_pattern_never_ends_fails_its_console_check(monkeypatch):
+    """SDD §7.5 (pentest 2026-11-28): the console check of such a plan fails saying so, within
+    the deadline; the verification itself ends."""
+    from seamless_migrate import console_patterns
+
+    monkeypatch.setattr(console_patterns, "PATTERN_TIMEOUT_S", 0.5)
+    dest = Dest(console="a" * 64 + "!")
+    res = await asyncio.wait_for(
+        Verifier(dest, Settings(), poll_s=0.01).verify(ctx(console_success_patterns=[r"(a+)+$"])),
+        10,
+    )
+    console = next(c for c in res.checks if c["name"] == "console")
+    assert res.passed is False and console["ok"] is False
+    assert "0.5 s" in console["detail"], console

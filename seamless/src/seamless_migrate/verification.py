@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -26,6 +25,7 @@ from typing import Any, Literal
 
 import httpx
 
+from . import console_patterns
 from .ai.redaction import redact
 from .config import Settings
 from .domain.models import AppProbe, GpuDevice, ProbeResult, VerificationRecord, utcnow
@@ -239,15 +239,9 @@ def _gpu_request(device: GpuDevice) -> str:
     return f"PCI alias {device.alias} ×{device.count}"
 
 
-def _pattern_match(patterns: list[str], text: str) -> str | None:
-    for pattern in patterns:
-        try:
-            if re.search(pattern, text):
-                return pattern
-        except re.error:
-            if pattern in text:
-                return pattern
-    return None
+#: the patterns of the console check, as one search (SDD §7.5); the check itself runs them in a
+#: process of their own (console_patterns.match_bounded)
+_pattern_match = console_patterns.pattern_match
 
 
 class Verifier:
@@ -507,15 +501,21 @@ class Verifier:
         if console is not None:
             excerpt = "\n".join(str(console).splitlines()[-CONSOLE_LINES:])
             evidence["console"] = excerpt
-            matched = _pattern_match(list(cfg.console_success_patterns), excerpt)
-            checks.append(
-                _check(
-                    "console",
-                    matched is not None,
-                    f"matched {matched!r}"
-                    if matched
-                    else f"no success pattern in the last {CONSOLE_LINES} console lines",
-                )
+            # in a process of their own, stopped at a deadline: an operator's pattern must not
+            # hold the event loop (SDD §7.5, pentest 2026-11-28)
+            found = await console_patterns.match_bounded(
+                list(cfg.console_success_patterns), excerpt
             )
+            matched = found.pattern
+            if matched:
+                detail = f"matched {matched!r}"
+            elif found.timed_out:
+                detail = (
+                    "the success patterns did not finish within "
+                    f"{console_patterns.PATTERN_TIMEOUT_S:g} s: simplify them"
+                )
+            else:
+                detail = f"no success pattern in the last {CONSOLE_LINES} console lines"
+            checks.append(_check("console", matched is not None, detail))
         passed = all(c["ok"] for c in checks if not c.get("skipped"))
         return VerificationResult(passed, checks, evidence, probes)
