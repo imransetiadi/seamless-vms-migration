@@ -162,7 +162,56 @@ def connect(provider: Provider, settings: Settings, project_id: str | None = Non
                 check_destination(str(url), settings, field=field)
             except DestinationNotAllowed as exc:
                 raise ProviderError(f"{provider.id}: {exc}") from None
-    return openstack.connect(**kwargs)
+    conn = openstack.connect(**kwargs)
+    # every request of the connection - a catalog endpoint of any service, a redirect's target -
+    # is judged as the endpoint was (SDD §13.5)
+    http = getattr(getattr(conn, "session", None), "session", None)
+    if http is None or not callable(getattr(http, "mount", None)):
+        raise ProviderError(f"{provider.id}: the connection has no HTTP session to guard")
+    guard_session(http, provider.id, settings)
+    return conn
+
+
+#: how long a host the guard allowed stays allowed for a connection's next requests (seconds):
+#: an inventory read sends hundreds to the same few hosts
+_ALLOWED_HOST_TTL_S = 30.0
+
+
+def guard_session(http: Any, provider_id: str, settings: Settings) -> None:
+    """Mount the destination guard on a requests session (SDD §13.5; pentest 2026-11-28).
+
+    ``connect`` judges the endpoint and the auth URL, a check the five services of ``_SERVICES``
+    in the catalog; everything else the session sent went unjudged: the catalog endpoints an
+    inventory read uses, those of placement, orchestration, load balancer and DNS, the version
+    discovery before a check's own judgment, and the target of a redirect, which keystoneauth
+    follows with the token and the body. The adapter judges the URL of every request it is about
+    to send; a refusal is a connection failure that names the host and why."""
+    import requests
+    from keystoneauth1.session import TCPKeepAliveAdapter
+
+    class RefusedDestination(requests.exceptions.ConnectionError):
+        """The destination guard refused the request's URL."""
+
+    class GuardedAdapter(TCPKeepAliveAdapter):  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._allowed: dict[str, float] = {}
+
+        def send(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+            url = str(request.url)
+            host = urllib.parse.urlsplit(url).netloc
+            now = time.monotonic()
+            if self._allowed.get(host, 0.0) < now:
+                try:
+                    check_destination(url, settings, field="request")
+                except DestinationNotAllowed as exc:
+                    raise RefusedDestination(f"{provider_id}: {exc}", request=request) from None
+                self._allowed[host] = now + _ALLOWED_HOST_TTL_S
+            return super().send(request, *args, **kwargs)
+
+    adapter = GuardedAdapter()
+    for scheme in ("http://", "https://"):
+        http.mount(scheme, adapter)
 
 
 def _refuse_catalog(provider: Provider, conn: Any, settings: Settings) -> None:
