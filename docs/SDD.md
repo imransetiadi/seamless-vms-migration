@@ -4684,7 +4684,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
-| POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
+| POST | `/migrations/{id}/rollback` | operator; approver once the migration is `completed` | `{"reason": str}` | `Migration` (undoing a cutover needs what the cutover needed - the rollback of a `completed` migration deletes the destination server -: an operator's is 403, recorded as `auth.denied`, and one that completed while the request was on its way is 409, pentest 2026-11-28; 409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead), and takes an earlier Retry's mark off once it holds none - the estimate eligible again when that reason was its only one (review RV43B-02); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing` and the finalize deletes the source, `delete_source: true`, §8.1; review RV51-25) |
@@ -4859,7 +4859,9 @@ query, §11) or at the latest after 5 seconds — a deletion and a re-creation a
 leave the stamp unchanged — so access survives restarts, a change is visible across processes
 within seconds, and a flood of invalid tokens costs no document read; once the bootstrap file does
 not know a token, the per-address lockout (§15.1) is consulted before the database is asked at
-all. Adding users is refused while authentication is disabled. The bootstrap token file remains read-only.
+all: a locked-out address's token is compared with the digests kept in memory, and only one they
+know is looked up - so a database user behind the same NAT or VPN as a flood is not kept out with
+it, and the flood still costs no read (pentest 2026-11-28). Adding users is refused while authentication is disabled. The bootstrap token file remains read-only.
 The dashboard holds the issued token only until Done or navigation; it never puts it in browser
 storage. Editing roles, rotating tokens and deleting users are not exposed by this screen.
 
@@ -5113,6 +5115,15 @@ and names the host and the reason, never a path, a query or a credential. A Slac
 (§24.3). Demo mode reaches nothing and judges nothing. Plain `http://` is refused for a provider's endpoint as it is
 stored unless its admin sets `allow_plain_http: true` (a lab); a provider stored before keeps working, and its check
 keeps reporting `capabilities.plain_http` (§10).
+
+A URL holding a backslash, a space or a control character is refused as it is stored and before it is resolved: URL
+parsers disagree on where its host ends, and the guard would judge one host while the client connects to another
+(pentest 2026-11-28). An OpenStack connection's HTTP session judges every request it sends by the URL it is about to
+connect to - the sign-in, a catalog endpoint of any service, a version discovery, the target of a redirect - and a
+refusal is a connection failure that names the host and the reason; an allowed host stays allowed for that connection's
+requests of the next 30 s. A verification's TCP checks and application probes (§7.5) go to the address the destination
+reports for the server's port: one the guard refuses is not connected to - the TCP check fails, the application probe
+is `unreachable`, both with "destination not allowed" - unless the destination simulates its guests (§7.4).
 
 The guard judges the addresses a name resolves to at that moment and the connection resolves it again: a record that
 changes in between is the NetworkPolicies' to stop (Security.md §8), which stay the second layer.
@@ -5502,7 +5513,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_DB_URL` | `sqlite:///{data_dir}/seamless.db` | database |
 | `SEAMLESS_HOST` / `SEAMLESS_PORT` | `127.0.0.1` / `8080` | bind |
 | `SEAMLESS_DEMO`, `SEAMLESS_DEMO_SPEED`, `SEAMLESS_DEMO_SEED`, `SEAMLESS_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (a valid bootstrap-file token always passes — a shared ingress or NAT address never locks it out; a database user's token is looked up only while its address is not locked out, §13.1; `0` disables) |
+| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (a valid bootstrap-file token always passes — a shared ingress or NAT address never locks it out; a database user's token from a locked-out address is looked up only when the digests kept in memory know it, §13.1; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
 | `SEAMLESS_EGRESS_DENY_CIDRS`, `SEAMLESS_EGRESS_ALLOW_PRIVATE_CIDRS` | empty, empty | the destination guard (§13.5), comma-separated networks in CIDR form: the deployment's own networks - a cluster's pod and service networks -, never connected to; and, when set, the only private networks a provider, a hook or a channel may be in (unset: every private network is allowed) |
 | `SEAMLESS_CA_DIRS` | `/etc/seamless/ca,/etc/seamless/clouds,/etc/pki,/etc/ssl/certs` | comma-separated directories a provider's `ca_cert_path` may lie in (§12): any other path is refused as the provider is stored, so no check probes the control plane's files |
