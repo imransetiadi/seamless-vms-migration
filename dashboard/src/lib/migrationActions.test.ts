@@ -87,6 +87,19 @@ describe('migrationActions rules', () => {
     expect(migrationActions(migration('completed', { checkpoint: 'verified' }), 'approver').rollback.enabled).toBe(true);
   });
 
+  it('keeps the Rollback of a completed migration to an approver, as the API does (SDD §12, pentest 2026-11-28)', () => {
+    const operator = migrationActions(migration('completed', { checkpoint: 'verified' }), 'operator').rollback;
+    expect(operator.enabled).toBe(false);
+    expect(operator.reason).toBe('Rolling back a completed migration requires the approver role.');
+    expect(migrationActions(migration('completed', { checkpoint: 'verified' }), 'approver').rollback.enabled).toBe(true);
+    expect(migrationActions(migration('completed', { checkpoint: 'verified' }), 'admin').rollback.enabled).toBe(true);
+    // before its cutover completed an operator rolls back, as before
+    expect(migrationActions(migration('failed'), 'operator').rollback.enabled).toBe(true);
+    expect(migrationActions(migration('verifying'), 'operator').rollback.enabled).toBe(true);
+    // a viewer is told the operator role, the minimum for any rollback
+    expect(migrationActions(migration('completed'), 'viewer').rollback.reason).toBe('Requires the operator role.');
+  });
+
   it('lets single-shot strategies cut over from ready (SDD §5.2)', () => {
     expect(migrationActions(migration('ready', {}, 'cold'), 'approver').cutover.enabled).toBe(true);
     // a warm migration may be requested from ready too: it cuts over once pre-copy converged

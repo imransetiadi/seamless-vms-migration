@@ -341,7 +341,8 @@ def fake_conn(admin=True, ovn=True):
         network=FakeNetwork(ports, networks, ovn=ovn),
         identity=NS(get_project=lambda pid: NS(id=pid, name="finance")),
         current_project_id="proj-1",
-        session=NS(auth=auth),
+        # the HTTP session connect mounts the destination guard on (SDD §13.5)
+        session=NS(auth=auth, session=NS(mount=lambda scheme, adapter: None)),
     )
 
 
@@ -948,12 +949,13 @@ async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):
     def unreadable(session):
         raise RuntimeError("the auth plugin keeps no access info")
 
-    conn.session = NS(auth=NS(get_access=unreadable))
+    conn.session = NS(auth=NS(get_access=unreadable), session=conn.session.session)
     stub_openstack(conn)
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert "roles" not in caps and caps["admin"] is True
     conn.session = NS(
-        auth=NS(get_access=lambda session: NS(role_names=["reader", "admin", "admin"]))
+        auth=NS(get_access=lambda session: NS(role_names=["reader", "admin", "admin"])),
+        session=conn.session.session,
     )
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["roles"] == ["admin", "reader"]
@@ -1017,7 +1019,7 @@ async def test_a_destinations_inventory_reads_its_tokens_roles_live(stub_opensta
     def unreadable(session):
         raise RuntimeError("the token has expired")
 
-    conn.session = NS(auth=NS(get_access=unreadable))
+    conn.session = NS(auth=NS(get_access=unreadable), session=conn.session.session)
     assert (await OpenStackProvider(destination, settings()).inventory()).roles is None
     assert not hasattr(await OpenStackProvider(make_provider(), settings()).inventory(), "roles")
 
@@ -1804,8 +1806,9 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
     from seamless_migrate.providers import openstack as osp
 
     calls = {}
+    conn = NS(session=NS(session=NS(mount=lambda scheme, adapter: None)))
     monkeypatch.setattr(
-        osp, "_import_openstack", lambda: NS(connect=lambda **kw: calls.update(kw) or "conn")
+        osp, "_import_openstack", lambda: NS(connect=lambda **kw: calls.update(kw) or conn)
     )
     clouds = tmp_path / "clouds.yaml"
     clouds.write_text(
@@ -1814,7 +1817,7 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
     )
     cfg = settings(clouds_yaml=clouds)
     provider = make_provider(cloud="src", region="regionTwo", ca_cert_path="/etc/pki/ca.pem")
-    assert osp.connect(provider, cfg) == "conn"
+    assert osp.connect(provider, cfg) is conn
     assert calls["auth"]["username"] == "u" and calls["load_yaml_config"] is False
     assert calls["region_name"] == "regionTwo", "Provider.region wins over clouds.yaml"
     assert calls["cacert"] == "/etc/pki/ca.pem" and calls["verify"] is True

@@ -443,7 +443,11 @@ class FakeCloud:
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
         self.roles = ["admin", "member", "reader"]
-        self.session = NS(auth=NS(get_access=lambda session: NS(role_names=list(self.roles))))
+        self.session = NS(
+            auth=NS(get_access=lambda session: NS(role_names=list(self.roles))),
+            # the HTTP session connect mounts the destination guard on (SDD §13.5)
+            session=NS(mount=lambda scheme, adapter: None),
+        )
         self.network_list = None
         self.subnet_list = None
         self.image_metadata = {}

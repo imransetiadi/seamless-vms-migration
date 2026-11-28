@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import Role
-from seamless_migrate.domain.models import Hook, NotificationChannel, utcnow
+from seamless_migrate.domain.models import Hook, NotificationChannel, Provider, utcnow
 from seamless_migrate.hooks import HookRunner
 from seamless_migrate.notify.messages import Message
 from seamless_migrate.notify.webhook import WebhookSender
@@ -302,3 +302,64 @@ def test_a_provider_endpoint_two_parsers_read_as_two_hosts_is_refused(api):
     assert refused.status_code == 422 and "destination not allowed" in message(refused)
     with pytest.raises(DestinationNotAllowed):
         check_stored("https://keystone@127.0.0.1/v3", settings())
+
+
+def test_every_request_of_an_openstack_session_passes_the_guard(monkeypatch):
+    """SDD §13.5 (pentest 2026-11-28): the catalog was judged in a provider's check alone and
+    for five services, and a redirect not at all - an inventory read followed a catalog or a
+    ``Location`` to an internal address with the token. The session's own adapter now judges
+    every request it sends - the sign-in, a catalog endpoint of any service, a redirect's
+    target - by the URL it is about to connect to."""
+    import requests
+
+    from seamless_migrate.providers import openstack as provider_module
+
+    sent = []
+
+    def send(self, request, **kwargs):
+        sent.append(request.url)
+        response = requests.Response()
+        response.status_code = 204
+        response.request = request
+        return response
+
+    session = requests.Session()
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    provider_module.guard_session(session, "src-osp", settings(egress_deny_cidrs=["10.96.0.0/12"]))
+    for url in (
+        "http://169.254.169.254/latest/meta-data/",
+        "https://10.96.0.1/api",
+        "https://kubernetes.default.svc/",
+        "https://127.0.0.1:8774/v2.1/servers",
+    ):
+        with pytest.raises(requests.exceptions.ConnectionError) as refused:
+            session.get(url)
+        assert "destination not allowed" in str(refused.value), url
+    assert sent == []
+    assert session.get("https://nova.cloud.example:8774/v2.1/servers").status_code == 204
+    assert sent == ["https://nova.cloud.example:8774/v2.1/servers"]
+
+
+def test_an_openstack_connection_is_given_the_guarded_session(monkeypatch):
+    """SDD §13.5: ``connect`` mounts the guard on the connection's own HTTP session."""
+    from types import SimpleNamespace
+
+    import requests
+
+    from seamless_migrate.providers import openstack as provider_module
+
+    http = requests.Session()
+    conn = SimpleNamespace(session=SimpleNamespace(session=http))
+    fake = SimpleNamespace(connect=lambda **kwargs: conn)
+    monkeypatch.setattr(provider_module, "_import_openstack", lambda: fake)
+    provider = Provider(
+        id="src-osp",
+        name="Source",
+        kind="openstack",
+        role="source",
+        endpoint="https://keystone.cloud.example:13000/v3",
+        cloud="src",
+    )
+    assert provider_module.connect(provider, settings()) is conn
+    for scheme in ("http://", "https://"):
+        assert type(http.get_adapter(f"{scheme}x.example/")).__name__ == "GuardedAdapter"

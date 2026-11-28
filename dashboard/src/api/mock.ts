@@ -3718,6 +3718,13 @@ export class MockServer {
         record('delta sync requested');
         break;
       case 'rollback': {
+        // like the API (SDD §12, pentest 2026-11-28): undoing a cutover needs what the cutover needed - an approver's once
+        // the migration completed -, refused before anything else is judged
+        if (m.phase === 'completed' && !hasRole(me.role, 'approver')) {
+          const why = 'rolling back a completed migration requires the approver role';
+          this.auditDenied(why, 'approver', me);
+          throw new HttpError(403, 'forbidden', why);
+        }
         const reason = typeof input.reason === 'string' ? pyStrip(input.reason) : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
         if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);

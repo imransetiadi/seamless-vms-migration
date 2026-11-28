@@ -10,7 +10,7 @@ from pydantic import TypeAdapter
 from ..domain.enums import Phase, Role
 from ..domain.models import Migration, MigrationSummary
 from ..security.auth import Principal
-from .deps import AuthFirstRoute, require_role, services
+from .deps import ApiError, AuthFirstRoute, _audit_denied, require_role, services
 from .schemas import (
     ApproveRequest,
     CancelRequest,
@@ -23,6 +23,9 @@ from .schemas import (
 )
 
 router = APIRouter(tags=["migrations"], route_class=AuthFirstRoute)
+
+#: why an operator's rollback of a completed migration is refused (SDD §12)
+COMPLETED_ROLLBACK = f"rolling back a completed migration requires the {Role.approver} role"
 
 #: the list as JSON in one pass: the store has validated each migration already, and a response
 #: model would dump, validate and serialize all of them again (44 ms against 21 ms per 1,000)
@@ -121,7 +124,20 @@ async def rollback(
     request: Request,
     principal: Principal = Depends(require_role(Role.operator)),
 ) -> Migration:
-    return await services(request).orchestrator.rollback(migration_id, principal.name, body.reason)
+    # SDD §12 (pentest 2026-11-28): undoing a cutover needs what the cutover needed. The rollback
+    # of a completed migration deletes the destination server: an approver's; before that, an
+    # operator's. The orchestrator judges it again under the migration's lock.
+    svc = services(request)
+    orchestrator = svc.orchestrator
+    approver = principal.role.at_least(Role.approver)
+    if not approver:
+        migration = await svc.db.get("migration", migration_id, Migration)
+    if not approver and migration.phase == Phase.completed:
+        await _audit_denied(request, COMPLETED_ROLLBACK, Role.approver, principal)
+        raise ApiError(403, "forbidden", COMPLETED_ROLLBACK)
+    return await orchestrator.rollback(
+        migration_id, principal.name, body.reason, undo_completed=approver
+    )
 
 
 @router.post("/migrations/{migration_id}/retry", response_model=Migration)

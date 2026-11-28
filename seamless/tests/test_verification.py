@@ -1238,3 +1238,50 @@ async def test_a_verification_whose_pattern_never_ends_fails_its_console_check(m
     console = next(c for c in res.checks if c["name"] == "console")
     assert res.passed is False and console["ok"] is False
     assert "0.5 s" in console["detail"], console
+
+
+@pytest.mark.real_probe_guard
+@pytest.mark.parametrize("address", ["169.254.169.254", "127.0.0.1", "10.96.0.1", "::1"])
+async def test_a_probe_never_connects_where_the_control_plane_may_not(address):
+    """SDD §7.5, §13.5 (pentest 2026-11-28): the address a verification probes is the one the
+    destination cloud reports for the server's port. One the destination guard refuses - a
+    loopback or link-local address, the deployment's own networks - is not connected to: its TCP
+    check fails and its application probe is unreachable, both saying why, and neither tells
+    what listens there."""
+    from seamless_migrate.domain.models import AppProbe
+
+    connected = []
+
+    async def tcp(host, port):
+        connected.append((host, port))
+        return True, "connected"
+
+    async def app(host, probe):
+        connected.append((host, probe.port))
+        raise AssertionError("never called")
+
+    settings = Settings(egress_deny_cidrs=["10.96.0.0/12"])
+    verifier = Verifier(Dest(address=address), settings, poll_s=0.01, probe=tcp, app_probe=app)
+    res = await verifier.verify(
+        ctx(tcp_ports=[22], timeout_s=0, app_probes=[AppProbe(kind="http", port=80, path="/")])
+    )
+    assert connected == []
+    tcp_check = next(c for c in res.checks if c["name"] == "tcp:22")
+    assert tcp_check["ok"] is False and "destination not allowed" in tcp_check["detail"]
+    assert res.probes[0].result == "unreachable"
+    assert "destination not allowed" in res.probes[0].detail
+
+
+@pytest.mark.real_probe_guard
+async def test_a_probe_of_a_tenant_address_goes_out_as_before():
+    """SDD §7.5, §13.5: a private address outside the deployment's networks is a tenant's."""
+    connected = []
+
+    async def tcp(host, port):
+        connected.append((host, port))
+        return True, "connected"
+
+    res = await Verifier(Dest(address="10.20.0.7"), Settings(), poll_s=0.01, probe=tcp).verify(
+        ctx(tcp_ports=[22], timeout_s=0)
+    )
+    assert connected == [("10.20.0.7", 22)] and res.passed

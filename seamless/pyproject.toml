@@ -74,6 +74,7 @@ filterwarnings = ["ignore::PendingDeprecationWarning:openstack\\."]
 markers = [
   "live: talks to real external services (Jev, agentmemory, Slack, an SMTP relay, a webhook receiver); skipped unless enabled",
   "lab: runs against the reference lab clouds (QASuite §7); skipped unless SEAMLESS_LAB_* is set",
+  "real_probe_guard: the verification probes pass the destination guard as in production (SDD §13.5); off otherwise, the probes of a test go to 127.0.0.1",
 ]
 
 [tool.ruff]
