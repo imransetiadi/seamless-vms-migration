@@ -101,6 +101,15 @@ class Services:
             self._users_read_at = time.monotonic()
             return users
 
+    def knows_digest(self, digest: str) -> bool:
+        """Whether a database user's digest kept in memory equals ``digest`` (SDD §13.1): no
+        read, and no early exit. What is kept may be stale - the store decides after it."""
+        known = False
+        for user in self._users:
+            if hmac.compare_digest(user.sha256, digest):
+                known = True
+        return known
+
     def forget_users(self) -> None:
         """Read the users' digests again at the next authentication (SDD §13.1): a removed user's
         token stops at once, whatever the change stamp says."""
@@ -231,9 +240,12 @@ async def authenticate(request: Request) -> Principal | None:
     principal = svc.tokens.authenticate(token.strip())
     if principal is not None:
         return principal
-    if svc.auth_locked(_client(request)):
-        return None  # SDD §13.1: a locked-out address never reaches the database
     digest = hash_token(token.strip())
+    if svc.auth_locked(_client(request)) and not svc.knows_digest(digest):
+        # SDD §13.1: a locked-out address reaches the database only with a token the digests
+        # kept in memory know - a flood of unknown ones costs no read, and a database user
+        # behind the same NAT or VPN is not kept out with it (pentest 2026-11-28)
+        return None
     for user in await svc.database_users():  # no early exit, like the file tokens
         if hmac.compare_digest(user.sha256, digest):
             principal = Principal(user.name, user.role)

@@ -1604,3 +1604,53 @@ def test_a_route_whose_request_is_empty_refuses_a_field(api, path):
     for body in ({}, None):
         taken = api.client.post(path, headers=api.h(Role.admin), json=body)
         assert taken.status_code == 404, (body, taken.text)  # its unknown id, as before
+
+
+def test_a_locked_out_address_still_admits_a_database_users_valid_token(tmp_path, monkeypatch):
+    """SDD §13.1 (pentest 2026-11-28): sixty failures from one address answered a database
+    user's valid token 429 for a minute - anyone behind the same NAT or VPN could keep every
+    such user out. A locked-out address's token is compared with the digests kept in memory:
+    one that matches is looked up as ever, one that does not is answered 429 without a read."""
+    from seamless_migrate.security.auth import DashboardUser, generate_token, hash_token
+
+    settings, _ = api_settings(tmp_path, auth_lockout_per_minute=2)
+    store = Store(f"sqlite:///{tmp_path / 'lock.db'}")
+    store.create_schema()
+    token = generate_token()
+    store.create_user(
+        DashboardUser(id="alice", name="alice", role=Role.viewer, sha256=hash_token(token)),
+        "admin-user",
+    )
+    reads: list[str] = []
+    original_list, original_stamp = Store.list, Store.change_stamp
+
+    def counting_list(self, kind, *args, **kwargs):
+        if kind == "user":
+            reads.append("list")
+        return original_list(self, kind, *args, **kwargs)
+
+    def counting_stamp(self, kind):
+        if kind == "user":
+            reads.append("stamp")
+        return original_stamp(self, kind)
+
+    monkeypatch.setattr(Store, "list", counting_list)
+    monkeypatch.setattr(Store, "change_stamp", counting_stamp)
+    with TestClient(create_app(settings, store)) as client:
+        bad = {"Authorization": "Bearer smg_not_a_real_token"}
+        good = {"Authorization": f"Bearer {token}"}
+        for _ in range(2):
+            assert client.get("/api/v1/me", headers=bad).status_code == 401
+        assert client.get("/api/v1/me", headers=bad).status_code == 429
+        before = list(reads)
+        for _ in range(20):
+            assert client.get("/api/v1/me", headers=bad).status_code == 429
+        assert reads == before, "a flood of unknown tokens still costs no read"
+        answer = client.get("/api/v1/me", headers=good)
+        assert answer.status_code == 200 and answer.json()["name"] == "alice"
+        assert client.get("/api/v1/me", headers=bad).status_code == 429
+        # a deleted user's token is no way around the lockout: the store has the last word
+        store.delete("user", "alice")
+        client.app.state.services.forget_users()
+        assert client.get("/api/v1/me", headers=good).status_code == 429
+    store.dispose()
