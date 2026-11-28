@@ -259,3 +259,46 @@ async def test_a_name_that_does_not_resolve_in_time_is_refused(monkeypatch):
         )
     assert "slow.example.org did not resolve in 0.05 s" in str(refused.value)
     assert "/x" not in str(refused.value)
+
+
+TWO_HOSTS = [
+    "https://169.254.169.254\\@keystone.example/v3",  # urlsplit: keystone.example; urllib3: the IP
+    "https://10.96.0.1\\@keystone.example:5000/v3",
+    "https://keystone.example\\.internal/v3",
+    "https://keystone.example/v3\n",
+    "https://keystone\t.example/v3",
+    " https://keystone.example/v3",
+    "https://keystone.example/v3\x00",
+]
+
+
+@pytest.mark.parametrize("url", TWO_HOSTS)
+def test_a_url_two_parsers_read_as_two_hosts_is_refused(url):
+    """SDD §13.5 (pentest 2026-11-28): the guard reads a URL with ``urlsplit``, the OpenStack
+    session with urllib3, which ends the host at a backslash - ``https://<internal>\\@<allowed>/``
+    was judged by its second host and connected to its first. A URL holding a backslash, a space
+    or a control character is refused before anything is resolved, as a route stores it too."""
+    resolved = []
+    for check in (check_destination, check_stored):
+        with pytest.raises(DestinationNotAllowed) as refused:
+            kw = {"resolver": lambda host: resolved.append(host) or ["8.8.8.8"]}
+            check(url, settings(), **(kw if check is check_destination else {}))
+        assert "destination not allowed" in str(refused.value)
+        assert "169.254.169.254" not in str(refused.value)
+    assert resolved == []
+
+
+def test_a_provider_endpoint_two_parsers_read_as_two_hosts_is_refused(api):
+    """SDD §12, §13.5 (pentest 2026-11-28): POST and PATCH /providers refuse (422) such an
+    endpoint; an endpoint with a user name before its host stays one host and is judged by it."""
+    endpoint = "https://169.254.169.254\\@keystone.src.example:13000/v3"
+    refused = api.post("/api/v1/providers", json={**SOURCE, "endpoint": endpoint})
+    assert refused.status_code == 422, refused.text
+    assert "destination not allowed" in message(refused), message(refused)
+    assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+    refused = api.client.patch(
+        "/api/v1/providers/src-osp", headers=api.h(Role.admin), json={"endpoint": endpoint}
+    )
+    assert refused.status_code == 422 and "destination not allowed" in message(refused)
+    with pytest.raises(DestinationNotAllowed):
+        check_stored("https://keystone@127.0.0.1/v3", settings())

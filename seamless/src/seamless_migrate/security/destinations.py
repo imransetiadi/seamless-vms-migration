@@ -128,6 +128,23 @@ def refused_host(host: str, settings: Settings) -> str | None:
     return None
 
 
+#: why a URL two parsers may read as two hosts is refused (SDD §13.5, pentest 2026-11-28)
+_AMBIGUOUS = "it holds a backslash, a space or a control character"
+
+
+def _ambiguous(destination: str) -> bool:
+    """Whether ``destination`` holds a character URL parsers disagree on (SDD §13.5): the guard
+    reads a URL with ``urlsplit``, the OpenStack session with urllib3, which ends the host at a
+    backslash - ``https://<internal>\\@<allowed>/`` was judged by its second host and connected to
+    its first -, and ``urlsplit`` drops a tab or a newline another client keeps."""
+    return any(ch == "\\" or ch <= " " or ch == "\x7f" for ch in destination)
+
+
+def _refuse_ambiguous(destination: str, field: str) -> None:
+    if _ambiguous(destination):
+        raise DestinationNotAllowed(f"{field}: {NOT_ALLOWED}: {_AMBIGUOUS}")
+
+
 def _host_of(destination: str) -> str:
     """The host of a URL, or of a bare ``host`` / ``host:port`` (a conversion host's address)."""
     try:
@@ -140,6 +157,7 @@ def _host_of(destination: str) -> str:
 def check_stored(destination: str, settings: Settings, field: str = "url") -> None:
     """Refuse a destination a route is about to store (SDD §13.5): no resolution, so a receiver
     whose name does not resolve yet can be registered."""
+    _refuse_ambiguous(destination, field)
     host = _host_of(destination)
     why = refused_host(host, settings)
     if why is not None:
@@ -162,6 +180,7 @@ def check_destination(
     """Refuse ``destination`` - a URL or a host - unless every address its host resolves to is
     one the control plane may connect to (SDD §13.5); returns those addresses. A name that does
     not resolve is refused too: nothing would be reached, and the answer takes no longer."""
+    _refuse_ambiguous(destination, field)
     host = _host_of(destination)
     why = refused_host(host, settings)
     if why is not None:
