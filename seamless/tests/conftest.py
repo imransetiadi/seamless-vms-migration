@@ -156,3 +156,15 @@ def _no_name_is_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
     from seamless_migrate.security import destinations
 
     monkeypatch.setattr(destinations, "system_resolver", lambda host: ["203.0.113.10"])
+
+
+@pytest.fixture(autouse=True)
+def _probes_reach_loopback(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verification's probes go to listeners on 127.0.0.1 in a test, an address the destination
+    guard refuses (SDD §7.5, §13.5): the probes' guard is off unless a test asks for the real one
+    (``@pytest.mark.real_probe_guard``)."""
+    if request.node.get_closest_marker("real_probe_guard") is not None:
+        return
+    from seamless_migrate import verification
+
+    monkeypatch.setattr(verification, "_probe_refused", lambda address, settings: None)

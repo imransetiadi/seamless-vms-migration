@@ -32,6 +32,7 @@ from .domain.models import AppProbe, GpuDevice, ProbeResult, VerificationRecord,
 from .planning.gpu import gpu_flavor, gpu_requests, pool_name
 from .planning.probes import is_database, probes_for
 from .providers.base import ProviderError
+from .security.destinations import DestinationNotAllowed, check_destination
 
 log = logging.getLogger(__name__)
 #: Nova states no amount of polling leaves (SDD §7.5): the verification fails at once.
@@ -103,6 +104,18 @@ def _moved_addresses(migration: Any) -> list[str]:
     """The addresses the keep-address move moved (SDD §4.2, §8.3): its journal's moved entries."""
     moves = getattr(migration, "fip_moves", None) or []
     return list(dict.fromkeys(e.address for e in moves if e.state == "moved"))
+
+
+def _probe_refused(address: str, settings: Settings) -> str | None:
+    """Why a probe does not connect to ``address``, else None (SDD §7.5, §13.5; pentest
+    2026-11-28). The address is what the destination cloud reports for the server's port: one
+    the destination guard refuses - a loopback or link-local address, the deployment's own
+    networks - would make the probe's answer tell what listens inside the deployment."""
+    try:
+        check_destination(address, settings, field="probe")
+    except DestinationNotAllowed as exc:
+        return str(exc)
+    return None
 
 
 def _check(name: str, ok: bool, detail: str, skipped: bool = False) -> dict[str, Any]:
@@ -288,6 +301,16 @@ class Verifier:
         if callable(simulate):
             answer: ProbeAnswer = await simulate(server_id, vm, probe, address)
             return answer
+        return await self._guarded_app_probe(address, probe)
+
+    async def _guarded_app_probe(self, address: str, probe: AppProbe) -> ProbeAnswer:
+        """The application probe, unless the destination guard refuses its address (SDD §13.5):
+        then nothing is connected to and the probe is unreachable, saying why."""
+        refused = await asyncio.to_thread(_probe_refused, address, self.settings)
+        if refused is not None:
+            return ProbeAnswer(
+                "unreachable", f"{address}:{probe.port} unreachable ({refused})", False
+            )
         return await self._app_probe(address, probe)
 
     async def _floating_ip_check(
@@ -306,7 +329,7 @@ class Verifier:
         if vm is not None:
             answer = await self._run_app_probe(server_id, vm, probe, address)
         else:
-            answer = await self._app_probe(address, probe)
+            answer = await self._guarded_app_probe(address, probe)
         if answer.result == "unreachable":
             return _check(name, False, answer.detail)
         if answer.result == "failed":
@@ -450,6 +473,12 @@ class Verifier:
                 tcp = AppProbe(kind="tcp", port=int(port))
                 answer = await self._run_app_probe(server_id, vm, tcp, address)
                 checks.append(_check(f"tcp:{port}", answer.result == "passed", answer.detail))
+                continue
+            refused = await asyncio.to_thread(_probe_refused, address, self.settings)
+            if refused is not None:  # SDD §13.5: nothing is connected to
+                checks.append(
+                    _check(f"tcp:{port}", False, f"{address}:{port} unreachable ({refused})")
+                )
                 continue
             ok, detail = await self._probe(address, int(port))
             checks.append(_check(f"tcp:{port}", ok, detail))
